@@ -415,3 +415,362 @@ A **Deployment** is a higher-level object that *manages* one or more ReplicaSets
 | **Purpose** | Guarantees a stable number of Pod replicas. | Provides **declarative updates** to Pods and ReplicaSets. |
 | **Updates** | No native update capabilities. Requires manual management. | Manages automated **rolling updates** and **rollbacks** by controlling multiple underlying ReplicaSets. |
 | **Use Case** | Rarely used directly. Used by Deployments. | The standard way to deploy and manage stateless applications. |
+
+
+This section covers essential questions about **Containerization and Docker Basics**.
+
+-----
+
+## 41\. What is Docker?
+
+**Docker** is a popular open-source platform that enables developers to **package applications** and their dependencies into standardized units called **containers**.
+
+  * It uses **containerization technology** to ensure an application runs reliably and consistently when moved from one computing environment to another (e.g., from development to testing to production).
+  * It provides the tooling and runtime (Docker Engine) to build, share, and run these containers.
+
+-----
+
+## 42\. Difference between image and container.
+
+| Feature | Docker Image 🖼️ | Docker Container 📦 |
+| :--- | :--- | :--- |
+| **Definition** | A **read-only template** containing the application code, dependencies, libraries, configuration, and environment setup. | A **runnable instance** of an image. It's the live, executing process. |
+| **State** | **Static** and **immutable**. It exists on disk. | **Dynamic** and **ephemeral**. It exists in memory and runs. |
+| **Creation** | Created using a **Dockerfile** and built with `docker build`. | Created from an image using `docker run`. |
+| **Layers** | Composed of multiple **read-only layers**. | Adds a single **read-write layer** on top of the image's read-only layers. |
+
+-----
+
+## 43\. How do you create a Docker image?
+
+A Docker image is typically created using two main steps:
+
+1.  **Create a Dockerfile:** Write a text file (named `Dockerfile`) that contains a set of instructions for building the image.
+2.  **Run the build command:** Execute the `docker build` command in the directory containing the Dockerfile.
+
+<!-- end list -->
+
+```bash
+docker build -t my-app:v1 .
+```
+
+  * **`-t my-app:v1`**: Tags the resulting image with a name and version.
+  * **`.`**: Specifies the build context (the current directory) where the Dockerfile and application files are located.
+
+-----
+
+## 44\. What is a Dockerfile?
+
+A **Dockerfile** is a plain text file that contains a sequence of **instructions** and **arguments** used to automatically **build a Docker image**.
+
+  * Each instruction in the Dockerfile (like `FROM`, `RUN`, `COPY`, `CMD`) results in a new, read-only layer in the image.
+  * It provides a transparent and reproducible way to define the image content.
+
+-----
+
+## 45\. Explain the purpose of layers in Docker.
+
+Docker images are composed of a stack of **read-only layers**, where each layer represents a file system difference introduced by an instruction in the Dockerfile.
+
+  * **Reusability & Efficiency:** Layers enable **caching**. If an instruction hasn't changed, Docker reuses the layer from a previous build, speeding up subsequent builds.
+  * **Storage Efficiency:** Multiple images can share common base layers, saving disk space (e.g., many applications use the same Linux base image).
+  * **Containers are built on layers:** When a container runs, a single thin, **read-write layer** is placed on top of the image's read-only layers. All changes made by the running container are isolated in this top layer.
+
+-----
+
+## 46\. How do you reduce Docker image size?
+
+Reducing image size is crucial for faster build, push, and pull times. Key strategies include:
+
+1.  **Use a Minimal Base Image:** Use minimal Linux distributions like **Alpine (`alpine`)** or slim versions (`node:18-slim`) instead of full OS images.
+2.  **Use Multi-Stage Builds:** Separate the build environment (which needs compilers, testing tools, etc.) from the runtime environment, copying only the final, compiled artifact into a tiny final image (see Q51).
+3.  **Combine `RUN` Commands:** Combine multiple commands into a single `RUN` instruction using `&&` and cleaning up artifacts in the same layer (e.g., removing package caches like `apt-get clean`).
+4.  **Use `.dockerignore`:** Exclude unnecessary files and folders (like `.git`, `node_modules`, test files) from the build context.
+
+-----
+
+## 47\. What is the difference between ENTRYPOINT and CMD?
+
+Both specify the command to be executed when a container starts, but they serve different purposes and interact with each other.
+
+| Feature | `CMD` (Command) | `ENTRYPOINT` (Entry Point) |
+| :--- | :--- | :--- |
+| **Purpose** | Sets the default command that will be executed. | Sets the command that will *always* be executed. |
+| **Execution** | The full command executed when the container starts. | Defines the **executable** that will be run. |
+| **Override** | **Easily overridden** by arguments passed on `docker run`. | **Not easily overridden**. It's usually a static binary/script. |
+| **Interaction** | Often used to supply **arguments** to the `ENTRYPOINT`. |
+
+**Analogy:** Think of `ENTRYPOINT` as the fixed program, and `CMD` as the default arguments for that program.
+
+  * **Example (Shell form):** `ENTRYPOINT ["/usr/bin/supervisord"]` and `CMD ["-c", "/etc/supervisord.conf"]`
+  * **Resulting command:** `/usr/bin/supervisord -c /etc/supervisord.conf`
+
+-----
+
+## 48\. How do you expose ports in Docker?
+
+Ports are managed using two different Dockerfile instructions/command-line flags:
+
+1.  **`EXPOSE` (Dockerfile Instruction):**
+      * **Function:** **Documents** the ports on which the application inside the container is listening.
+      * **Effect:** It's purely informational and **does not** actually publish or map the port to the host machine.
+      * *Example:* `EXPOSE 8080`
+2.  **`-p` or `--publish` (Command-line flag for `docker run`):**
+      * **Function:** **Publishes** a container's port to the host machine's network.
+      * **Effect:** It creates a firewall rule and mapping.
+      * *Example:* `docker run -p 80:8080 my-image` (Maps host port 80 to container port 8080).
+
+-----
+
+## 49\. What is Docker Compose?
+
+**Docker Compose** is a tool for **defining and running multi-container Docker applications**.
+
+  * It uses a single **YAML file** (typically `docker-compose.yaml`) to configure all the application's services (containers), networks, and volumes.
+  * It simplifies the management of complex microservice applications by allowing a single command (`docker compose up`) to start, stop, and manage the entire defined stack.
+
+-----
+
+## 50\. What are Docker volumes?
+
+**Docker Volumes** are the preferred mechanism for **persisting data** generated by or used by Docker containers.
+
+  * They are managed by Docker (created, managed, and deleted via Docker CLI).
+  * They are stored in a part of the host filesystem that is managed by Docker (usually `/var/lib/docker/volumes/` on Linux) and **isolated** from the core logic of the host machine.
+  * Data in a volume **persists** even if the container is stopped, removed, or replaced, making them ideal for databases and stateful applications.
+
+-----
+
+## 51\. Explain bind mounts vs volumes.
+
+Both are methods of persistence, but they differ in how data is managed and where it resides.
+
+| Feature | Docker Volumes 💾 | Bind Mounts 🔗 |
+| :--- | :--- | :--- |
+| **Host Location** | Managed by Docker in a dedicated area (abstracted). | Arbitrary, user-defined path on the host file system. |
+| **Management** | **Managed by Docker** (Docker CLI commands). | **Managed by the user** (Host operating system tools). |
+| **Portability** | **Highly portable** across different operating systems. | **Less portable**, as the specific host directory must exist. |
+| **Ideal Use Case** | Persistent application data (e.g., database storage). | Sharing host configuration files or source code during development. |
+
+-----
+
+## 52\. What is Docker networking?
+
+**Docker networking** is the system that allows containers to communicate with each other and with the external world. Docker Engine uses the **Container Network Model (CNM)** to manage this.
+
+Default network drivers:
+
+1.  **Bridge (Default):** Creates a private internal network for containers on a single host. Containers on this network can communicate with each other, and traffic can be routed to the external world via the host.
+2.  **Host:** Removes network isolation; the container shares the host's networking namespace.
+3.  **None:** Disables all networking for the container.
+4.  **Overlay:** Used for multi-host communication (Docker Swarm/Compose across multiple machines).
+
+-----
+
+## 53\. How do you inspect Docker containers?
+
+The primary command to view detailed, low-level information about a container's configuration, state, networking, and volumes is:
+
+```bash
+docker inspect <container_id_or_name>
+```
+
+Other useful commands:
+
+  * `docker ps`: Lists running containers.
+  * `docker logs <container_id>`: Views the standard output/error.
+  * `docker top <container_id>`: Shows the running processes inside the container.
+
+-----
+
+## 54\. How do you connect multiple containers?
+
+Multiple containers can communicate via Docker networking, primarily using the **Bridge** network (for single-host communication) or **Overlay** network (for multi-host communication).
+
+1.  **Docker Compose (Recommended):** Docker Compose automatically sets up a default bridge network and registers all services (containers) by their service name as a DNS entry.
+2.  **Manual Bridge Network:** Create a custom bridge network and attach containers to it. Containers can then resolve each other using their container names.
+    ```bash
+    docker network create my-net
+    docker run --network my-net --name web ...
+    docker run --network my-net --name db ...
+    ```
+
+-----
+
+## 55\. What is Docker Hub?
+
+**Docker Hub** is the **public cloud-based registry service** provided by Docker.
+
+  * It acts as a central repository for finding and sharing container images.
+  * It hosts official images (like Ubuntu, Nginx, Node.js) and allows users to create public or private repositories to store their own built images.
+
+-----
+
+## 56\. Explain Docker registry and repository.
+
+  * **Docker Registry:** A storage and content delivery system that holds Docker images. It's the server-side component.
+      * *Example:* **Docker Hub** (a public registry), **AWS ECR**, or a private company registry.
+  * **Docker Repository:** A collection of related Docker images, often corresponding to a single application.
+      * A repository can contain images with the same name but different tags (versions), such as `my-app:1.0` and `my-app:2.0`.
+      * *Example:* The repository `nginx` on Docker Hub contains all Nginx versions.
+
+-----
+
+## 57\. What is the purpose of `.dockerignore`?
+
+The **`.dockerignore`** file works similarly to `.gitignore` but for Docker builds.
+
+  * **Purpose:** It specifies files and directories in the build context that should be **excluded** from being sent to the Docker daemon during the `docker build` process.
+  * **Benefit:** This reduces the build time, prevents unnecessary sensitive data from being copied into the image, and keeps the build context small.
+
+-----
+
+## 58\. What are Docker labels used for?
+
+**Docker Labels** are a mechanism to attach **metadata** (key-value pairs) to Docker objects like images, containers, volumes, or networks.
+
+  * **Purpose:** To organize, categorize, and provide descriptive information.
+  * **Use Cases:** Specifying the version, license information, maintainer, or integrating with third-party tools (e.g., Traefik uses labels for routing configuration).
+
+-----
+
+## 59\. How do you clean up unused containers and images?
+
+Docker provides "prune" commands for efficient cleanup:
+
+| Object | Command | Function |
+| :--- | :--- | :--- |
+| **Containers** | `docker container prune` | Removes all stopped containers. |
+| **Images** | `docker image prune` | Removes all dangling (untagged and not used by a container) images. |
+| **Volumes** | `docker volume prune` | Removes all unused volumes. **Be cautious\!** |
+| **Everything (System)** | `docker system prune` | Removes all stopped containers, dangling images, unused networks, and dangling build cache. (Use with caution\!) |
+
+-----
+
+## 60\. What are multi-stage builds?
+
+**Multi-stage builds** are a feature of Dockerfiles that involves using **multiple `FROM` statements** to define different stages (e.g., `builder`, `tester`, `final`).
+
+  * **Goal:** To significantly reduce the final image size.
+  * **How it works:** The intermediate stages contain all the necessary tools (compilers, SDKs, dev dependencies) needed for the build. The final, production-ready stage uses a minimal base image and only copies the necessary compiled artifacts (executables, static files) from the previous stage using the `COPY --from=<stage-name>` command.
+
+-----
+
+## 61\. What is container orchestration?
+
+**Container Orchestration** is the automated management, deployment, scaling, networking, and availability of containerized applications, especially in large, dynamic environments.
+
+Key orchestration tasks:
+
+  * **Load Balancing** and Traffic Routing.
+  * **Resource Allocation** (scheduling containers to machines).
+  * **Health Monitoring** and self-healing.
+  * **Service Discovery**.
+  * Managing storage and secrets.
+
+*Popular tools: **Kubernetes** and **Docker Swarm**.*
+
+-----
+
+## 62\. Why use Kubernetes instead of Docker Swarm?
+
+While **Docker Swarm** is simpler to set up and use, **Kubernetes (K8s)** is the industry standard for production-grade container orchestration due to its:
+
+| Feature | Kubernetes (K8s) | Docker Swarm |
+| :--- | :--- | :--- |
+| **Ecosystem** | Massive, open-source community and tooling. | Smaller, Docker-centric community. |
+| **Features** | Rich features: **Ingress, StatefulSets, RBAC, HPA,** and advanced scheduling. | Basic features: simpler Load Balancing, limited scaling options. |
+| **Architecture** | Complex but robust; separate Control Plane components (`etcd`, API Server, Scheduler). | Simpler, more integrated. |
+| **Cloud Integration** | Deep integration with all major cloud providers. | More limited, though improving. |
+
+**In short:** Use Docker Swarm for simple, small-scale deployments. Use Kubernetes for complex, mission-critical, large-scale, or multi-cloud deployments.
+
+-----
+
+## 63\. What is an image tag?
+
+An **image tag** is a textual label used to denote a specific version or variant of a Docker image within a repository.
+
+  * **Format:** Images are referenced as `<repository-name>:<tag>`.
+  * **Purpose:** To differentiate between multiple versions of the same application (e.g., `my-app:1.0`, `my-app:latest`, `my-app:alpine`).
+  * **Best Practice:** Always use explicit tags (like `1.2.3`) instead of the mutable `latest` tag in production environments for build reproducibility.
+
+-----
+
+## 64\. What is the difference between `docker run` and `docker start`?
+
+| Command | `docker run` 🚀 | `docker start` ▶️ |
+| :--- | :--- | :--- |
+| **Function** | **Creates and starts** a new container from a specified image. | **Starts** an existing, stopped container. |
+| **Prerequisites** | Requires an **image** to exist. | Requires a **container** to exist (i.e., must have run `docker run` previously). |
+| **Ephemeral** | The container is new each time it is run. | The container retains its state and changes from the last run. |
+
+-----
+
+## 65\. What is the Docker overlay network?
+
+The **Overlay Network** is a network driver used for connecting **multiple Docker daemons** running on different host machines (nodes).
+
+  * **Purpose:** To allow containers on different hosts to communicate as if they were on the same local network.
+  * **Implementation:** It is primarily used in **Docker Swarm** mode to create a cluster-wide private network, enabling multi-host service discovery and secure communication.
+
+-----
+
+## 66\. Explain difference between COPY and ADD in Dockerfile.
+
+Both instructions copy files from the build context into the image, but `ADD` has additional functionality.
+
+| Feature | `COPY` | `ADD` |
+| :--- | :--- | :--- |
+| **Function** | Copies local files/directories from the build context. | Copies local files/directories. |
+| **URL Support** | **No** support for remote URLs. | **Can fetch remote URLs** and copy the contents. |
+| **Tar Extraction** | **No** automatic archive extraction. | **Automatically extracts** local compressed archives (e.g., `.tar`, `.gz`, `.zip`) into the destination directory. |
+| **Best Practice** | **Preferred** for simple file copying as it is more transparent. | Used only when the archive extraction or remote URL feature is required. |
+
+-----
+
+## 67\. What is Docker security scanning?
+
+**Docker Security Scanning** (often facilitated by tools like Docker Scout or third-party scanners like Trivy, Clair) is the process of **analyzing a Docker image** for security vulnerabilities.
+
+  * **How it works:** It scans the image layers, comparing the installed software packages and dependencies against publicly known vulnerability databases (CVEs).
+  * **Purpose:** To identify critical risks early in the development lifecycle before deployment.
+
+-----
+
+## 68\. What is a container runtime?
+
+A **Container Runtime** is the low-level component responsible for **running and managing containers** on a host operating system.
+
+  * **Core Function:** It handles tasks like pulling images, managing image layers, creating the container's isolated environment (namespaces and cgroups), and executing the application process.
+  * **Examples:**
+      * **High-level runtimes:** **Docker Engine**, **containerd** (which implements CRI for Kubernetes).
+      * **Low-level runtimes:** **runc** (the OCI-compliant reference implementation).
+
+-----
+
+## 69\. Explain Docker logs and how to view them.
+
+**Docker logs** are the standard output (`stdout`) and standard error (`stderr`) streams generated by the main process running inside a container.
+
+  * **Viewing Logs:** The primary command to retrieve and stream logs:
+    ```bash
+    docker logs <container_id_or_name>
+    # Common flags:
+    docker logs -f <id>   # Follows the log output in real-time
+    docker logs -t <id>   # Shows timestamps
+    docker logs --since 5m <id> # Shows logs from the last 5 minutes
+    ```
+  * **Importance:** Crucial for debugging and monitoring containerized applications.
+
+-----
+
+## 70\. How do you troubleshoot container performance issues?
+
+Troubleshooting container performance involves examining resource usage and application behavior:
+
+1.  **Check Resource Usage:** Use `docker stats` to get real-time CPU, memory, and I/O usage for running containers.
+2.  **Inspect Resource Limits:** Check if the container's CPU or Memory Limits have been hit, causing throttling or out-of-memory (OOM) kills.
+3.  **Monitor Logs:** Use `docker logs` to check for application errors, excessive I/O operations, or repeated restarts.
+4.  **Application Profiling:** Use tools like `docker top` and `docker exec` to run internal profiling tools (e.g., `strace`, `perf`) inside the container to identify bottlenecks in the running process.
+5.  **I/O Bottlenecks:** Use `docker stats` or system-level tools to check if disk I/O is the constraint, often an issue with slow volumes or bind mounts.
