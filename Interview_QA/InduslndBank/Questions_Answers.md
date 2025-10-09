@@ -774,3 +774,255 @@ Troubleshooting container performance involves examining resource usage and appl
 3.  **Monitor Logs:** Use `docker logs` to check for application errors, excessive I/O operations, or repeated restarts.
 4.  **Application Profiling:** Use tools like `docker top` and `docker exec` to run internal profiling tools (e.g., `strace`, `perf`) inside the container to identify bottlenecks in the running process.
 5.  **I/O Bottlenecks:** Use `docker stats` or system-level tools to check if disk I/O is the constraint, often an issue with slow volumes or bind mounts.
+
+Here’s a **comprehensive and detailed explanation** for each Helm question you listed:
+
+---
+
+### **71. What is Helm?**
+Helm is a **package manager for Kubernetes**. It simplifies the deployment and management of applications by packaging Kubernetes manifests into reusable units called **charts**. Helm provides:
+- **Installation**: Deploy complex apps with a single command.
+- **Versioning**: Track and roll back releases.
+- **Configuration**: Override default values easily.
+
+---
+
+### **72. Why use Helm in Kubernetes?**
+- **Simplifies Deployment**: Instead of applying multiple YAML files manually, Helm installs everything in one go.
+- **Version Control**: Helm tracks releases, making upgrades and rollbacks easy.
+- **Parameterization**: Use `values.yaml` to customize deployments without editing manifests.
+- **Reusable Charts**: Share charts across teams or public repositories.
+- **Dependency Management**: Handle subcharts and dependencies automatically.
+
+---
+
+### **73. What is a Helm chart?**
+A Helm chart is a **collection of files** that describe a Kubernetes application. It includes:
+- **Templates**: Kubernetes manifests with placeholders.
+- **Values**: Default configuration values.
+- **Metadata**: Chart name, version, and description.
+
+---
+
+### **74. What are templates in Helm?**
+Templates are **Go-based text files** inside the `templates/` directory of a chart. They allow dynamic rendering of Kubernetes manifests using:
+- **Variables** from `values.yaml`.
+- **Functions** for logic (e.g., conditionals, loops).
+- **Helpers** defined in `_helpers.tpl`.
+
+---
+
+### **75. What is the structure of a Helm chart?**
+```
+mychart/
+  Chart.yaml        # Metadata
+  values.yaml       # Default values
+  templates/        # Kubernetes manifests as templates
+  charts/           # Subcharts (dependencies)
+  _helpers.tpl      # Template helpers
+```
+
+---
+
+### **76. What is the `values.yaml` file used for?**
+`values.yaml` contains **default configuration values** for templates. Users can override these values during installation or upgrade using:
+- `--values custom.yaml`
+- `--set key=value`
+
+---
+
+### **77. How do you install a Helm chart?**
+```bash
+helm install <release-name> <chart-name> --namespace <namespace>
+```
+Example:
+```bash
+helm install myapp ./mychart --namespace dev
+```
+
+---
+
+### **78. How do you upgrade a Helm release?**
+```bash
+helm upgrade <release-name> <chart-name> --values custom.yaml
+```
+
+---
+
+### **79. How do you rollback a Helm release?**
+```bash
+helm rollback <release-name> <revision>
+```
+Find revisions:
+```bash
+helm history <release-name>
+```
+
+---
+
+### **80. Difference between `helm install` and `helm upgrade --install`?**
+- `helm install`: Installs a new release.
+- `helm upgrade --install`: Upgrades if release exists, otherwise installs. Useful for **idempotent deployments**.
+
+---
+
+### **81. How do you search for charts?**
+```bash
+helm search hub <keyword>   # Search in Artifact Hub
+helm search repo <keyword>  # Search in added repos
+```
+
+---
+
+### **82. What are repositories in Helm?**
+Repositories are **locations hosting charts**. Example:
+- Add repo:
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+```
+- Update repo:
+```bash
+helm repo update
+```
+
+---
+
+### **83. How do you package and share a Helm chart?**
+```bash
+helm package <chart-directory>
+helm push <chart.tgz> <repo>
+```
+
+---
+
+### **84. What are Helm hooks?**
+Hooks allow running **custom tasks** at specific lifecycle events (e.g., pre-install, post-upgrade). Defined in templates using:
+```yaml
+annotations:
+  "helm.sh/hook": pre-install
+```
+
+---
+
+### **85. How do you override values during installation?**
+- Inline:
+```bash
+helm install myapp ./mychart --set image.tag=2.0
+```
+- File:
+```bash
+helm install myapp ./mychart --values prod-values.yaml
+```
+
+---
+
+### **86. What is a Helm release?**
+A **release** is an **instance of a chart deployed to a Kubernetes cluster** with a specific configuration.
+
+---
+
+### **87. Purpose of `_helpers.tpl` file?**
+Stores **reusable template snippets** (functions, labels) to avoid duplication.
+
+---
+
+### **88. How do you debug a Helm template?**
+```bash
+helm template <chart> --values custom.yaml
+helm install --dry-run --debug <release> <chart>
+```
+
+---
+
+### **89. What is Helm linting?**
+Checks chart structure and syntax:
+```bash
+helm lint <chart-directory>
+```
+
+---
+
+### **90. Difference between Helm 2 and Helm 3?**
+- **Helm 2**: Used Tiller (server-side component).
+- **Helm 3**: Removed Tiller, uses Kubernetes API directly, improved security.
+
+---
+
+### **91. How do you test Helm charts?**
+Use **Helm test hooks**:
+```bash
+helm test <release-name>
+```
+
+---
+
+### **92. What is a subchart in Helm?**
+A **chart inside another chart** (in `charts/` directory) used for dependencies.
+
+---
+
+### **93. How does Helm manage dependencies?**
+Defined in `Chart.yaml` under `dependencies`. Update with:
+```bash
+helm dependency update
+```
+
+---
+
+### **94. How do you uninstall a Helm release?**
+```bash
+helm uninstall <release-name>
+```
+
+---
+
+### **95. How do you specify a namespace in Helm commands?**
+```bash
+helm install myapp ./mychart --namespace dev
+```
+
+---
+
+### **96. Role of `Chart.yaml`?**
+Contains **metadata**:
+- Name
+- Version
+- Description
+- Dependencies
+
+---
+
+### **97. How can you see the rendered manifests of a chart?**
+```bash
+helm template <chart> --values custom.yaml
+```
+
+---
+
+### **98. How do you perform dry-run installations in Helm?**
+```bash
+helm install --dry-run --debug <release> <chart>
+```
+
+---
+
+### **99. How do you define environment-specific values in Helm?**
+Create separate files:
+- `values-dev.yaml`
+- `values-prod.yaml`
+Use:
+```bash
+helm install myapp ./mychart --values values-prod.yaml
+```
+
+---
+
+### **100. How do you store Helm secrets securely?**
+- Use **Helm Secrets plugin** with SOPS:
+```bash
+helm secrets enc values.yaml
+helm secrets install myapp ./mychart -f secrets.yaml
+```
+- Or integrate with **Sealed Secrets** or **External Secrets Operator**.
+
+---
