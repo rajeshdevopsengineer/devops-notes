@@ -2007,5 +2007,1950 @@ docker buildx build --platform linux/amd64,linux/arm64 -t repo/app:1.0 --push .
 
 ***
 
+Awesome—continuing with interview‑ready answers and hands‑on examples for **101–110**, tailored for day‑to‑day DevOps/SRE work.
+
+***
+
+## 101) Explain Docker image lifecycle (build, tag, push, pull, run)
+
+**Lifecycle steps:**
+
+1.  **Build** – Create an image from a Dockerfile and build context.
+    ```bash
+    docker build -t repo/api:1.0 .
+    ```
+2.  **Tag** – Add a new name (repository:tag) to the image ID.
+    ```bash
+    docker tag repo/api:1.0 myacr.azurecr.io/repo/api:1.0
+    ```
+3.  **Push** – Upload the image to a registry.
+    ```bash
+    az acr login --name myacr
+    docker push myacr.azurecr.io/repo/api:1.0
+    ```
+4.  **Pull** – Download the image on another host/CI agent.
+    ```bash
+    docker pull myacr.azurecr.io/repo/api:1.0
+    ```
+5.  **Run** – Start a container from the image.
+    ```bash
+    docker run -d -p 8080:8080 --name api myacr.azurecr.io/repo/api:1.0
+    ```
+
+> Under the hood: the image is a stack of immutable layers; containers add a writable CoW layer at runtime.
+
+***
+
+## 102) How do you use `docker-compose` for multi‑container app networking?
+
+Compose creates **user‑defined bridge networks**; services get **DNS names** equal to the service name. Containers in the same network can reach each other by `http://service-name:port`.
+
+```yaml
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: example
+    networks: [appnet]
+
+  api:
+    build: ./api
+    environment:
+      DB_HOST: db
+    depends_on:
+      - db
+    networks: [appnet]
+
+  web:
+    image: nginx:1.25
+    depends_on:
+      - api
+    ports:
+      - "8080:80"    # published to host
+    networks: [appnet]
+
+networks:
+  appnet:
+    driver: bridge
+```
+
+*   **Service discovery**: `api` can reach `db:5432`.
+*   **Isolation**: multiple networks can be defined; a service can attach to several.
+*   **Aliases** (optional): add alternate names via `networks: { appnet: { aliases: ["backend"] } }`.
+
+***
+
+## 103) How to optimize Dockerfile for smaller images? (layer ordering, slim base)
+
+**Key tactics:**
+
+*   Use **slim/minimal base** (`alpine`, `distroless`, `scratch`) where compatible.
+*   **Multi‑stage builds**: compile in builder, copy final artifacts only.
+*   **Order for cache**: copy manifests (e.g., `package.json`) before app source to cache dependency installs.
+*   Combine `RUN` steps and **clean up** in the same layer.
+*   Avoid `apt-get update` without **`--no-install-recommends`** and remove package lists.
+
+Example (Node):
+
+```dockerfile
+# Builder
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+RUN npm run build
+
+# Runtime
+FROM alpine:3.20
+WORKDIR /app
+COPY --from=build /app/dist ./dist
+ENV NODE_ENV=production
+USER 10001
+ENTRYPOINT ["node"]
+CMD ["./dist/server.js"]
+```
+
+***
+
+## 104) What is `dive` and how can it help analyze image layers? (concept)
+
+**`dive`** is a CLI tool that:
+
+*   Visualizes image **layers**, sizes, and file changes per layer.
+*   Shows **efficiency score** and highlights **bloat** (large files added repeatedly).
+*   Helps identify **cache‑unfriendly** instruction ordering.
+
+Usage (local):
+
+```bash
+dive repo/api:1.0
+```
+
+***
+
+## 105) How to use multi‑stage builds to remove build‑time dependencies?
+
+Compile/package in a builder stage; copy only the compiled artifact into a clean runtime stage—**no compilers or package managers** remain.
+
+Example (Go):
+
+```dockerfile
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY . .
+RUN go build -o app
+
+FROM scratch
+COPY --from=build /src/app /app
+USER 10001
+ENTRYPOINT ["/app"]
+```
+
+Benefits: smaller image, reduced attack surface, faster pulls, cleaner SBOMs.
+
+***
+
+## 106) How to cache credentials securely during builds (best practice concept)?
+
+*   **Avoid** putting credentials into `ARG`/`ENV` (they end up in image metadata or layer history).
+*   Use **private registries** with `docker login` for base images.
+*   Leverage **BuildKit** secret mounts for package manager tokens (npm, pip, maven).
+*   Use **SSH forwarding** for private Git (no secrets stored in layers).
+*   Ensure CI injects secrets via **secure variables**; never commit `.npmrc`, `.pypirc`, or `.netrc` with tokens.
+
+***
+
+## 107) How to mount secrets at build‑time without leaving them in image (BuildKit secrets)?
+
+Enable BuildKit and use `RUN --mount=type=secret`:
+
+```bash
+# Build command
+docker build \
+  --secret id=npm_token,env=NPM_TOKEN \
+  -t repo/app:1.0 .
+
+# Dockerfile
+# syntax=docker/dockerfile:1
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+# Mount secret only during RUN; not persisted
+RUN --mount=type=secret,id=npm_token \
+    sh -c 'echo "//registry.npmjs.org/:_authToken=$(cat /run/secrets/npm_token)" > ~/.npmrc && npm ci'
+COPY . .
+RUN npm run build
+```
+
+For private Git clones:
+
+```dockerfile
+# Requires: docker build --ssh default
+RUN --mount=type=ssh git clone git@github.com:org/private-repo.git
+```
+
+> Secrets are available **ephemerally** during the `RUN` step and **not** committed to image layers.
+
+***
+
+## 108) How to use `ONBUILD` instruction and why be careful with it?
+
+`ONBUILD` queues a trigger in a base image that runs when **another Dockerfile uses it as `FROM`**.
+
+Example:
+
+```dockerfile
+# In a base image
+ONBUILD COPY . /app
+ONBUILD RUN npm ci
+```
+
+**Be careful**:
+
+*   Hidden side effects for downstream builds—**surprising behavior**.
+*   Hard to control build order/caching in child Dockerfiles.
+*   Modern guidance: **avoid ONBUILD**; instead document a **base image + sample Dockerfile** or provide **multi‑stage templates**.
+
+***
+
+## 109) How to create a healthcheck that verifies app readiness?
+
+Use a **local**, **fast** endpoint for readiness (e.g., `/readyz`) and a shallow liveness (`/healthz`). In Docker:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM alpine:3.20
+RUN apk add --no-cache curl
+COPY app /usr/local/bin/app
+ENTRYPOINT ["/usr/local/bin/app"]
+
+# Readiness check (fast, local)
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 --start-period=20s \
+  CMD ["curl", "-fsS", "http://localhost:8080/readyz"]
+```
+
+In Compose, you can rely on health status:
+
+```yaml
+services:
+  api:
+    image: repo/api:1.0
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/readyz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+  web:
+    image: nginx:1.25
+    depends_on:
+      api:
+        condition: service_healthy
+```
+
+**Tips**:
+
+*   Keep readiness shallow: check **listener bound** + **event loop**; avoid deep external checks.
+*   On graceful shutdown, **fail readiness** immediately, keep liveness passing while draining.
+
+***
+
+## 110) How to use `docker network create` and custom networks?
+
+Create **user‑defined bridge** networks (better isolation and DNS) and attach containers:
+
+```bash
+# Create a network with custom subnet
+docker network create --driver bridge \
+  --subnet 172.22.0.0/16 --gateway 172.22.0.1 appnet
+
+# Run containers on it
+docker run -d --name db --network appnet postgres:16
+docker run -d --name api --network appnet -e DB_HOST=db repo/api:1.0
+docker run -d --name web --network appnet -p 8080:80 nginx:1.25
+
+# Connect/disconnect an existing container
+docker network connect appnet some-container
+docker network disconnect appnet some-container
+
+# Inspect network (subnets, endpoints, aliases)
+docker network inspect appnet
+```
+
+Other drivers:
+
+*   `overlay` (Swarm, multi‑host networking)
+*   `host` (share host stack, no port mapping)
+*   `none` (no networking)
+*   `macvlan` (containers get their own MAC/IP on the LAN)
+
+***
+
+### Quick add‑ons you might find handy
+
+*   **BuildKit defaults**:
+    ```bash
+    export DOCKER_BUILDKIT=1
+    docker build -t repo/app:1.0 .
+    ```
+*   **Compose profiles** (dev vs prod):
+    ```yaml
+    services:
+      api:
+        profiles: ["dev"]
+    ```
+*   **Clean up safely**:
+    ```bash
+    docker ps -aq --filter status=exited | xargs -r docker rm
+    docker image prune -f
+    docker volume prune -f
+    ```
+
+Absolutely—here are crisp, interview‑ready answers with hands‑on examples for **111–120**, tailored for DevOps/SRE work.
+
+***
+
+## 111) How to attach containers to multiple networks?
+
+You can connect a running container to **additional networks** (and disconnect later):
+
+```bash
+# Create networks
+docker network create appnet
+docker network create observability
+
+# Start container on one network
+docker run -d --name api --network appnet repo/api:1.0
+
+# Attach to another
+docker network connect observability api
+
+# Optional: assign alias on that network
+docker network connect --alias api-metrics observability api
+
+# Disconnect
+docker network disconnect observability api
+```
+
+**Compose** (attach to multiple networks):
+
+```yaml
+services:
+  api:
+    image: repo/api:1.0
+    networks:
+      appnet:
+      observability:
+        aliases: ["api-metrics"]
+
+networks:
+  appnet:
+  observability:
+```
+
+***
+
+## 112) How to inspect network details (`docker network inspect`)?
+
+Get subnets, endpoints, IP/MACs, and options:
+
+```bash
+docker network inspect appnet
+# Pretty-print selected fields
+docker network inspect appnet \
+  --format '{{json .IPAM.Config}}' | jq .
+```
+
+***
+
+## 113) How do containers resolve DNS by default? (embedded DNS in Docker)
+
+*   On **user‑defined bridge networks**, Docker provides an **embedded DNS** at **`127.0.0.11`** that resolves **container names** and **network aliases** to container IPs on that network.
+*   On the **default `bridge`** network, name resolution between containers is **not automatic** (historically required `--link`). Containers will still resolve **external DNS** using the host’s resolvers.
+*   On **overlay networks** (Swarm), embedded DNS also resolves **service names**.
+
+Check inside a container:
+
+```bash
+cat /etc/resolv.conf
+# Expect nameserver 127.0.0.11 on user-defined networks
+```
+
+***
+
+## 114) How to set custom DNS for containers (`--dns`)?
+
+Per container:
+
+```bash
+docker run -d --name api \
+  --dns 1.1.1.1 --dns 8.8.8.8 \
+  --dns-search mycorp.local \
+  repo/api:1.0
+```
+
+Global defaults in **`/etc/docker/daemon.json`**:
+
+```json
+{
+  "dns": ["1.1.1.1", "8.8.8.8"]
+}
+```
+
+Then reload:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart docker
+```
+
+***
+
+## 115) How to control container restart behavior on failure?
+
+Use **`--restart`** policy:
+
+```bash
+# Restart on non-zero exit (up to N retries)
+docker run --restart=on-failure:5 -d repo/job:1.0
+
+# Always restart (including on daemon restart)
+docker run --restart=always -d repo/api:1.0
+
+# Restart unless manually stopped
+docker run --restart=unless-stopped -d repo/worker:1.0
+```
+
+> Note: Docker **does not** automatically restart containers marked `unhealthy` by healthchecks; orchestration (Swarm/K8s) handles that.
+
+***
+
+## 116) How to manage container log rotation at Docker daemon level? (`daemon.json` logging-opts)
+
+Configure **log driver** and rotation globally:
+
+`/etc/docker/daemon.json`
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "5",
+    "mode": "non-blocking",
+    "max-buffer-size": "8m"
+  }
+}
+```
+
+Apply:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart docker
+```
+
+Per container override:
+
+```bash
+docker run -d --log-driver=json-file \
+  --log-opt max-size=10m --log-opt max-file=5 \
+  repo/api:1.0
+```
+
+For centralized logging:
+
+```bash
+docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 repo/api:1.0
+```
+
+***
+
+## 117) How to set resource **reservations** vs **limits** for containers? (`--memory-reservation`)
+
+*   **Hard limit** (enforced): `--memory`
+*   **Soft reservation** (best effort; throttling under pressure): `--memory-reservation`
+
+```bash
+docker run -d --name api \
+  --memory=512m \
+  --memory-reservation=256m \
+  --cpus=1.0 \
+  --cpu-shares=512 \
+  repo/api:1.0
+```
+
+Other useful flags:
+
+*   **CPU pinning**: `--cpuset-cpus="0,2"`
+*   **PIDs**: `--pids-limit=200`
+*   **I/O throttling**: `--device-read-bps /dev/sda:10mb` (needs correct device path)
+
+***
+
+## 118) How to configure cgroups and namespace limits for container isolation? (concept)
+
+**Namespaces** isolate:
+
+*   **PID** (process IDs), **NET** (network stack), **MNT** (filesystems), **IPC**, **UTS** (hostname), **USER** (UID/GID mapping).
+
+**cgroups** enforce limits:
+
+*   **CPU** (`--cpus`, `--cpu-quota/--cpu-period`, `--cpu-shares`)
+*   **Memory** (`--memory`, `--memory-reservation`, `--memory-swap`)
+*   **I/O** (`--device-read-bps`, `--device-write-bps`, `--blkio-weight`)
+*   **Processes** (`--pids-limit`)
+
+Examples:
+
+```bash
+docker run -d \
+  --cpus=0.5 --cpuset-cpus="1-2" \
+  --memory=256m --memory-swap=512m \
+  --pids-limit=150 \
+  repo/worker:1.0
+```
+
+Security profiles:
+
+*   **seccomp**: `--security-opt seccomp=/path/profile.json`
+*   **AppArmor/SELinux**: `--security-opt apparmor=profile` or `--security-opt label:type:...`
+*   **Capabilities**: `--cap-drop=ALL --cap-add=NET_BIND_SERVICE`
+
+***
+
+## 119) How to enable user namespaces to map container root to non‑root on host?
+
+Enable **userns‑remap** so container **UID 0** maps to an **unprivileged host UID range**:
+
+`/etc/docker/daemon.json`
+
+```json
+{
+  "userns-remap": "default"
+}
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart docker
+```
+
+**Considerations:**
+
+*   Host paths/volumes may need ownership remapping (UID/GID from `/etc/subuid`, `/etc/subgid`).
+*   Some plugins/drivers and privileged operations aren’t compatible.
+*   Improves defense‑in‑depth even if containers run as root inside.
+
+***
+
+## 120) What are rootless containers and when to use them?
+
+**Rootless Docker** (or Podman) runs the daemon and containers **without root privileges**:
+
+**Why/When:**
+
+*   Multi‑tenant developer machines or hardened environments where root is prohibited.
+*   Reduce risk of host compromise.
+
+**Setup (Docker):**
+
+*   Install rootless extras, then:
+
+```bash
+dockerd-rootless-setuptool.sh install
+# Start daemon in user session
+systemctl --user start docker
+export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock
+```
+
+**Limitations:**
+
+*   No `--privileged` or direct device mounts; limited capabilities.
+*   Port binding <1024 needs workarounds (e.g., rootlesskit) or use higher ports.
+*   Networking uses **slirp4netns** (slower NAT); some storage/network drivers unavailable.
+*   Some cgroup features require cgroup v2 & user delegation.
+
+**Alternatives:**
+
+*   **Podman rootless** (daemonless) is commonly used for rootless workflows.
+
+***
+
+### Quick add‑ons (tailored for you)
+
+*   **Best practice bundle for secure runtime**:
+    ```bash
+    docker run -d \
+      --read-only \
+      --cap-drop=ALL --cap-add=NET_BIND_SERVICE \
+      --pids-limit=200 --cpus=1 --memory=512m \
+      --user 10001 \
+      -v appdata:/var/lib/app \
+      -p 8080:8080 \
+      repo/app:1.0
+    ```
+*   **Network troubleshooting**:
+    ```bash
+    docker run --rm -it --network appnet nicolaka/netshoot sh
+    # dig api, curl http://api:8080, tcpdump -i any
+    ```
+
+Awesome—continuing with interview‑ready, hands‑on answers for **121–140**, tailored for real DevOps/SRE workflows (and with a few Azure/ACR examples where useful).
+
+***
+
+## 121) Sign and verify images using Notary / Docker Content Trust (concept)
+
+**Docker Content Trust (DCT)** uses **Notary v1** to sign images and verify publisher identity + integrity.
+
+*   **Enable trust** (client-side):
+    ```bash
+    export DOCKER_CONTENT_TRUST=1
+    ```
+*   **Sign on push**:
+    ```bash
+    docker push myregistry/repo/app:1.0   # signs if DCT enabled
+    ```
+*   **Verify on pull**:
+    ```bash
+    docker pull myregistry/repo/app:1.0   # verifies signatures
+    ```
+*   **Keys**: root key (offline) + repository keys (online). Manage via `notary` CLI or Docker key stores.
+*   **Modern alternatives**: Many orgs now prefer **Sigstore Cosign** or **Notation (Notary v2)** with OCI‑native signatures.
+
+***
+
+## 122) Image scanning and tools (concept)
+
+Scan images for known CVEs and misconfigurations:
+
+*   **Open-source**: **Trivy**, **Grype**, **Clair**.
+*   **Commercial**: **Aqua**, **Snyk**, **Anchore**, **Qualys**, **Tenable**.
+*   **Cloud**: **Azure Container Registry (ACR)** integration via **Microsoft Defender for Cloud**, **Amazon ECR** built‑in scanning, **GCR/Artifact Registry** scanning.
+
+Usage (Trivy example):
+
+```bash
+trivy image myacr.azurecr.io/repo/app:1.0 --severity HIGH,CRITICAL
+```
+
+Integrate in CI with **quality gates** (fail builds on critical findings).
+
+***
+
+## 123) Handle layer caching with frequently changing files
+
+*   **Order instructions** to maximize cache:
+    ```dockerfile
+    COPY package*.json ./
+    RUN npm ci --only=production
+    COPY . .
+    ```
+*   Use **`.dockerignore`** to exclude noisy/large files (e.g., `node_modules/`, `.git/`, `dist/`, `*.log`, `.env`).
+*   Split steps: copy **manifests early**, app source **later**.
+*   Prefer **BuildKit** cache mounts for tooling (npm/maven/pip).
+
+***
+
+## 124) Share volumes between containers & manage permissions
+
+*   Use **named volumes**:
+    ```bash
+    docker volume create appdata
+    docker run -d --name api -v appdata:/var/lib/app repo/api:1.0
+    docker run -d --name worker -v appdata:/var/lib/app repo/worker:1.0
+    ```
+*   **Permissions**:
+    *   Run containers as the **same UID/GID** (`USER 10001`) or use `--user`.
+    *   Initialize volume ownership (one‑off):
+        ```bash
+        docker run --rm -v appdata:/var/lib/app alpine chown -R 10001:10001 /var/lib/app
+        ```
+*   Avoid root‑owned data; prefer non‑root runtime users.
+
+***
+
+## 125) Back up and restore named volumes
+
+**Backup**:
+
+```bash
+docker run --rm \
+  -v appdata:/data \
+  -v "$(pwd)":/backup \
+  alpine sh -c 'cd /data && tar -czf /backup/appdata-backup.tgz .'
+```
+
+**Restore**:
+
+```bash
+docker run --rm \
+  -v appdata:/data \
+  -v "$(pwd)":/backup \
+  alpine sh -c 'cd /data && tar -xzf /backup/appdata-backup.tgz'
+```
+
+***
+
+## 126) Use `tmpfs` mounts for ephemeral data (`--tmpfs`)
+
+Mount an in‑memory filesystem (cleared when container stops):
+
+```bash
+docker run -d \
+  --tmpfs /tmp:rw,size=64m,mode=1777 \
+  --tmpfs /run \
+  repo/app:1.0
+```
+
+Compose:
+
+```yaml
+services:
+  app:
+    image: repo/app:1.0
+    tmpfs:
+      - /tmp:size=64m
+```
+
+***
+
+## 127) Use `docker context` for multiple endpoints
+
+Switch between local/remote engines (desktop, VM, remote host):
+
+```bash
+docker context ls
+docker context create my-remote --docker "host=tcp://10.0.0.5:2376"
+docker context use my-remote
+docker info    # against remote
+```
+
+Contexts can store **TLS** settings and credentials; great for targeting different environments cleanly.
+
+***
+
+## 128) Docker behind corporate HTTP proxies
+
+Set environment variables for **client** and **daemon**:
+
+**Client** (shell):
+
+```bash
+export HTTP_PROXY=http://proxy.mycorp:8080
+export HTTPS_PROXY=http://proxy.mycorp:8080
+export NO_PROXY=localhost,127.0.0.1,.mycorp.local
+```
+
+**Daemon** (systemd drop‑in `/etc/systemd/system/docker.service.d/proxy.conf`):
+
+```ini
+[Service]
+Environment="HTTP_PROXY=http://proxy.mycorp:8080"
+Environment="HTTPS_PROXY=http://proxy.mycorp:8080"
+Environment="NO_PROXY=localhost,127.0.0.1,.mycorp.local"
+```
+
+Reload:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart docker
+```
+
+Builds may need proxy **build args**:
+
+```bash
+docker build --build-arg HTTP_PROXY --build-arg HTTPS_PROXY -t repo/app:1.0 .
+```
+
+***
+
+## 129) Containerized CI runners with Docker‑in‑Docker (dind) caveats
+
+*   **Security**: `dind` often requires `--privileged`; broad host access risk.
+*   **Performance**: nested overlay filesystems can be slow; cleanup is critical.
+*   **Alternatives**:
+    *   **Docker‑out‑of‑Docker** (mount host `docker.sock`)—simpler but grants host control.
+    *   **Kaniko**, **BuildKit (buildx)**, **Podman**—rootless or daemonless builders for CI.
+*   **If using dind**:
+    *   Pin versions; enable **BuildKit**; set log/cleanup policies; guard network egress.
+
+***
+
+## 130) Build multi‑arch images (amd64/arm64) with `buildx`
+
+```bash
+docker buildx create --name multi --use
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t myacr.azurecr.io/repo/app:1.0 \
+  --push .
+```
+
+Requires QEMU emulation or native builders; `buildx` handles **multi‑platform** cross‑builds.
+
+***
+
+## 131) Push multi‑platform manifests to registry
+
+The `buildx build --platform ... --push` creates a **manifest list** pointing to per‑arch images. Verify:
+
+```bash
+docker buildx imagetools inspect myacr.azurecr.io/repo/app:1.0
+```
+
+This publishes a single tag that works on **both amd64 and arm64** clients.
+
+***
+
+## 132) Programmatic authentication to registries (CI, service principals)
+
+*   **ACR (Azure)**:
+    ```bash
+    az acr login --name myacr
+    # or Service Principal:
+    docker login myacr.azurecr.io -u <appId> -p <password>
+    ```
+*   **ECR (AWS)**:
+    ```bash
+    aws ecr get-login-password | \
+      docker login --username AWS --password-stdin <acct>.dkr.ecr.ap-south-1.amazonaws.com
+    ```
+*   **GHCR**:
+    ```bash
+    echo $GH_PAT | docker login ghcr.io -u <username> --password-stdin
+    ```
+
+Store creds as **CI secrets** (masked) and avoid echoing them in logs.
+
+***
+
+## 133) Image retention / lifecycle policies in private registries
+
+*   **ACR**: retention policies for **untagged manifests**, repository‑level **content trust**, tasks to purge old tags.
+*   **ECR**: **lifecycle policies** (JSON) to expire images by count/age/tag patterns.
+*   **Harbor/Quay**: retention, immutability, vulnerability gates, replication rules.
+
+Best practice: **immutable tags** with **automated cleanup** for stale or untagged images.
+
+***
+
+## 134) Compress images & reduce layer sizes (squashing trade‑offs)
+
+*   **Reduce size** properly:
+    *   Minimal base (alpine/distroless)
+    *   Multi‑stage builds
+    *   Combine `RUN` steps and **remove caches** (apt, npm, pip)
+    *   `.dockerignore` to prevent copying junk
+*   **Squashing** (experimental): merges layers into one; may reduce redundant copies but **breaks caching**, complicates diffs.
+    *   Prefer **not** to squash unless required by legacy constraints.
+
+***
+
+## 135) Immutable tags & promotion across environments
+
+*   Use immutable **semver** tags (e.g., `1.4.2`) and **digests** for deploys.
+*   Promotion by **retagging/importing**:
+    ```bash
+    # Copy image across registries without pull/push (ACR import)
+    az acr import --name prodacr \
+      --source devacr.azurecr.io/repo/app:1.4.2 \
+      --image repo/app:1.4.2
+    ```
+*   Keep `:dev`, `:staging`, `:prod` as **pointers** to immutable version tags; never mutate existing version tags.
+
+***
+
+## 136) Image provenance & metadata tracking (labels, SBOM)
+
+*   **Labels**:
+    ```dockerfile
+    LABEL org.opencontainers.image.source="https://github.com/acme/api" \
+          org.opencontainers.image.version="1.4.2" \
+          org.opencontainers.image.revision="abc123"
+    ```
+*   **SBOM** (Software Bill of Materials):
+    *   Generate with **Syft**, **Trivy**, or **buildx attestation**.
+    ```bash
+    syft myacr.azurecr.io/repo/app:1.4.2 -o spdx-json
+    ```
+*   Attach SBOM/signatures to enforce **supply‑chain** policies in admission controllers (Kyverno/Gatekeeper).
+
+***
+
+## 137) Run security hardening scans during CI
+
+*   **Stages**:
+    *   **SAST** (code), **SCA** (dependencies), **Image scanning** (Trivy/Grype), **Secret scanning** (git‑secrets, trufflehog), **Policy** (Open Policy Agent).
+*   **Quality gates**: fail pipeline on **CRITICAL/HIGH** vulns; allow waivers with expiration.
+*   **Continuous**: rescan regularly and on base image updates.
+
+***
+
+## 138) Detect & prevent sensitive files from being added to images
+
+*   Use **`.dockerignore`** to exclude `.env`, keys, `.aws/`, `.kube/`, `id_rsa`, etc.
+*   Add CI checks: **trufflehog**, **git‑secrets**, **detect‑secrets**.
+*   Prefer **BuildKit secrets** for build‑time access; never bake secrets into `ENV` or layers.
+
+***
+
+## 139) Integrate runtime security protections (seccomp, AppArmor, SELinux)
+
+*   **seccomp**: restrict syscalls (Docker has a **default** profile).
+*   **AppArmor/SELinux**: confine filesystem/process access.
+*   **Capabilities**: drop all, add minimal necessary (e.g., `NET_BIND_SERVICE`).
+*   **User namespaces**, **rootless**, **read‑only** FS, **no privileged**, **pids/cpu/mem limits**.
+
+Example:
+
+```bash
+docker run -d \
+  --security-opt seccomp=default \
+  --security-opt no-new-privileges \
+  --cap-drop=ALL --cap-add=NET_BIND_SERVICE \
+  --read-only --tmpfs /tmp \
+  --user 10001 \
+  repo/app:1.0
+```
+
+***
+
+## 140) Configure seccomp profiles (concept)
+
+*   A **seccomp profile** is a JSON policy defining allowed/blocked **syscalls**.
+*   Start from Docker’s **default** profile; customize only as needed.
+*   Apply per container:
+    ```bash
+    docker run --security-opt seccomp=/path/to/profile.json repo/app:1.0
+    ```
+*   **Process**:
+    *   Identify required syscalls (test under load; use `strace`/audit logs).
+    *   Block dangerous calls (`ptrace`, `keyctl`, `kexec`, `mount`, etc.) not needed by your app.
+    *   Validate with integration tests; avoid `seccomp=unconfined` in production.
+
+***
+
+### Handy bundle (security‑tight runtime template)
+
+```bash
+docker run -d \
+  --restart=unless-stopped \
+  --cpus=1.0 --memory=512m --memory-reservation=256m --pids-limit=200 \
+  --read-only --tmpfs /tmp:rw,size=64m \
+  --cap-drop=ALL --cap-add=NET_BIND_SERVICE \
+  --security-opt no-new-privileges \
+  --user 10001 \
+  -v appdata:/var/lib/app \
+  -p 8080:8080 \
+  myacr.azurecr.io/repo/app:1.0
+```
+
+***
+
+Absolutely—continuing with crisp, interview‑ready answers and hands‑on examples for **141–160**, tailored for day‑to‑day DevOps/SRE work.
+
+***
+
+## 141) How to configure AppArmor or SELinux policies for Docker? (concept)
+
+**AppArmor (Ubuntu/Debian):**
+
+*   Docker ships a **default AppArmor profile**. You can apply a custom one per container:
+    ```bash
+    docker run --security-opt apparmor=docker-default repo/app:1.0
+    docker run --security-opt apparmor=my-custom-profile repo/app:1.0
+    ```
+*   Create a profile under `/etc/apparmor.d/my-custom-profile`, then load it:
+    ```bash
+    sudo apparmor_parser -r /etc/apparmor.d/my-custom-profile
+    ```
+*   Profile controls filesystem access, network, capabilities, etc. Start from `docker-default`, restrict paths (e.g., `deny /host/secrets/** r`), and allow only what the app needs.
+
+**SELinux (RHEL/CentOS/Fedora):**
+
+*   Run containers under `container_t` domain; volumes need labels:
+    *   `:Z` (private relabel) or `:z` (shared relabel) for bind mounts:
+        ```bash
+        docker run -v /data/app:/var/lib/app:Z repo/app:1.0
+        ```
+*   Per‑container contexts/booleans via `--security-opt`:
+    ```bash
+    docker run --security-opt label=type:container_t repo/app:1.0
+    ```
+*   Avoid `--privileged`; prefer fine‑grained SELinux labels + capabilities.
+
+***
+
+## 142) How to manage user/group IDs when mounting host volumes (avoid permission issues)
+
+*   **Align UID/GID**: Run the container with the same UID/GID as files on the host:
+    ```bash
+    docker run --user 10001:10001 -v /data/app:/var/lib/app repo/app:1.0
+    ```
+*   **Pre‑set ownership** of the mount:
+    ```bash
+    sudo chown -R 10001:10001 /data/app
+    ```
+*   **Initialize via helper container**:
+    ```bash
+    docker run --rm -v appdata:/var/lib/app alpine sh -c 'chown -R 10001:10001 /var/lib/app'
+    ```
+*   On SELinux hosts, add `:Z`/`:z` to bind mounts to fix labeling.
+*   Prefer **numeric IDs** (portable) vs names (which may differ across images).
+
+***
+
+## 143) Group namespaces or `chown` in entrypoint for runtime permissions
+
+*   Linux doesn’t have “group namespaces” like user ns; instead:
+    *   Add **supplementary groups**: `--group-add 2000`
+    *   Use consistent **UID/GID** across containers sharing volumes.
+*   **Entrypoint `chown`** (last resort): fix ownership at startup, understanding it can be slow on large trees:
+    ```bash
+    # entrypoint.sh
+    set -e
+    chown -R 10001:10001 /var/lib/app
+    exec /usr/local/bin/app
+    ```
+*   Prefer using **init/sidecar** to initialize volume ownership once, rather than every start. Tools like **gosu**/**su-exec** can drop privileges cleanly in scripts.
+
+***
+
+## 144) Running system services inside containers (best practices & alternatives)
+
+*   **Avoid full init/systemd** in containers; run **one process per container**.
+*   If you must run multiple processes, use a **lightweight init** (e.g., `tini`, `dumb-init`) or a **supervisor** (s6, supervisord) to forward signals and reap zombies:
+    ```bash
+    docker run --init repo/app:1.0  # adds tini
+    ```
+*   Don’t run **SSH** in app containers; use `docker exec` or orchestrator tooling for access.
+*   For cron, use:
+    *   App‑native schedulers,
+    *   Orchestrator **CronJobs** (K8s),
+    *   Separate **sidecar** for scheduled tasks.
+
+***
+
+## 145) Blue/green or canary deployments with Docker + orchestrator (concept)
+
+*   **Blue/Green**: run **two versions** (blue and green) and switch traffic atomically.
+    *   **Kubernetes**: two Deployments behind one Service; flip selector or update Ingress routing to point to the new deployment.
+    *   **Swarm**: two Services; switch DNS or external LB to the new one.
+*   **Canary**: gradually shift traffic to the new version.
+    *   **Kubernetes**: use Ingress/Service mesh (Istio/Linkerd/NGINX Ingress) with **weighted routing**; scale canary replicas progressively.
+    *   **Swarm**: use external LB with weighted backends or gradually scale tasks.
+*   Always combine with **readiness probes**, **rolling updates**, and **automatic rollback** on errors.
+
+***
+
+## 146) Graceful shutdown of containers & handling SIGTERM
+
+*   Ensure the **main process (PID 1)** handles `SIGTERM` and exits cleanly.
+*   Docker sends `SIGTERM`, then `SIGKILL` after the stop timeout (default \~10s).
+*   App example (Node.js):
+    ```js
+    process.on('SIGTERM', async () => {
+      await server.close(); // stop accepting new connections
+      process.exit(0);
+    });
+    ```
+*   Docker run options:
+    ```bash
+    docker stop --time 20 app  # extend grace period
+    ```
+*   In Kubernetes, use a **preStop** hook for drain, and set `terminationGracePeriodSeconds`.
+
+***
+
+## 147) Forward signals to child processes in entrypoint
+
+*   Use **exec** form in shell entrypoint so the child becomes **PID 1** and receives signals:
+    ```bash
+    #!/bin/sh
+    set -e
+    trap 'echo "SIGTERM"; kill -TERM "$child" 2>/dev/null' TERM INT
+    /usr/local/bin/app "$@" &
+    child=$!
+    wait "$child"
+    ```
+*   Or use **tini**:
+    ```dockerfile
+    ENTRYPOINT ["/sbin/tini","--","/usr/local/bin/app"]
+    ```
+*   Avoid `bash -c "app"` without `exec`—signals won’t reach the actual app properly.
+
+***
+
+## 148) Create a reproducible build environment using Docker (dev containers)
+
+*   Package dev toolchain and dependencies into a **Dev Container**:
+    *   **VS Code**: `.devcontainer/devcontainer.json` + `Dockerfile`.
+    *   Pin base image **digest** and versions.
+*   Mount source, use **bind mounts** for live edit, and define tasks/debug configs inside the container.
+*   Benefits: consistent tooling across machines/CI, fast onboarding, fewer “works‑on‑my‑machine” bugs.
+
+***
+
+## 149) Debug build failures locally & in CI (layer caching, verbose build)
+
+*   Enable **BuildKit** and verbose logs:
+    ```bash
+    export DOCKER_BUILDKIT=1
+    docker build --progress=plain -t repo/app:debug .
+    ```
+*   Force cold build to find cache issues:
+    ```bash
+    docker build --no-cache -t repo/app:nocache .
+    ```
+*   Check **context** and `.dockerignore` (missing/excluded files).
+*   Use `docker history`, `dive`, and **split steps** to pinpoint failing instructions.
+*   In CI, replicate with same Builder (`buildx create --use`), same platform, same base image **digest** (`FROM node@sha256:...`).
+
+***
+
+## 150) Use `docker-compose.override.yml` for dev vs prod configs
+
+*   Compose auto‑merges `docker-compose.override.yml`—great for dev:
+    *   Add **ports**, **bind mounts**, **debug env**.
+*   For prod, avoid overrides or specify explicit files:
+    ```bash
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+    ```
+*   Example override for dev:
+    ```yaml
+    services:
+      api:
+        ports: ["8080:8080"]
+        volumes: ["./src:/app/src:ro"]
+        environment: { LOG_LEVEL: "debug" }
+    ```
+
+***
+
+## 151) Limit image pull rate or manage pull‑through cache (registry caching)
+
+*   Configure **registry mirrors** in the Docker daemon to cache upstream pulls:
+    ```json
+    // /etc/docker/daemon.json
+    {
+      "registry-mirrors": ["https://mirror.mycorp.local"]
+    }
+    ```
+*   Run a **pull‑through cache** (e.g., `registry:2` configured as a proxy to Docker Hub).
+*   Prefer **private registries** (ACR/ECR/Harbor) with geo‑replication and local caching to avoid Hub rate limits.
+
+***
+
+## 152) Operate private registries at scale (storage, GC, replication)
+
+*   Back registry with **object storage** (S3/Azure Blob/GCS) and enable **garbage collection** (delete unreferenced blobs).
+*   Use **retention policies** (expire old/untagged manifests), **immutability**, and **vulnerability scanning**.
+*   **Replication** to DR/edge sites; protect with **TLS**, **RBAC**, and **WAF/CDN** as appropriate.
+*   Monitor **storage usage**, **latency**, and **error rates**; run GC during **low‑traffic windows**.
+
+***
+
+## 153) Configure TLS & auth for Docker registry (Harbor, registry:2)
+
+*   **registry:2**:
+    *   TLS: configure `http: { tls: { certificate, key } }` in `config.yml` and run behind a secure endpoint.
+    *   Auth: **basic auth** via `htpasswd`, or **token‑based** auth. Place CA under `/etc/docker/certs.d/<host>/ca.crt` on clients.
+*   **Harbor**:
+    *   Built‑in HTTPS, **OIDC/LDAP** auth, **RBAC**, **project‑level** permissions, **vuln scanning**, and **replication**.
+    *   Use real certificates (Let’s Encrypt/internal CA), enforce **content trust** and **immutable tags**.
+
+***
+
+## 154) Set up role‑based access control in private registries (Harbor/ACR/ECR)
+
+*   **Harbor**: roles (guest/developer/maintainer/project admin), per‑project permissions (pull/push/delete/scan).
+*   **ACR**: Azure **RBAC** (`AcrPull`, `AcrPush`, `Owner`) bound to users/service principals.
+*   **ECR**: **IAM** policies for repositories/actions (GetDownloadUrl, BatchGetImage, PutImage, etc.).
+*   Principle: **least privilege**, audit logs, service accounts/tokens for CI.
+
+***
+
+## 155) Migrate images between registries (preserve tags/digests)
+
+*   **Skopeo** (best for copy without re‑pulling):
+    ```bash
+    skopeo copy docker://devacr.azurecr.io/repo/app:1.4.2 \
+                docker://prodacr.azurecr.io/repo/app:1.4.2
+    ```
+*   **ACR import**:
+    ```bash
+    az acr import --name prodacr \
+      --source devacr.azurecr.io/repo/app:1.4.2 \
+      --image repo/app:1.4.2
+    ```
+*   Avoid `docker save/load` when you need to **preserve digests/manifests** and multi‑arch lists—use registry‑native copy tools.
+
+***
+
+## 156) Atomic deploys with image tags & orchestration (concept)
+
+*   Deploy **immutable** tags/digests; never mutate existing version tags.
+*   Use **rolling updates** with readiness probes for zero‑downtime; ensure **maxUnavailable/ surge** settings (K8s).
+*   Prefetch images (daemon or node image cache) to prevent cold start delays.
+*   Rollback on probe failure; record **deploy metadata** (build ID, git SHA) for traceability.
+
+***
+
+## 157) Use labels & metadata for automated orchestration/discovery
+
+*   **Dockerfile**:
+    ```dockerfile
+    LABEL org.opencontainers.image.source="https://github.com/acme/api" \
+          org.opencontainers.image.version="1.4.2" \
+          org.opencontainers.image.revision="abc123"
+    ```
+*   Use labels for:
+    *   Ownership & cost allocation,
+    *   Automated routing (e.g., Traefik uses container labels to configure routes),
+    *   CI/CD selection & policies,
+    *   Search/filters: `docker ps --filter "label=env=prod"`.
+
+***
+
+## 158) Test containerized apps locally with Compose & integration tests
+
+*   Spin up dependencies with Compose; gate tests on **healthchecks**:
+    ```yaml
+    services:
+      db:
+        image: postgres:16
+        healthcheck:
+          test: ["CMD", "pg_isready","-U","postgres"]
+          interval: 10s
+      api:
+        build: ./api
+        depends_on:
+          db:
+            condition: service_healthy
+    ```
+*   Run integration tests **inside the network**:
+    ```bash
+    docker compose up -d
+    docker run --rm --network <compose_net> repo/tests:latest
+    docker compose down -v
+    ```
+*   Seed data via init scripts; ensure **isolated** test environments and **cleanup** (`down -v`).
+
+***
+
+## 159) Ensure reproducible builds across CI runners (same builder/image)
+
+*   Pin **base images by digest** (`FROM node@sha256:...`).
+*   Use **buildx** with a **named builder** across runners and **remote/registry cache**:
+    ```bash
+    docker buildx create --name ci --use
+    docker buildx build --cache-to type=registry,ref=myacr.azurecr.io/repo/cache:build \
+                        --cache-from type=registry,ref=myacr.azurecr.io/repo/cache:build \
+                        -t myacr.azurecr.io/repo/app:1.0 --push .
+    ```
+*   **DOCKER\_BUILDKIT=1**, consistent **platform** (`--platform`), and deterministic tooling versions (lockfiles).
+*   Generate and store **SBOM** + metadata (labels) for traceability.
+
+***
+
+## 160) Implement image signing in CI/CD and verify at deploy time (concept)
+
+*   **Sign after build** (CI):
+    *   **Cosign (Sigstore)** – keyless with OIDC or key‑pair:
+        ```bash
+        cosign sign myacr.azurecr.io/repo/app:1.0
+        ```
+    *   **Notation (Notary v2)** for OCI‑native signatures.
+*   **Store signatures** in the registry (OCI artifacts).
+*   **Verify at deploy**:
+    *   **Admission control** (K8s: Kyverno/Gatekeeper/OPA) requiring **valid signatures** and matching **issuer/subject**.
+    *   **Cluster image policy**: only allow images from trusted registries, signed by your CI.
+*   Combine with **provenance/attestations** (SLSA, `buildx` attestations) and **immutable tags** to enforce supply‑chain integrity end‑to‑end.
+
+***
+
+### Handy bundle (secure, robust runtime template)
+
+```bash
+docker run -d \
+  --restart=unless-stopped \
+  --cpus=1.0 --memory=512m --memory-reservation=256m --pids-limit=200 \
+  --read-only --tmpfs /tmp:rw,size=64m \
+  --cap-drop=ALL --cap-add=NET_BIND_SERVICE \
+  --security-opt no-new-privileges \
+  --user 10001 \
+  -v appdata:/var/lib/app:rw \
+  -p 8080:8080 \
+  myacr.azurecr.io/repo/app:1.0
+```
+
+***
+Love the focus—here are crisp, interview‑ready answers with practical commands and patterns for **161–180**. I’ll keep them hands‑on and tuned for a DevOps/SRE workflow.
+
+***
+
+## 161) Use `docker exec` to collect diagnostics and create reproducible traces
+
+Run lightweight commands inside the running container to capture **process**, **network**, **filesystem**, and **env** state. Store outputs to a mounted path for reproducibility.
+
+```bash
+# One-off: collect key diagnostics
+docker exec app sh -c '
+  set -o pipefail
+  echo "# date"; date
+  echo "# uname -a"; uname -a
+  echo "# env"; env
+  echo "# ps aux"; ps aux
+  echo "# open files"; (command -v lsof && lsof -p 1) || echo "lsof not installed"
+  echo "# listening sockets"; (command -v ss && ss -lntp) || netstat -lntp
+  echo "# routes"; ip route
+  echo "# disk usage"; df -h
+' > diag_app.txt
+
+# Stream logs during incident
+docker logs -t --since 10m -f app > app_logs_tail.txt
+```
+
+Tip: Use a **netshoot** toolbox container for deep network debugging:
+
+```bash
+docker run --rm -it --network appnet nicolaka/netshoot sh
+# dig api, curl http://api:8080, tcpdump -i any
+```
+
+***
+
+## 162) Configure `daemon.json` for proxy, logging, registry mirrors
+
+**Linux:** `/etc/docker/daemon.json`
+
+```json
+{
+  "dns": ["1.1.1.1", "8.8.8.8"],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "5", "mode": "non-blocking", "max-buffer-size": "8m" },
+  "registry-mirrors": ["https://mirror.mycorp.local"],
+  "insecure-registries": ["registry.mycorp.local:5000"]
+}
+```
+
+Systemd proxy for the **daemon** (if behind corporate proxy):
+`/etc/systemd/system/docker.service.d/proxy.conf`
+
+```ini
+[Service]
+Environment="HTTP_PROXY=http://proxy.mycorp:8080"
+Environment="HTTPS_PROXY=http://proxy.mycorp:8080"
+Environment="NO_PROXY=localhost,127.0.0.1,.mycorp.local"
+```
+
+Apply:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart docker
+```
+
+***
+
+## 163) Docker Swarm secrets and configs (concept)
+
+*   **Secrets**: small, sensitive blobs mounted **in‑memory** at `/run/secrets/<name>` to services.
+*   **Configs**: non‑secret blobs (e.g., config files) mounted as read‑only files.
+
+```bash
+# Create
+echo "supersecret" | docker secret create db_pass -
+docker config create app_conf ./conf.yml
+
+# Use in service
+docker service create --name api \
+  --secret db_pass \
+  --config source=app_conf,target=/etc/app/conf.yml \
+  myorg/api:1.0
+```
+
+Secrets are not exposed in image layers, `docker logs`, or environment variables (unless you explicitly export them—which you should avoid).
+
+***
+
+## 164) Restrict container capabilities (`--cap-drop`, `--cap-add`)
+
+Drop **all** Linux capabilities, add back only what’s needed:
+
+```bash
+docker run -d \
+  --cap-drop=ALL \
+  --cap-add=NET_BIND_SERVICE \   # bind to low ports
+  --cap-add=CHOWN \              # if you need chown
+  --security-opt no-new-privileges \
+  myorg/web:1.0
+```
+
+Common minimal set for web apps: `NET_BIND_SERVICE` only.
+
+***
+
+## 165) Run privileged containers & risks
+
+`--privileged` gives the container **full** capabilities, device access, and relaxes security (AppArmor/SELinux). Risks:
+
+*   Potential **host compromise** (kernel interfaces, device nodes).
+*   Broad **filesystem** and **proc** access.
+*   Bypasses many isolation guarantees.
+
+**Avoid** unless absolutely necessary (e.g., low‑level tooling). Prefer targeted device access (`--device`), specific capabilities, and tailored security opts.
+
+***
+
+## 166) Use Linux capabilities to reduce surface area
+
+Start with none, then add only what’s required:
+
+```bash
+docker run --cap-drop=ALL \
+  --cap-add=NET_BIND_SERVICE \
+  --cap-add=SYS_TIME \        # only if you truly must set time (rare)
+  myorg/app:1.0
+```
+
+Combine with:
+
+*   `--read-only` (root filesystem),
+*   `--tmpfs /tmp`,
+*   Non‑root `USER`,
+*   Seccomp default profile,
+*   AppArmor/SELinux confinement.
+
+***
+
+## 167) Audit host kernel parameters for container workload safety (concept)
+
+Checklist:
+
+*   **cgroups v2** enabled and configured (consistent across nodes).
+*   **Kernel hardening**:
+    *   `kernel.unprivileged_bpf_disabled=1`
+    *   `kernel.kptr_restrict=2`
+    *   `fs.protected_hardlinks=1`, `fs.protected_symlinks=1`
+    *   `vm.max_map_count` tuned for Elasticsearch‑like workloads.
+*   **Networking**:
+    *   `net.ipv4.ip_forward=1` (if NAT/forwarding needed),
+    *   `net.ipv4.conf.all.rp_filter=1` (anti‑spoof),
+    *   `net.ipv4.tcp_syncookies=1` (DoS protection).
+*   **Time sync**: chrony/ntpd running on host.
+
+Use `sysctl -a | grep <param>` and manage via `/etc/sysctl.d/*.conf`.
+
+***
+
+## 168) Detect container breakout attempts & harden hosts (concept)
+
+*   **Runtime detection**: Falco/Tracee (eBPF) rules for suspicious syscalls (e.g., `mount`, `ptrace`, `chmod 777`, `/proc` tampering).
+*   **Hardening**:
+    *   Drop caps; `no-new-privileges`; seccomp default; AppArmor/SELinux enforcing.
+    *   User namespaces (`userns-remap`), **rootless** where possible.
+    *   Read‑only FS; minimal images; mount only required volumes.
+    *   Isolate CI builders from prod nodes; never mount `/var/run/docker.sock` into arbitrary containers.
+*   **Monitoring**: centralize logs, kernel audit, eBPF sensors; alert on anomalies.
+
+***
+
+## 169) Host‑level isolation: VMs + containers vs bare‑metal
+
+*   **VMs + containers**: stronger **isolation boundary** (hypervisor + container), safer multi‑tenancy, blast‑radius reduction. Slight overhead; more layers to manage. Good for **security‑sensitive** workloads.
+*   **Bare‑metal containers**: max performance; fewer layers; but weaker isolation. Better for **trusted**, single‑tenant clusters.
+
+Middle ground: **sandboxed runtimes** (gVisor, Kata Containers) add syscall interception / lightweight VMs for stronger isolation with partial performance trade‑offs.
+
+***
+
+## 170) Measure image pull & startup times and optimize
+
+**Measure:**
+
+```bash
+time docker pull myorg/api:1.0
+time docker run --rm myorg/api:1.0 --help
+docker events --since 5m   # see pull/run events with timestamps
+```
+
+**Optimize:**
+
+*   **Smaller images** (multi‑stage, minimal base, remove build tools).
+*   **Layer reuse** across images (common base).
+*   **Registry caching/mirrors** close to nodes.
+*   **Warm cache**: pre‑pull on nodes ahead of deploy.
+*   **Multi‑arch** manifests for native pulls; avoid emulation.
+
+***
+
+## 171) Incremental image builds during CI to speed iteration
+
+*   Enable **BuildKit** and use **registry cache**:
+
+```bash
+docker buildx build \
+  --cache-to type=registry,ref=myacr.azurecr.io/repo/cache:build,mode=max \
+  --cache-from type=registry,ref=myacr.azurecr.io/repo/cache:build \
+  -t myacr.azurecr.io/repo/app:1.0 --push .
+```
+
+*   Order Dockerfile to maximize cache hits (copy manifests first).
+*   Pin base image digest to avoid unexpected cache busts.
+
+***
+
+## 172) Use `docker-compose` with environment variable substitution (`env_file`)
+
+Compose supports `${VAR}` and `.env` / `env_file`:
+
+```yaml
+services:
+  api:
+    image: ${REGISTRY}/api:${TAG}
+    env_file:
+      - ./api/.env
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DB_HOST: db
+```
+
+`.env` (auto‑loaded from project root) or explicit `env_file` entries provide variables securely without hardcoding in YAML.
+
+***
+
+## 173) Centralize logging to ELK/EFK or Splunk (concept)
+
+Options:
+
+*   **Log drivers**: `fluentd`, `gelf`, `awslogs`, `splunk` to ship stdout/stderr directly.
+    ```bash
+    docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 myorg/api:1.0
+    ```
+*   **Agent approach**: run **Fluent Bit/Fluentd/Filebeat** on nodes to collect container logs (json-file) and forward to **Elasticsearch/Kibana**, **Splunk**, or **Graylog**.
+*   Use structured logs (JSON), include correlation IDs, and set sane rotation (`daemon.json`).
+
+***
+
+## 174) Expose metrics & scrape via Prometheus (concept)
+
+*   **Instrument the app** (Prometheus client libraries) or run an **exporter** (Node Exporter, cAdvisor) exposing `/metrics`.
+*   Prometheus scrape config (targets via static list or service discovery):
+
+```yaml
+scrape_configs:
+  - job_name: 'api'
+    static_configs:
+      - targets: ['api:9090']
+```
+
+In Compose, run a Prometheus service on the same network and point to `api:9090`.
+
+***
+
+## 175) Use healthchecks with orchestrator to avoid routing to unhealthy containers
+
+*   **Docker Engine**: `HEALTHCHECK` marks containers `healthy/unhealthy` but doesn’t stop routing by itself.
+*   **Compose**: `depends_on: condition: service_healthy` gates start order only.
+*   **Kubernetes**: **readinessProbe** controls **traffic routing** (Service excludes unready pods), **livenessProbe** controls restarts, **startupProbe** avoids premature kills. This is the recommended way to **avoid routing to unhealthy containers**.
+
+***
+
+## 176) Readiness vs liveness at container level
+
+*   **Liveness**: “should I restart?”—very shallow check (process responsiveness/heartbeat).
+*   **Readiness**: “can I serve traffic?”—listener bound, local fast checks; **fail readiness** during drain/startup.
+*   Docker’s `HEALTHCHECK` is a **single probe**; treat it like **readiness**. For true separation, use **Kubernetes** with distinct probes.
+
+***
+
+## 177) Run multiple replicas locally with Compose
+
+```bash
+docker compose up -d --scale api=3
+```
+
+**Port publishing caveat**: if `api` publishes a host port (`8080:8080`), only one replica can bind it. Use a **reverse proxy** (Traefik/Nginx) fronting the replicas or remove direct port publishing and expose only the proxy.
+
+***
+
+## 178) Live reloading of code in containers during development
+
+*   **Bind mount** your source and run a watcher:
+
+```bash
+docker run -it --rm \
+  -v "$PWD"/src:/app/src \
+  -p 3000:3000 \
+  myorg/node-dev:latest sh -c "npm install && npx nodemon --watch src server.js"
+```
+
+Compose example:
+
+```yaml
+services:
+  api:
+    build: ./api
+    command: npx nodemon --watch src server.js
+    volumes:
+      - ./api/src:/app/src
+    ports:
+      - "3000:3000"
+```
+
+***
+
+## 179) CI pipelines that build, scan, sign, and push images (outline)
+
+1.  **Checkout & metadata** (commit SHA, build date).
+2.  **Build** (BuildKit, multi‑arch if needed).
+3.  **Scan** image (Trivy/Grype) → **quality gates**.
+4.  **Sign** (Cosign/Notation).
+5.  **Push** to registry (ACR/ECR/GHCR).
+6.  **Attestations/SBOM** (Syft/buildx).
+7.  **Deploy** (K8s/Compose) using **immutable tags/digests** and probes.
+
+Example (pseudo‑script):
+
+```bash
+export DOCKER_BUILDKIT=1
+docker buildx build --platform linux/amd64 -t myacr.azurecr.io/repo/app:${TAG} --push .
+trivy image --exit-code 1 --severity HIGH,CRITICAL myacr.azurecr.io/repo/app:${TAG}
+cosign sign myacr.azurecr.io/repo/app:${TAG}
+kubectl set image deploy/api api=myacr.azurecr.io/repo/app:${TAG} --record
+```
+
+***
+
+## 180) Handle time synchronization (chrony/NTP) for containers needing correct time
+
+*   Containers **inherit time** from the **host kernel**. Ensure host runs **chrony/ntpd** and is in sync.
+*   **Timezone** inside container:
+    *   Set `TZ` env: `-e TZ=Asia/Kolkata`
+    *   Or bind mount localtime: `-v /etc/localtime:/etc/localtime:ro`
+*   **Changing time inside container** requires elevated privileges (`SYS_TIME`)—**avoid**; fix time at the **host** level or via orchestration.
+
+***
+
+### Handy bundle (secure dev/prod defaults)
+
+```bash
+docker run -d \
+  --restart=unless-stopped \
+  --cpus=1.0 --memory=512m --memory-reservation=256m --pids-limit=200 \
+  --read-only --tmpfs /tmp:rw,size=64m \
+  --cap-drop=ALL --cap-add=NET_BIND_SERVICE \
+  --security-opt no-new-privileges \
+  --user 10001 \
+  -v appdata:/var/lib/app \
+  -p 8080:8080 \
+  myorg/app:1.0
+```
+
+Absolutely—continuing with crisp, interview‑ready answers and practical patterns for **181–200**. I’ll keep them hands‑on and tuned for real SRE/DevOps work.
+
+***
+
+## 181) How to implement runtime configuration reloading inside containerized apps?
+
+**Approaches:**
+
+*   **Signal‑based reload**: App traps `SIGHUP`/`SIGUSR1` and re‑reads config (Nginx, HAProxy, many servers).
+    ```bash
+    # Trigger reload from host
+    docker kill -s HUP app
+    ```
+*   **File watch**: App uses inotify to re‑load when a mounted config file/dir changes (e.g., `fsnotify` in Go).
+*   **Admin endpoint**: Expose `/reload` guarded by auth to trigger reload without restart.
+*   **Mount configs**: Use bind mounts or configs/secrets (Swarm/K8s) so updates are visible in‑place.
+*   **Kubernetes**: Use **ConfigMap volumes** + app file watch; for env var changes you need a restart (or reloader sidecar).
+
+**Tips:** Make reload **idempotent**, **fast**, and **fail‑safe** (validate new config; fallback to last good).
+
+***
+
+## 182) How to avoid layering secrets into images (runtime secret providers)?
+
+*   **Do NOT** bake secrets via `ARG`/`ENV`/`COPY`.
+*   Use **runtime secret mounts**:
+    *   **Docker Swarm**: `docker secret` → mounted at `/run/secrets/<name>`.
+    *   **Kubernetes**: `Secret` → mounted files or env (files preferred).
+    *   **External managers**: Azure Key Vault (CSI driver), HashiCorp Vault Agent sidecar, AWS Secrets Manager/SSM.
+*   Configure apps to **read secrets from files** at known paths; combine with **`read-only`** FS and strict permissions.
+
+***
+
+## 183) Init containers pattern analog with Docker Compose (workarounds)
+
+Compose has no native `initContainers`. Workarounds:
+
+*   **One‑shot init service**:
+    ```yaml
+    services:
+      initdb:
+        image: postgres:16
+        command: ["bash","-lc","psql ... < /init.sql"]
+        depends_on: [db]
+      api:
+        depends_on:
+          initdb:
+            condition: service_completed_successfully
+    ```
+*   **Healthcheck gating**: gate dependent service start on `service_healthy`.
+*   **`wait-for`** scripts in the app entrypoint to delay until deps are ready.
+*   **Manual step**: `docker compose run --rm migrator` before `up`.
+
+***
+
+## 184) Ensure containers start in a specific order (depends\_on caveats)
+
+*   `depends_on` controls **start order**, not **readiness** (unless you use Compose v2 conditions).
+*   Prefer **healthchecks** + `condition: service_healthy`:
+    ```yaml
+    services:
+      db:
+        image: postgres:16
+        healthcheck: { test: ["CMD","pg_isready","-U","postgres"], interval: 10s, retries: 6 }
+      api:
+        depends_on:
+          db:
+            condition: service_healthy
+    ```
+*   Even then, apps should **retry** connections (defensive design).
+
+***
+
+## 185) Test network partitioning locally (tc/netem concepts)
+
+*   Apply **latency/loss/packet‑corruption** using `tc netem` **inside the container’s netns**:
+    ```bash
+    pid=$(docker inspect -f '{{.State.Pid}}' api)
+    sudo nsenter -t "$pid" -n tc qdisc add dev eth0 root netem delay 200ms loss 2%
+    # remove
+    sudo nsenter -t "$pid" -n tc qdisc del dev eth0 root
+    ```
+*   Block routes using iptables in the same netns:
+    ```bash
+    sudo nsenter -t "$pid" -n iptables -A OUTPUT -d 10.0.0.5 -j DROP
+    ```
+*   Tools: **pumba**, **toxiproxy**, **comcast**, service‑mesh fault injection (in K8s).
+
+***
+
+## 186) Debug container networking issues
+
+Checklist:
+
+*   **Inspect network**: `docker network inspect <net>` (subnet, endpoints, aliases).
+*   **Inside container**: `ip a`, `ip route`, `ss -lntup`, `dig`, `nslookup`.
+*   **Host NAT** (published ports): `sudo iptables -t nat -L -n -v | grep <port>`.
+*   **Logs & events**: `docker events --since 10m`.
+*   **Name resolution**: check `/etc/resolv.conf` (Docker embedded DNS `127.0.0.11` on user-defined bridges).
+*   **Packet capture**: `tcpdump -i any port 5432` (or use **netshoot** container).
+*   **nsenter** into container netns as shown in #185.
+
+***
+
+## 187) Handle IPv6 in Docker networks (configuration concept)
+
+*   Enable IPv6 in the daemon:
+    ```json
+    // /etc/docker/daemon.json
+    { "ipv6": true, "fixed-cidr-v6": "2001:db8:1::/64" }
+    ```
+*   Create networks with IPv6:
+    ```bash
+    docker network create --ipv6 --subnet "2001:db8:2::/64" appnet6
+    docker run --network appnet6 --ip6 "2001:db8:2::10" nginx
+    ```
+*   Ensure host kernel IPv6 enabled, firewall allows IPv6; be aware of **NAT66** limitations (often none—use routing).
+
+***
+
+## 188) Transparent outbound proxying for inspection
+
+Options:
+
+*   **Env proxy**: set `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` per container or globally in daemon/systemd (simple, app‑aware).
+*   **Sidecar proxy**: run Squid/mitmproxy and set containers to route via it.
+*   **Transparent (app‑agnostic)**: iptables **REDIRECT/TProxy** to proxy’s port within container’s netns or host:
+    ```bash
+    # example: redirect all :80 to local proxy :3128 in the container netns
+    nsenter -t "$pid" -n iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports 3128
+    ```
+*   In Kubernetes, use a **service mesh** (Istio/Linkerd) for mTLS/inspection policies.
+
+***
+
+## 189) `docker scan` (Snyk) concept
+
+*   Historically `docker scan <image>` invoked Snyk to scan for CVEs and report severities/fixes.
+*   In CI, prefer **Snyk CLI** (`snyk container test`) or **Trivy/Grype**.
+*   Output can be used as a **quality gate** (fail on HIGH/CRITICAL).
+
+*(Note: newer Docker tooling emphasizes **Docker Scout**; for interview context, focus on the scanning concept and CI integration.)*
+
+***
+
+## 190) Enforce runtime policies (block unsigned/untrusted images)
+
+*   **Kubernetes**: Admission controllers (Kyverno, OPA Gatekeeper, Sigstore Policy Controller, Connaisseur) to **verify signatures**, registry allow‑lists, label checks, and block privileged configs.
+*   **Docker/Compose**: No native admission control—enforce at **registry** (immutability, RBAC), **CI** (signing), and **host** (run as non‑root, userns, seccomp/AppArmor/SELinux).
+*   **Registries**: Enable content trust/immutability; require signed images via org policy.
+
+***
+
+## 191) Periodic image garbage collection (registry & host)
+
+*   **Host**:
+    *   `docker system prune -f`, `docker image prune -a -f`, `docker volume prune -f` via **cron/systemd timers**.
+    *   Observe `docker system df` before cleanup.
+*   **Registry**:
+    *   **registry:2**: delete manifests/tags, then run `garbage-collect` during maintenance.
+    *   **ACR/ECR/Harbor**: use **retention/lifecycle policies** to auto‑expire old or untagged images (no downtime).
+
+***
+
+## 192) Minimal attack surface images (distroless) & trade‑offs
+
+*   **Distroless**: only app + runtime libs, **no shell/package manager** → smallest surface.
+    *   **Pros**: tiny, fewer CVEs, faster pull/start.
+    *   **Cons**: debugging harder (no shell/tools), must ensure logging to stdout/stderr; may need a separate **debug** tag.
+*   Alternatives: `alpine` (musl, tiny), `scratch` (empty, static binaries only).
+
+***
+
+## 193) Run GUI apps in Docker (X forwarding / VNC) + considerations
+
+*   **X11 on Linux**:
+    ```bash
+    xhost +local:root
+    docker run -e DISPLAY=$DISPLAY \
+      -v /tmp/.X11-unix:/tmp/.X11-unix:ro guiimage
+    ```
+*   **VNC/noVNC/xpra**: run an X server inside container and connect via VNC/web.
+*   **Considerations**: security (X11 is permissive), GPU access (`--gpus all` for NVIDIA), audio (PulseAudio/ALSA), input devices `--device`.
+
+***
+
+## 194) Control container startup order with systemd units
+
+*   Wrap containers in **systemd** services:
+    ```ini
+    [Unit]
+    Description=API Container
+    After=docker.service db.service
+    Requires=docker.service db.service
+
+    [Service]
+    Restart=always
+    ExecStart=/usr/bin/docker start -a api
+    ExecStop=/usr/bin/docker stop -t 20 api
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+*   Use `After=` and `Requires=` to control ordering; or run **Compose** via a unit and manage dependencies across units.
+
+***
+
+## 195) Run in Kubernetes vs standalone Docker (concept)
+
+*   **Docker**: single‑node, manual lifecycle (`docker run`, volumes, bridge networks).
+*   **Kubernetes**: multi‑node **orchestrator**: Pods, Deployments, Services, Ingress, StatefulSets, PVCs, ConfigMaps/Secrets, HPA, RBAC, network policy, probes, rolling/blue‑green/canary, admission controls.
+*   K8s uses **CNI** for networking, **containerd/runc** as runtime; Docker CLI is not used on nodes.
+
+***
+
+## 196) Ephemeral containers for debugging (concept)
+
+*   **Kubernetes feature**: add a temporary **ephemeral container** into a running Pod’s namespaces for debugging without restarts:
+    ```bash
+    kubectl debug -it deploy/api --image=nicolaka/netshoot --target=api
+    ```
+*   Great for prod: you get shell/tools in the pod’s netns/PID ns. Removed when done.
+*   Docker standalone: use `docker exec` or `nsenter`.
+
+***
+
+## 197) Test resilience to OOM/CPU starvation in CI
+
+*   Start app with **limits**, then stress:
+    ```bash
+    docker run --rm --memory=256m --cpus=0.5 myorg/app:1.0 &
+    docker run --rm --cpus=2 --memory=64m --name stress --pid container:<app_pid1> alpine sh -c "apk add --no-cache stress-ng && stress-ng --vm 1 --vm-bytes 300m --timeout 30s"
+    ```
+*   Assert behavior: exit codes (137/139), retries, backoff, health signals, graceful degradation.
+*   Record metrics: RSS growth, GC pauses, latency under load.
+
+***
+
+## 198) Configure CPU shares vs CFS quotas (`--cpu-shares`, `--cpu-quota`)
+
+*   **`--cpu-shares`**: relative weight **only under contention** (default 1024). 512 gets \~½ CPU share vs 1024 siblings.
+*   **CFS quotas**:
+    *   `--cpu-quota`/`--cpu-period` or **`--cpus`** (e.g., `--cpus=1.5`).
+    *   Hard limit of CPU time over the period; enforces fair throttling.
+*   Pinning: `--cpuset-cpus="0,2"` to pin to specific cores.
+
+Examples:
+
+```bash
+docker run --cpu-shares=512 myorg/worker
+docker run --cpus=1.0 myorg/api
+docker run --cpu-quota=50000 --cpu-period=100000 myorg/job  # 0.5 CPU
+```
+
+***
+
+## 199) Handle large file uploads/downloads with limited disk
+
+*   **Stream** data (chunked upload/download); avoid buffering whole files to disk.
+*   Use **tmpfs** for temporary data:
+    ```bash
+    docker run --tmpfs /tmp:size=256m myorg/app
+    ```
+*   Store artifacts on **external object storage** (S3/Blob/GCS) via **pre‑signed URLs**; don’t spool to container FS.
+*   Configure proxies/servers for size/timeouts (`client_max_body_size` in Nginx, `maxRequestBodySize` etc.).
+*   Mount a **dedicated volume** for larger capacity if needed; keep the root FS **read‑only**.
+
+***
+
+## 200) Instrument & trace container startup to reduce cold‑start latency
+
+*   **Measure**:
+    *   Add timestamps/spans around init phases (config load, DB connect, cache warm, JIT).
+    *   Use **OpenTelemetry** to emit a **“startup” trace** and **duration metrics**.
+    *   Capture image pull + container start times (`docker events`, CI timers).
+*   **Optimize**:
+    *   **Smaller images** (fewer layers, multi‑stage) → faster pulls.
+    *   **Warm caches**: lazy‑init; defer non‑critical work to post‑start.
+    *   **Connection pools**: exponential backoff, timeouts tuned; avoid sync waits where possible.
+    *   **Pre‑pull** images on nodes; use **registry mirrors** close to hosts.
+    *   **Native arch** builds (avoid emulation); avoid heavy init scripts; consider **`--init` (tini)** for reliable signal handling.
+    *   For JVM/Node: class‑data sharing (JVM), AOT/native images (GraalVM), Node’s snapshot/compile strategies; trim dependencies.
+
+***
+
+### Handy, secure runtime template (drop‑in)
+
+```bash
+docker run -d \
+  --restart=unless-stopped \
+  --cpus=1.0 --memory=512m --memory-reservation=256m --pids-limit=200 \
+  --read-only --tmpfs /tmp:rw,size=64m \
+  --cap-drop=ALL --cap-add=NET_BIND_SERVICE \
+  --security-opt no-new-privileges \
+  --user 10001 \
+  -v appdata:/var/lib/app \
+  -p 8080:8080 \
+  myorg/app:1.0
+```
+
+***
+
 
 
