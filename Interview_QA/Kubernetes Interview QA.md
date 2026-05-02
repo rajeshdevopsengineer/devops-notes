@@ -1651,5 +1651,400 @@ Say:
 
 ---
 
+## 31. Check if the pod’s ServiceAccount has permission to list services in that namespace
+
+When a pod accesses the Kubernetes API, it uses its attached **ServiceAccount** identity. If RBAC permissions are missing, DNS sidecars, operators, controllers, or app code may fail when querying Services.
+
+---
+
+## Step 1: Identify Pod ServiceAccount
+
+```bash id="o1n5v6"
+kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.serviceAccountName}'
+```
+
+Default is usually:
+
+```text id="u2q5ca"
+default
+```
+
+---
+
+## Step 2: Test Permission Using kubectl auth can-i
+
+```bash id="y8m0rn"
+kubectl auth can-i list services \
+--as=system:serviceaccount:<namespace>:<serviceaccount> \
+-n <namespace>
+```
+
+Example:
+
+```bash id="w7j4v9"
+kubectl auth can-i list services \
+--as=system:serviceaccount:dev:web-sa \
+-n dev
+```
+
+---
+
+## Output Meaning
+
+```text id="i9g3pd"
+yes  -> permission granted
+no   -> denied by RBAC
+```
+
+---
+
+## Fix
+
+Create Role + RoleBinding.
+
+```yaml id="u4w9sj"
+kind: Role
+rules:
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get","list","watch"]
+```
+
+Bind it to ServiceAccount.
+
+---
+
+## Real Use Case
+
+Apps using Kubernetes API for service discovery or operators needing to watch services.
+
+---
+
+# 32. Inspect RBAC roles — is there a RoleBinding for discovery?
+
+If ServiceAccount has no permission, check whether RoleBinding exists.
+
+---
+
+## List RoleBindings in Namespace
+
+```bash id="x1j6qn"
+kubectl get rolebinding -n <namespace>
+```
+
+---
+
+## Describe Specific RoleBinding
+
+```bash id="u6f4mt"
+kubectl describe rolebinding <rolebinding-name> -n <namespace>
+```
+
+Look for:
+
+```text id="u9k1ca"
+Subjects:
+  Kind: ServiceAccount
+  Name: web-sa
+
+RoleRef:
+  Kind: Role
+  Name: discovery-role
+```
+
+---
+
+## Check Role Permissions
+
+```bash id="x0f3lu"
+kubectl describe role discovery-role -n <namespace>
+```
+
+Need:
+
+```text id="t7k0nb"
+resources: services
+verbs: get,list,watch
+```
+
+---
+
+## If Missing, Create Binding
+
+```yaml id="n6v3mx"
+kind: RoleBinding
+subjects:
+- kind: ServiceAccount
+  name: web-sa
+roleRef:
+  kind: Role
+  name: discovery-role
+```
+
+---
+
+## Interview Answer
+
+> I verify both Role permissions and whether RoleBinding correctly maps the ServiceAccount.
+
+---
+
+# 33. Review NetworkPolicies – are they blocking intra-namespace traffic?
+
+Kubernetes NetworkPolicy controls pod-to-pod traffic. If deny rules exist, DNS or service communication may fail.
+
+---
+
+## Step 1: List Policies
+
+```bash id="v0r7yt"
+kubectl get networkpolicy -n <namespace>
+```
+
+---
+
+## Step 2: Describe Policies
+
+```bash id="c8d2la"
+kubectl describe networkpolicy <policy-name> -n <namespace>
+```
+
+---
+
+## What to Check
+
+### Ingress Rules
+
+Allows incoming traffic.
+
+### Egress Rules
+
+Allows outgoing traffic.
+
+### Pod Selectors
+
+Which pods are affected.
+
+---
+
+## Common DNS Blocking Issue
+
+Pod cannot reach CoreDNS because UDP/TCP 53 blocked.
+
+Need egress allow:
+
+```yaml id="x8s4rz"
+ports:
+- protocol: UDP
+  port: 53
+- protocol: TCP
+  port: 53
+```
+
+---
+
+## Intra-namespace Block Example
+
+If policy only allows labeled pods:
+
+```text id="v7m0lw"
+app=frontend can talk
+others blocked
+```
+
+---
+
+## Test Connectivity
+
+```bash id="v2u1ox"
+kubectl exec -it <pod> -- wget -qO- http://service-name
+```
+
+---
+
+## Interview Answer
+
+> When NetworkPolicy exists, I always validate DNS egress and namespace pod selectors first.
+
+---
+
+# 34. Examine CoreDNS ConfigMap – look for caching misconfigurations or recursive loops
+
+CoreDNS provides cluster DNS.
+
+---
+
+## View ConfigMap
+
+```bash id="j4h8ke"
+kubectl get configmap coredns -n kube-system -o yaml
+```
+
+or
+
+```bash id="n2z5dr"
+kubectl edit configmap coredns -n kube-system
+```
+
+---
+
+## Typical Corefile Example
+
+```text id="s1u0gn"
+.:53 {
+    errors
+    health
+    kubernetes cluster.local
+    forward . /etc/resolv.conf
+    cache 30
+    loop
+    reload
+}
+```
+
+---
+
+# What to Check
+
+## 1. Cache Misconfiguration
+
+Too high cache TTL may return stale records.
+
+```text id="k5q2cx"
+cache 3600
+```
+
+May delay updates.
+
+Better:
+
+```text id="n3j4sz"
+cache 30
+```
+
+---
+
+## 2. Recursive Forwarding Loop
+
+If forward points back to itself:
+
+```text id="m4r7qp"
+forward . 10.x.x.x
+```
+
+Where IP is CoreDNS service IP.
+
+This creates loop.
+
+Use valid upstream DNS.
+
+---
+
+## 3. Missing kubernetes Plugin
+
+Without it, cluster service DNS fails.
+
+---
+
+## 4. Syntax Errors
+
+After changes restart pods:
+
+```bash id="q2e7wy"
+kubectl rollout restart deployment coredns -n kube-system
+```
+
+---
+
+## Logs
+
+```bash id="d7m3ko"
+kubectl logs -n kube-system deploy/coredns
+```
+
+---
+
+# 35. Use tcpdump inside the pod to confirm UDP port 53 DNS traffic
+
+Used when DNS issue is unclear.
+
+---
+
+## Exec Into Pod
+
+```bash id="u8n2lr"
+kubectl exec -it <pod-name> -- sh
+```
+
+---
+
+## Run tcpdump
+
+If installed:
+
+```bash id="e4j6pn"
+tcpdump -i any udp port 53
+```
+
+---
+
+## Filter for Specific DNS Server
+
+```bash id="n5q9sv"
+tcpdump -i any host <dns-ip> and port 53
+```
+
+---
+
+## What You Confirm
+
+### Successful Query
+
+```text id="j1z6wa"
+Pod -> DNS server UDP/53
+Response returned
+```
+
+### No Packets
+
+Likely:
+
+* NetworkPolicy block
+* CNI issue
+* Pod routing issue
+
+### Query Sent, No Reply
+
+Likely:
+
+* DNS server unreachable
+* Firewall block
+* CoreDNS down
+
+---
+
+## If tcpdump Not Installed
+
+Use debug pod:
+
+```bash id="v4t0cm"
+kubectl run debug --rm -it --image=nicolaka/netshoot -- bash
+```
+
+Then:
+
+```bash id="p1m7dr"
+tcpdump -i any udp port 53
+```
+
+---
+
+## Interview Tip (Strong Answer)
+
+> For DNS failures I validate in sequence: serviceaccount RBAC, rolebindings, network policies, CoreDNS config, then packet capture on UDP 53 to isolate whether the issue is auth, policy, config, or network.
+
+---
+
+If you'd like, I can also turn **31–35 into a real production troubleshooting scenario with expected outputs and fixes**, which is very useful for senior DevOps interviews.
 
 
