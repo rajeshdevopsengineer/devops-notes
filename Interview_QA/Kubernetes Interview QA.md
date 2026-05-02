@@ -7401,3 +7401,1850 @@ That makes you stand out.
 
 ---
 
+## 101. What is PV & PVC?
+
+PersistentVolume (PV) and PersistentVolumeClaim (PVC) are Kubernetes storage objects used for persistent data.
+
+---
+
+# PV = PersistentVolume
+
+A storage resource created in the cluster by admin or dynamically provisioned.
+
+Examples:
+
+* NFS
+* Amazon Web Services EBS
+* Microsoft Azure Disk
+* Ceph
+
+Example:
+
+```text id="a1011b122"
+100Gi storage available
+```
+
+---
+
+# PVC = PersistentVolumeClaim
+
+A request for storage by application/user.
+
+Example:
+
+```text id="b122c233"
+Need 20Gi ReadWriteOnce
+```
+
+---
+
+# Flow
+
+```text id="c233d344"
+PVC requests storage -> binds to PV -> Pod mounts PVC
+```
+
+---
+
+# Why Needed?
+
+Separates app teams from storage backend details.
+
+---
+
+# Strong Interview Answer
+
+> PV is actual storage resource; PVC is request/claim for storage used by pods.
+
+---
+
+# 102. What are access modes in PV?
+
+Access modes define how a volume can be mounted.
+
+---
+
+# Main Modes
+
+## 1. ReadWriteOnce (RWO)
+
+Mounted read-write by one node.
+
+Common with cloud block storage.
+
+```text id="d344e455"
+One node only
+```
+
+---
+
+## 2. ReadOnlyMany (ROX)
+
+Many nodes can mount read-only.
+
+---
+
+## 3. ReadWriteMany (RWX)
+
+Many nodes can mount read-write simultaneously.
+
+Used with NFS / shared storage.
+
+---
+
+## 4. ReadWriteOncePod (RWOP)
+
+Mounted read-write by only one pod cluster-wide.
+
+(Newer Kubernetes mode)
+
+---
+
+# Examples
+
+* EBS / Azure Disk = mostly RWO
+* NFS = RWX
+
+---
+
+# Strong Interview Answer
+
+> Access modes define whether one or many nodes/pods can mount the volume and with read-only or read-write access.
+
+---
+
+# 103. What is node selector?
+
+nodeSelector is the simplest way to schedule a pod onto nodes with matching labels.
+
+---
+
+# Example
+
+Label node:
+
+```bash id="e455f566"
+kubectl label node worker1 disktype=ssd
+```
+
+Pod YAML:
+
+```yaml id="f566g677"
+spec:
+  nodeSelector:
+    disktype: ssd
+```
+
+---
+
+# Result
+
+Pod runs only on nodes labeled:
+
+```text id="g677h788"
+disktype=ssd
+```
+
+---
+
+# Use Cases
+
+* GPU nodes
+* SSD nodes
+* Dedicated environments
+* Region-specific workloads
+
+---
+
+# Strong Interview Answer
+
+> nodeSelector pins pods to nodes using simple key-value labels.
+
+---
+
+# 104. What are the two regions in projects?
+
+This question is commonly asked in OpenShift context and often means **user/project roles or project visibility zones** rather than geographic regions. It may also be a typo for “roles”.
+
+Most common interview interpretation:
+
+# Two Types of Project Access in OpenShift
+
+## 1. User Project / Namespace
+
+Application team deploys workloads.
+
+## 2. System / Infrastructure Project
+
+Reserved for platform components.
+
+Examples:
+
+```text id="h788i899"
+openshift-*
+kube-system
+```
+
+---
+
+# If They Mean Geographic Regions
+
+Then answer:
+
+```text id="i899j900"
+Primary region
+Disaster Recovery region
+```
+
+---
+
+# Best Interview Response
+
+> This question can mean project access areas or cloud regions. In OpenShift, we usually separate user namespaces and system namespaces. In DR design, we use primary and secondary regions.
+
+---
+
+# 105. Difference between template & Deployment Configuration?
+
+This is OpenShift terminology.
+
+---
+
+# Template
+
+Reusable parameterized blueprint containing multiple objects.
+
+Can generate:
+
+* Service
+* Route
+* DeploymentConfig
+* Secret
+
+Example:
+
+```text id="j900k011"
+APP_NAME=myapp
+IMAGE=nodejs
+```
+
+---
+
+# DeploymentConfig (DC)
+
+Actual deployment controller managing rollout of app pods.
+
+Handles:
+
+* replicas
+* image changes
+* rollout strategy
+
+---
+
+# Difference
+
+| Feature           | Template           | DeploymentConfig |
+| ----------------- | ------------------ | ---------------- |
+| Purpose           | Reusable blueprint | Deploy app       |
+| Creates Resources | Yes                | No               |
+| Manages Rollout   | No                 | Yes              |
+| Parameters        | Yes                | Limited          |
+
+---
+
+# Strong Interview Answer
+
+> Template is used to generate resources; DeploymentConfig manages deployment lifecycle.
+
+---
+
+# 106. How to migrate whole cluster to another?
+
+Cluster migration means workloads, configs, storage, and access moved to a new cluster.
+
+---
+
+# High-Level Process
+
+## 1. Build Target Cluster
+
+Same / newer version.
+
+## 2. Export Resources
+
+```bash id="k011l122"
+kubectl get all -A -o yaml
+```
+
+Also export:
+
+* ConfigMaps
+* Secrets
+* CRDs
+* RBAC
+* Ingress
+
+---
+
+## 3. Migrate Storage/Data
+
+* DB replication
+* Snapshot restore
+* PVC migration tools
+
+---
+
+## 4. Restore to New Cluster
+
+Use GitOps:
+
+* ArgoCD
+* Helm
+* Terraform
+
+---
+
+## 5. Validate
+
+* Pods healthy
+* Services reachable
+* Monitoring active
+
+---
+
+## 6. Cutover Traffic
+
+DNS / Load balancer switch.
+
+---
+
+# Strong Interview Answer
+
+> I recreate infrastructure as code, migrate data separately, restore workloads, validate, then cut traffic gradually.
+
+---
+
+# 107. How to manually migrate container?
+
+If they mean move workload manually from one node/cluster to another:
+
+---
+
+# Within Same Cluster
+
+Drain node:
+
+```bash id="l122m233"
+kubectl drain <node> --ignore-daemonsets
+```
+
+Pods reschedule elsewhere.
+
+---
+
+# To Another Cluster
+
+1. Push image to registry
+2. Export manifests
+3. Apply to target cluster
+
+```bash id="m233n344"
+kubectl apply -f app.yaml
+```
+
+---
+
+# If Need Data
+
+Copy persistent data separately.
+
+---
+
+# If Plain Docker Container
+
+Commit/push image then run elsewhere.
+
+---
+
+# Strong Interview Answer
+
+> Containers themselves are ephemeral; we migrate images + manifests + data, not “move” running containers directly.
+
+---
+
+# 108. What are the types of health probes in Kubernetes? How does K8s determine if a pod is ready?
+
+Kubernetes probes
+
+---
+
+# Probe Types
+
+## 1. Liveness Probe
+
+Checks if app is alive.
+
+Fail = restart container.
+
+---
+
+## 2. Readiness Probe
+
+Checks if app can receive traffic.
+
+Fail = removed from service endpoints.
+
+---
+
+## 3. Startup Probe
+
+For slow-starting apps.
+
+Disables liveness until startup completes.
+
+---
+
+# How K8s Determines Readiness
+
+If readiness probe succeeds:
+
+```text id="n344o455"
+Pod Ready = True
+Added to Service endpoints
+```
+
+If fails:
+
+```text id="o455p566"
+Ready = False
+No traffic routed
+```
+
+---
+
+# Methods
+
+* HTTP GET
+* TCP socket
+* Exec command
+
+---
+
+# 109. Difference between stateful and stateless applications?
+
+# Stateless Applications
+
+Do not store session/data locally.
+
+Examples:
+
+* Web frontend
+* REST APIs
+
+Pods interchangeable.
+
+Easy horizontal scaling.
+
+---
+
+# Stateful Applications
+
+Need persistent data / identity.
+
+Examples:
+
+* MongoDB
+* Apache Kafka
+* Redis cluster
+
+Need:
+
+* Persistent storage
+* Stable hostname
+* Ordered startup
+
+---
+
+# Comparison
+
+| Feature      | Stateless  | Stateful     |
+| ------------ | ---------- | ------------ |
+| Local Data   | No         | Yes          |
+| Easy Replace | Yes        | More Complex |
+| Controller   | Deployment | StatefulSet  |
+
+---
+
+# Strong Interview Answer
+
+> Stateless apps can be replaced freely; stateful apps depend on data persistence and stable identity.
+
+---
+
+# 110. Difference between ConfigMap and Secret in Kubernetes?
+
+ConfigMap stores non-sensitive configuration.
+Secret stores sensitive data.
+
+---
+
+# ConfigMap Examples
+
+* URLs
+* Feature flags
+* App mode
+
+```yaml id="p566q677"
+data:
+  APP_ENV: prod
+```
+
+---
+
+# Secret Examples
+
+* Passwords
+* Tokens
+* TLS certs
+
+```yaml id="q677r788"
+data:
+  password: cGFzcw==
+```
+
+(Base64 encoded)
+
+---
+
+# Differences
+
+| Feature   | ConfigMap | Secret                               |
+| --------- | --------- | ------------------------------------ |
+| Sensitive | No        | Yes                                  |
+| Use Case  | Config    | Credentials                          |
+| Security  | Basic     | Better (encrypt at rest recommended) |
+
+---
+
+# Best Practice
+
+Use external secret stores:
+
+* HashiCorp Vault
+* Cloud key vaults
+
+---
+
+# Strong Interview Answer
+
+> ConfigMap is for normal configuration; Secret is for credentials and confidential values.
+
+---
+## 111. How can we restrict which pod can access the other pod in Kubernetes?
+
+The standard way is using NetworkPolicy.
+
+By default, many clusters allow pod-to-pod communication. NetworkPolicy lets you enforce **zero trust** communication.
+
+---
+
+# Example Requirement
+
+Only frontend pods can access backend pods on port 8080.
+
+---
+
+# Example Policy
+
+```yaml id="a111b222"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: prod
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  policyTypes:
+  - Ingress
+```
+
+---
+
+# Result
+
+```text id="b222c333"
+frontend -> backend allowed
+other pods -> blocked
+```
+
+---
+
+# Also Restrict Cross-Namespace Access
+
+Use:
+
+* `namespaceSelector`
+* `podSelector`
+
+---
+
+# Important Requirement
+
+Need CNI supporting policies:
+
+* Calico
+* Cilium
+
+---
+
+# Strong Interview Answer
+
+> I use NetworkPolicies with pod labels and namespace selectors to allow only required pod communication.
+
+---
+
+# 112. Suppose I want the pod to be scheduled on a specific node only. How can I achieve this?
+
+Use one of these methods:
+
+1. nodeSelector
+2. Node Affinity
+3. Taints + Tolerations (advanced isolation)
+
+---
+
+# Option 1: nodeSelector (Simple)
+
+Label node:
+
+```bash id="c333d444"
+kubectl label node worker1 env=prod
+```
+
+Pod YAML:
+
+```yaml id="d444e555"
+spec:
+  nodeSelector:
+    env: prod
+```
+
+---
+
+# Option 2: Node Affinity (Preferred)
+
+```yaml id="e555f666"
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: env
+          operator: In
+          values:
+          - prod
+```
+
+---
+
+# Option 3: Dedicated Node
+
+Taint node:
+
+```bash id="f666g777"
+kubectl taint node worker1 dedicated=app:NoSchedule
+```
+
+Add toleration to pod.
+
+---
+
+# Strong Interview Answer
+
+> For specific node scheduling, I use nodeSelector for simple cases and node affinity for production-grade flexible scheduling.
+
+---
+
+# 113. I am getting a 503 error when I hit a load balancer URL, which routes traffic to the application deployed in a Kubernetes cluster. How will you troubleshoot this?
+
+503 usually means:
+
+```text id="g777h888"
+Load balancer reachable, but backend unavailable
+```
+
+This is commonly due to no healthy pods/endpoints.
+
+---
+
+# Step-by-Step Troubleshooting
+
+## 1. Check LoadBalancer Service
+
+```bash id="h888i999"
+kubectl get svc -A
+kubectl describe svc <service-name>
+```
+
+Verify external IP exists.
+
+---
+
+## 2. Check Endpoints
+
+```bash id="i999j000"
+kubectl get endpoints <service-name> -n <namespace>
+```
+
+If empty:
+
+```text id="j000k111"
+No healthy backend pods
+```
+
+---
+
+## 3. Check Pods
+
+```bash id="k111l222"
+kubectl get pods -n <namespace>
+```
+
+Look for:
+
+* CrashLoopBackOff
+* Pending
+* Not Ready
+
+---
+
+## 4. Check Readiness Probe
+
+Pods running but not Ready = not added to service endpoints.
+
+```bash id="l222m333"
+kubectl describe pod <pod>
+```
+
+---
+
+## 5. Verify Labels / Selectors
+
+```bash id="m333n444"
+kubectl get svc <svc> -o yaml
+kubectl get pods --show-labels
+```
+
+Service selector must match pod labels.
+
+---
+
+## 6. Check Ingress / LB Health Checks
+
+Cloud LB may fail health probe path/port.
+
+---
+
+# Strong Interview Answer
+
+> I first check if service has healthy endpoints. Most 503 issues happen when pods are not Ready, labels mismatch, or readiness probes fail.
+
+---
+
+# 114. I am getting CrashLoopBackOff error for one of the pods in a namespace. What should be the reason?
+
+CrashLoopBackOff means container starts, crashes, and restarts repeatedly.
+
+---
+
+# Common Reasons
+
+## 1. Application Crash
+
+Bug or startup failure.
+
+---
+
+## 2. Wrong Command / Entrypoint
+
+Container exits immediately.
+
+---
+
+## 3. Missing ConfigMap / Secret
+
+App fails during startup.
+
+---
+
+## 4. OOMKilled
+
+Memory exceeded.
+
+```bash id="n444o555"
+kubectl describe pod <pod>
+```
+
+Look for:
+
+```text id="o555p666"
+Reason: OOMKilled
+```
+
+---
+
+## 5. Liveness Probe Failure
+
+Health check restarts container continuously.
+
+---
+
+## 6. Dependency Unreachable
+
+DB/API not reachable.
+
+---
+
+# Troubleshooting Commands
+
+```bash id="p666q777"
+kubectl logs <pod>
+kubectl logs <pod> --previous
+kubectl describe pod <pod>
+```
+
+---
+
+# Strong Interview Answer
+
+> CrashLoopBackOff is usually due to app crash, wrong startup command, probe failure, missing config, or memory kill.
+
+---
+
+# 115. Pod in Pending state after deployment is done? What can be the reason behind this?
+
+Pending Pod means pod is accepted but not yet scheduled/running.
+
+---
+
+# Common Reasons
+
+## 1. Insufficient Resources
+
+No node has enough CPU/RAM.
+
+```text id="q777r888"
+0/3 nodes available: insufficient memory
+```
+
+---
+
+## 2. Node Selector / Affinity Mismatch
+
+Pod requests labels no node has.
+
+---
+
+## 3. Taints Without Tolerations
+
+Node repels pod.
+
+---
+
+## 4. PVC Pending
+
+Storage volume not available.
+
+```bash id="r888s999"
+kubectl get pvc
+```
+
+---
+
+## 5. Image Pull Waiting (sometimes after scheduling)
+
+Though usually moves to ContainerCreating/ImagePullBackOff later.
+
+---
+
+## 6. Quota / LimitRange Restrictions
+
+Namespace resource quota exceeded.
+
+---
+
+# Troubleshooting Commands
+
+```bash id="s999t000"
+kubectl describe pod <pod>
+kubectl get nodes
+kubectl top nodes
+kubectl get pvc
+```
+
+---
+
+# Strong Interview Answer
+
+> Pending usually means scheduler cannot place the pod due to resources, taints, affinity mismatch, or storage issues.
+
+---
+
+# Interview Tip
+
+For questions 113–115, always say:
+
+> I start with `kubectl describe pod/service` because Events usually reveal the root cause quickly.
+
+That sounds practical and experienced.
+
+---
+## 116. How can you ensure high availability for your application deployed in K8s cluster?
+
+High Availability (HA) means application stays available even if pods, nodes, or zones fail.
+
+---
+
+# Application-Level HA
+
+## 1. Multiple Replicas
+
+Run more than one pod.
+
+```yaml id="a116b227"
+replicas: 3
+```
+
+If one pod fails, others serve traffic.
+
+---
+
+## 2. Use Deployment / StatefulSet
+
+* Stateless apps → Deployment
+* Stateful apps → StatefulSet
+
+---
+
+## 3. Readiness + Liveness Probes
+
+Only healthy pods receive traffic.
+
+---
+
+## 4. Pod Disruption Budget
+
+Pod Disruption Budget prevents too many pods being down during maintenance.
+
+```yaml id="b227c338"
+minAvailable: 2
+```
+
+---
+
+## 5. Pod Anti-Affinity
+
+Spread replicas across nodes.
+
+```text id="c338d449"
+Do not place all pods on same node
+```
+
+---
+
+## 6. Multi-Zone Node Pools
+
+Distribute workloads across availability zones.
+
+---
+
+## 7. Autoscaling
+
+* HPA for pods
+* Cluster autoscaler for nodes
+
+---
+
+## 8. Ingress / Load Balancer HA
+
+Multiple ingress replicas.
+
+---
+
+# Strong Interview Answer
+
+> I ensure HA with multiple replicas, anti-affinity, probes, PDBs, multi-zone nodes, and autoscaling so failures don’t affect availability.
+
+---
+
+# 117. I want to run one one-time database migration task before my application starts?
+
+Best Kubernetes-native options:
+
+1. Init Container
+2. Job
+3. Helm Hook / Pipeline Migration Step
+
+---
+
+# Option 1: Init Container (Before App Container Starts)
+
+Runs migration before app starts.
+
+```yaml id="d449e550"
+initContainers:
+- name: migrate
+  image: myapp:latest
+  command: ["sh","-c","python migrate.py"]
+```
+
+Main container starts only after success.
+
+---
+
+# Best For
+
+Simple migration tied to pod startup.
+
+---
+
+# Option 2: Kubernetes Job (Recommended Production)
+
+Job runs once and exits.
+
+```yaml id="e550f661"
+kind: Job
+```
+
+Run migration separately, then deploy app.
+
+---
+
+# Option 3: CI/CD Step
+
+Pipeline runs:
+
+```text id="f661g772"
+DB migration -> deploy app
+```
+
+Safest for production schema changes.
+
+---
+
+# Strong Interview Answer
+
+> For controlled production releases, I prefer a Job or pipeline migration step. For simpler startup migrations, initContainers work well.
+
+---
+
+# 118. I want to only give read-only permissions to check the logs for users. How can you set up RBAC for this?
+
+Use RBAC with Role + RoleBinding.
+
+---
+
+# Need Permissions
+
+To view logs:
+
+* get pods
+* list pods
+* get pods/log
+
+---
+
+# Role Example
+
+```yaml id="g772h883"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: log-reader
+  namespace: prod
+rules:
+- apiGroups: [""]
+  resources: ["pods","pods/log"]
+  verbs: ["get","list","watch"]
+```
+
+---
+
+# Bind User
+
+```yaml id="h883i994"
+kind: RoleBinding
+metadata:
+  name: log-reader-binding
+  namespace: prod
+subjects:
+- kind: User
+  name: rajesh
+roleRef:
+  kind: Role
+  name: log-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+---
+
+# Verify
+
+```bash id="i994j005"
+kubectl auth can-i get pods/log --as=rajesh -n prod
+```
+
+---
+
+# Strong Interview Answer
+
+> I create a namespace Role with read access to pods and pods/log, then bind it using RoleBinding.
+
+---
+
+# 119. What happens if the K8s master node and worker node firewall gets broken?
+
+Firewall misconfiguration can severely impact cluster communication.
+
+---
+
+# If Control Plane Firewall Breaks
+
+## API Server Blocked
+
+Symptoms:
+
+```text id="j005k116"
+kubectl timeout
+nodes NotReady
+controllers fail
+```
+
+## ETCD Ports Blocked
+
+Cluster instability.
+
+## kubelet → API Server Blocked
+
+Nodes become NotReady.
+
+---
+
+# If Worker Node Firewall Breaks
+
+## Pod Networking Breaks
+
+Pods cannot talk.
+
+## Service Traffic Fails
+
+kube-proxy rules ineffective if traffic blocked.
+
+## DNS Fails
+
+CoreDNS unreachable.
+
+---
+
+# Common Required Ports
+
+* 6443 API Server
+* 10250 kubelet
+* etcd ports
+* CNI overlay ports
+* NodePort range if used
+
+---
+
+# Recovery Steps
+
+1. Identify changed rules
+2. Restore baseline firewall config
+3. Test control plane connectivity
+4. Validate node Ready status
+
+---
+
+# Strong Interview Answer
+
+> Firewall issues can partition the cluster. If master communication breaks, nodes go NotReady. If worker ports break, pod networking and services fail.
+
+---
+
+# 120. What are the steps to be performed while updating a Kubernetes cluster?
+
+Cluster upgrades must be planned carefully.
+
+---
+
+# Step 1: Review Compatibility
+
+Check supported version upgrade path.
+
+---
+
+# Step 2: Backup ETCD / Cluster State
+
+etcd snapshot.
+
+```bash id="k116l227"
+etcdctl snapshot save backup.db
+```
+
+---
+
+# Step 3: Check Deprecated APIs
+
+Ensure manifests compatible.
+
+---
+
+# Step 4: Upgrade Non-Prod First
+
+Test staging cluster.
+
+---
+
+# Step 5: Upgrade Control Plane
+
+Managed service or kubeadm process.
+
+---
+
+# Step 6: Upgrade Worker Nodes One by One
+
+```bash id="l227m338"
+kubectl drain <node> --ignore-daemonsets
+```
+
+Upgrade node, then uncordon.
+
+```bash id="m338n449"
+kubectl uncordon <node>
+```
+
+---
+
+# Step 7: Validate Workloads
+
+* Pods healthy
+* Services healthy
+* Monitoring normal
+
+---
+
+# Step 8: Upgrade Add-ons
+
+* CNI
+* CoreDNS
+* CSI
+* Ingress
+
+---
+
+# Strong Interview Answer
+
+> I back up etcd, validate compatibility, upgrade control plane first, then rolling-upgrade workers node by node with drain/uncordon.
+
+---
+
+# 121. How can you ensure that only pods with a specific label can talk to your backend service?
+
+Use NetworkPolicy.
+
+---
+
+# Example Requirement
+
+Only pods labeled:
+
+```text id="n449o550"
+role=frontend
+```
+
+can access backend pods on port 8080.
+
+---
+
+# Policy Example
+
+```yaml id="o550p661"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend
+  namespace: prod
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          role: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  policyTypes:
+  - Ingress
+```
+
+---
+
+# Result
+
+```text id="p661q772"
+role=frontend -> allowed
+all others -> denied
+```
+
+---
+
+# Important
+
+Need policy-capable CNI:
+
+* Calico
+* Cilium
+
+---
+
+# Strong Interview Answer
+
+> I apply a NetworkPolicy selecting backend pods and allow ingress only from pods with the approved label.
+
+---
+## 122. All pods on the StatefulSet are trying to connect to the same storage volume. What's wrong, and how do you fix it?
+
+This usually means the StatefulSet storage is configured incorrectly.
+
+StatefulSet should give **each pod its own persistent volume**, not one shared volume (unless intentionally using RWX storage).
+
+---
+
+# What’s Wrong?
+
+Most common mistakes:
+
+## 1. Same PVC Mounted by All Pods
+
+Using one shared PVC like:
+
+```yaml id="a122b233"
+claimName: data-pvc
+```
+
+for every replica.
+
+That causes all pods to mount same storage.
+
+---
+
+## 2. Using Deployment Instead of StatefulSet
+
+Deployment does not create unique per-pod storage identities.
+
+---
+
+## 3. Shared RWX Volume Used for Database Workload
+
+Multiple DB replicas writing same filesystem can corrupt data.
+
+---
+
+# Correct Fix
+
+Use `volumeClaimTemplates`.
+
+```yaml id="b233c344"
+volumeClaimTemplates:
+- metadata:
+    name: data
+  spec:
+    accessModes: ["ReadWriteOnce"]
+    resources:
+      requests:
+        storage: 20Gi
+```
+
+This creates:
+
+```text id="c344d455"
+data-app-0
+data-app-1
+data-app-2
+```
+
+Unique PVC per pod.
+
+---
+
+# Why Important?
+
+Stateful apps need:
+
+* Separate disks
+* Stable identity
+* Data isolation
+
+---
+
+# Strong Interview Answer
+
+> A StatefulSet should usually create one PVC per pod using volumeClaimTemplates. If all pods share one volume, storage was configured incorrectly.
+
+---
+
+# 123. Have you worked with Kubernetes? What deployment strategy do you prefer and why?
+
+Yes—strong answer should combine practical use cases.
+
+---
+
+# Preferred Strategy Depends on Application Risk
+
+## My Preferred Default: Rolling Update
+
+Best for most stateless apps.
+
+Why:
+
+* Zero/minimal downtime
+* Native Kubernetes support
+* Easy rollback
+* Efficient resource use
+
+```yaml id="d455e566"
+strategy:
+  type: RollingUpdate
+```
+
+---
+
+# For Critical Releases: Canary
+
+Preferred when change risk is high.
+
+```text id="e566f677"
+5% traffic -> observe -> 25% -> 100%
+```
+
+Best for:
+
+* APIs
+* Revenue apps
+* High user impact systems
+
+---
+
+# For Major Version Changes: Blue-Green
+
+Safer for schema/app rewrites.
+
+---
+
+# Strong Interview Answer
+
+> My default is RollingUpdate for standard stateless apps. For high-risk production changes I prefer Canary, and for major releases I use Blue-Green.
+
+---
+
+# 124. How have you implemented blue-green deployment in a Kubernetes environment?
+
+Blue-Green means two identical environments:
+
+```text id="f677g788"
+Blue = current production
+Green = new version
+```
+
+Traffic switches only after validation.
+
+---
+
+# Example Implementation
+
+## Step 1: Existing Deployment
+
+```text id="g788h899"
+myapp-blue
+```
+
+## Step 2: New Deployment
+
+```text id="h899i900"
+myapp-green
+```
+
+---
+
+## Step 3: Service Initially Points to Blue
+
+```yaml id="i900j011"
+selector:
+  app: myapp-blue
+```
+
+---
+
+## Step 4: Validate Green
+
+* health checks
+* smoke tests
+* synthetic traffic
+
+---
+
+## Step 5: Switch Service Selector
+
+```yaml id="j011k122"
+selector:
+  app: myapp-green
+```
+
+Traffic instantly moves.
+
+---
+
+## Step 6: Keep Blue for Rollback
+
+Rollback = point service back to blue.
+
+---
+
+# Tools Used
+
+* Argo Rollouts
+* Istio
+* NGINX Ingress
+
+---
+
+# Strong Interview Answer
+
+> I deploy green alongside blue, validate it, then switch service routing. It gives near-zero downtime and instant rollback.
+
+---
+
+# 125. What is HPA in Kubernetes, and when would you use it?
+
+Horizontal Pod Autoscaler automatically scales pod replicas based on metrics.
+
+---
+
+# Example
+
+```text id="k122l233"
+CPU high -> 3 pods to 8 pods
+CPU low -> scale back to 3
+```
+
+---
+
+# Based On
+
+* CPU
+* Memory
+* Custom metrics
+* External metrics
+
+---
+
+# Use Cases
+
+## Use HPA For:
+
+* Web apps
+* APIs
+* Traffic spikes
+* Queue consumers
+
+---
+
+# Example
+
+```bash id="l233m344"
+kubectl autoscale deployment web \
+--cpu-percent=70 --min=3 --max=10
+```
+
+---
+
+# Strong Interview Answer
+
+> HPA scales pods horizontally based on demand. I use it for stateless workloads with variable traffic.
+
+---
+
+# 126. Suppose a new deployment introduces issues — how would you roll back to the previous stable version using Kubernetes?
+
+Kubernetes Deployments maintain rollout history.
+
+---
+
+# Check Rollout History
+
+```bash id="m344n455"
+kubectl rollout history deployment/myapp
+```
+
+---
+
+# Roll Back to Previous Version
+
+```bash id="n455o566"
+kubectl rollout undo deployment/myapp
+```
+
+---
+
+# Roll Back to Specific Revision
+
+```bash id="o566p677"
+kubectl rollout undo deployment/myapp --to-revision=2
+```
+
+---
+
+# Verify
+
+```bash id="p677q788"
+kubectl rollout status deployment/myapp
+```
+
+---
+
+# Production Best Practice
+
+Trigger rollback automatically if:
+
+* readiness fails
+* error rate spikes
+* latency rises
+
+---
+
+# Strong Interview Answer
+
+> I use rollout history and `kubectl rollout undo`. In production I prefer automated rollback gates in CI/CD.
+
+---
+
+# 127. What is the purpose of StatefulSets in Kubernetes, and how are they different from Deployments?
+
+StatefulSet is for applications needing stable identity and persistent storage.
+
+---
+
+# Purpose
+
+Used for:
+
+* Databases
+* Queues
+* Consensus systems
+
+Examples:
+
+* MongoDB
+* Apache Kafka
+* Redis cluster
+
+---
+
+# Difference from Deployment
+
+| Feature       | Deployment       | StatefulSet        |
+| ------------- | ---------------- | ------------------ |
+| Workload      | Stateless        | Stateful           |
+| Pod Names     | Random           | Stable             |
+| Storage       | Shared/Ephemeral | Per-pod persistent |
+| Startup Order | Any              | Ordered            |
+
+---
+
+# Strong Interview Answer
+
+> Deployments are for interchangeable stateless pods. StatefulSets are for apps needing stable identity and dedicated storage.
+
+---
+
+# 128. How do you implement Pod Disruption Budgets in Kubernetes for high availability?
+
+Pod Disruption Budget limits voluntary disruptions.
+
+---
+
+# Example
+
+3 replicas app:
+
+```yaml id="q788r899"
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api
+```
+
+---
+
+# Meaning
+
+Only one pod can be disrupted at a time.
+
+---
+
+# Used During
+
+* Node drain
+* Upgrades
+* Autoscaler scale-down
+
+---
+
+# Best Practice
+
+Combine with:
+
+* replicas >= 3
+* anti-affinity
+* probes
+
+---
+
+# Strong Interview Answer
+
+> I define PDBs so maintenance events never take down too many replicas at once.
+
+---
+
+# 129. What are Kubernetes Ingress Controllers, and how are they configured in AKS?
+
+Ingress Controller watches Ingress resources and configures routing.
+
+Examples:
+
+* NGINX Ingress
+* Traefik
+* Microsoft Application Gateway Ingress Controller (AGIC)
+
+---
+
+# In AKS Common Options
+
+## 1. NGINX Ingress
+
+Install via Helm.
+
+## 2. Application Gateway Ingress Controller
+
+Integrates with Azure Application Gateway.
+
+---
+
+# Basic Flow in AKS
+
+```text id="r899s900"
+Internet -> Public IP/App Gateway -> Ingress Controller -> Service -> Pods
+```
+
+---
+
+# Example Ingress
+
+```yaml id="s900t011"
+rules:
+- host: app.company.com
+  http:
+    paths:
+    - path: /
+```
+
+---
+
+# Strong Interview Answer
+
+> Ingress controllers translate Ingress rules into real routing. In AKS I commonly use NGINX or Application Gateway Ingress Controller.
+
+---
+
+# 130. Explain how Kubernetes Horizontal Pod Autoscaler (HPA) works based on custom metrics.
+
+By default HPA uses CPU/memory, but it can also scale using custom metrics.
+
+---
+
+# Examples of Custom Metrics
+
+* Requests per second
+* Queue length
+* Active sessions
+* Response latency
+* Kafka lag
+
+---
+
+# Architecture
+
+```text id="t011u122"
+App metrics -> Prometheus -> Adapter -> HPA
+```
+
+Common stack:
+
+* Prometheus
+* Prometheus Adapter
+
+---
+
+# Example Use Case
+
+Scale workers by queue depth:
+
+```text id="u122v233"
+Queue > 100 messages -> scale 2 to 10 pods
+```
+
+---
+
+# Benefits
+
+Better than CPU when CPU isn’t bottleneck.
+
+---
+
+# Example HPA YAML
+
+```yaml id="v233w344"
+metrics:
+- type: Pods
+  pods:
+    metric:
+      name: requests_per_second
+```
+
+---
+
+# Strong Interview Answer
+
+> Custom-metric HPA scales based on business signals like queue depth or RPS, which is often more accurate than CPU-based scaling.
+
+---
+
