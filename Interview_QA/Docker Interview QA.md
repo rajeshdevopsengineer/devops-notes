@@ -3075,3 +3075,2571 @@ docker history nginx
 
 > Docker image layers are read-only filesystem layers created by Dockerfile instructions. Layers are cached and reused, making builds faster and image storage more efficient.
 
+## 51. What is OverlayFS?
+
+**OverlayFS** is a Linux **union filesystem** used by Docker storage drivers (commonly `overlay2`) to combine multiple filesystem layers into a single unified view.
+
+It allows Docker images to use layered filesystems efficiently.
+
+---
+
+## How It Works
+
+OverlayFS combines:
+
+* **Lower layers** → read-only image layers
+* **Upper layer** → writable container layer
+* **Merged layer** → final view seen inside container
+
+```text
+Image Layer 1 (readonly)
+Image Layer 2 (readonly)
+Image Layer 3 (readonly)
+Container Writable Layer
+-------------------------
+Merged View
+```
+
+---
+
+## Why Docker Uses It
+
+* Fast container startup
+* Efficient disk usage
+* Layer reuse
+* Copy-on-write support
+* Better performance than older drivers
+
+---
+
+## Default Driver
+
+Modern Linux Docker installations commonly use:
+
+```bash id="f6x2pa"
+docker info | grep Storage
+```
+
+Shows:
+
+```text id="a3n9qw"
+Storage Driver: overlay2
+```
+
+---
+
+## Interview Answer
+
+> OverlayFS is a Linux union filesystem used by Docker’s `overlay2` storage driver. It merges image layers and the writable container layer into one unified filesystem view.
+
+---
+
+# 52. Where can image layers be found? In which directory?
+
+Docker stores image layers under Docker data root.
+
+## Default Linux Location
+
+```text id="g2m8vu"
+/var/lib/docker/
+```
+
+---
+
+## For overlay2 Driver
+
+```text id="r7t1nk"
+/var/lib/docker/overlay2/
+```
+
+Contains:
+
+* Layer directories
+* Diff data
+* Merged mounts
+* Work dirs
+
+---
+
+## Older AUFS Systems
+
+```text id="j5v4qp"
+/var/lib/docker/aufs/
+```
+
+---
+
+## Check Docker Root Directory
+
+```bash id="x8c1dl"
+docker info | grep "Docker Root Dir"
+```
+
+---
+
+## Important Note
+
+Do not manually edit these files.
+
+---
+
+## Interview Answer
+
+> Docker image layers are usually stored under `/var/lib/docker/`, and with modern systems using overlay2 they are typically located in `/var/lib/docker/overlay2/`.
+
+---
+
+# 53. How can we check the content of each layer?
+
+There are several ways.
+
+---
+
+# Method 1: Use docker history
+
+```bash id="z1w9mr"
+docker history nginx
+```
+
+Shows which Dockerfile commands created layers.
+
+---
+
+# Method 2: Save Image and Inspect Tar
+
+```bash id="n6k2ps"
+docker save nginx -o nginx.tar
+tar -tf nginx.tar
+```
+
+Shows layer tar archives.
+
+---
+
+# Method 3: Inspect overlay2 Directories (Linux)
+
+```bash id="m4x8qe"
+ls /var/lib/docker/overlay2/
+```
+
+Each directory maps to a layer.
+
+---
+
+# Method 4: Dive Tool
+
+Dive helps inspect layer contents interactively.
+
+---
+
+## Interview Answer
+
+> We can inspect layers using `docker history`, `docker save`, tools like Dive, or by checking `/var/lib/docker/overlay2/` on Linux hosts.
+
+---
+
+# 54. How to check the layers stacked with image?
+
+Use `docker history`.
+
+---
+
+## Command
+
+```bash id="q3r7ka"
+docker history myimage
+```
+
+Shows:
+
+* Layer sizes
+* Commands used
+* Created by
+* Order of stacking
+
+---
+
+## Inspect Metadata
+
+```bash id="u9p2wf"
+docker inspect myimage
+```
+
+Shows image IDs and metadata.
+
+---
+
+## Example
+
+```text id="v1m5xc"
+Layer 1: ubuntu base
+Layer 2: apt install
+Layer 3: copy app
+Layer 4: npm install
+```
+
+---
+
+## Interview Answer
+
+> To check image layers, I use `docker history <image>` which displays all stacked layers and the commands that created them.
+
+---
+
+# 55. What is Union Mount & AUFS?
+
+## Union Mount
+
+A **union mount filesystem** combines multiple directories/filesystems into one logical filesystem.
+
+This allows read-only and writable layers to appear as one filesystem.
+
+---
+
+## AUFS
+
+**AUFS** = Advanced Multi-Layered Unification Filesystem.
+
+It was an older Docker storage driver before `overlay2`.
+
+Used to manage image layers and container writable layers.
+
+---
+
+## Why Important Historically
+
+Before OverlayFS became standard, Docker widely used AUFS.
+
+---
+
+## Modern Usage
+
+Today Docker mostly uses:
+
+* overlay2
+* btrfs
+* zfs (some cases)
+
+---
+
+## Interview Answer
+
+> Union mount combines multiple filesystem layers into one view. AUFS was an older union filesystem used by Docker to manage layered images before overlay2 became the standard.
+
+---
+
+# 56. Why use Union mount system for Docker?
+
+Docker images are built in layers.
+
+Union mount systems help merge these layers efficiently.
+
+---
+
+## Benefits
+
+### 1. Layer Reuse
+
+Common base image shared across many containers.
+
+### 2. Copy-on-Write
+
+Only changed files go to writable layer.
+
+### 3. Saves Disk Space
+
+Shared layers are not duplicated.
+
+### 4. Faster Builds
+
+Cached layers reused.
+
+### 5. Lightweight Containers
+
+Container gets writable layer only.
+
+---
+
+## Interview Answer
+
+> Docker uses union mount systems so multiple read-only image layers plus one writable container layer can appear as a single filesystem. This improves storage efficiency and performance.
+
+---
+
+# 57. What are the 3 different directories in /var/lib/docker/aufs?
+
+For older AUFS-based Docker storage, common directories were:
+
+| Directory | Purpose                                  |
+| --------- | ---------------------------------------- |
+| `layers/` | Metadata about layer relationships       |
+| `diff/`   | Actual filesystem contents of each layer |
+| `mnt/`    | Mounted merged filesystem for containers |
+
+---
+
+## Example Path
+
+```text id="p7n3ez"
+/var/lib/docker/aufs/layers
+/var/lib/docker/aufs/diff
+/var/lib/docker/aufs/mnt
+```
+
+---
+
+## Note
+
+Modern systems usually use `overlay2`, not AUFS.
+
+---
+
+## Interview Answer
+
+> In older AUFS storage, `/var/lib/docker/aufs/` commonly contained `layers`, `diff`, and `mnt` directories for metadata, actual layer data, and merged mounts.
+
+---
+
+# 58. How to run an image?
+
+Use `docker run`.
+
+---
+
+## Basic Command
+
+```bash id="c8k4pv"
+docker run nginx
+```
+
+---
+
+## Detached Mode
+
+```bash id="w2n6lr"
+docker run -d nginx
+```
+
+---
+
+## Port Mapping
+
+```bash id="m7q1sa"
+docker run -d -p 8080:80 nginx
+```
+
+---
+
+## Name Container
+
+```bash id="h5v9de"
+docker run -d --name web nginx
+```
+
+---
+
+## Interactive Shell
+
+```bash id="t3x8fu"
+docker run -it ubuntu bash
+```
+
+---
+
+## Interview Answer
+
+> We run an image using `docker run <image>`. Options like `-d`, `-p`, `--name`, and `-it` control background mode, ports, naming, and interactive access.
+
+---
+
+# 59. How to tag an image?
+
+Use `docker tag`.
+
+---
+
+## Syntax
+
+```bash id="n1r6wb"
+docker tag source_image target_image:tag
+```
+
+---
+
+## Example
+
+```bash id="x9m2ko"
+docker tag myapp myrepo/myapp:v1
+```
+
+---
+
+## For Registry Push
+
+```bash id="f4t8ya"
+docker tag myapp myacr.azurecr.io/myapp:v1
+docker push myacr.azurecr.io/myapp:v1
+```
+
+---
+
+## Interview Answer
+
+> Docker image tagging is done using `docker tag`. It creates another reference name for the same image, usually before pushing to a registry.
+
+---
+
+# 60. How to link one container with another?
+
+## Old Method (Legacy)
+
+Docker had `--link`.
+
+```bash id="k6w3zt"
+docker run -d --name db mysql
+docker run -d --link db:database myapp
+```
+
+This injected host entries and env vars.
+
+---
+
+## Modern Recommended Method
+
+Use user-defined networks.
+
+```bash id="r5q8sv"
+docker network create appnet
+docker run -d --name db --network appnet mysql
+docker run -d --name app --network appnet myapp
+```
+
+Then app connects to:
+
+```text id="u7m1xd"
+Host = db
+```
+
+---
+
+## Docker Compose
+
+```yaml id="b3n9hf"
+services:
+  app:
+  db:
+```
+
+App accesses DB via service name `db`.
+
+---
+
+## Interview Answer
+
+> The old method used `--link`, but it is legacy. Today we connect containers using a user-defined Docker network where containers communicate through built-in DNS using container names.
+
+## 61. How do you sequence the containers? A first then B should execute after that?
+
+This means container **B should start only after A is ready**.
+
+---
+
+# Option 1: Docker Compose `depends_on`
+
+```yaml id="t6n4qa"
+services:
+  app:
+    depends_on:
+      - db
+
+  db:
+    image: mysql
+```
+
+This starts **db first**, then app.
+
+---
+
+# Important Note
+
+`depends_on` controls **startup order**, not readiness.
+
+If DB takes 30 seconds to initialize, app may still fail unless health checks are used.
+
+---
+
+# Option 2: Healthcheck + Dependency
+
+```yaml id="g2w8sr"
+services:
+  db:
+    image: mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+
+  app:
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+Now app starts after DB becomes healthy.
+
+---
+
+# Option 3: Wait Script
+
+Use tools:
+
+* wait-for-it.sh
+* dockerize
+* custom startup script
+
+---
+
+# Real Example
+
+* DB first
+* Backend next
+* Frontend last
+
+---
+
+## Interview Answer
+
+> I sequence containers using Docker Compose `depends_on`, but for real reliability I combine it with health checks so container B starts only when container A is actually ready.
+
+---
+
+# 62. How to create a volume in docker container to store data?
+
+Use Docker volumes.
+
+---
+
+# Create Volume
+
+```bash id="y5q2wp"
+docker volume create mydata
+```
+
+---
+
+# Use Volume in Container
+
+```bash id="n8k4sd"
+docker run -d -v mydata:/var/lib/mysql mysql
+```
+
+Meaning:
+
+* `mydata` = Docker managed volume
+* `/var/lib/mysql` = data path inside container
+
+---
+
+# List Volumes
+
+```bash id="u3m9lx"
+docker volume ls
+```
+
+---
+
+# Inspect Volume
+
+```bash id="p6r1fj"
+docker volume inspect mydata
+```
+
+---
+
+# Interview Answer
+
+> I create persistent storage using `docker volume create volume_name` and mount it using `-v volume_name:/path/in/container`.
+
+---
+
+# 63. How to mount a local directory into a container?
+
+Use a **bind mount**.
+
+---
+
+# Syntax
+
+```bash id="d7v5ac"
+docker run -v /host/path:/container/path image
+```
+
+---
+
+# Example Linux
+
+```bash id="f1x9we"
+docker run -d -v /home/app/logs:/var/log/app myapp
+```
+
+---
+
+# Example Windows Docker Desktop
+
+```bash id="m2p8yt"
+docker run -v C:\data:/app/data myapp
+```
+
+---
+
+# Use Cases
+
+* Local code development
+* Config files
+* Logs
+* Shared files
+
+---
+
+# Interview Answer
+
+> A local directory is mounted using bind mounts, for example `docker run -v /host/data:/app/data image`.
+
+---
+
+# 64. How to expose a port no to access container?
+
+Use port mapping.
+
+---
+
+# Syntax
+
+```bash id="q9n2sk"
+docker run -p host_port:container_port image
+```
+
+---
+
+# Example
+
+```bash id="w6r4pa"
+docker run -d -p 8080:80 nginx
+```
+
+Access:
+
+```text id="x1k8vu"
+http://server-ip:8080
+```
+
+---
+
+# Dockerfile Port Declaration
+
+```dockerfile id="h5m3dl"
+EXPOSE 80
+```
+
+This documents port but does not publish it externally.
+
+---
+
+# Interview Answer
+
+> Ports are exposed using `docker run -p hostPort:containerPort`, such as `-p 8080:80`.
+
+---
+
+# 65. What is ENTRYPOINT in Docker?
+
+`ENTRYPOINT` defines the **main executable** that always runs when the container starts.
+
+---
+
+# Example
+
+```dockerfile id="r8u4mx"
+ENTRYPOINT ["python"]
+CMD ["app.py"]
+```
+
+Runs:
+
+```text id="j4n6qt"
+python app.py
+```
+
+---
+
+# Why Use ENTRYPOINT?
+
+* Fixed startup behavior
+* Make image behave like command-line tool
+* Pass arguments dynamically
+
+---
+
+# Override
+
+```bash id="v2p9fk"
+docker run --entrypoint sh image
+```
+
+---
+
+# Interview Answer
+
+> ENTRYPOINT defines the primary command for the container. It is commonly used when the container should always run a specific executable.
+
+---
+
+# 66. What is Dockerfile?
+
+A **Dockerfile** is a text file containing instructions to build a Docker image.
+
+---
+
+# Example
+
+```dockerfile id="a7r2we"
+FROM node:20
+WORKDIR /app
+COPY . .
+RUN npm install
+CMD ["node","server.js"]
+```
+
+Build:
+
+```bash id="t3m5po"
+docker build -t myapp .
+```
+
+---
+
+# Common Instructions
+
+| Instruction | Purpose                |
+| ----------- | ---------------------- |
+| FROM        | Base image             |
+| WORKDIR     | Working path           |
+| COPY        | Copy files             |
+| RUN         | Execute build commands |
+| EXPOSE      | Document port          |
+| CMD         | Default command        |
+
+---
+
+# Interview Answer
+
+> Dockerfile is a declarative file used to build Docker images using instructions like FROM, COPY, RUN, CMD, and ENTRYPOINT.
+
+---
+
+# 67. Difference between ADD & COPY parameters in Dockerfile?
+
+| Feature             | COPY | ADD |
+| ------------------- | ---- | --- |
+| Copy files/folders  | Yes  | Yes |
+| Extract tar archive | No   | Yes |
+| Download URL        | No   | Yes |
+| Recommended default | Yes  | No  |
+
+---
+
+# Examples
+
+```dockerfile id="u1x7fs"
+COPY app/ /app/
+ADD archive.tar.gz /app/
+```
+
+---
+
+# Best Practice
+
+Use COPY unless special ADD features are required.
+
+---
+
+# Interview Answer
+
+> COPY is preferred for normal file copy operations. ADD can also extract tar archives and fetch remote URLs, so it has extra functionality.
+
+---
+
+# 68. How to create a bridge in container?
+
+This means create a **bridge network** in Docker.
+
+---
+
+# Create Bridge Network
+
+```bash id="k4v2mr"
+docker network create mybridge
+```
+
+---
+
+# Specify Driver Explicitly
+
+```bash id="g9p8tx"
+docker network create --driver bridge mybridge
+```
+
+---
+
+# Connect Containers
+
+```bash id="s2r6qw"
+docker run -d --name app --network mybridge nginx
+docker run -d --name db --network mybridge mysql
+```
+
+---
+
+# Why Use Custom Bridge?
+
+* Better DNS
+* Isolation
+* Easier container communication
+
+---
+
+# Interview Answer
+
+> We create a bridge network using `docker network create --driver bridge mybridge` and attach containers to it.
+
+---
+
+# 69. How a container gets an internal IP?
+
+When container joins a Docker network, Docker assigns an IP from that network subnet.
+
+---
+
+# Example
+
+Default bridge network:
+
+```text id="m8k1zp"
+172.17.0.x
+```
+
+Custom bridge:
+
+```text id="r4u9nd"
+172.18.0.x
+```
+
+---
+
+# How It Works
+
+Docker network driver:
+
+* Creates virtual bridge
+* Allocates IP from subnet
+* Configures routing
+* Adds DNS entry
+
+---
+
+# Check IP
+
+```bash id="p3n7wv"
+docker inspect container_name
+```
+
+---
+
+# Compose Example
+
+Each service gets internal IP + DNS name.
+
+---
+
+# Interview Answer
+
+> Docker automatically assigns internal IP addresses from the network subnet when a container joins a bridge or overlay network.
+
+---
+
+# 70. Can we check the process of a container inside as well as outside the container?
+
+## Yes.
+
+---
+
+# Outside the Container
+
+Use:
+
+```bash id="w1q8ce"
+docker top container_name
+```
+
+Shows running processes.
+
+---
+
+# Inside the Container
+
+```bash id="n6r2sx"
+docker exec -it container_name sh
+```
+
+Then run:
+
+```bash id="j7v4pd"
+ps -ef
+top
+```
+
+---
+
+# Host-Level Linux Check
+
+```bash id="x5m9ta"
+ps aux | grep containerd
+```
+
+or inspect namespaces/cgroups.
+
+---
+
+# Real Example
+
+```bash id="f2k7yu"
+docker top nginx
+```
+
+Output shows nginx master/worker processes.
+
+---
+
+# Interview Answer
+
+> Yes. From outside I use `docker top <container>`. From inside I use `docker exec -it <container> sh` and run `ps`, `top`, or `htop`.
+
+## 71. Can we check the container process on Docker host?
+
+## Yes.
+
+Containers are just processes running on the host, isolated by the Linux kernel. So you can view container processes directly from the Docker host.
+
+---
+
+# Method 1: docker top
+
+```bash id="m7q2zs"
+docker top container_name
+```
+
+Shows processes running inside that container.
+
+---
+
+# Method 2: Host ps command
+
+```bash id="v2r8kd"
+ps -ef
+```
+
+You will see container processes like:
+
+* nginx
+* java
+* node
+* mysqld
+
+They are normal host processes with namespaces.
+
+---
+
+# Method 3: Find by Container PID
+
+```bash id="j4n1px"
+docker inspect -f '{{.State.Pid}}' container_name
+```
+
+Then:
+
+```bash id="t9x5wa"
+ps -p PID -f
+```
+
+---
+
+# Interview Answer
+
+> Yes. Containers are host processes, so we can check them using `docker top`, `ps -ef`, or by inspecting the container PID and tracing it on the host.
+
+---
+
+# 72. How kernel isolates to run the container and how resources managed by the kernel?
+
+Containers do not have their own kernel. They use the host Linux kernel.
+
+The kernel provides two major mechanisms:
+
+1. **Namespaces** → Isolation
+2. **cgroups** → Resource control
+
+---
+
+# Isolation by Namespaces
+
+Separate views for:
+
+* Process IDs
+* Network interfaces
+* Mount points
+* Hostname
+* Users
+* IPC
+
+Each container thinks it has its own environment.
+
+---
+
+# Resource Management by cgroups
+
+Limits:
+
+* CPU
+* Memory
+* Disk I/O
+* Network priorities
+* Process count
+
+Example:
+
+```bash id="q6m3ye"
+docker run --memory=512m --cpus=1 nginx
+```
+
+---
+
+# Additional Security
+
+* Capabilities
+* Seccomp
+* AppArmor / SELinux
+
+---
+
+# Interview Answer
+
+> The Linux kernel runs containers using namespaces for isolation and cgroups for CPU, memory, and I/O resource control. Containers share the host kernel but operate in isolated environments.
+
+---
+
+# 73. What is namespace and cgroups?
+
+## Namespaces
+
+Namespaces isolate system resources so each container gets its own view.
+
+---
+
+# Common Namespace Types
+
+| Namespace | Isolates      |
+| --------- | ------------- |
+| PID       | Processes     |
+| NET       | Networking    |
+| MNT       | Filesystems   |
+| UTS       | Hostname      |
+| IPC       | Shared memory |
+| USER      | User IDs      |
+
+---
+
+## cgroups
+
+Control groups manage and limit resource usage.
+
+---
+
+# Controls
+
+* CPU shares
+* RAM limits
+* Disk I/O
+* PIDs
+
+---
+
+## Example
+
+```bash id="x8n4tw"
+docker run --memory=1g --cpus=2 app
+```
+
+---
+
+## Interview Answer
+
+> Namespaces provide isolation, while cgroups provide resource management. Together they are the core Linux features enabling containers.
+
+---
+
+# 74. What is docker-compose and docker-swarm?
+
+# Docker Compose
+
+Tool to run multi-container apps using YAML.
+
+Example:
+
+* app
+* db
+* redis
+
+```bash id="p3k9da"
+docker compose up -d
+```
+
+---
+
+# Docker Swarm
+
+Native Docker clustering/orchestration platform.
+
+Used to run containers across multiple nodes.
+
+Features:
+
+* Scaling
+* HA
+* Rolling updates
+* Load balancing
+
+---
+
+# Comparison
+
+| Feature   | Compose            | Swarm                 |
+| --------- | ------------------ | --------------------- |
+| Scope     | Single host        | Multi-host cluster    |
+| Use Case  | Dev / small setups | Cluster orchestration |
+| YAML file | Yes                | Yes                   |
+
+---
+
+# Modern Alternative
+
+Many enterprises now prefer Kubernetes.
+
+---
+
+## Interview Answer
+
+> Docker Compose manages multi-container applications on a single host, while Docker Swarm manages container clusters across multiple hosts with scaling and high availability.
+
+---
+
+# 75. How you can give different network IP to the container?
+
+Use custom Docker networks with defined subnet or use macvlan.
+
+---
+
+# Method 1: Custom Bridge Network
+
+```bash id="m5q2sp"
+docker network create \
+--subnet=172.20.0.0/16 mynet
+```
+
+Run container with static IP:
+
+```bash id="v7r8nx"
+docker run -d --network mynet --ip 172.20.0.10 nginx
+```
+
+---
+
+# Method 2: Docker Compose
+
+```yaml id="t1x4we"
+services:
+  app:
+    networks:
+      mynet:
+        ipv4_address: 172.20.0.10
+```
+
+---
+
+# Method 3: Macvlan
+
+Container gets real LAN IP.
+
+---
+
+## Interview Answer
+
+> We can assign different IPs by creating a custom bridge network with a subnet and launching containers using `--ip`, or by using macvlan for direct LAN IP addresses.
+
+---
+
+# 76. What are the parameters of Dockerfile?
+
+This means common Dockerfile instructions.
+
+---
+
+# Common Dockerfile Instructions
+
+| Instruction | Purpose                      |
+| ----------- | ---------------------------- |
+| FROM        | Base image                   |
+| RUN         | Execute command during build |
+| COPY        | Copy files                   |
+| ADD         | Copy/extract files           |
+| WORKDIR     | Set working directory        |
+| CMD         | Default command              |
+| ENTRYPOINT  | Main executable              |
+| EXPOSE      | Document port                |
+| ENV         | Environment variable         |
+| ARG         | Build variable               |
+| USER        | Run as specific user         |
+| VOLUME      | Mount point                  |
+| LABEL       | Metadata                     |
+
+---
+
+## Example
+
+```dockerfile id="y8n2fa"
+FROM node:20
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3000
+CMD ["node","app.js"]
+```
+
+---
+
+## Interview Answer
+
+> Dockerfile parameters are instructions such as FROM, RUN, COPY, CMD, ENTRYPOINT, ENV, EXPOSE, WORKDIR, ARG, USER, and VOLUME used to build images.
+
+---
+
+# 77. Is there any Windows container also available?
+
+## Yes.
+
+Docker supports Windows containers.
+
+---
+
+# Types
+
+1. Windows Server Core
+2. Nano Server
+
+Provided by Microsoft.
+
+---
+
+# Modes in Docker Desktop
+
+* Linux containers
+* Windows containers
+
+Switch between modes.
+
+---
+
+# Use Cases
+
+* .NET Framework apps
+* IIS apps
+* Legacy Windows workloads
+* PowerShell-based apps
+
+---
+
+# Example
+
+```bash id="k9v1rs"
+docker run mcr.microsoft.com/windows/servercore:ltsc2022
+```
+
+---
+
+## Important Note
+
+Windows containers require Windows host or compatible environment.
+
+---
+
+## Interview Answer
+
+> Yes, Docker supports Windows containers such as Nano Server and Server Core images, commonly used for IIS, legacy .NET Framework, and Windows-based workloads.
+
+---
+
+# 78. How to stop a container?
+
+Use:
+
+```bash id="f2m8cx"
+docker stop container_name
+```
+
+Example:
+
+```bash id="q7n4zd"
+docker stop nginx
+```
+
+---
+
+# Force Stop
+
+```bash id="u1r6ks"
+docker kill nginx
+```
+
+---
+
+# Stop All Running Containers
+
+```bash id="m3x9ta"
+docker stop $(docker ps -q)
+```
+
+---
+
+## Interview Answer
+
+> Use `docker stop <container>` for graceful shutdown. Use `docker kill` for immediate termination.
+
+---
+
+# 79. How to run a container in background?
+
+Use detached mode `-d`.
+
+```bash id="w5p1eu"
+docker run -d nginx
+```
+
+---
+
+# Named Container
+
+```bash id="r8t2mx"
+docker run -d --name web nginx
+```
+
+---
+
+# With Ports
+
+```bash id="s4q7nv"
+docker run -d -p 8080:80 nginx
+```
+
+---
+
+## Interview Answer
+
+> Use `docker run -d image_name` to run a container in background (detached mode).
+
+---
+
+# 80. How to go inside a container if container is running in background?
+
+Use `docker exec`.
+
+---
+
+# Shell Access
+
+```bash id="j1m9pz"
+docker exec -it container_name sh
+```
+
+If bash exists:
+
+```bash id="x6r2sw"
+docker exec -it container_name bash
+```
+
+---
+
+# Example
+
+```bash id="p8n4fd"
+docker exec -it web sh
+```
+
+---
+
+# Older Method
+
+```bash id="t7q3va"
+docker attach container_name
+```
+
+But `exec` is preferred.
+
+---
+
+## Interview Answer
+
+> To access a running background container, I use `docker exec -it <container> sh` or `bash` for an interactive shell.
+
+## 81. How to check running containers?
+
+Use the `docker ps` command.
+
+---
+
+## Running Containers Only
+
+```bash id="x7n2qp"
+docker ps
+```
+
+Shows:
+
+* Container ID
+* Image
+* Command
+* Created time
+* Status
+* Ports
+* Names
+
+---
+
+## All Containers (Running + Stopped)
+
+```bash id="m3r8dk"
+docker ps -a
+```
+
+---
+
+## Only Container IDs
+
+```bash id="q9t1sw"
+docker ps -q
+```
+
+---
+
+## Interview Answer
+
+> To check running containers, I use `docker ps`. To see all containers including stopped ones, I use `docker ps -a`.
+
+---
+
+# 82. How to remove an image?
+
+Use `docker rmi`.
+
+---
+
+## Remove by Name
+
+```bash id="v2m7cx"
+docker rmi nginx
+```
+
+---
+
+## Remove by Tag
+
+```bash id="j6p4na"
+docker rmi myapp:v1
+```
+
+---
+
+## Remove by Image ID
+
+```bash id="k8x1rd"
+docker rmi image_id
+```
+
+---
+
+## Force Remove
+
+```bash id="w4q9tb"
+docker rmi -f image_id
+```
+
+---
+
+## Remove Unused Images
+
+```bash id="n1s5eu"
+docker image prune -a
+```
+
+---
+
+## Interview Answer
+
+> Docker images are removed using `docker rmi <image>` or `docker image rm <image>`.
+
+---
+
+# 83. How to run an image which is in tar format?
+
+A tar file usually contains a saved Docker image.
+
+---
+
+# Step 1: Load the Tar File
+
+```bash id="f3n7ws"
+docker load -i myimage.tar
+```
+
+This imports the image into local Docker.
+
+---
+
+# Step 2: Check Images
+
+```bash id="r5k2md"
+docker images
+```
+
+---
+
+# Step 3: Run It
+
+```bash id="u8p4zx"
+docker run myimage:latest
+```
+
+---
+
+# Difference: save vs export
+
+| Command         | Used For                 |
+| --------------- | ------------------------ |
+| `docker save`   | Image tar                |
+| `docker export` | Container filesystem tar |
+
+---
+
+## Interview Answer
+
+> If the image is in tar format, I first import it using `docker load -i image.tar`, then run it using `docker run image_name`.
+
+---
+
+# 84. Command to check the process of a container?
+
+Use `docker top`.
+
+---
+
+## Command
+
+```bash id="t7q2nw"
+docker top container_name
+```
+
+Shows running processes inside the container.
+
+---
+
+## Example
+
+```bash id="m1x8va"
+docker top nginx
+```
+
+---
+
+## Alternative
+
+```bash id="y5r4pd"
+docker exec -it nginx ps -ef
+```
+
+---
+
+## Interview Answer
+
+> I use `docker top <container>` to check processes running inside a container.
+
+---
+
+# 85. How to check resource utilization of a container?
+
+Use `docker stats`.
+
+---
+
+## Command
+
+```bash id="k2m6we"
+docker stats
+```
+
+Shows live metrics:
+
+* CPU %
+* Memory usage
+* Network I/O
+* Block I/O
+* PIDs
+
+---
+
+## Single Container
+
+```bash id="q4r1sx"
+docker stats nginx
+```
+
+---
+
+## One-Time Snapshot
+
+```bash id="z9n3vd"
+docker stats --no-stream
+```
+
+---
+
+## Interview Answer
+
+> I monitor container resource usage using `docker stats`, which shows CPU, memory, network, and I/O metrics.
+
+---
+
+# 86. How to create an image?
+
+Most common method: build from Dockerfile.
+
+---
+
+## Example Dockerfile
+
+```dockerfile id="w6p8ta"
+FROM nginx
+COPY . /usr/share/nginx/html
+```
+
+---
+
+## Build Image
+
+```bash id="x3n7mu"
+docker build -t myweb:v1 .
+```
+
+---
+
+## Verify
+
+```bash id="r1k5dz"
+docker images
+```
+
+---
+
+## Alternative Method
+
+Create from container changes:
+
+```bash id="m8q2sv"
+docker commit container_id myimage:v1
+```
+
+---
+
+## Interview Answer
+
+> Docker images are usually created using a Dockerfile and `docker build -t image_name .`.
+
+---
+
+# 87. How to save changes of a container?
+
+Use `docker commit`.
+
+---
+
+## Command
+
+```bash id="j4p9tw"
+docker commit container_name newimage:v1
+```
+
+This creates a new image from the modified container.
+
+---
+
+## Example
+
+```bash id="v7m2ra"
+docker commit ubuntu-test myubuntu:v2
+```
+
+---
+
+## Best Practice
+
+Use Dockerfile for reproducible builds. `commit` is mainly for quick snapshots/debugging.
+
+---
+
+## Interview Answer
+
+> To save container changes as a new image, I use `docker commit`. However, Dockerfile-based builds are preferred in production.
+
+---
+
+# 88. What are registries?
+
+Registries are repositories used to store and distribute Docker images.
+
+---
+
+## Common Registries
+
+| Registry                                | Use Case                 |
+| --------------------------------------- | ------------------------ |
+| Docker Hub                              | Public/private images    |
+| Azure Container Registry (ACR)          | Azure workloads          |
+| Amazon Elastic Container Registry (ECR) | AWS workloads            |
+| GitHub Container Registry               | GitHub CI/CD             |
+| Harbor                                  | On-prem private registry |
+
+---
+
+## Common Actions
+
+```bash id="n6x1pd"
+docker login
+docker push myimage
+docker pull myimage
+```
+
+---
+
+## Interview Answer
+
+> Registries are centralized repositories where Docker images are stored, versioned, and shared. Examples include Docker Hub, ACR, ECR, and Harbor.
+
+---
+
+# 89. Difference between docker commands: up, run & start ?
+
+## docker run
+
+Creates and starts a **new container** from image.
+
+```bash id="q8m4tc"
+docker run nginx
+```
+
+---
+
+## docker start
+
+Starts an **existing stopped container**.
+
+```bash id="w2p7ra"
+docker start mycontainer
+```
+
+---
+
+## docker compose up
+
+Creates/starts all services defined in compose file.
+
+```bash id="x5n1sv"
+docker compose up -d
+```
+
+---
+
+# Comparison Table
+
+| Command             | Purpose                    |
+| ------------------- | -------------------------- |
+| `docker run`        | New container from image   |
+| `docker start`      | Restart existing container |
+| `docker compose up` | Start multi-container app  |
+
+---
+
+## Interview Answer
+
+> `docker run` creates a new container, `docker start` starts an existing stopped container, and `docker compose up` launches services defined in a compose file.
+
+---
+
+# 90. Can we run more than one process in a container?
+
+## Yes, Technically Possible
+
+A container can run multiple processes.
+
+Example:
+
+* Web server
+* Cron
+* Worker
+
+---
+
+## But Best Practice = One Main Process Per Container
+
+Why:
+
+* Easier scaling
+* Easier monitoring
+* Cleaner logs
+* Better fault isolation
+
+---
+
+## If Multiple Processes Needed
+
+Use:
+
+* Supervisor
+* s6
+* tini
+* Custom startup script
+
+Example:
+
+```bash id="p3k8zx"
+nginx && php-fpm
+```
+
+---
+
+## Real Example
+
+PHP app image may run:
+
+* Nginx
+* PHP-FPM
+
+Though modern designs split them into separate containers.
+
+---
+
+## Interview Answer
+
+> Yes, a container can run multiple processes, but the recommended practice is one main process per container for better manageability and scalability.
+
+## 91–97. Docker Task
+
+You need:
+
+1. Dockerfile for WordPress
+2. Dockerfile for database (MySQL)
+3. Docker Compose to run both containers
+4. Mount host `/etc/mysql` into DB container `/etc/mysql`
+
+---
+
+# Solution Architecture
+
+```text id="n7m4px"
+wordpress-app  --->  mysql-db
+```
+
+---
+
+# Folder Structure
+
+```text id="v2r8ya"
+project/
+ ├── wordpress/
+ │    └── Dockerfile
+ ├── mysql/
+ │    └── Dockerfile
+ └── docker-compose.yml
+```
+
+---
+
+# 92–93. Part 1: Dockerfile for WordPress
+
+Create file:
+
+`wordpress/Dockerfile`
+
+```dockerfile id="j4x9mc"
+FROM wordpress:php8.2-apache
+
+EXPOSE 80
+
+ENV WORDPRESS_DB_HOST=db
+ENV WORDPRESS_DB_USER=wpuser
+ENV WORDPRESS_DB_PASSWORD=wppass
+ENV WORDPRESS_DB_NAME=wordpress
+```
+
+---
+
+## Explanation
+
+* Uses official WordPress image
+* Apache included
+* Exposes port 80
+* DB connection variables
+
+---
+
+# 94. Part 2: Dockerfile for Database
+
+Create file:
+
+`mysql/Dockerfile`
+
+```dockerfile id="q7v2ks"
+FROM mysql:8.0
+
+EXPOSE 3306
+
+ENV MYSQL_ROOT_PASSWORD=rootpass
+ENV MYSQL_DATABASE=wordpress
+ENV MYSQL_USER=wpuser
+ENV MYSQL_PASSWORD=wppass
+```
+
+---
+
+# 95–97. Docker Compose File
+
+Create file:
+
+`docker-compose.yml`
+
+```yaml id="w8n3fa"
+version: "3.8"
+
+services:
+  db:
+    build: ./mysql
+    container_name: mysql-db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wpuser
+      MYSQL_PASSWORD: wppass
+    volumes:
+      - /etc/mysql:/etc/mysql
+      - dbdata:/var/lib/mysql
+
+  wordpress:
+    build: ./wordpress
+    container_name: wordpress-app
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "8080:80"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: wpuser
+      WORDPRESS_DB_PASSWORD: wppass
+      WORDPRESS_DB_NAME: wordpress
+
+volumes:
+  dbdata:
+```
+
+---
+
+# Start Containers
+
+```bash id="m1r7zp"
+docker compose up -d
+```
+
+---
+
+# Access WordPress
+
+```text id="k5v2qx"
+http://server-ip:8080
+```
+
+---
+
+# Interview Best Practice Note
+
+In production, use:
+
+* Docker secrets
+* Managed DB like Amazon RDS
+* Persistent storage
+* Reverse proxy
+
+---
+
+# Interview Answer
+
+> I would create separate Dockerfiles for WordPress and MySQL, then orchestrate them with Docker Compose. The MySQL container would mount `/etc/mysql` from host to container and WordPress would connect using service name `db`.
+
+---
+
+# 98. How can we see environment variables from a stopped Docker container?
+
+## Yes, Use docker inspect
+
+Even if container is stopped, metadata remains.
+
+---
+
+## Command
+
+```bash id="u9m4da"
+docker inspect container_name
+```
+
+---
+
+## Filter Only Env Variables
+
+```bash id="p6x2we"
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' container_name
+```
+
+---
+
+## Example Output
+
+```text id="t7n1rc"
+MYSQL_ROOT_PASSWORD=rootpass
+MYSQL_DATABASE=wordpress
+```
+
+---
+
+## Interview Answer
+
+> Environment variables of a stopped container can be viewed using `docker inspect`, because Docker stores container metadata even after it stops.
+
+---
+
+# 99. How do you reduce the size of a Docker image?
+
+## Best Practices
+
+---
+
+# 1. Use Smaller Base Images
+
+Instead of:
+
+```dockerfile id="s2v7km"
+FROM ubuntu
+```
+
+Use:
+
+```dockerfile id="n5x1pq"
+FROM alpine
+```
+
+or distroless images.
+
+---
+
+# 2. Use Multi-Stage Builds
+
+Build in one stage, runtime in smaller stage.
+
+---
+
+# 3. Remove Cache / Temp Files
+
+```dockerfile id="g4r8ws"
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+```
+
+---
+
+# 4. Install Only Production Dependencies
+
+Node:
+
+```dockerfile id="h7m2qd"
+npm install --only=production
+```
+
+---
+
+# 5. Use .dockerignore
+
+Exclude:
+
+```text id="x8q4na"
+node_modules
+.git
+logs
+tmp
+```
+
+---
+
+# 6. Combine RUN Commands
+
+Reduce layers.
+
+---
+
+# 7. Analyze with Tools
+
+Dive
+
+---
+
+## Interview Answer
+
+> I reduce image size using Alpine or distroless base images, multi-stage builds, removing cache files, excluding unnecessary files with `.dockerignore`, and installing only runtime dependencies.
+
+---
+
+# 100. Difference between CMD and ENTRYPOINT in Docker?
+
+## CMD
+
+Provides default command or arguments.
+
+```dockerfile id="j3n7tp"
+CMD ["node","app.js"]
+```
+
+Can be overridden:
+
+```bash id="f5m8wr"
+docker run image bash
+```
+
+---
+
+## ENTRYPOINT
+
+Defines fixed executable.
+
+```dockerfile id="v6r1ks"
+ENTRYPOINT ["node"]
+CMD ["app.js"]
+```
+
+Default:
+
+```text id="d2q9xa"
+node app.js
+```
+
+If run:
+
+```bash id="k8w3mf"
+docker run image test.js
+```
+
+Executes:
+
+```text id="m4n7pe"
+node test.js
+```
+
+---
+
+# Comparison Table
+
+| Feature  | CMD                  | ENTRYPOINT          |
+| -------- | -------------------- | ------------------- |
+| Purpose  | Default args/command | Main executable     |
+| Override | Easy                 | With `--entrypoint` |
+| Best Use | Flexible defaults    | Fixed startup       |
+
+---
+
+# Interview Answer
+
+> CMD sets the default command for the container, while ENTRYPOINT sets the primary executable. CMD is easily overridden, whereas ENTRYPOINT is typically fixed.
+
+## 101. Difference between Containerization and Virtualization?
+
+Both are isolation technologies, but they work at different layers.
+
+---
+
+# Containerization
+
+Containerization packages an application with dependencies into containers that share the host OS kernel.
+
+Examples:
+
+* Docker
+* containerd
+
+---
+
+# Virtualization
+
+Virtualization creates full virtual machines using a hypervisor.
+
+Examples:
+
+* VMware
+* Microsoft Hyper-V
+* KVM
+
+---
+
+# Comparison Table
+
+| Feature              | Containerization   | Virtualization    |
+| -------------------- | ------------------ | ----------------- |
+| OS per workload      | Shared host kernel | Full guest OS     |
+| Startup time         | Seconds            | Minutes           |
+| Size                 | MBs                | GBs               |
+| Density              | High               | Lower             |
+| Performance overhead | Low                | Higher            |
+| Isolation            | Process-level      | Stronger VM-level |
+
+---
+
+# Real Example
+
+* 20 microservices → Containers ideal
+* Legacy Windows apps needing full OS → VMs ideal
+
+---
+
+## Interview Answer
+
+> Containerization isolates applications while sharing the host kernel, making it lightweight and fast. Virtualization runs full guest operating systems on a hypervisor, providing stronger isolation but higher overhead.
+
+---
+
+# 102. Difference between docker kill and docker rm?
+
+These commands do different things.
+
+---
+
+# docker kill
+
+Forcefully stops a running container immediately using SIGKILL.
+
+```bash id="q7n4we"
+docker kill myapp
+```
+
+* Container remains موجود (stopped state)
+* Can be restarted
+
+---
+
+# docker rm
+
+Removes a stopped container from Docker metadata/storage.
+
+```bash id="v2m8ta"
+docker rm myapp
+```
+
+* Deletes container object
+* Cannot restart after removal
+
+---
+
+# Combined Example
+
+```bash id="k4r1ps"
+docker kill myapp
+docker rm myapp
+```
+
+---
+
+# Comparison Table
+
+| Command       | Action               |
+| ------------- | -------------------- |
+| `docker kill` | Force stop container |
+| `docker rm`   | Remove container     |
+
+---
+
+# Better Graceful Stop
+
+```bash id="m6x2ud"
+docker stop myapp
+```
+
+---
+
+## Interview Answer
+
+> `docker kill` forcefully terminates a running container, while `docker rm` removes a stopped container from Docker. Kill stops it; rm deletes it.
+
+---
+
+# 103. How do you manage multiple application versions in the same Docker repository?
+
+Use **image tags**.
+
+---
+
+# Example Repository
+
+```text id="a8p3zx"
+myrepo/app:1.0
+myrepo/app:1.1
+myrepo/app:2.0
+myrepo/app:latest
+myrepo/app:dev
+myrepo/app:prod
+```
+
+---
+
+# Best Tagging Strategy
+
+Use meaningful tags:
+
+* Semantic versioning (`1.2.3`)
+* Build number
+* Git commit SHA
+* Environment tags
+
+---
+
+# Example Build
+
+```bash id="u7m5kr"
+docker build -t myrepo/app:2.1.0 .
+docker push myrepo/app:2.1.0
+```
+
+---
+
+# CI/CD Best Practice
+
+Push two tags:
+
+```text id="y3n8wd"
+2.1.0
+latest
+```
+
+---
+
+# Avoid
+
+Using only `latest` in production.
+
+---
+
+# Registry Cleanup
+
+Use retention policies in:
+
+* Azure Container Registry (ACR)
+* Amazon Elastic Container Registry (ECR)
+
+---
+
+## Interview Answer
+
+> I manage multiple versions using tags such as semantic versions, build numbers, or Git SHAs. I avoid relying only on `latest` and use immutable version tags for production deployments.
+
+---
+
+# 104. What is the advantage of using Alpine images for container builds?
+
+Alpine Linux based images are lightweight base images.
+
+---
+
+# Advantages
+
+## 1. Smaller Image Size
+
+Example:
+
+* Ubuntu image = larger
+* Alpine image = much smaller
+
+---
+
+## 2. Faster Pull/Push
+
+Smaller images transfer faster.
+
+---
+
+## 3. Lower Attack Surface
+
+Fewer installed packages = fewer vulnerabilities.
+
+---
+
+## 4. Better for CI/CD
+
+Faster builds and deployments.
+
+---
+
+## Example
+
+```dockerfile id="n1q7sr"
+FROM node:20-alpine
+```
+
+---
+
+# Considerations
+
+Sometimes debugging tools/libs are missing, so additional packages may be required.
+
+---
+
+## Interview Answer
+
+> Alpine images are preferred because they are lightweight, faster to download, consume less storage, and reduce the security attack surface.
+
+---
+
+# 105. How can you securely inject environment variables into a running Docker container?
+
+Avoid hardcoding secrets in Dockerfiles or images.
+
+---
+
+# Methods
+
+## 1. Runtime Environment Variables
+
+```bash id="w8m2pa"
+docker run -e DB_HOST=db -e DB_USER=app myimage
+```
+
+Good for non-sensitive config.
+
+---
+
+## 2. Env File
+
+```bash id="r5x9ud"
+docker run --env-file .env myimage
+```
+
+---
+
+## 3. Secret Managers (Best Practice)
+
+Use:
+
+* AWS Secrets Manager
+* AWS Systems Manager Parameter Store
+* HashiCorp Vault
+* Azure Key Vault
+
+Inject at runtime.
+
+---
+
+## 4. Orchestrator Secrets
+
+* Kubernetes Secrets
+* Docker Swarm Secrets
+
+---
+
+# Avoid
+
+* Putting passwords in Dockerfile `ENV`
+* Committing `.env` to Git
+
+---
+
+## Interview Answer
+
+> I securely inject environment variables using secret managers, orchestrator secrets, or runtime `--env-file`. I avoid storing secrets inside images or source code.
+
+---
+
+# 106. Explain the concept of Docker Content Trust (DCT) and why it matters.
+
+## What is Docker Content Trust?
+
+Docker Content Trust provides **image signing and verification** to ensure images are authentic and untampered.
+
+It uses digital signatures based on The Update Framework (TUF) concepts.
+
+---
+
+# Why It Matters
+
+## 1. Verify Publisher Authenticity
+
+Confirms image came from trusted publisher.
+
+## 2. Prevent Tampering
+
+Detects modified or malicious images.
+
+## 3. Supply Chain Security
+
+Improves trust in CI/CD pipelines.
+
+## 4. Compliance
+
+Useful in regulated environments.
+
+---
+
+# Enable DCT
+
+```bash id="f4n8ps"
+export DOCKER_CONTENT_TRUST=1
+```
+
+Then Docker verifies signed images during pull/push.
+
+---
+
+# Real Example
+
+Only signed production images can be deployed.
+
+---
+
+# Modern Related Concepts
+
+* Image signing
+* Sigstore
+* Cosign
+* SBOM / supply chain security
+
+---
+
+## Interview Answer
+
+> Docker Content Trust ensures images are digitally signed and verified before use. It helps prevent pulling tampered or untrusted images and strengthens container supply chain security.
+
