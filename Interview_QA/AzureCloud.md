@@ -1,4 +1,4 @@
-## Basic Questions (100)
+### Basic Questions (100)
 # 1. What is Microsoft Azure, and what are its Main Service Categories?
 
 [Microsoft Azure](https://azure.microsoft.com/?utm_source=chatgpt.com) is Microsoft’s cloud computing platform that provides services for building, deploying, managing, and scaling applications and infrastructure through Microsoft-managed datacenters worldwide.
