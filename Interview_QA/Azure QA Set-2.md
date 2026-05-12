@@ -8403,3 +8403,4091 @@ Timer/event fires → orchestrator replays from checkpoint
 | **State storage** | Azure Storage (automatic) | Managed by Azure |
 | **Use case** | Complex custom workflows | Enterprise integration, SaaS connectors |
 
+# Azure Interview Questions – Detailed Answers (Q31–Q40)
+
+---
+
+## 31. What is the difference between Azure Functions and AWS Lambda?
+
+| Feature | Azure Functions | AWS Lambda |
+|---|---|---|
+| **Provider** | Microsoft Azure | Amazon Web Services |
+| **Runtime support** | C#, Java, JS, Python, PowerShell, Custom | Node.js, Python, Java, Go, Ruby, .NET, Custom |
+| **Max timeout** | 10 min (Consumption), unlimited (Premium/Dedicated) | 15 minutes (hard limit) |
+| **Max memory** | 14 GB (Premium EP3) | 10 GB |
+| **Cold start** | Yes (Consumption), No (Premium) | Yes (mitigated via Provisioned Concurrency) |
+| **VNet integration** | Premium / Dedicated plan | VPC integration (all plans) |
+| **Trigger sources** | HTTP, Timer, Queue, Event Hub, Cosmos DB, etc. | API Gateway, S3, SQS, DynamoDB, EventBridge, etc. |
+| **Orchestration** | Durable Functions (built-in) | AWS Step Functions (separate service) |
+| **Deployment package** | ZIP, Docker, Azure DevOps | ZIP, Container Image, SAM |
+| **Monitoring** | Application Insights | CloudWatch |
+| **Concurrency control** | Host-level concurrency config | Reserved / Provisioned concurrency |
+| **Free tier** | 1M executions + 400K GB-s/month | 1M executions + 400K GB-s/month |
+| **Local dev experience** | Azure Functions Core Tools + VS Code | AWS SAM CLI + AWS Toolkit |
+
+**Trigger comparison:**
+
+| Azure Functions Trigger | AWS Lambda Equivalent |
+|---|---|
+| HTTP Trigger | API Gateway |
+| Timer Trigger | EventBridge Scheduler |
+| Queue Trigger (Storage) | SQS Trigger |
+| Event Hub Trigger | Kinesis Trigger |
+| Cosmos DB Trigger | DynamoDB Streams |
+| Service Bus Trigger | SQS / SNS Trigger |
+| Blob Trigger | S3 Event Trigger |
+
+**Hosting plan vs Lambda:**
+```
+Azure Consumption  ←→  AWS Lambda default (pay-per-use, scale to zero)
+Azure Premium      ←→  AWS Provisioned Concurrency (no cold start)
+Azure Dedicated    ←→  AWS Lambda on EC2/Fargate (always-on compute)
+```
+
+**Key architectural differences:**
+- Azure Functions uses a **host process model** — multiple functions share one host
+- Lambda uses **one function per execution environment** — fully isolated
+- Azure has **Durable Functions** built-in for orchestration; AWS needs **Step Functions** (separate service, separate pricing)
+- Azure Functions supports **PowerShell** natively — useful for IT automation
+- Lambda has stricter **15-min hard timeout** — Azure Premium has no timeout limit
+
+---
+
+## 32. How do you secure secrets in Functions?
+
+**Layered approach — never hardcode secrets:**
+
+**Layer 1: App Settings (basic, not recommended for sensitive secrets)**
+```bash
+az functionapp config appsettings set \
+  --name myFunctionApp \
+  --resource-group myRG \
+  --settings "DB_PASSWORD=mysecret"
+# Stored encrypted at rest, but visible in portal
+```
+
+**Layer 2: Key Vault References (recommended)**
+```bash
+# Format: @Microsoft.KeyVault(SecretUri=<uri>)
+az functionapp config appsettings set \
+  --name myFunctionApp \
+  --resource-group myRG \
+  --settings "DB_PASSWORD=@Microsoft.KeyVault(SecretUri=https://myKV.vault.azure.net/secrets/DbPassword/)"
+
+# Function reads it like a normal env variable — no code change needed
+string dbPassword = Environment.GetEnvironmentVariable("DB_PASSWORD");
+```
+
+**Layer 3: Managed Identity + Key Vault SDK (most secure)**
+```csharp
+// No credentials anywhere — identity-based access
+public class MyFunction
+{
+    private readonly SecretClient _secretClient;
+
+    public MyFunction()
+    {
+        _secretClient = new SecretClient(
+            new Uri("https://myKV.vault.azure.net/"),
+            new DefaultAzureCredential()  // Uses Managed Identity automatically
+        );
+    }
+
+    [FunctionName("MyFunc")]
+    public async Task<IActionResult> Run(
+        [HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
+    {
+        var secret = await _secretClient.GetSecretAsync("DbPassword");
+        // Use secret.Value.Value
+    }
+}
+```
+
+**Setup Managed Identity for Function App:**
+```bash
+# Enable system-assigned identity
+az functionapp identity assign \
+  --name myFunctionApp \
+  --resource-group myRG
+
+# Grant Key Vault access
+az role assignment create \
+  --assignee <principalId> \
+  --role "Key Vault Secrets User" \
+  --scope /subscriptions/.../vaults/myKV
+```
+
+**Secret management best practices:**
+
+| Practice | Description |
+|---|---|
+| **Never in source code** | Use env vars or Key Vault references |
+| **Never in app settings directly** | Use Key Vault references instead |
+| **Rotate secrets regularly** | Use Key Vault rotation policies |
+| **Use Managed Identity** | Eliminate credential management entirely |
+| **Least privilege** | Grant only `Key Vault Secrets User`, not full admin |
+| **Enable soft delete** | Protect against accidental secret deletion |
+| **Audit access** | Monitor Key Vault access logs via Diagnostic Settings |
+
+**Function-level security (HTTP trigger authorization levels):**
+```csharp
+// AuthorizationLevel controls who can call the function
+[HttpTrigger(AuthorizationLevel.Anonymous)]  // No key needed
+[HttpTrigger(AuthorizationLevel.Function)]   // Function-specific key
+[HttpTrigger(AuthorizationLevel.Admin)]      // Master host key only
+```
+
+---
+
+## 33. How do you implement Service-to-Service Authentication?
+
+**Three primary patterns:**
+
+**Pattern 1: Managed Identity (recommended for Azure-to-Azure)**
+```
+Service A (Function App) → requests token from Azure AD using Managed Identity
+                         → presents token to Service B (API / Storage / SQL)
+                         → Service B validates token → grants access
+```
+
+```csharp
+// Service A: Call Service B's API using Managed Identity
+var credential = new DefaultAzureCredential();
+var token = await credential.GetTokenAsync(
+    new TokenRequestContext(new[] { "https://serviceb.azurewebsites.net/.default" })
+);
+
+var httpClient = new HttpClient();
+httpClient.DefaultRequestHeaders.Authorization =
+    new AuthenticationHeaderValue("Bearer", token.Token);
+
+var response = await httpClient.GetAsync("https://serviceb.azurewebsites.net/api/data");
+```
+
+```csharp
+// Service B: Validate incoming token (in middleware or JWT validation)
+// Uses Azure AD to validate the token automatically
+services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApi(configuration);
+```
+
+**Pattern 2: Client Credentials Flow (OAuth 2.0)**
+```
+Service A → Azure AD: "Here's my client_id + client_secret"
+Azure AD → Service A: "Here's an access token"
+Service A → Service B: "Here's the access token"
+Service B → Azure AD: "Is this token valid?" → Yes → grant access
+```
+
+```csharp
+// Register both services as App Registrations in Azure AD
+// Service A gets client_id + client_secret
+// Service B exposes an API scope
+
+var confidentialClient = ConfidentialClientApplicationBuilder
+    .Create(clientId)
+    .WithClientSecret(clientSecret)
+    .WithAuthority(new Uri($"https://login.microsoftonline.com/{tenantId}"))
+    .Build();
+
+var result = await confidentialClient
+    .AcquireTokenForClient(new[] { "api://serviceb-app-id/.default" })
+    .ExecuteAsync();
+
+// Use result.AccessToken in HTTP calls
+```
+
+**Pattern 3: Certificates (most secure client credentials)**
+```csharp
+// Use certificate instead of client secret
+var certificate = new X509Certificate2("mycert.pfx", "password");
+
+var confidentialClient = ConfidentialClientApplicationBuilder
+    .Create(clientId)
+    .WithCertificate(certificate)
+    .WithAuthority($"https://login.microsoftonline.com/{tenantId}")
+    .Build();
+```
+
+**Service-to-Service auth comparison:**
+
+| Pattern | Credential type | Security | Azure-native | Use case |
+|---|---|---|---|---|
+| **Managed Identity** | None (Azure-managed) | Highest | ✅ Yes | Azure service → Azure service |
+| **Client Credentials + Secret** | Client secret | Medium | ✅ Yes | App → external API |
+| **Client Credentials + Cert** | X.509 certificate | High | ✅ Yes | B2B, high-security |
+| **API Keys** | Shared key | Low | ❌ No | Simple, low-security scenarios |
+
+---
+
+## 34. What is a Virtual Network Gateway?
+
+A **Virtual Network Gateway** is a managed Azure service that provides **encrypted connectivity** between Azure VNets and external networks (on-premises or other VNets).
+
+**Two types of VNet Gateways:**
+
+| Type | Purpose |
+|---|---|
+| **VPN Gateway** | IPsec/IKE encrypted tunnels to on-premises or other VNets |
+| **ExpressRoute Gateway** | Private, dedicated connectivity via ExpressRoute circuit |
+
+**VPN Gateway SKUs:**
+
+| SKU | Throughput | VNet-to-VNet | BGP | Zone-redundant |
+|---|---|---|---|---|
+| Basic | 100 Mbps | ✅ | ❌ | ❌ |
+| VpnGw1 | 650 Mbps | ✅ | ✅ | ❌ |
+| VpnGw2 | 1 Gbps | ✅ | ✅ | ❌ |
+| VpnGw3 | 1.25 Gbps | ✅ | ✅ | ❌ |
+| VpnGw1AZ | 650 Mbps | ✅ | ✅ | ✅ |
+| VpnGw2AZ | 1 Gbps | ✅ | ✅ | ✅ |
+
+**Gateway connection types:**
+
+```
+Site-to-Site (S2S):
+  Azure VNet ←─── IPsec tunnel ───→ On-premises VPN device
+
+Point-to-Site (P2S):
+  Azure VNet ←─── VPN tunnel ───→ Individual client machine
+
+VNet-to-VNet:
+  Azure VNet A ←─── IPsec tunnel ───→ Azure VNet B
+  (alternative to VNet peering when encryption needed)
+
+ExpressRoute:
+  Azure VNet ←─── Private circuit ───→ On-premises (via provider)
+```
+
+**Gateway subnet requirement:**
+```bash
+# VPN Gateway requires a dedicated subnet named exactly "GatewaySubnet"
+az network vnet subnet create \
+  --vnet-name myVNet \
+  --name GatewaySubnet \
+  --resource-group myRG \
+  --address-prefix 10.0.255.0/27  # /27 or larger recommended
+```
+
+**Deployment time:** VNet Gateway takes **25–45 minutes** to deploy — plan accordingly.
+
+---
+
+## 35. What is the difference between Route-Based and Policy-Based VPNs?
+
+| Feature | Route-Based VPN | Policy-Based VPN |
+|---|---|---|
+| **Routing method** | Dynamic routing (IKEv2) | Static routing (IKEv1) |
+| **Traffic selection** | Any-to-any (wildcard) | Specific IP prefixes (ACL-based) |
+| **IKE version** | IKEv2 | IKEv1 only |
+| **Simultaneous tunnels** | Multiple (up to 30+) | 1 tunnel only |
+| **Point-to-Site** | ✅ Supported | ❌ Not supported |
+| **BGP support** | ✅ Yes | ❌ No |
+| **VNet-to-VNet** | ✅ Yes | ❌ No |
+| **Active-Active gateway** | ✅ Yes | ❌ No |
+| **Azure Gateway SKU** | All SKUs | Basic SKU only |
+| **Use case** | Modern, flexible connectivity | Legacy on-premises VPN devices |
+
+**How they select traffic:**
+
+```
+Policy-Based (static):
+  Traffic selector: 10.1.0.0/24 ←→ 192.168.1.0/24 (explicit mapping)
+  If traffic doesn't match policy → dropped
+
+Route-Based (dynamic):
+  Traffic selector: 0.0.0.0/0 ←→ 0.0.0.0/0 (any-to-any)
+  Routing table determines next hop → flexible and scalable
+```
+
+> **Always use Route-Based VPN** for new deployments. Policy-based is only for legacy device compatibility.
+
+---
+
+## 36. What is Azure BGP?
+
+**BGP (Border Gateway Protocol)** is the standard internet routing protocol used in Azure VPN Gateways to **dynamically exchange routing information** between Azure and on-premises networks.
+
+**Why BGP over static routing:**
+
+| Feature | Static Routing | BGP Dynamic Routing |
+|---|---|---|
+| **Route updates** | Manual | Automatic |
+| **Failover** | Manual reconfiguration | Automatic rerouting |
+| **Scalability** | Poor (many manual routes) | Excellent |
+| **Active-Active support** | ❌ No | ✅ Yes |
+| **Multi-site connectivity** | Complex | Simple |
+
+**Azure BGP key concepts:**
+
+```
+Azure VPN Gateway BGP settings:
+  ASN (Autonomous System Number): 65515 (Azure default)
+  BGP Peer IP: IP address on the GatewaySubnet
+
+On-premises BGP settings:
+  ASN: 65000 (customer defined, must differ from Azure)
+  BGP Peer IP: on-premises VPN device IP
+```
+
+**BGP with Active-Active gateway (high availability):**
+```
+On-premises VPN Device
+        ↕ BGP session 1 (tunnel 1)
+Azure Gateway Instance 0 (primary)
+        ↕ BGP session 2 (tunnel 2)
+Azure Gateway Instance 1 (secondary)
+
+→ Both tunnels active simultaneously
+→ BGP automatically fails over if one instance goes down
+→ No manual intervention needed
+```
+
+**Configure BGP on VPN Gateway:**
+```bash
+az network vnet-gateway create \
+  --name myVPNGateway \
+  --resource-group myRG \
+  --vnet myVNet \
+  --gateway-type Vpn \
+  --vpn-type RouteBased \
+  --sku VpnGw1 \
+  --asn 65515 \           # Azure side ASN
+  --bgp-peering-address 10.0.255.254  # BGP peer IP
+```
+
+**BGP route advertisement:**
+```
+Azure advertises: VNet address space (e.g., 10.1.0.0/16)
+On-premises advertises: Local network prefixes (e.g., 192.168.0.0/16)
+Both learn each other's routes dynamically → full connectivity
+```
+
+---
+
+## 37. How do you configure Custom Routes in Azure?
+
+Custom routes override Azure's default system routes to **control traffic flow** through specific network appliances or paths.
+
+**Azure default system routes (automatic):**
+```
+Destination          Next Hop
+10.0.0.0/16    →    VirtualNetwork   (local VNet traffic)
+0.0.0.0/0      →    Internet         (all other traffic → internet)
+10.0.0.0/8     →    None             (RFC 1918 → dropped by default)
+172.16.0.0/12  →    None             (RFC 1918 → dropped by default)
+192.168.0.0/16 →    None             (RFC 1918 → dropped by default)
+```
+
+**Custom route creation (UDR):**
+```bash
+# Step 1: Create a route table
+az network route-table create \
+  --name myRouteTable \
+  --resource-group myRG \
+  --location eastus
+
+# Step 2: Add a custom route
+az network route-table route create \
+  --route-table-name myRouteTable \
+  --resource-group myRG \
+  --name ForceToFirewall \
+  --address-prefix 0.0.0.0/0 \
+  --next-hop-type VirtualAppliance \
+  --next-hop-ip-address 10.0.1.4   # Azure Firewall private IP
+
+# Step 3: Associate route table with subnet
+az network vnet subnet update \
+  --vnet-name myVNet \
+  --name mySubnet \
+  --resource-group myRG \
+  --route-table myRouteTable
+```
+
+**Next hop types:**
+
+| Next Hop Type | Description | Use case |
+|---|---|---|
+| `VirtualNetworkGateway` | Send to VPN/ExpressRoute gateway | On-premises routing |
+| `VirtualNetwork` | Stay within VNet | Local VNet traffic |
+| `Internet` | Route to public internet | Internet-bound traffic |
+| `VirtualAppliance` | Send to NVA/Firewall IP | Traffic inspection |
+| `None` | Drop the traffic (blackhole) | Block specific prefixes |
+
+**Common custom routing scenarios:**
+
+```
+Scenario 1 — Force tunnel all internet traffic through Azure Firewall:
+  0.0.0.0/0 → VirtualAppliance → 10.0.1.4 (Azure Firewall)
+
+Scenario 2 — Force on-premises traffic through NVA:
+  192.168.0.0/16 → VirtualAppliance → 10.0.1.4 (NVA)
+
+Scenario 3 — Blackhole traffic to specific subnet:
+  10.0.5.0/24 → None (drop all traffic to this range)
+
+Scenario 4 — Override BGP routes from VPN gateway:
+  Custom UDR takes precedence over BGP-learned routes
+```
+
+---
+
+## 38. What is User-Defined Route (UDR)?
+
+A **UDR** is a custom routing rule created by an administrator to **override Azure's default system routes** and control where network traffic is directed.
+
+**UDR vs System Routes vs BGP:**
+
+| Route type | Created by | Priority | Override |
+|---|---|---|---|
+| **System routes** | Azure (automatic) | Lowest | Can be overridden by UDR |
+| **BGP routes** | VPN/ExpressRoute | Medium | Can be overridden by UDR |
+| **UDR (User-Defined)** | Administrator | Highest | Overrides everything |
+
+**UDR architecture — Hub-Spoke with Firewall:**
+```
+Spoke VNet A (10.1.0.0/16)
+  └── Subnet: UDR → 0.0.0.0/0 → Azure Firewall (10.0.1.4)
+                                          ↓
+                                   Hub VNet (10.0.0.0/16)
+                                   [Azure Firewall inspects all traffic]
+                                          ↓
+Spoke VNet B (10.2.0.0/16)          Internet / On-prem
+  └── Subnet: UDR → 0.0.0.0/0 → Azure Firewall (10.0.1.4)
+```
+
+**Important UDR rules:**
+- One route table can be associated with **multiple subnets**
+- One subnet can only have **one route table**
+- UDRs do NOT apply to traffic **originating from the gateway subnet** (avoid adding UDRs to GatewaySubnet)
+- Longest prefix match wins (more specific route beats less specific)
+
+**UDR for forced tunneling (send all internet traffic on-premises):**
+```bash
+az network route-table route create \
+  --route-table-name myRouteTable \
+  --name ForceTunnel \
+  --address-prefix 0.0.0.0/0 \
+  --next-hop-type VirtualNetworkGateway
+# All internet traffic goes back to on-premises for inspection
+```
+
+---
+
+## 39. How do you configure NSG vs ASG?
+
+**NSG (Network Security Group)** controls inbound/outbound traffic at **subnet or NIC level** using IP-based rules.
+
+**ASG (Application Security Group)** groups VMs logically so NSG rules can reference **app groups instead of IPs.**
+
+**NSG rule structure:**
+```
+Priority | Source          | Source Port | Destination     | Dest Port | Protocol | Action
+100      | 10.0.1.0/24    | *           | 10.0.2.0/24    | 443       | TCP      | Allow
+200      | Internet        | *           | VirtualNetwork  | 3389      | TCP      | Deny
+```
+
+**NSG configuration:**
+```bash
+# Create NSG
+az network nsg create --name myNSG --resource-group myRG
+
+# Add inbound rule: allow HTTPS from specific subnet
+az network nsg rule create \
+  --nsg-name myNSG \
+  --resource-group myRG \
+  --name AllowHTTPS \
+  --priority 100 \
+  --direction Inbound \
+  --source-address-prefixes 10.0.1.0/24 \
+  --destination-port-ranges 443 \
+  --protocol Tcp \
+  --access Allow
+
+# Associate NSG with subnet
+az network vnet subnet update \
+  --vnet-name myVNet \
+  --name mySubnet \
+  --resource-group myRG \
+  --network-security-group myNSG
+```
+
+**Problem NSGs alone create — IP management nightmare:**
+```
+Without ASG (IP-based rules):
+  Allow WebServers (10.0.1.4, 10.0.1.5, 10.0.1.6) → DB port 1433
+  → Add new web server 10.0.1.7? → Update EVERY rule manually
+```
+
+**ASG solution — group by role, not IP:**
+```bash
+# Create ASGs
+az network asg create --name WebServers --resource-group myRG
+az network asg create --name DBServers --resource-group myRG
+az network asg create --name AppServers --resource-group myRG
+
+# Assign VMs to ASGs (associate NIC with ASG)
+az network nic ip-config update \
+  --nic-name webVM1-nic \
+  --resource-group myRG \
+  --name ipconfig1 \
+  --application-security-groups WebServers
+
+# Create NSG rule using ASG names (no IPs needed!)
+az network nsg rule create \
+  --nsg-name myNSG \
+  --resource-group myRG \
+  --name WebToDB \
+  --priority 100 \
+  --direction Inbound \
+  --source-asgs WebServers \
+  --destination-asgs DBServers \
+  --destination-port-ranges 1433 \
+  --protocol Tcp \
+  --access Allow
+```
+
+**NSG vs ASG comparison:**
+
+| Feature | NSG | ASG |
+|---|---|---|
+| **Purpose** | Traffic filtering rules | Logical grouping of VMs |
+| **Defines** | Allow/Deny rules | VM membership groups |
+| **Works alone** | ✅ Yes | ❌ No (used inside NSG rules) |
+| **Referencing** | IP addresses / CIDR | ASG names |
+| **Scaling** | Update IPs when VMs change | Add VM to ASG group only |
+| **Applied to** | Subnet or NIC | NIC only |
+
+**NSG + ASG together (best practice):**
+```
+NSG Rule: Allow WebServers(ASG) → DBServers(ASG) on port 1433
+  ↓
+New web VM added → just assign it to WebServers ASG
+  ↓
+No NSG rule changes needed — rule applies automatically
+```
+
+---
+
+## 40. What is Azure DDoS Protection?
+
+**Azure DDoS Protection** defends Azure resources against **Distributed Denial of Service attacks** by absorbing and mitigating malicious traffic before it impacts your applications.
+
+**Two tiers:**
+
+| Feature | DDoS Network Protection (Basic) | DDoS IP Protection | DDoS Network Protection (Standard) |
+|---|---|---|---|
+| **Cost** | Free | Per public IP | Per VNet (~$2,944/month) |
+| **Always-on monitoring** | ✅ Yes | ✅ Yes | ✅ Yes |
+| **Automatic mitigation** | ✅ Basic | ✅ Yes | ✅ Advanced |
+| **Adaptive tuning** | ❌ No | ❌ No | ✅ Yes (ML-based) |
+| **Attack analytics** | ❌ No | Limited | ✅ Full (real-time) |
+| **DDoS Rapid Response** | ❌ No | ❌ No | ✅ Yes (Microsoft team) |
+| **Cost protection guarantee** | ❌ No | ❌ No | ✅ Yes (credit for scale-out) |
+| **WAF integration** | ❌ No | ❌ No | ✅ Yes |
+
+**Types of DDoS attacks mitigated:**
+
+```
+Volumetric Attacks (Layer 3/4):
+  → UDP floods, ICMP floods, amplification attacks
+  → Mitigated by: traffic scrubbing at Azure network edge
+
+Protocol Attacks (Layer 3/4):
+  → SYN floods, fragmented packet attacks
+  → Mitigated by: TCP state tracking, anomaly detection
+
+Application Layer Attacks (Layer 7):
+  → HTTP floods, DNS query floods
+  → Mitigated by: WAF (Application Gateway / Front Door)
+  → DDoS Protection alone does NOT cover L7 — combine with WAF
+```
+
+**How DDoS Standard works:**
+```
+Normal traffic: →→→→→→→→→ Azure Resource (no inspection overhead)
+                                    ↑
+                         Always-on traffic monitoring
+                         (ML baseline per public IP)
+
+DDoS Attack detected:
+Attack traffic →→→→→ Azure DDoS scrubbing centers
+                              ↓ (clean traffic only)
+                         Azure Resource protected
+                              ↓
+                     Alert fired → Microsoft DDoS team notified
+```
+
+**Enable DDoS Network Protection:**
+```bash
+# Enable on VNet
+az network vnet update \
+  --name myVNet \
+  --resource-group myRG \
+  --ddos-protection true \
+  --ddos-protection-plan /subscriptions/.../ddosProtectionPlans/myDDoSPlan
+
+# Create DDoS Protection Plan first
+az network ddos-protection create \
+  --name myDDoSPlan \
+  --resource-group myRG \
+  --location eastus
+```
+
+**DDoS Protection + WAF — complete defense:**
+```
+Internet
+    ↓
+Azure DDoS Protection (L3/L4 volumetric + protocol attacks)
+    ↓
+Azure Front Door / App Gateway with WAF (L7 application attacks)
+    ↓
+Your Application (protected end-to-end)
+```
+
+**DDoS metrics to monitor:**
+| Metric | Description |
+|---|---|
+| `Under DDoS attack or not` | Boolean — is attack ongoing |
+| `Inbound packets dropped DDoS` | Packets scrubbed per second |
+| `Inbound bytes DDoS` | Total attack volume |
+| `TCP packets dropped DDoS` | TCP-specific attack packets |
+
+> **Cost protection**: With DDoS Standard, if your resources auto-scale due to a DDoS attack, Azure provides **service credits** to cover the excess compute costs incurred during the attack.
+
+# Azure Interview Questions – Detailed Answers (Q41–Q50)
+
+---
+
+## 41. What are the differences between DDoS Basic and DDoS Standard?
+
+| Feature | DDoS Basic (Network Protection) | DDoS Standard (Network Protection) |
+|---|---|---|
+| **Cost** | Free (included in Azure) | ~$2,944/month per DDoS plan |
+| **Scope** | Azure platform-wide | Per VNet |
+| **Always-on monitoring** | ✅ Yes (platform level) | ✅ Yes (per resource, ML-tuned) |
+| **Automatic mitigation** | ✅ Basic (shared policy) | ✅ Advanced (per-IP adaptive policy) |
+| **Adaptive tuning** | ❌ No | ✅ Yes (ML baseline per public IP) |
+| **Real-time attack metrics** | ❌ No | ✅ Yes (Azure Monitor) |
+| **Attack analytics & reports** | ❌ No | ✅ Yes (post-attack forensics) |
+| **Attack flow logs** | ❌ No | ✅ Yes |
+| **DDoS Rapid Response Team** | ❌ No | ✅ Yes (Microsoft experts) |
+| **Cost protection guarantee** | ❌ No | ✅ Yes (auto-scale credits) |
+| **WAF integration** | ❌ No | ✅ Yes |
+| **Multi-VNet coverage** | ❌ No | ✅ Yes (one plan covers multiple VNets) |
+| **Resource-level alerts** | ❌ No | ✅ Yes (per public IP alerts) |
+| **SLA guarantee** | ❌ No | ✅ Yes |
+
+**Attack types and coverage:**
+
+| Attack Type | Layer | DDoS Basic | DDoS Standard |
+|---|---|---|---|
+| **Volumetric (UDP/ICMP floods)** | L3 | Partial | ✅ Full |
+| **Protocol (SYN floods)** | L4 | Partial | ✅ Full |
+| **Amplification attacks** | L3/L4 | Partial | ✅ Full |
+| **Application layer (HTTP floods)** | L7 | ❌ No | ❌ No (needs WAF) |
+
+**Mitigation policy differences:**
+```
+DDoS Basic:
+  → Shared mitigation thresholds across all Azure customers
+  → Generic traffic policies → may cause false positives
+  → No tuning to your specific traffic patterns
+
+DDoS Standard:
+  → Dedicated mitigation policy per public IP
+  → ML learns your normal traffic baseline
+  → Triggers precisely when YOUR traffic deviates
+  → Separate policies for TCP SYN, TCP, UDP, fragments
+```
+
+**When to choose Standard:**
+- Production workloads with public-facing endpoints
+- Applications where downtime = revenue loss
+- Compliance requirements (PCI-DSS, HIPAA)
+- Need post-attack forensics and reporting
+- SLA-backed protection required
+
+**Complete DDoS + WAF architecture:**
+```
+Internet Traffic
+      ↓
+Azure DDoS Standard     ← L3/L4 volumetric + protocol attacks
+      ↓
+Azure Front Door / App Gateway WAF  ← L7 application attacks
+      ↓
+Backend Application     ← Protected from all layers
+```
+
+---
+
+## 42. How do you configure Azure Firewall Rules?
+
+Azure Firewall uses **three types of rule collections**, processed in priority order:
+
+**Rule collection types and priority:**
+```
+Processing order (evaluated top to bottom, first match wins):
+1. DNAT Rules          → Translate inbound traffic to internal IPs
+2. Network Rules       → Allow/deny based on IP, port, protocol (L3/L4)
+3. Application Rules   → Allow/deny based on FQDN, URLs (L7)
+
+Within each type: lower priority number = evaluated first
+```
+
+**Rule Collection Groups → Rule Collections → Rules hierarchy:**
+```
+Rule Collection Group (Priority: 100)
+  └── Network Rule Collection (Priority: 100)
+        ├── Rule: Allow-DNS
+        └── Rule: Allow-NTP
+  └── Application Rule Collection (Priority: 200)
+        ├── Rule: Allow-Windows-Update
+        └── Rule: Allow-AzureMonitor
+```
+
+**1. DNAT Rules (Destination NAT — inbound traffic):**
+```bash
+az network firewall nat-rule create \
+  --firewall-name myFirewall \
+  --resource-group myRG \
+  --collection-name InboundNAT \
+  --priority 100 \
+  --action Dnat \
+  --name RDP-To-VM \
+  --protocols TCP \
+  --source-addresses "*" \
+  --destination-addresses 20.10.10.1 \  # Firewall public IP
+  --destination-ports 3389 \
+  --translated-address 10.0.1.4 \       # Internal VM IP
+  --translated-port 3389
+```
+
+**2. Network Rules (L3/L4 — IP + port based):**
+```bash
+az network firewall network-rule create \
+  --firewall-name myFirewall \
+  --resource-group myRG \
+  --collection-name AllowInternalTraffic \
+  --priority 200 \
+  --action Allow \
+  --name Allow-DNS \
+  --protocols UDP \
+  --source-addresses 10.0.0.0/16 \
+  --destination-addresses 168.63.129.16 \  # Azure DNS
+  --destination-ports 53
+```
+
+**3. Application Rules (L7 — FQDN based):**
+```bash
+az network firewall application-rule create \
+  --firewall-name myFirewall \
+  --resource-group myRG \
+  --collection-name AllowWebTraffic \
+  --priority 300 \
+  --action Allow \
+  --name Allow-WindowsUpdate \
+  --protocols Http=80 Https=443 \
+  --source-addresses 10.0.0.0/16 \
+  --target-fqdns \
+      "*.windowsupdate.microsoft.com" \
+      "*.update.microsoft.com" \
+      "*.microsoft.com"
+```
+
+**Firewall Policy (recommended over classic rules):**
+```json
+{
+  "ruleCollectionGroups": [
+    {
+      "name": "DefaultNetworkRuleCollectionGroup",
+      "priority": 200,
+      "ruleCollections": [
+        {
+          "name": "AllowAzureServices",
+          "priority": 100,
+          "action": { "type": "Allow" },
+          "rules": [
+            {
+              "name": "Allow-AzureMonitor",
+              "ruleType": "NetworkRule",
+              "sourceAddresses": ["10.0.0.0/16"],
+              "destinationAddresses": ["AzureMonitor"],
+              "destinationPorts": ["443"],
+              "ipProtocols": ["TCP"]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Azure Firewall vs NSG rule processing:**
+
+| Aspect | Azure Firewall | NSG |
+|---|---|---|
+| **Layer** | L3, L4, L7 | L3, L4 |
+| **FQDN filtering** | ✅ Yes | ❌ No |
+| **Threat intelligence** | ✅ Yes | ❌ No |
+| **Centralized policy** | ✅ Yes (Firewall Policy) | ❌ Per subnet/NIC |
+| **Logging** | Structured logs → Log Analytics | Flow logs → Storage |
+| **Cost** | ~$1.25/hour + data | Free |
+
+---
+
+## 43. What is Threat Intelligence in Azure Firewall?
+
+**Threat Intelligence (TI)** in Azure Firewall uses **Microsoft's global threat intelligence feed** to automatically alert on or block traffic to/from known malicious IP addresses and domains.
+
+**How it works:**
+```
+Microsoft Threat Intelligence Feed
+  → Continuously updated list of malicious IPs + domains
+  → Sourced from: Microsoft Security Research, Azure Sentinel,
+    MSTIC (Microsoft Threat Intelligence Center), third-party feeds
+          ↓
+Azure Firewall checks every connection against this feed
+          ↓
+Match found → Alert or Deny (based on mode)
+```
+
+**Three TI modes:**
+
+| Mode | Behavior | Use case |
+|---|---|---|
+| **Off** | TI disabled | Dev/test environments |
+| **Alert only** | Logs the match, allows traffic | Monitoring/audit mode |
+| **Alert and Deny** | Logs + blocks traffic | Production (recommended) |
+
+**Configure via Azure Firewall Policy:**
+```bash
+az network firewall policy create \
+  --name myFirewallPolicy \
+  --resource-group myRG \
+  --threat-intel-mode Deny \
+  --sku Premium     # Premium SKU for full TI + IDPS features
+```
+
+**What TI detects:**
+```
+Outbound connections to:
+  → Command & Control (C2) servers (malware botnet communication)
+  → Known malware distribution sites
+  → Phishing domains
+  → Tor exit nodes
+  → Cryptomining pools
+
+Inbound connections from:
+  → Known attack sources
+  → Scanning/enumeration IPs
+  → Botnet-infected hosts
+```
+
+**Azure Firewall Premium — additional security features:**
+
+| Feature | Standard | Premium |
+|---|---|---|
+| **Threat Intelligence** | ✅ Basic | ✅ Enhanced |
+| **IDPS (Intrusion Detection/Prevention)** | ❌ No | ✅ Yes (signature-based) |
+| **TLS Inspection** | ❌ No | ✅ Yes (decrypt + inspect HTTPS) |
+| **URL Filtering** | ❌ No | ✅ Yes (full URL, not just FQDN) |
+| **Web Categories** | ❌ No | ✅ Yes (block adult/gambling/etc.) |
+
+**TI + IDPS together (Premium):**
+```
+Encrypted HTTPS traffic
+        ↓
+TLS Inspection (decrypts traffic)
+        ↓
+IDPS (inspects decrypted payload for attack signatures)
+        ↓
+Threat Intelligence (checks IPs/domains against feed)
+        ↓
+Clean traffic forwarded to destination
+```
+
+**Monitoring TI alerts:**
+```kusto
+// Query TI hits in Log Analytics
+AzureDiagnostics
+| where Category == "AzureFirewallNetworkRule"
+| where msg_s contains "ThreatIntel"
+| project TimeGenerated, msg_s, sourceIP_s, destinationIP_s
+| order by TimeGenerated desc
+```
+
+---
+
+## 44. What is Application Gateway WAF?
+
+**Application Gateway WAF (Web Application Firewall)** is a Layer 7 security feature that protects web applications from common web exploits and vulnerabilities defined in the **OWASP Core Rule Set (CRS).**
+
+**WAF modes:**
+
+| Mode | Behavior | Use case |
+|---|---|---|
+| **Detection** | Logs threats, does NOT block | Initial deployment, tuning phase |
+| **Prevention** | Logs AND blocks threats | Production (recommended) |
+
+**OWASP rule sets supported:**
+
+| Rule Set | Coverage |
+|---|---|
+| CRS 3.2 (recommended) | Latest OWASP Top 10 + bot protection |
+| CRS 3.1 | Previous stable version |
+| CRS 3.0 | Legacy support |
+
+**OWASP Top 10 threats WAF protects against:**
+```
+A01 - Broken Access Control
+A02 - Cryptographic Failures
+A03 - Injection (SQL, NoSQL, LDAP, OS Command)
+A04 - Insecure Design
+A05 - Security Misconfiguration
+A06 - Vulnerable and Outdated Components
+A07 - Authentication and Authorization Failures
+A08 - Software and Data Integrity Failures
+A09 - Security Logging and Monitoring Failures
+A10 - Server-Side Request Forgery (SSRF)
+```
+
+**WAF Policy configuration:**
+```bash
+# Create WAF Policy
+az network application-gateway waf-policy create \
+  --name myWAFPolicy \
+  --resource-group myRG \
+  --location eastus
+
+# Set mode to Prevention
+az network application-gateway waf-policy policy-setting update \
+  --policy-name myWAFPolicy \
+  --resource-group myRG \
+  --mode Prevention \
+  --state Enabled \
+  --request-body-check true \
+  --max-request-body-size-kb 128 \
+  --file-upload-limit-mb 100
+
+# Associate with Application Gateway
+az network application-gateway update \
+  --name myAppGateway \
+  --resource-group myRG \
+  --waf-policy myWAFPolicy
+```
+
+**Custom WAF rules (beyond OWASP):**
+```bash
+# Block specific countries by IP range (geo-blocking)
+az network application-gateway waf-policy custom-rule create \
+  --policy-name myWAFPolicy \
+  --resource-group myRG \
+  --name BlockSuspiciousIP \
+  --priority 10 \
+  --rule-type MatchRule \
+  --action Block \
+  --match-conditions '[{
+    "matchVariables": [{"variableName": "RemoteAddr"}],
+    "operator": "IPMatch",
+    "matchValues": ["192.168.1.0/24", "10.0.0.0/8"]
+  }]'
+```
+
+**WAF exclusions (reduce false positives):**
+```bash
+# Exclude specific request header from WAF inspection
+# E.g., custom auth header that triggers false positive
+az network application-gateway waf-policy exclusion add \
+  --policy-name myWAFPolicy \
+  --resource-group myRG \
+  --match-variable RequestHeaderNames \
+  --selector-match-operator Equals \
+  --selector "X-Custom-Auth-Header"
+```
+
+**WAF logs — query in Log Analytics:**
+```kusto
+AzureDiagnostics
+| where ResourceType == "APPLICATIONGATEWAYS"
+| where Category == "ApplicationGatewayFirewallLog"
+| where action_s == "Blocked"
+| summarize count() by ruleId_s, requestUri_s
+| order by count_ desc
+```
+
+---
+
+## 45. What is the difference between WAF and Firewall?
+
+| Feature | Azure Firewall | Application Gateway WAF |
+|---|---|---|
+| **OSI Layer** | L3, L4, L7 (FQDN) | L7 only (HTTP/HTTPS) |
+| **Primary purpose** | Network-level perimeter security | Web application protection |
+| **Traffic direction** | Inbound + Outbound + East-West | Inbound web traffic only |
+| **Protocol support** | Any TCP/UDP + HTTP/HTTPS | HTTP, HTTPS, WebSocket, HTTP/2 |
+| **OWASP rules** | ❌ No | ✅ Yes (CRS 3.x) |
+| **SQL Injection protection** | ❌ No | ✅ Yes |
+| **XSS protection** | ❌ No | ✅ Yes |
+| **IP/Port filtering** | ✅ Yes | Limited (custom rules) |
+| **FQDN filtering** | ✅ Yes | ❌ No |
+| **Threat Intelligence** | ✅ Yes | ❌ No |
+| **TLS Inspection** | ✅ Premium only | ✅ Yes (SSL offload) |
+| **IDPS** | ✅ Premium only | ❌ No |
+| **East-West traffic** | ✅ Yes (between subnets) | ❌ No |
+| **Scope** | Entire VNet / Hub | Per application |
+| **Cost** | ~$1.25/hr + data | Included in App Gateway v2 |
+
+**They are COMPLEMENTARY, not alternatives:**
+
+```
+Internet
+    ↓
+Azure DDoS Protection          ← L3/L4 volumetric attack absorption
+    ↓
+Azure Firewall                 ← Network perimeter, threat intel, outbound control
+    ↓
+Application Gateway + WAF      ← Web app protection, OWASP rules, SSL termination
+    ↓
+Backend Application Servers    ← Protected end-to-end
+```
+
+**Decision guide:**
+
+```
+Protecting web apps from SQLi/XSS/OWASP?  → WAF
+Controlling outbound internet access?      → Azure Firewall
+Filtering non-HTTP protocols?              → Azure Firewall
+East-West traffic between subnets?         → Azure Firewall
+Threat intelligence blocking?              → Azure Firewall
+SSL termination + L7 routing?              → App Gateway (with WAF)
+Complete protection?                       → Both together
+```
+
+---
+
+## 46. What is Azure SQL Elastic Pool?
+
+An **Elastic Pool** is a shared resource model where **multiple Azure SQL databases share a common pool of compute and storage resources (eDTUs or vCores)**, optimizing cost for databases with variable/unpredictable usage.
+
+**Problem it solves:**
+```
+Without Elastic Pool:
+  DB1 (peak at 9 AM):  needs 100 DTUs → provisioned 100 DTUs
+  DB2 (peak at 2 PM):  needs 100 DTUs → provisioned 100 DTUs
+  DB3 (peak at 8 PM):  needs 100 DTUs → provisioned 100 DTUs
+  Total cost: 300 DTUs (even though peaks never overlap)
+
+With Elastic Pool:
+  Pool: 150 eDTUs shared among DB1, DB2, DB3
+  Each DB bursts up to 100 eDTUs but shares pool
+  Total cost: 150 eDTUs → ~50% savings
+```
+
+**Elastic Pool architecture:**
+```
+Elastic Pool (200 eDTUs total)
+  ├── Database A: min 0 eDTU, max 100 eDTU
+  ├── Database B: min 0 eDTU, max 100 eDTU
+  ├── Database C: min 10 eDTU, max 50 eDTU
+  └── Database D: min 0 eDTU, max 50 eDTU
+  (Sum of maximums > Pool total = by design)
+```
+
+**When to use Elastic Pools:**
+
+| Scenario | Elastic Pool? |
+|---|---|
+| SaaS with many small tenant DBs | ✅ Ideal |
+| Databases with predictable, constant load | ❌ Use single DB |
+| Variable, unpredictable workloads | ✅ Ideal |
+| All DBs peak at same time | ❌ No benefit |
+| Minimum 2+ databases | ✅ Required |
+
+**Create Elastic Pool:**
+```bash
+# Create pool
+az sql elastic-pool create \
+  --server mySQLServer \
+  --resource-group myRG \
+  --name myElasticPool \
+  --edition Standard \
+  --dtu 200 \
+  --db-dtu-min 0 \
+  --db-dtu-max 100
+
+# Add database to pool
+az sql db create \
+  --server mySQLServer \
+  --resource-group myRG \
+  --name myDB \
+  --elastic-pool myElasticPool
+```
+
+**Elastic Pool limits:**
+
+| Service Tier | Max DBs per Pool | Max eDTUs/vCores |
+|---|---|---|
+| Basic | 500 | 1600 eDTU |
+| Standard | 500 | 3000 eDTU |
+| Premium | 100 | 4000 eDTU |
+| General Purpose (vCore) | 500 | 80 vCores |
+| Business Critical (vCore) | 100 | 80 vCores |
+
+---
+
+## 47. What is the difference between DTU and vCore models?
+
+**DTU (Database Transaction Unit)** is a blended measure of CPU, memory, and I/O bundled together. **vCore** separates compute, memory, and storage for full control.
+
+| Feature | DTU Model | vCore Model |
+|---|---|---|
+| **Pricing model** | Bundled (CPU+RAM+IO combined) | Separate compute + storage |
+| **Transparency** | Opaque (what is 1 DTU?) | Clear (X vCores, Y GB RAM) |
+| **Compute control** | Limited | Full control |
+| **Storage scaling** | Tied to service tier | Independent of compute |
+| **Azure Hybrid Benefit** | ❌ No | ✅ Yes (SQL Server license) |
+| **Reserved capacity** | ❌ No | ✅ Yes (1 or 3 year savings) |
+| **Serverless** | ❌ No | ✅ Yes (auto-pause, auto-scale) |
+| **Max memory** | Tier-dependent | Up to 40 GB (GP), 238 GB (BC) |
+| **In-memory OLTP** | ❌ No | ✅ Business Critical only |
+| **Migration from on-prem** | Harder to size | Easier (map to SQL Server cores) |
+| **Best for** | Simple, predictable workloads | Complex, enterprise workloads |
+
+**DTU tiers:**
+```
+Basic:    5 DTUs,   2 GB storage    → Dev/Test, tiny apps
+Standard: 10–3000 DTUs, 1 TB       → SMB workloads, web apps
+Premium:  125–4000 DTUs, 4 TB      → OLTP, mission-critical
+```
+
+**vCore tiers:**
+```
+General Purpose:
+  → Balanced compute + storage
+  → 2–80 vCores, up to 40 GB RAM
+  → Remote storage (Premium SSD)
+  → 99.99% SLA
+
+Business Critical:
+  → High performance + HA
+  → 2–80 vCores, up to 238 GB RAM
+  → Local NVMe SSD (ultra-fast)
+  → Built-in read replica (free)
+  → 99.99% SLA
+
+Hyperscale:
+  → Massive scale (up to 100 TB)
+  → Instant backups (snapshot-based)
+  → Rapid scale-out (read replicas in minutes)
+  → Best for very large OLTP/mixed workloads
+```
+
+**DTU to vCore rough mapping:**
+```
+100 DTUs  ≈ 1 vCore (General Purpose)
+200 DTUs  ≈ 2 vCores
+400 DTUs  ≈ 4 vCores
+800 DTUs  ≈ 8 vCores
+```
+
+**Azure Hybrid Benefit (vCore only):**
+```
+Standard SQL Server License → 1 vCore Azure SQL General Purpose
+Enterprise SQL License      → 1 vCore Azure SQL Business Critical
+→ Saves up to 55% vs pay-as-you-go pricing
+```
+
+---
+
+## 48. What is Always Encrypted in SQL?
+
+**Always Encrypted** is a SQL Server / Azure SQL feature that **encrypts sensitive data on the client side** so that the database engine **never sees the plaintext data** — not even DBAs or cloud admins.
+
+**Core principle:**
+```
+Traditional encryption:  Data encrypted at rest/in transit
+                         → SQL Server decrypts → processes → returns
+                         → DBA CAN see plaintext data
+
+Always Encrypted:        Encryption/decryption happens CLIENT-SIDE ONLY
+                         → SQL Server only ever sees ciphertext
+                         → DBA CANNOT see plaintext data
+                         → Even if DB is compromised → data useless
+```
+
+**Architecture:**
+```
+Client Application
+  ↓ (has Column Master Key)
+Client Driver (ADO.NET, JDBC, ODBC)
+  → Encrypts data before sending to SQL
+  → Decrypts results after receiving from SQL
+          ↓ (only ciphertext transmitted)
+Azure SQL Database
+  → Stores ciphertext only
+  → Queries on ciphertext only
+  → Column Master Key NEVER leaves client/Key Vault
+```
+
+**Two key types:**
+
+| Key | Location | Purpose |
+|---|---|---|
+| **Column Master Key (CMK)** | Azure Key Vault or Windows Cert Store | Master key, protects CEKs |
+| **Column Encryption Key (CEK)** | SQL Database (encrypted by CMK) | Actually encrypts column data |
+
+**Two encryption types:**
+
+| Type | Supports equality queries | Supports range queries | Use case |
+|---|---|---|---|
+| **Deterministic** | ✅ Yes (WHERE, JOIN, GROUP BY) | ❌ No | SSN, Email, ID lookups |
+| **Randomized** | ❌ No | ❌ No | Salary, medical data (no querying needed) |
+
+**Setup Always Encrypted:**
+```sql
+-- Step 1: Create Column Master Key (points to Azure Key Vault)
+CREATE COLUMN MASTER KEY MyCMK
+WITH (
+  KEY_STORE_PROVIDER_NAME = 'AZURE_KEY_VAULT',
+  KEY_PATH = 'https://myKeyVault.vault.azure.net/keys/MyCMK/version'
+);
+
+-- Step 2: Create Column Encryption Key
+CREATE COLUMN ENCRYPTION KEY MyCEK
+WITH VALUES (
+  COLUMN_MASTER_KEY = MyCMK,
+  ALGORITHM = 'RSA_OAEP',
+  ENCRYPTED_VALUE = 0x01700000...  -- encrypted by CMK
+);
+
+-- Step 3: Create table with encrypted columns
+CREATE TABLE Patients (
+  PatientID       INT IDENTITY PRIMARY KEY,
+  Name            NVARCHAR(100),
+  SSN             CHAR(11) ENCRYPTED WITH (
+                    ENCRYPTION_TYPE = DETERMINISTIC,
+                    ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256',
+                    COLUMN_ENCRYPTION_KEY = MyCEK),
+  Salary          DECIMAL(10,2) ENCRYPTED WITH (
+                    ENCRYPTION_TYPE = RANDOMIZED,
+                    ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256',
+                    COLUMN_ENCRYPTION_KEY = MyCEK)
+);
+```
+
+**Always Encrypted with Secure Enclaves (enhanced):**
+```
+Standard Always Encrypted:
+  → No pattern matching on encrypted columns
+  → No range queries on encrypted columns
+
+Always Encrypted + Secure Enclaves:
+  → Trusted Execution Environment (TEE) inside SQL Server
+  → Can do: LIKE, >, <, BETWEEN on encrypted data
+  → Enclave decrypts temporarily inside protected memory
+  → Enables richer queries while maintaining encryption
+```
+
+---
+
+## 49. How do you implement Geo-Replication in Azure SQL Database?
+
+**Active Geo-Replication** creates **readable secondary replicas** in different Azure regions, providing disaster recovery and read scale-out.
+
+**Architecture:**
+```
+Primary DB (East US) ─── async replication ───→ Secondary DB (West Europe) [readable]
+                     ─── async replication ───→ Secondary DB (Southeast Asia) [readable]
+                     ─── async replication ───→ Secondary DB (UK South) [readable]
+Max: 4 readable secondaries per primary
+```
+
+**Key characteristics:**
+- Secondaries are **readable** — can offload read workloads
+- Replication is **asynchronous** — slight lag (RPO ~seconds)
+- **Manual failover** required (unlike Failover Groups which are automatic)
+- Secondaries are in **same or different subscriptions**
+- Supports **Premium and Business Critical** tiers
+
+**Configure geo-replication:**
+```bash
+# Create secondary replica in West Europe
+az sql db replica create \
+  --name myDatabase \
+  --server myPrimaryServer \
+  --resource-group myRG \
+  --partner-server mySecondaryServer \
+  --partner-resource-group mySecondaryRG \
+  --partner-location westeurope \
+  --secondary-type Geo
+```
+
+**Manual failover (planned — synchronous, no data loss):**
+```bash
+az sql db replica set-primary \
+  --name myDatabase \
+  --server mySecondaryServer \
+  --resource-group mySecondaryRG
+```
+
+**Forced failover (unplanned — async, possible data loss):**
+```bash
+az sql db replica set-primary \
+  --name myDatabase \
+  --server mySecondaryServer \
+  --resource-group mySecondaryRG \
+  --allow-data-loss
+```
+
+**Geo-Replication vs Failover Groups:**
+
+| Feature | Geo-Replication | Failover Groups |
+|---|---|---|
+| **Failover** | Manual only | Manual + Automatic |
+| **DNS endpoint** | ❌ No (server name changes) | ✅ Yes (stable endpoint) |
+| **Multiple DBs** | Per database | Group of databases |
+| **Read endpoint** | Direct secondary server | `.secondary.database.windows.net` |
+| **Scope** | Single database | Multiple databases |
+| **App connection string change** | Required on failover | ❌ Not required (DNS updates) |
+
+---
+
+## 50. How do you implement Failover Groups in SQL Database?
+
+**Failover Groups** extend geo-replication by adding **automatic failover, stable connection endpoints, and group-level management** for one or more databases.
+
+**Architecture:**
+```
+Failover Group: "mygroup"
+  ├── Primary Server: myserver-primary (East US)
+  │     └── DB1, DB2, DB3 (all replicated)
+  └── Secondary Server: myserver-secondary (West Europe)
+        └── DB1, DB2, DB3 (readable secondaries)
+
+Connection endpoints:
+  Read-Write: mygroup.database.windows.net → always points to PRIMARY
+  Read-Only:  mygroup.secondary.database.windows.net → always points to SECONDARY
+```
+
+**Key advantages over geo-replication:**
+```
+1. Stable DNS endpoints → app connection strings NEVER change on failover
+2. Automatic failover → no manual intervention needed
+3. Group management → replicate multiple DBs as one unit
+4. Read-only endpoint → built-in read scale-out
+```
+
+**Create Failover Group:**
+```bash
+# Step 1: Create secondary server
+az sql server create \
+  --name myserver-secondary \
+  --resource-group mySecondaryRG \
+  --location westeurope \
+  --admin-user sqladmin \
+  --admin-password <password>
+
+# Step 2: Create Failover Group
+az sql failover-group create \
+  --name myFailoverGroup \
+  --server myserver-primary \
+  --resource-group myRG \
+  --partner-server myserver-secondary \
+  --partner-resource-group mySecondaryRG \
+  --failover-policy Automatic \
+  --grace-period 1 \       # Hours before automatic failover triggers
+  --add-db myDatabase1 \
+  --add-db myDatabase2
+```
+
+**Failover policies:**
+
+| Policy | Behavior | Use case |
+|---|---|---|
+| **Automatic** | Fails over after grace period (min 1 hour) | Mission-critical, zero-touch DR |
+| **Manual** | Only fails over when explicitly triggered | Controlled DR, compliance scenarios |
+
+**Connection strings (never change regardless of failover):**
+```
+# Application always uses these — DNS auto-updates on failover
+
+# Read-Write (primary):
+Server=tcp:myFailoverGroup.database.windows.net,1433;
+Database=myDatabase;
+
+# Read-Only (secondary — for reporting, analytics):
+Server=tcp:myFailoverGroup.secondary.database.windows.net,1433;
+Database=myDatabase;ApplicationIntent=ReadOnly;
+```
+
+**Manual failover (planned maintenance):**
+```bash
+# Graceful failover — waits for sync, zero data loss
+az sql failover-group set-primary \
+  --name myFailoverGroup \
+  --server myserver-secondary \
+  --resource-group mySecondaryRG
+```
+
+**Failover group with Elastic Pool:**
+```bash
+# All databases in pool can be added to failover group
+az sql failover-group create \
+  --name myFailoverGroup \
+  --server myserver-primary \
+  --resource-group myRG \
+  --partner-server myserver-secondary \
+  --failover-policy Automatic \
+  --grace-period 2 \
+  --add-elastic-pool myElasticPool
+```
+
+**Monitoring failover group health:**
+```bash
+# Check replication state and lag
+az sql failover-group show \
+  --name myFailoverGroup \
+  --server myserver-primary \
+  --resource-group myRG \
+  --query "{role:replicationRole, state:replicationState, lag:replicationStateDescription}"
+```
+
+**Complete SQL HA/DR strategy:**
+```
+Within Region (HA):
+  → Azure SQL uses built-in Always On (automatic, transparent)
+  → General Purpose: remote storage redundancy
+  → Business Critical: 3-node Always On cluster
+
+Across Regions (DR):
+  → Failover Groups (automatic failover + stable endpoints)
+  → Grace period: 1 hour (balance between false positives and RTO)
+
+Read Scale-Out:
+  → Route reporting queries to .secondary endpoint
+  → Reduces primary load, improves performance
+
+Backup Strategy:
+  → Full: weekly, Differential: 12hr, Log: 5-10min
+  → Retention: 7–35 days (configurable)
+  → Long-term retention: up to 10 years
+```
+
+# Azure Interview Questions – Detailed Answers (Q51–Q70)
+
+---
+
+## 51. What is Azure Cosmos DB?
+
+**Azure Cosmos DB** is Microsoft's **fully managed, globally distributed, multi-model NoSQL database** designed for mission-critical applications requiring low latency, high availability, and elastic scale.
+
+**Core capabilities:**
+```
+Global Distribution  → Replicate data to any Azure region with one click
+Multi-Model         → SQL, MongoDB, Cassandra, Gremlin, Table APIs
+Elastic Scale       → Scale RUs and storage independently, instantly
+Low Latency         → <10ms reads, <15ms writes at 99th percentile
+High Availability   → 99.999% SLA (multi-region), 99.99% (single-region)
+Multiple Consistency → 5 consistency levels (Strong → Eventual)
+```
+
+**Resource hierarchy:**
+```
+Azure Cosmos DB Account
+  └── Database
+        └── Container (Collection / Table / Graph)
+              └── Items (Documents / Rows / Nodes)
+                    └── Partition (logical grouping by partition key)
+```
+
+**Key differentiators vs traditional databases:**
+
+| Feature | Azure SQL | Azure Cosmos DB |
+|---|---|---|
+| **Schema** | Fixed (relational) | Schema-agnostic |
+| **Scale** | Vertical (scale-up) | Horizontal (scale-out) |
+| **Distribution** | Single region (+ geo-rep) | Native multi-region |
+| **Latency SLA** | No guarantee | <10ms at p99 |
+| **APIs** | SQL only | 5 APIs |
+| **Consistency** | Strong only | 5 levels |
+| **Pricing** | vCore/DTU | RU/s + storage |
+
+**Best use cases:**
+- IoT telemetry at scale
+- Real-time personalization
+- Gaming leaderboards
+- E-commerce product catalogs
+- Global user profile stores
+- Multi-region active-active apps
+
+---
+
+## 52. What is the difference between Cosmos DB APIs?
+
+Cosmos DB supports **5 wire-protocol compatible APIs** — same engine underneath, different interfaces:
+
+| API | Protocol compatible with | Data model | Query language | Use case |
+|---|---|---|---|---|
+| **NoSQL (SQL)** | Native Cosmos DB | JSON documents | SQL-like (SELECT, WHERE) | New apps, JSON docs |
+| **MongoDB** | MongoDB wire protocol | BSON documents | MongoDB query language | Migrate MongoDB apps |
+| **Cassandra** | Apache Cassandra CQL | Wide-column (rows) | CQL (Cassandra Query Language) | Migrate Cassandra apps |
+| **Gremlin** | Apache TinkerPop | Graph (nodes + edges) | Gremlin traversal language | Relationship/graph data |
+| **Table** | Azure Table Storage | Key-value pairs | OData / REST | Migrate Azure Table Storage |
+
+**API comparison in depth:**
+
+**NoSQL (SQL) API — recommended for new projects:**
+```json
+// Document structure
+{
+  "id": "user123",
+  "name": "John Doe",
+  "email": "john@example.com",
+  "orders": [
+    {"orderId": "ord1", "amount": 99.99}
+  ],
+  "partitionKey": "US"
+}
+
+// Query
+SELECT c.name, c.email
+FROM c
+WHERE c.partitionKey = "US"
+AND c.orders[0].amount > 50
+```
+
+**MongoDB API:**
+```javascript
+// Same Cosmos DB backend, MongoDB driver works as-is
+db.users.find({
+  "address.country": "US",
+  "orders.amount": { $gt: 50 }
+})
+// Existing MongoDB apps work with connection string change only
+```
+
+**Cassandra API:**
+```sql
+-- Wide-column model, CQL syntax
+CREATE TABLE users (
+  user_id UUID PRIMARY KEY,
+  name TEXT,
+  email TEXT
+);
+SELECT * FROM users WHERE user_id = ?;
+```
+
+**Gremlin (Graph) API:**
+```groovy
+// Traverse relationships
+g.V().hasLabel('person').has('name', 'John')
+ .out('knows')          // John's friends
+ .out('knows')          // Friends of friends
+ .values('name')        // Get their names
+```
+
+**Table API:**
+```
+// Key-value, compatible with Azure Table Storage SDK
+PartitionKey: "US"
+RowKey: "user123"
+Name: "John Doe"
+Email: "john@example.com"
+// Azure Table Storage apps migrate with connection string change
+```
+
+---
+
+## 53. What is RUs in Cosmos DB?
+
+**Request Units (RUs)** are the **currency of throughput** in Cosmos DB — a normalized measure that abstracts CPU, memory, and IOPS into a single unit.
+
+**RU cost basis:**
+```
+1 RU = Cost to read a 1KB item by its ID (point read)
+       (single-partition, indexed document)
+```
+
+**Typical RU costs:**
+
+| Operation | Typical RU cost |
+|---|---|
+| Point read (1KB item by ID) | 1 RU |
+| Point write (1KB item) | ~5 RUs |
+| Query (single partition, simple) | 2–10 RUs |
+| Query (cross-partition) | 10–100+ RUs |
+| Query (full scan, large result) | 100–1000+ RUs |
+| Stored procedure execution | Variable |
+
+**Factors that affect RU cost:**
+```
+Item size          → 10KB item costs ~10x more than 1KB item
+Indexing policy    → More indexes = higher write RU cost
+Query complexity   → Joins, aggregations, cross-partition = more RUs
+Consistency level  → Strong > Bounded Staleness > Session > Eventual
+Number of regions  → Multi-region write multiplies write RU cost
+```
+
+**RU provisioning models:**
+
+```
+Manual Throughput:
+  → Fixed RUs allocated (e.g., 400 RU/s)
+  → 400 RU/s minimum per container
+  → Throttled (HTTP 429) if exceeded
+  → Billed for provisioned amount regardless of usage
+
+Autoscale Throughput:
+  → Set maximum RUs (e.g., 4000 RU/s)
+  → Scales from 10% to max automatically (400–4000 RU/s)
+  → No throttling within range
+  → Billed for highest RU/s per hour
+```
+
+**Estimating RU requirements:**
+```
+Read-heavy app (e-commerce catalog):
+  1000 reads/sec × 2 RU avg = 2000 RU/s needed
+
+Write-heavy app (IoT telemetry):
+  500 writes/sec × 10 RU avg = 5000 RU/s needed
+
+Mixed workload:
+  Calculate peak reads + writes + queries separately
+  Add 20–30% headroom for spikes
+```
+
+**Handle throttling (HTTP 429):**
+```csharp
+// Cosmos DB SDK automatically retries with exponential backoff
+CosmosClientOptions options = new CosmosClientOptions
+{
+    MaxRetryAttemptsOnRateLimitedRequests = 9,
+    MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(30)
+};
+```
+
+---
+
+## 54. What is Partitioning in Cosmos DB?
+
+**Partitioning** is the mechanism Cosmos DB uses to **horizontally scale data and throughput** by distributing data across multiple physical partitions using a **partition key.**
+
+**Two levels of partitioning:**
+```
+Logical Partitions:
+  → Defined by partition key value
+  → Max size: 20 GB per logical partition
+  → All items with same partition key = same logical partition
+  → Max 20 GB and 10,000 RU/s per logical partition
+
+Physical Partitions:
+  → Internal Azure infrastructure (SSDs + compute)
+  → Each physical partition: up to 50 GB, 10,000 RU/s
+  → Multiple logical partitions map to one physical partition
+  → Physical partitions split automatically as data grows
+```
+
+**Partition key selection — critical design decision:**
+
+| Criterion | Good partition key | Bad partition key |
+|---|---|---|
+| **Cardinality** | High (many unique values) | Low (few values like true/false) |
+| **Distribution** | Even data spread | Hot partition (one key dominates) |
+| **Query pattern** | Matches WHERE clauses | Never used in queries |
+| **Write distribution** | Spreads writes evenly | Sequential IDs (timestamp, auto-increment) |
+
+**Examples:**
+
+```
+E-commerce Orders:
+  ❌ Bad:  status ("pending", "complete") → only 2-3 values, hot partitions
+  ❌ Bad:  createdDate → sequential, all writes to "today" partition
+  ✅ Good: customerId → high cardinality, even distribution
+
+IoT Telemetry:
+  ❌ Bad:  deviceType → few values
+  ✅ Good: deviceId → millions of unique devices
+
+Social Media Posts:
+  ❌ Bad:  userId (if celebrity has millions of posts → 20GB limit hit)
+  ✅ Good: userId + month composite → "user123_2024_01"
+```
+
+**Cross-partition vs single-partition queries:**
+```
+Single-partition query (efficient):
+  SELECT * FROM c WHERE c.customerId = "cust123"
+  → Routed to ONE physical partition → fast + cheap
+
+Cross-partition query (expensive):
+  SELECT * FROM c WHERE c.amount > 1000
+  → Fan-out to ALL partitions → slow + costly
+  → Use sparingly, add to indexing policy if needed
+```
+
+**Synthetic partition keys (for hot partition problems):**
+```javascript
+// Problem: Only 10 users but millions of orders
+// Solution: Append random suffix to partition key
+
+const suffix = Math.floor(Math.random() * 10); // 0-9
+item.partitionKey = `${userId}_${suffix}`;
+
+// Now 10 users × 10 suffixes = 100 logical partitions
+// Tradeoff: Must query all suffixes to aggregate one user's data
+```
+
+---
+
+## 55. What is the difference between Manual and Autoscale RUs?
+
+| Feature | Manual (Standard) | Autoscale |
+|---|---|---|
+| **Provisioning** | Fixed RU/s set by admin | Max RU/s, scales 10%–100% automatically |
+| **Minimum RUs** | 400 RU/s | 10% of max (e.g., max 4000 → min 400) |
+| **Scale speed** | Manual change (minutes) | Instant (within seconds) |
+| **Throttling** | Yes (if exceeded) | No (within max limit) |
+| **Billing** | Provisioned RU/s (always) | Highest RU/s consumed per hour |
+| **Cost predictability** | High (fixed cost) | Variable (based on usage) |
+| **Best for** | Steady, predictable workloads | Variable, spiky workloads |
+| **Dev/Test** | Use lowest (400 RU/s) | Use autoscale (cost-efficient at low usage) |
+
+**Cost comparison example:**
+```
+Workload: peaks at 4000 RU/s for 2 hrs/day, idles at 400 RU/s rest of day
+
+Manual (4000 RU/s fixed):
+  → Pay 4000 RU/s × 24 hrs = expensive even during idle
+
+Autoscale (max 4000 RU/s):
+  → Pay 4000 RU/s × 2 hrs (peak)
+  → Pay 400 RU/s × 22 hrs (idle)
+  → Significant savings for spiky workloads
+```
+
+**Switching between modes:**
+```bash
+# Switch container to autoscale
+az cosmosdb sql container throughput migrate \
+  --account-name myCosmosAccount \
+  --database-name myDB \
+  --name myContainer \
+  --resource-group myRG \
+  --throughput-type autoscale
+```
+
+---
+
+## 56. What is Consistency Model in Cosmos DB?
+
+**Consistency models** define the **trade-off between data freshness, availability, and performance** in a distributed database where data is replicated across multiple regions.
+
+**The CAP theorem context:**
+```
+CAP Theorem: A distributed system can only guarantee 2 of 3:
+  C = Consistency (all nodes see same data)
+  A = Availability (system always responds)
+  P = Partition Tolerance (works despite network failures)
+
+Cosmos DB: Chooses C-P or A-P depending on consistency level
+  Strong    → Prioritizes C over A (lower availability)
+  Eventual  → Prioritizes A over C (may return stale data)
+  Middle 3  → Tunable trade-offs between C and A
+```
+
+**PACELC model (more complete than CAP):**
+```
+When Partition: choose Availability or Consistency
+Else (no partition): choose Latency or Consistency
+
+Cosmos DB covers the entire PACELC spectrum with 5 consistency levels
+```
+
+---
+
+## 57. What are the 5 Consistency Models in Cosmos DB?
+
+```
+Strong ──── Bounded Staleness ──── Session ──── Consistent Prefix ──── Eventual
+(Highest consistency)                                          (Highest availability)
+(Lowest availability)                                          (Lowest latency)
+(Highest latency)                                              (Lowest consistency)
+```
+
+**1. Strong Consistency:**
+```
+Guarantee: Always reads the latest committed write
+Behavior:  Read must see ALL previous writes before returning
+Latency:   Highest (must wait for all replicas to confirm)
+Availability: Reduced (cannot serve reads during network issues)
+Write RU cost: Highest (synchronous across regions)
+Use case:  Financial transactions, inventory systems
+           Where stale data = business error
+
+Example:
+  Write $100 transfer → MUST see $100 balance on immediate read
+  Guaranteed always
+```
+
+**2. Bounded Staleness:**
+```
+Guarantee: Reads lag behind writes by at most K versions OR T seconds
+           (you define K and T)
+Behavior:  Global ordering guaranteed, bounded lag only
+Latency:   High (similar to Strong for single-region)
+Use case:  News feeds, live scores (slight delay acceptable)
+           Multi-region with near-real-time consistency needed
+
+Example:
+  Configure: max 100 versions OR 5 seconds lag
+  Read might see data up to 5 seconds old, never older
+```
+
+**3. Session Consistency (DEFAULT — most popular):**
+```
+Guarantee: Within a session = Strong consistency
+           Across sessions = Eventual consistency
+Behavior:  Your own writes are always visible to you immediately
+           Other clients may see slightly stale data
+Latency:   Low
+Use case:  User profile updates, shopping cart, social media posts
+           "Read your own writes" guarantee needed
+
+Example:
+  User updates their profile → immediately sees their own update
+  Other users may see old profile for a few seconds
+```
+
+**4. Consistent Prefix:**
+```
+Guarantee: Reads never see out-of-order writes
+           Reads lag behind but always in correct order
+Behavior:  Never see Write3 without first seeing Write1 and Write2
+Latency:   Low
+Use case:  Social media timelines, event streams, order tracking
+
+Example:
+  Writes: A → B → C
+  Reader might see: A (ok), A,B (ok), A,B,C (ok)
+  Reader never sees: B without A, or C without A,B
+```
+
+**5. Eventual Consistency:**
+```
+Guarantee: All replicas will eventually converge (no time bound)
+Behavior:  May read stale or out-of-order data
+Latency:   Lowest
+Availability: Highest
+Cost:      Lowest RU cost (reads cheapest)
+Use case:  Non-critical counters, likes/views count, recommendations
+           Highest throughput needed, correctness less critical
+
+Example:
+  Like counter: shows 1000 likes, actual may be 1003
+  Eventually all regions show correct count
+```
+
+**Consistency selection guide:**
+```
+Strong          → Banking, stock trading, medical records
+Bounded Staleness → Multiplayer gaming scores, live auctions
+Session         → Most web/mobile apps (DEFAULT, recommended start)
+Consistent Prefix → Event sourcing, change tracking
+Eventual        → Social media counters, telemetry aggregation
+```
+
+---
+
+## 58. What is Multi-Region Write in Cosmos DB?
+
+**Multi-region write** (Multi-master) allows **writes to be accepted in ANY configured region simultaneously**, rather than routing all writes to a single primary region.
+
+**Single-region write vs Multi-region write:**
+```
+Single-Region Write:
+  Region A (Write) ──async replication──→ Region B (Read only)
+                   ──async replication──→ Region C (Read only)
+  Write latency from Region C: high (must round-trip to Region A)
+
+Multi-Region Write:
+  Region A (Read+Write) ←──sync──→ Region B (Read+Write)
+                        ←──sync──→ Region C (Read+Write)
+  Write latency from Region C: low (writes locally in Region C)
+```
+
+**Enable multi-region write:**
+```bash
+az cosmosdb update \
+  --name myCosmosAccount \
+  --resource-group myRG \
+  --enable-multiple-write-locations true \
+  --locations regionName=eastus failoverPriority=0 isZoneRedundant=true \
+             regionName=westeurope failoverPriority=1 isZoneRedundant=true \
+             regionName=southeastasia failoverPriority=2 isZoneRedundant=true
+```
+
+**Conflict resolution (critical with multi-region writes):**
+
+When two regions write to the same item simultaneously → conflict occurs.
+
+| Resolution Policy | Behavior | Use case |
+|---|---|---|
+| **Last Write Wins (LWW)** | Highest `_ts` timestamp wins | Default, most scenarios |
+| **Custom (Merge Procedure)** | User-defined stored procedure resolves conflict | Complex business rules |
+| **Manual (Conflict Feed)** | Conflicts stored in feed for app to resolve | Audit trail needed |
+
+```javascript
+// Custom merge procedure example
+function mergeItems(existingItem, incomingItem, isTombstone) {
+  if (!existingItem) return incomingItem;
+  // Business rule: keep highest value
+  existingItem.score = Math.max(existingItem.score, incomingItem.score);
+  return existingItem;
+}
+```
+
+**Multi-region write RU cost:**
+```
+Single-region write: 1 RU/s provisioned per region for reads
+Multi-region write:  Writes charged × number of regions
+  Example: 1000 RU/s × 3 regions = 3000 RU/s billed
+  Trade-off: Higher cost, lower write latency globally
+```
+
+---
+
+## 59. How do you secure Cosmos DB with Private Link?
+
+**Private Link** brings Cosmos DB into your VNet via a **Private Endpoint**, eliminating exposure to the public internet.
+
+**Architecture without Private Link:**
+```
+App (VNet) ──→ Internet ──→ myaccount.documents.azure.com (public endpoint)
+              (traffic leaves VNet, traverses internet)
+```
+
+**Architecture with Private Link:**
+```
+App (VNet) ──→ Private Endpoint (10.0.1.5 in your VNet) ──→ Cosmos DB
+              (traffic stays on Microsoft backbone, never hits internet)
+```
+
+**Implementation:**
+```bash
+# Step 1: Disable public network access
+az cosmosdb update \
+  --name myCosmosAccount \
+  --resource-group myRG \
+  --public-network-access Disabled
+
+# Step 2: Create Private Endpoint
+az network private-endpoint create \
+  --name myCosmosPrivateEndpoint \
+  --resource-group myRG \
+  --vnet-name myVNet \
+  --subnet mySubnet \
+  --private-connection-resource-id \
+    /subscriptions/.../Microsoft.DocumentDB/databaseAccounts/myCosmosAccount \
+  --group-id Sql \
+  --connection-name myCosmosConnection
+
+# Step 3: Create Private DNS Zone for name resolution
+az network private-dns zone create \
+  --resource-group myRG \
+  --name "privatelink.documents.azure.com"
+
+# Step 4: Link DNS Zone to VNet
+az network private-dns link vnet create \
+  --resource-group myRG \
+  --zone-name "privatelink.documents.azure.com" \
+  --name myDNSLink \
+  --virtual-network myVNet \
+  --registration-enabled false
+
+# Step 5: Create DNS record for private endpoint
+az network private-endpoint dns-zone-group create \
+  --resource-group myRG \
+  --endpoint-name myCosmosPrivateEndpoint \
+  --name myZoneGroup \
+  --private-dns-zone "privatelink.documents.azure.com" \
+  --zone-name "privatelink.documents.azure.com"
+```
+
+**Additional Cosmos DB security layers:**
+
+| Layer | Control | Implementation |
+|---|---|---|
+| **Network** | Private Endpoint | Disable public access |
+| **Authentication** | Keys or RBAC | Prefer Azure AD RBAC |
+| **Authorization** | Built-in RBAC roles | `Cosmos DB Data Reader/Contributor` |
+| **Encryption** | At rest + in transit | Default AES-256, TLS 1.2+ |
+| **Firewall** | IP allowlist | Allow specific IP ranges |
+| **Keys** | Primary + Secondary | Rotate regularly via Key Vault |
+
+```bash
+# Use Azure RBAC instead of account keys (recommended)
+az cosmosdb sql role assignment create \
+  --account-name myCosmosAccount \
+  --resource-group myRG \
+  --role-definition-name "Cosmos DB Built-in Data Contributor" \
+  --principal-id <managed-identity-principal-id> \
+  --scope "/subscriptions/.../databaseAccounts/myCosmosAccount"
+```
+
+---
+
+## 60. What is Change Feed in Cosmos DB?
+
+**Change Feed** is a persistent, ordered log of every **insert and update** to items in a Cosmos DB container, enabling **event-driven architectures** and **real-time data processing.**
+
+**How Change Feed works:**
+```
+Application writes/updates items in Container
+           ↓
+Cosmos DB records changes in Change Feed (ordered by modification time)
+           ↓
+Change Feed consumers read and process changes
+           ↓
+Consumer checkpoints position → can resume from any point
+```
+
+**Key characteristics:**
+```
+✅ Captures: Inserts + Updates
+❌ Does NOT capture: Deletes (use soft-delete pattern)
+✅ Ordering: Per logical partition (guaranteed order)
+✅ Retention: Indefinite (as long as data exists)
+✅ Multiple consumers: Each consumer tracks own position
+✅ At-least-once delivery: may deliver duplicates → design for idempotency
+```
+
+**Three consumption models:**
+
+**1. Change Feed Processor (recommended):**
+```csharp
+// Automatically distributes partitions across multiple consumers
+var processor = container.GetChangeFeedProcessorBuilder<MyItem>(
+    processorName: "myProcessor",
+    onChangesDelegate: HandleChangesAsync)
+  .WithInstanceName("instance1")
+  .WithLeaseContainer(leaseContainer)  // tracks position per partition
+  .Build();
+
+await processor.StartAsync();
+
+static async Task HandleChangesAsync(
+    IReadOnlyCollection<MyItem> changes,
+    CancellationToken token)
+{
+    foreach (var item in changes)
+    {
+        Console.WriteLine($"Changed: {item.Id}");
+        // process change: update search index, send event, etc.
+    }
+}
+```
+
+**2. Azure Functions Cosmos DB Trigger:**
+```csharp
+// Serverless processing — no infrastructure management
+[FunctionName("CosmosChangeFeed")]
+public static async Task Run(
+    [CosmosDBTrigger(
+        databaseName: "myDB",
+        containerName: "myContainer",
+        Connection = "CosmosConnection",
+        LeaseContainerName = "leases",
+        CreateLeaseContainerIfNotExists = true)]
+    IReadOnlyList<MyItem> changedItems,
+    ILogger log)
+{
+    foreach (var item in changedItems)
+    {
+        log.LogInformation($"Processing change for: {item.Id}");
+        // Send to Event Hub, update search, trigger workflow
+    }
+}
+```
+
+**3. Pull Model (on-demand reading):**
+```csharp
+// Read changes on-demand (batch processing scenarios)
+var iterator = container.GetChangeFeedIterator<MyItem>(
+    ChangeFeedStartFrom.Beginning(),
+    ChangeFeedMode.Incremental);
+
+while (iterator.HasMoreResults)
+{
+    var response = await iterator.ReadNextAsync();
+    foreach (var item in response)
+    {
+        // process items
+    }
+}
+```
+
+**Common Change Feed patterns:**
+
+| Pattern | Description |
+|---|---|
+| **Real-time analytics** | Feed changes to Stream Analytics → Power BI |
+| **Search indexing** | Sync Cosmos changes → Azure Cognitive Search |
+| **Cache invalidation** | Invalidate Redis cache on data change |
+| **Event sourcing** | Publish changes to Event Hub → downstream consumers |
+| **Data archival** | Move old data to cold storage (Blob, Synapse) |
+| **Materialized views** | Maintain pre-computed aggregates in another container |
+| **Audit logging** | Log every change for compliance |
+
+**Handling deletes (soft-delete pattern):**
+```javascript
+// Instead of deleting, mark as deleted
+{
+  "id": "item123",
+  "isDeleted": true,        // soft delete flag
+  "deletedAt": "2024-01-15",
+  "_ts": 1705276800
+}
+// Change Feed captures this update
+// Consumer checks isDeleted flag and acts accordingly
+// TTL policy physically removes after retention period
+```
+
+---
+
+## 61. What is Azure Event Grid Topic vs Domain?
+
+**Event Grid** is a fully managed **event routing service** using pub-sub model.
+
+**Topic** = single event source endpoint. **Domain** = grouping of hundreds/thousands of topics under one management endpoint.
+
+| Feature | Event Grid Topic | Event Grid Domain |
+|---|---|---|
+| **Purpose** | Single event source | Logical grouping of many topics |
+| **Scale** | One publisher | Thousands of publishers |
+| **Topics** | 1 | Up to 100,000 topics |
+| **Subscriptions per topic** | Up to 500 | 500 per topic within domain |
+| **Use case** | Single app/service events | Multi-tenant SaaS, per-customer topics |
+| **Management** | Per-topic | Centralized for all topics |
+| **Auth** | Per-topic key | Domain-level key or per-topic |
+
+**Topic types:**
+
+| Type | Description | Use case |
+|---|---|---|
+| **Custom Topic** | Your app publishes custom events | Application events |
+| **System Topic** | Azure services publish automatically | Storage, Event Hub, IoT Hub events |
+| **Partner Topic** | Third-party SaaS events | Auth0, SAP, Salesforce events |
+| **Domain Topic** | Sub-topic within a domain | Multi-tenant scenarios |
+
+**Custom Topic example:**
+```bash
+# Create custom topic
+az eventgrid topic create \
+  --name myEventTopic \
+  --resource-group myRG \
+  --location eastus
+
+# Create subscription → route to Function App
+az eventgrid event-subscription create \
+  --name mySubscription \
+  --source-resource-id /subscriptions/.../topics/myEventTopic \
+  --endpoint-type azurefunction \
+  --endpoint /subscriptions/.../functions/myFunction \
+  --included-event-types "Order.Created" "Order.Cancelled"
+```
+
+**Publish events to topic:**
+```csharp
+var client = new EventGridPublisherClient(
+    new Uri("https://myEventTopic.eastus-1.eventgrid.azure.net/api/events"),
+    new AzureKeyCredential(topicKey));
+
+var events = new List<EventGridEvent>
+{
+    new EventGridEvent(
+        subject: "orders/order123",
+        eventType: "Order.Created",
+        dataVersion: "1.0",
+        data: new { OrderId = "order123", Amount = 99.99 })
+};
+
+await client.SendEventsAsync(events);
+```
+
+**Domain example (multi-tenant SaaS):**
+```bash
+# Create domain
+az eventgrid domain create \
+  --name myEventDomain \
+  --resource-group myRG \
+  --location eastus
+
+# Topics created automatically per tenant
+# tenant1 → myEventDomain/topics/tenant1
+# tenant2 → myEventDomain/topics/tenant2
+# Each tenant subscribes only to their own topic
+```
+
+---
+
+## 62. What is Event Hub Capture?
+
+**Event Hub Capture** automatically saves streaming data from Event Hubs to **Azure Blob Storage or Azure Data Lake Storage Gen2** in **Avro format** without writing any code.
+
+**Architecture:**
+```
+Producers (IoT/Apps) → Event Hub → [Capture enabled]
+                                          ↓
+                                   Azure Storage / ADLS Gen2
+                                   (Avro files, time-partitioned)
+                                          ↓
+                                   Spark / Synapse / Databricks
+                                   (batch analytics on captured data)
+```
+
+**Capture file naming pattern:**
+```
+{Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}.avro
+
+Example:
+myNamespace/myHub/0/2024/01/15/14/30/00.avro
+myNamespace/myHub/1/2024/01/15/14/30/00.avro
+```
+
+**Configure Capture:**
+```bash
+az eventhubs eventhub update \
+  --name myEventHub \
+  --namespace-name myNamespace \
+  --resource-group myRG \
+  --enable-capture true \
+  --capture-interval 300 \          # Save every 300 seconds (5 min)
+  --capture-size-limit 314572800 \  # Or every 300 MB (whichever first)
+  --destination-name EventHubArchive.AzureBlockBlob \
+  --storage-account /subscriptions/.../storageAccounts/myStorage \
+  --blob-container capturecontainer \
+  --archive-name-format "{Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}"
+```
+
+**Avro file reading:**
+```python
+import avro.schema
+from avro.datafile import DataFileReader
+from avro.io import DatumReader
+
+with DataFileReader(open("capture.avro", "rb"), DatumReader()) as reader:
+    for record in reader:
+        print(record["Body"])  # Event payload
+        print(record["EnqueuedTimeUtc"])
+```
+
+**Capture vs Stream Analytics:**
+```
+Capture:           Raw data archival → batch processing later
+Stream Analytics:  Real-time processing → immediate insights
+Use both:          Capture for replay/audit, SA for real-time alerts
+```
+
+---
+
+## 63. How do you integrate Event Hubs with Kafka?
+
+**Event Hubs has a built-in Kafka endpoint** that makes it protocol-compatible with Apache Kafka — existing Kafka apps work with **just a connection string change**, no Kafka cluster needed.
+
+**Compatibility:**
+```
+Kafka Producer/Consumer API → Event Hubs Kafka endpoint
+Kafka Topic                 → Event Hub
+Kafka Consumer Group        → Event Hub Consumer Group
+Kafka Partition             → Event Hub Partition
+Zookeeper                   → Not needed (managed by Azure)
+```
+
+**Connection string format:**
+```properties
+# Standard Kafka config → just change bootstrap.servers
+bootstrap.servers=myNamespace.servicebus.windows.net:9093
+security.protocol=SASL_SSL
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
+    username="$ConnectionString" \
+    password="Endpoint=sb://myNamespace.servicebus.windows.net/;SharedAccessKeyName=...";
+```
+
+**Kafka Producer → Event Hubs:**
+```java
+Properties props = new Properties();
+props.put("bootstrap.servers", "myNamespace.servicebus.windows.net:9093");
+props.put("security.protocol", "SASL_SSL");
+props.put("sasl.mechanism", "PLAIN");
+props.put("sasl.jaas.config", "...connection string...");
+props.put("key.serializer", StringSerializer.class);
+props.put("value.serializer", StringSerializer.class);
+
+KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+producer.send(new ProducerRecord<>("myEventHub", "key", "Hello Event Hubs!"));
+```
+
+**Schema Registry integration:**
+```bash
+# Event Hubs Schema Registry (Avro schema enforcement)
+az eventhubs namespace schema-registry create \
+  --name mySchemaGroup \
+  --namespace-name myNamespace \
+  --resource-group myRG \
+  --schema-compatibility Forward \
+  --schema-type Avro
+```
+
+**Migration from Kafka to Event Hubs:**
+```
+Step 1: Replace bootstrap.servers in all producer/consumer configs
+Step 2: Add SASL authentication config
+Step 3: Map Kafka topics → Event Hub names
+Step 4: Set partition count to match (Event Hub max 32 standard, 2000 premium)
+Step 5: No code changes required in application logic
+```
+
+---
+
+## 64. What is Azure Stream Analytics?
+
+**Azure Stream Analytics (ASA)** is a fully managed, **real-time stream processing service** that analyzes high-volume streaming data using **SQL-like queries.**
+
+**Architecture:**
+```
+Input Sources          Stream Analytics Job         Output Sinks
+─────────────         ─────────────────────        ─────────────
+Event Hubs       →    SQL-like query engine    →   Power BI (real-time)
+IoT Hub          →    Windowing functions      →   Blob Storage
+Blob Storage     →    Pattern detection        →   SQL Database
+                       Anomaly detection        →   Cosmos DB
+                       ML model scoring         →   Event Hubs
+                                                →   Azure Functions
+                                                →   Service Bus
+```
+
+**ASA Query language (SQL-like):**
+```sql
+-- Real-time average temperature per device, 5-minute window
+SELECT
+    deviceId,
+    AVG(temperature) AS avgTemp,
+    MAX(temperature) AS maxTemp,
+    System.Timestamp() AS windowEnd
+INTO
+    [output-blob]
+FROM
+    [iot-hub-input] TIMESTAMP BY EventEnqueuedUtcTime
+GROUP BY
+    deviceId,
+    TumblingWindow(minute, 5)
+
+-- Alert when temperature exceeds threshold
+SELECT deviceId, temperature, EventEnqueuedUtcTime
+INTO [alert-output]
+FROM [iot-hub-input]
+WHERE temperature > 85
+```
+
+**Windowing functions:**
+
+| Window Type | Behavior | Use case |
+|---|---|---|
+| **Tumbling** | Fixed, non-overlapping periods | 5-min aggregates |
+| **Hopping** | Overlapping fixed windows | Rolling averages |
+| **Sliding** | Event-triggered, overlap | Continuous monitoring |
+| **Session** | Groups by activity gaps | User session tracking |
+| **Snapshot** | Groups by same timestamp | Point-in-time grouping |
+
+```sql
+-- Tumbling: 0-5min, 5-10min, 10-15min (no overlap)
+GROUP BY TumblingWindow(minute, 5)
+
+-- Hopping: every 1min compute last 5min (overlapping)
+GROUP BY HoppingWindow(minute, 5, 1)
+
+-- Sliding: window whenever event occurs, look back 5min
+GROUP BY SlidingWindow(minute, 5)
+```
+
+**ASA tiers:**
+
+| Feature | Standard | Cluster |
+|---|---|---|
+| **Pricing** | Per Streaming Unit (SU) | Dedicated cluster |
+| **Isolation** | Shared | Dedicated |
+| **Custom code** | .NET UDF | .NET UDF |
+| **Private endpoint** | ❌ | ✅ |
+| **Use case** | Standard workloads | Large-scale enterprise |
+
+---
+
+## 65. What is Azure Data Factory?
+
+**Azure Data Factory (ADF)** is a fully managed, **cloud-scale ETL (Extract, Transform, Load) and data integration service** for orchestrating data movement and transformation pipelines.
+
+**Core components:**
+
+| Component | Description | Example |
+|---|---|---|
+| **Pipeline** | Logical grouping of activities | "Ingest daily sales data" |
+| **Activity** | Single step in pipeline | Copy, Databricks, Stored Proc |
+| **Dataset** | Named reference to data | "Sales CSV in Blob Storage" |
+| **Linked Service** | Connection to data store | SQL Server connection string |
+| **Trigger** | Starts pipeline execution | Schedule, event, tumbling window |
+| **Integration Runtime** | Compute infrastructure | Azure IR, Self-hosted IR |
+
+**ADF activity types:**
+
+```
+Data Movement:
+  → Copy Activity: move data between 90+ connectors
+  → Supports: SQL, Blob, ADLS, Cosmos, REST APIs, SAP, Salesforce
+
+Data Transformation:
+  → Mapping Data Flow (visual, no-code Spark)
+  → Databricks Notebook/Jar/Python
+  → HDInsight Hive/Pig/Spark
+  → SQL Stored Procedure
+  → Azure Function call
+
+Control Flow:
+  → ForEach, If Condition, Until loop
+  → Execute Pipeline (nested pipelines)
+  → Wait, Web activity, Get Metadata
+```
+
+**Copy Activity — 90+ connectors:**
+```json
+{
+  "name": "CopyFromSQLToBlob",
+  "type": "Copy",
+  "inputs": [{"referenceName": "SqlDataset", "type": "DatasetReference"}],
+  "outputs": [{"referenceName": "BlobDataset", "type": "DatasetReference"}],
+  "typeProperties": {
+    "source": {"type": "SqlSource", "sqlReaderQuery": "SELECT * FROM Sales"},
+    "sink": {"type": "BlobSink", "writeBatchSize": 10000},
+    "parallelCopies": 4
+  }
+}
+```
+
+**Triggers:**
+```
+Schedule Trigger:    Run pipeline at fixed time (daily at 2 AM)
+Tumbling Window:     Run for each time window, handles backfill
+Event Trigger:       Run when file arrives in Blob Storage
+Manual:              On-demand execution
+```
+
+---
+
+## 66. What are Integration Runtimes in ADF?
+
+**Integration Runtime (IR)** is the **compute infrastructure** that ADF uses to perform data movement, activity dispatch, and SSIS package execution.
+
+**Three types:**
+
+**1. Azure Integration Runtime (Auto-Resolve):**
+```
+→ Fully managed by Azure
+→ Automatically scales, no management needed
+→ Used for: Cloud-to-cloud data movement
+→ Supports: 90+ cloud data stores
+→ Location: Auto (nearest region) or specific region
+
+Use case:
+  Blob Storage → Azure SQL (both in cloud)
+  REST API → Cosmos DB (internet-accessible sources)
+```
+
+**2. Self-Hosted Integration Runtime (SHIR):**
+```
+→ Installed on your on-premises Windows machine or VM
+→ Bridges private network to ADF cloud service
+→ Communicates outbound only (port 443) → no inbound firewall rules
+→ Can be clustered for HA (multiple nodes)
+
+Use case:
+  On-premises SQL Server → Azure SQL
+  On-premises Oracle → ADLS Gen2
+  Private network resources not accessible from internet
+```
+
+```powershell
+# Install SHIR on on-premises machine
+# Download from Azure Portal → ADF → Integration Runtimes
+# Register with authentication key:
+.\dmgcmd.exe -RegisterNewNode "your-authentication-key"
+
+# HA setup (multiple nodes)
+.\dmgcmd.exe -RegisterNewNode "key" -EnableRemoteAccess 8060
+```
+
+**3. Azure-SSIS Integration Runtime:**
+```
+→ Dedicated cluster for running SQL Server Integration Services (SSIS) packages
+→ Lift-and-shift existing SSIS workloads to cloud
+→ Configure node size, count, edition (Standard/Enterprise)
+
+Use case:
+  Existing SSIS packages → run in Azure without rewriting
+  Legacy ETL modernization path
+```
+
+**IR comparison:**
+
+| Feature | Azure IR | Self-Hosted IR | Azure-SSIS IR |
+|---|---|---|---|
+| **Management** | Microsoft managed | Customer managed | Microsoft managed |
+| **Location** | Azure regions | On-premises / VM | Azure regions |
+| **Private data** | ❌ No | ✅ Yes | ❌ No |
+| **SSIS packages** | ❌ No | Limited | ✅ Yes |
+| **Cost** | Per DIU (data unit) | VM/machine cost | Per node per hour |
+| **HA** | Built-in | Manual (multi-node) | Built-in |
+
+---
+
+## 67. What is the difference between Azure Synapse Serverless and Dedicated SQL Pool?
+
+| Feature | Serverless SQL Pool | Dedicated SQL Pool |
+|---|---|---|
+| **Infrastructure** | No provisioning needed | Pre-provisioned DWUs |
+| **Pricing** | Per TB data scanned | Per DWU-hour (always running) |
+| **Scale** | Automatic | Manual (100–30,000 DWUs) |
+| **Startup time** | Instant | Always running |
+| **Data location** | External (ADLS, Blob) | Internal Synapse storage |
+| **Data ingestion** | Query in-place (no load needed) | Must load data (COPY/PolyBase) |
+| **Transactions** | ❌ No | ✅ Yes |
+| **Updates/Deletes** | ❌ No (read-only) | ✅ Yes |
+| **Indexes** | ❌ No | ✅ Yes (Clustered Columnstore) |
+| **Materialized views** | ❌ No | ✅ Yes |
+| **Best for** | Ad-hoc exploration, data lake queries | Regular heavy analytics workloads |
+| **Max storage** | Unlimited (ADLS) | 240 TB |
+
+**Serverless — query data lake directly:**
+```sql
+-- Query CSV files in ADLS without loading
+SELECT
+    year,
+    SUM(sales_amount) AS total_sales
+FROM OPENROWSET(
+    BULK 'https://mydatalake.dfs.core.windows.net/sales/2024/*.csv',
+    FORMAT = 'CSV',
+    HEADER_ROW = TRUE
+) AS sales_data
+GROUP BY year
+ORDER BY year;
+
+-- Query Parquet files (much faster)
+SELECT TOP 100 *
+FROM OPENROWSET(
+    BULK 'https://mydatalake.dfs.core.windows.net/sales/**',
+    FORMAT = 'PARQUET'
+) AS parquet_data;
+```
+
+**Dedicated Pool — load then query:**
+```sql
+-- Load data into dedicated pool
+COPY INTO dbo.SalesData
+FROM 'https://mydatalake.dfs.core.windows.net/sales/2024/*.parquet'
+WITH (FILE_TYPE = 'PARQUET');
+
+-- Query with full DW features
+SELECT
+    region,
+    SUM(amount) AS total,
+    AVG(amount) AS average
+FROM dbo.SalesData
+WHERE year = 2024
+GROUP BY region;
+```
+
+**When to use which:**
+```
+Serverless:
+  → Exploring new datasets before committing to a schema
+  → Infrequent, ad-hoc queries on data lake
+  → Pay only when querying (cost-efficient for low frequency)
+  → Data scientists exploring raw data
+
+Dedicated:
+  → Power BI dashboards with sub-second refresh
+  → Regular scheduled analytics (daily/hourly reports)
+  → Large joins, aggregations on TBs of data
+  → Production analytics workloads with SLA requirements
+```
+
+---
+
+## 68. How do you optimize Synapse Queries?
+
+**Optimization covers distribution, indexing, statistics, and query patterns:**
+
+**1. Table Distribution strategies:**
+```sql
+-- ROUND_ROBIN: Default, even row distribution, no skew
+-- Good for: staging tables, when no clear distribution column
+CREATE TABLE staging.Sales
+WITH (DISTRIBUTION = ROUND_ROBIN)
+AS SELECT * FROM external_sales;
+
+-- HASH: Distributes by column value, co-locates joins
+-- Good for: large fact tables, frequent joins on that column
+CREATE TABLE dbo.Sales
+WITH (DISTRIBUTION = HASH(CustomerId))
+AS SELECT * FROM staging.Sales;
+
+-- REPLICATE: Full copy on every compute node (60 copies)
+-- Good for: small dimension tables (<2GB) joined frequently
+CREATE TABLE dbo.Customers
+WITH (DISTRIBUTION = REPLICATE)
+AS SELECT * FROM staging.Customers;
+```
+
+**2. Index types:**
+```sql
+-- Clustered Columnstore Index (CCI) — DEFAULT, best for analytics
+-- Compresses data 10x, vectorized batch execution
+CREATE TABLE dbo.SalesFact
+WITH (
+    DISTRIBUTION = HASH(CustomerId),
+    CLUSTERED COLUMNSTORE INDEX   -- best for >60M rows
+);
+
+-- Clustered Rowstore — for small tables or frequent point lookups
+CREATE TABLE dbo.Config
+WITH (
+    DISTRIBUTION = REPLICATE,
+    CLUSTERED INDEX (ConfigKey)   -- good for <60M rows
+);
+
+-- Heap — for fast loading, no index overhead
+CREATE TABLE staging.RawLoad
+WITH (
+    DISTRIBUTION = ROUND_ROBIN,
+    HEAP   -- fastest for initial data load
+);
+```
+
+**3. Statistics (critical for query optimizer):**
+```sql
+-- Create statistics on join and filter columns
+CREATE STATISTICS stat_sales_customerid ON dbo.Sales(CustomerId);
+CREATE STATISTICS stat_sales_date ON dbo.Sales(SaleDate);
+
+-- Update statistics after significant data changes
+UPDATE STATISTICS dbo.Sales;
+
+-- Check if statistics are outdated
+SELECT * FROM sys.dm_pdw_nodes_db_partition_stats
+WHERE object_id = OBJECT_ID('dbo.Sales');
+```
+
+**4. Partitioning for large tables:**
+```sql
+-- Partition by date for time-series data
+CREATE TABLE dbo.SalesFact
+WITH (
+    DISTRIBUTION = HASH(CustomerId),
+    CLUSTERED COLUMNSTORE INDEX,
+    PARTITION (SaleDate RANGE RIGHT FOR VALUES
+        ('2023-01-01', '2023-04-01', '2023-07-01', '2024-01-01'))
+)
+AS SELECT * FROM staging.SalesFact;
+-- Partition elimination: queries with date filter skip irrelevant partitions
+```
+
+**5. Result set caching:**
+```sql
+-- Enable result cache (re-uses previous query results)
+ALTER DATABASE mySynapseDB SET RESULT_SET_CACHING ON;
+
+-- Check if result came from cache
+SELECT is_result_set_caching FROM sys.dm_pdw_exec_requests
+WHERE request_id = 'QID12345';
+```
+
+**6. Materialized views:**
+```sql
+-- Pre-compute expensive aggregations
+CREATE MATERIALIZED VIEW dbo.SalesByRegion
+WITH (DISTRIBUTION = HASH(Region))
+AS
+SELECT
+    Region,
+    YEAR(SaleDate) AS SaleYear,
+    SUM(Amount) AS TotalSales,
+    COUNT(*) AS OrderCount
+FROM dbo.SalesFact
+GROUP BY Region, YEAR(SaleDate);
+-- Query optimizer automatically uses this view
+```
+
+---
+
+## 69. What is PolyBase in Synapse?
+
+**PolyBase** is a technology in Azure Synapse that enables **querying external data sources** (ADLS, Blob Storage, Hadoop) **using T-SQL**, treating external files as if they were tables.
+
+**PolyBase architecture:**
+```
+External Data Source          Synapse Dedicated Pool
+(ADLS Gen2 / Blob)    →      External Table (T-SQL interface)
+                       →      PolyBase reads + pushes computation
+                       →      Results returned to SQL client
+```
+
+**PolyBase setup process:**
+```sql
+-- Step 1: Create database scoped credential
+CREATE DATABASE SCOPED CREDENTIAL myADLSCredential
+WITH IDENTITY = 'Managed Identity';
+-- Or use SAS token:
+-- WITH IDENTITY = 'SHARED ACCESS SIGNATURE',
+-- SECRET = 'sv=2021...';
+
+-- Step 2: Create external data source
+CREATE EXTERNAL DATA SOURCE myDataLake
+WITH (
+    TYPE = HADOOP,
+    LOCATION = 'abfss://container@mydatalake.dfs.core.windows.net',
+    CREDENTIAL = myADLSCredential
+);
+
+-- Step 3: Create external file format
+CREATE EXTERNAL FILE FORMAT parquetFormat
+WITH (
+    FORMAT_TYPE = PARQUET,
+    DATA_COMPRESSION = 'org.apache.hadoop.io.compress.SnappyCodec'
+);
+
+-- Step 4: Create external table
+CREATE EXTERNAL TABLE dbo.ExternalSales (
+    OrderId     INT,
+    CustomerId  INT,
+    Amount      DECIMAL(10,2),
+    OrderDate   DATE
+)
+WITH (
+    LOCATION = '/sales/2024/',
+    DATA_SOURCE = myDataLake,
+    FILE_FORMAT = parquetFormat
+);
+
+-- Step 5: Query external data as if it's a regular table
+SELECT Region, SUM(Amount)
+FROM dbo.ExternalSales
+WHERE YEAR(OrderDate) = 2024
+GROUP BY Region;
+```
+
+**PolyBase vs COPY command vs OPENROWSET:**
+
+| Feature | PolyBase (External Table) | COPY Command | OPENROWSET (Serverless) |
+|---|---|---|---|
+| **Pool type** | Dedicated | Dedicated | Serverless |
+| **Schema definition** | Required (DDL) | Optional | Optional |
+| **Reusability** | ✅ Permanent table | Per statement | Per statement |
+| **Performance** | High (parallel) | Highest (optimized) | Good |
+| **Joins with internal** | ✅ Yes | After load only | ✅ Yes |
+| **Use case** | Frequent external queries | One-time bulk load | Ad-hoc exploration |
+
+**COPY command (preferred for loading):**
+```sql
+-- Faster than PolyBase for bulk loads
+COPY INTO dbo.SalesFact
+FROM 'https://mydatalake.dfs.core.windows.net/sales/2024/*.parquet'
+WITH (
+    FILE_TYPE = 'PARQUET',
+    IDENTITY_INSERT = 'OFF',
+    AUTO_CREATE_TABLE = 'OFF'
+);
+```
+
+---
+
+## 70. What is Data Lake Storage Gen2?
+
+**Azure Data Lake Storage Gen2 (ADLS Gen2)** is a **massively scalable, hierarchical, enterprise-grade data lake** built on top of Azure Blob Storage, combining Blob Storage economics with file system semantics.
+
+**Gen2 = Blob Storage + Hierarchical Namespace (HNS):**
+```
+Blob Storage (Gen1 limitation):
+  → Flat namespace (no real directories)
+  → Rename folder = copy all objects + delete originals → SLOW
+  → No true POSIX ACLs
+
+ADLS Gen2 (with HNS enabled):
+  → True hierarchical directories (like a file system)
+  → Rename/move = atomic metadata operation → INSTANT
+  → POSIX-compliant ACLs at file + folder level
+  → Blob Storage pricing (cheap object storage)
+```
+
+**Storage hierarchy:**
+```
+Storage Account (ADLS Gen2)
+  └── Container (File System)
+        └── Directory (virtual folder)
+              └── Subdirectory
+                    └── Files (blobs)
+
+Example:
+  mydatalake
+    └── raw/
+          └── sales/
+                └── 2024/
+                      └── 01/
+                            └── sales_20240101.parquet
+    └── processed/
+    └── curated/
+```
+
+**Key features:**
+
+| Feature | Description |
+|---|---|
+| **Hierarchical Namespace** | True directory operations (atomic rename/delete) |
+| **POSIX ACLs** | Fine-grained access control per file/folder |
+| **Multi-protocol** | Blob API + ABFS (Azure Blob File System) driver |
+| **Zone-redundant** | ZRS, GRS, GZRS storage options |
+| **Lifecycle management** | Auto-tier hot→cool→archive by age |
+| **Soft delete** | Recover deleted files (up to 365 days) |
+| **Versioning** | Keep previous file versions |
+| **Encryption** | Microsoft or customer-managed keys |
+
+**Access protocols:**
+```
+Blob REST API:  https://account.blob.core.windows.net/container/path
+ABFS driver:    abfss://container@account.dfs.core.windows.net/path
+                (used by Spark, Databricks, Synapse, ADF)
+```
+
+**Security model:**
+
+```
+Two complementary access control models:
+
+1. Azure RBAC (coarse-grained, at account/container level):
+   Storage Blob Data Reader    → read all blobs
+   Storage Blob Data Contributor → read/write/delete
+
+2. POSIX ACLs (fine-grained, per file/directory):
+   rwx (7) = read + write + execute
+   r-- (4) = read only
+   --- (0) = no access
+
+   Directory: user:alice:rwx  → Alice can list + create files
+   File:      user:bob:r--    → Bob can read this file only
+```
+
+**Zone medallion architecture (standard pattern):**
+```
+Raw Zone (Bronze):
+  → Exact copy of source data, no transformation
+  → Immutable, append-only
+  → Format: CSV, JSON, XML (as-is from source)
+
+Processed Zone (Silver):
+  → Cleansed, validated, deduplicated
+  → Standardized schema
+  → Format: Parquet (columnar, compressed)
+
+Curated Zone (Gold):
+  → Business-ready, aggregated, enriched
+  → Serves BI reports and ML models
+  → Format: Parquet / Delta Lake
+
+Tools that read ADLS Gen2:
+  Synapse Analytics → SQL queries over data lake
+  Azure Databricks  → Spark processing
+  Azure Data Factory → ETL pipelines
+  Power BI          → Direct Query on curated zone
+  Azure ML          → Training data for models
+```
+
+# 71. What is the difference between Blob Storage and Data Lake?
+
+Both services are part of Microsoft Azure storage offerings, but they are designed for different workloads.
+
+---
+
+# Azure Blob Storage
+
+Azure Blob Storage is an object storage service used for storing:
+
+* Images
+* Videos
+* Documents
+* Backups
+* Logs
+* Media files
+
+It is optimized for:
+
+* General-purpose cloud storage
+* Unstructured data
+
+---
+
+## Key Features of Blob Storage
+
+| Feature              | Description            |
+| -------------------- | ---------------------- |
+| Object Storage       | Stores files as blobs  |
+| Massively Scalable   | Petabyte-scale         |
+| Cost Effective       | Multiple storage tiers |
+| REST API Access      | HTTP/HTTPS access      |
+| Lifecycle Management | Auto-tiering/archive   |
+
+---
+
+## Common Use Cases
+
+* Website media hosting
+* Backup solutions
+* File archives
+* Static website hosting
+* Application logs
+
+---
+
+# Azure Data Lake Storage Gen2 (ADLS Gen2)
+
+Azure Data Lake Storage Gen2 is built on top of Blob Storage but optimized for:
+
+* Big data analytics
+* AI/ML workloads
+* Hadoop/Spark ecosystems
+
+It combines:
+
+* Blob Storage scalability
+  with
+* File-system capabilities
+
+---
+
+## Key Features of ADLS Gen2
+
+| Feature                | Description                |
+| ---------------------- | -------------------------- |
+| Hierarchical Namespace | Folder/file structure      |
+| Big Data Optimized     | Hadoop/Spark compatible    |
+| Fine-Grained Security  | ACL support                |
+| Massive Throughput     | Analytics optimized        |
+| Parallel Processing    | High-performance analytics |
+
+---
+
+# Main Difference
+
+| Feature              | Blob Storage    | ADLS Gen2           |
+| -------------------- | --------------- | ------------------- |
+| Purpose              | General storage | Analytics storage   |
+| Namespace            | Flat            | Hierarchical        |
+| Big Data Support     | Limited         | Excellent           |
+| Hadoop Compatibility | No              | Yes                 |
+| ACL Support          | Basic           | Advanced POSIX ACLs |
+| File Operations      | Object-based    | File-system based   |
+
+---
+
+# Real-Time Enterprise Scenario
+
+## Blob Storage Example
+
+Media company stores:
+
+* Images
+* Videos
+* Documents
+
+for web applications.
+
+---
+
+## Data Lake Example
+
+Retail organization stores:
+
+* Sales data
+* IoT telemetry
+* Customer analytics
+
+for processing using:
+
+* Spark
+* Synapse
+* Databricks
+
+---
+
+# Architecture Example
+
+```text id="p8v2mx"
+Raw Data → ADLS Gen2 → Databricks/Synapse → Power BI
+```
+
+---
+
+# Interview Tip
+
+Blob Storage is general-purpose object storage, while ADLS Gen2 is optimized for analytics and big-data processing.
+
+---
+
+# 72. What is hierarchical namespace in ADLS Gen2?
+
+Hierarchical Namespace (HNS) is a feature in Azure Data Lake Storage Gen2 that organizes data into:
+
+* Directories
+* Subdirectories
+* Files
+
+similar to a traditional file system.
+
+---
+
+# Without Hierarchical Namespace
+
+Standard Blob Storage uses:
+
+```text id="z1k7qw"
+Flat namespace
+```
+
+Example:
+
+```text id="g8m4ry"
+container/file1.csv
+container/file2.csv
+```
+
+No real folder structure exists.
+
+---
+
+# With Hierarchical Namespace
+
+ADLS Gen2 supports:
+
+```text id="v6n9tp"
+/finance/2026/january/report.csv
+```
+
+This behaves like a real directory hierarchy.
+
+---
+
+# Benefits of HNS
+
+| Benefit                     | Description                      |
+| --------------------------- | -------------------------------- |
+| Faster Directory Operations | Rename/move operations efficient |
+| Better Organization         | File-system structure            |
+| Hadoop Compatibility        | HDFS-like operations             |
+| ACL Security                | Folder-level permissions         |
+| Analytics Optimization      | Spark/Hadoop friendly            |
+
+---
+
+# Why HNS Matters in Big Data
+
+Big data engines like:
+
+* Apache Spark
+* Hadoop
+* Databricks
+
+perform millions of file operations.
+
+Without HNS:
+
+* Operations become slow and expensive.
+
+With HNS:
+
+* File manipulation becomes efficient.
+
+---
+
+# Real-Time Example
+
+Data engineering pipeline:
+
+```text id="m2x5df"
+/raw/
+/processed/
+/curated/
+```
+
+Data moves between folders during ETL processing.
+
+---
+
+# Technical Advantage
+
+Rename operation:
+
+## Without HNS
+
+Copies entire file.
+
+## With HNS
+
+Only updates metadata.
+
+This significantly improves performance.
+
+---
+
+# Interview Tip
+
+Hierarchical Namespace enables ADLS Gen2 to function like a distributed file system optimized for analytics workloads.
+
+---
+
+# 73. How do you secure Data Lake?
+
+Securing a Data Lake requires multiple layers of security.
+
+---
+
+# Security Layers for ADLS Gen2
+
+| Layer         | Security Method  |
+| ------------- | ---------------- |
+| Identity      | Entra ID         |
+| Authorization | RBAC + ACLs      |
+| Network       | Private Endpoint |
+| Encryption    | SSE/CMK          |
+| Monitoring    | Defender/Monitor |
+| Governance    | Purview          |
+
+---
+
+# A. Identity and Authentication
+
+Use:
+Microsoft Entra ID
+
+for centralized authentication.
+
+---
+
+## Best Practices
+
+* Enable MFA
+* Use Conditional Access
+* Avoid shared accounts
+
+---
+
+# B. Authorization Using RBAC
+
+Azure RBAC controls access at:
+
+* Subscription
+* Resource Group
+* Storage Account
+
+---
+
+## Example Roles
+
+| Role                          | Permission |
+| ----------------------------- | ---------- |
+| Storage Blob Data Reader      | Read only  |
+| Storage Blob Data Contributor | Read/write |
+
+---
+
+# C. Access Control Lists (ACLs)
+
+ADLS Gen2 supports POSIX-style ACLs.
+
+You can assign:
+
+* User permissions
+* Folder permissions
+* File permissions
+
+---
+
+## Example
+
+```text id="f4z8xn"
+/finance → Only Finance Team Access
+```
+
+---
+
+# D. Network Security
+
+Secure access using:
+
+| Security Feature | Purpose               |
+| ---------------- | --------------------- |
+| Private Endpoint | Private access        |
+| Firewall Rules   | Restrict IP access    |
+| VNet Integration | Internal traffic only |
+
+---
+
+# E. Encryption
+
+## 1. Server-Side Encryption (SSE)
+
+Default encryption at rest.
+
+---
+
+## 2. Customer-Managed Keys (CMK)
+
+Use Key Vault-managed encryption keys.
+
+---
+
+# F. Monitoring & Threat Detection
+
+Use:
+
+* Azure Monitor
+* Log Analytics
+* Defender for Cloud
+
+to monitor suspicious activity.
+
+---
+
+# G. Data Governance
+
+Use:
+Microsoft Purview
+for:
+
+* Data classification
+* Data lineage
+* Sensitive data discovery
+
+---
+
+# Real-Time Enterprise Security Architecture
+
+```text id="k5w9qm"
+User → Entra ID → Private Endpoint → ADLS Gen2 → ACL Authorization
+```
+
+---
+
+# Interview Tip
+
+Secure Data Lake using identity-based access, ACLs, encryption, private networking, and continuous monitoring.
+
+---
+
+# 74. What is Azure Purview?
+
+Microsoft Purview is a unified data governance and compliance platform.
+
+It helps organizations:
+
+* Discover data
+* Classify data
+* Govern data
+* Track lineage
+* Ensure compliance
+
+across:
+
+* Azure
+* On-premises
+* Multi-cloud
+
+---
+
+# Purpose of Purview
+
+Modern enterprises have data spread across:
+
+* SQL databases
+* Data Lakes
+* SaaS platforms
+* Power BI
+* AWS/GCP
+
+Purview provides centralized governance.
+
+---
+
+# Core Features
+
+| Feature             | Description             |
+| ------------------- | ----------------------- |
+| Data Discovery      | Scan data sources       |
+| Data Catalog        | Searchable metadata     |
+| Data Classification | Identify sensitive data |
+| Data Lineage        | Track data movement     |
+| Compliance          | Regulatory governance   |
+
+---
+
+# A. Data Discovery
+
+Purview scans:
+
+* SQL
+* Blob Storage
+* Synapse
+* Power BI
+* SAP
+
+automatically.
+
+---
+
+# B. Data Classification
+
+Automatically identifies:
+
+* PII
+* Credit card data
+* Financial records
+* Sensitive information
+
+---
+
+# C. Data Lineage
+
+Tracks data flow:
+
+```text id="d8x4wp"
+Source → ETL → Data Lake → Synapse → Power BI
+```
+
+---
+
+# D. Data Catalog
+
+Provides searchable metadata repository.
+
+Example:
+
+```text id="t3q7zl"
+Find all customer-related datasets
+```
+
+---
+
+# Real-Time Enterprise Example
+
+Banking organization uses Purview to:
+
+* Identify sensitive financial datasets
+* Track data usage
+* Ensure GDPR compliance
+
+---
+
+# Architecture Example
+
+```text id="h7m1yc"
+Data Sources → Purview Scanner → Governance Catalog
+```
+
+---
+
+# Interview Tip
+
+Azure Purview centralizes enterprise data governance, classification, and lineage management.
+
+---
+
+# 75. What is the difference between Azure Purview and Synapse?
+
+| Feature        | Purview            | Synapse         |
+| -------------- | ------------------ | --------------- |
+| Purpose        | Data governance    | Data analytics  |
+| Primary Focus  | Catalog/compliance | Data processing |
+| ETL Capability | No                 | Yes             |
+| SQL Analytics  | No                 | Yes             |
+| Data Lineage   | Strong             | Limited         |
+| Governance     | Core feature       | Minimal         |
+
+---
+
+# Azure Purview
+
+Focuses on:
+
+* Governance
+* Compliance
+* Data discovery
+
+---
+
+## Used For
+
+* Finding datasets
+* Classifying sensitive data
+* Tracking lineage
+
+---
+
+# Azure Synapse Analytics
+
+Microsoft Azure Synapse is an analytics platform used for:
+
+* Data warehousing
+* Big data analytics
+* ETL processing
+
+---
+
+## Used For
+
+* SQL queries
+* Spark analytics
+* BI reporting
+* Large-scale analytics
+
+---
+
+# Real-Time Example
+
+| Requirement                 | Service |
+| --------------------------- | ------- |
+| Govern enterprise data      | Purview |
+| Analyze petabyte-scale data | Synapse |
+
+---
+
+# Combined Enterprise Workflow
+
+```text id="x6v9nd"
+ADLS → Synapse Analytics → Purview Governance
+```
+
+---
+
+# Interview Tip
+
+Purview governs and catalogs data, while Synapse processes and analyzes data.
+
+# 76. What is Azure Confidential Computing?
+
+Microsoft Azure Confidential Computing is a security technology that protects data while it is being processed in memory using hardware-based Trusted Execution Environments (TEEs).
+
+Traditional security protects data:
+
+* At rest (stored data)
+* In transit (network traffic)
+
+But Confidential Computing also protects:
+
+```text id="a8q4vm"
+Data in use
+```
+
+which is data actively being processed by applications.
+
+---
+
+# Why Confidential Computing is Important
+
+In traditional systems:
+
+* Administrators
+* Hypervisors
+* Malware
+* Memory attacks
+
+may potentially access sensitive data during processing.
+
+Confidential Computing isolates workloads inside secure enclaves.
+
+---
+
+# What is a Trusted Execution Environment (TEE)?
+
+A TEE is a protected memory region where:
+
+* Data
+* Applications
+* Computation
+
+remain encrypted and isolated.
+
+Even:
+
+* Cloud administrators
+* Host OS
+* Hypervisors
+
+cannot access data inside the enclave.
+
+---
+
+# Key Features
+
+| Feature                   | Description                     |
+| ------------------------- | ------------------------------- |
+| Memory Encryption         | Encrypts data during processing |
+| Hardware Isolation        | Uses CPU-level security         |
+| Secure Enclaves           | Isolated execution              |
+| Attestation               | Verify workload integrity       |
+| Insider Threat Protection | Prevent unauthorized access     |
+
+---
+
+# Azure Services Supporting Confidential Computing
+
+| Service                 | Purpose                     |
+| ----------------------- | --------------------------- |
+| Confidential VMs        | Secure VM execution         |
+| Confidential Containers | Secure container workloads  |
+| Confidential AKS        | Secure Kubernetes workloads |
+| Intel SGX               | Secure enclave technology   |
+| AMD SEV-SNP             | Memory encryption           |
+
+---
+
+# Use Cases
+
+## 1. Financial Services
+
+Secure transaction processing.
+
+---
+
+## 2. Healthcare
+
+Protect patient medical records during analytics.
+
+---
+
+## 3. Multi-Party Analytics
+
+Multiple organizations analyze shared data securely.
+
+---
+
+## 4. AI/ML Workloads
+
+Protect sensitive model training data.
+
+---
+
+# Real-Time Enterprise Example
+
+A bank processes:
+
+* Credit card transactions
+* Fraud analytics
+
+inside Confidential VMs to prevent memory-level exposure.
+
+---
+
+# Architecture Example
+
+```text id="u2z7pk"
+Application → Confidential VM → Encrypted Memory Processing
+```
+
+---
+
+# Benefits
+
+| Benefit                        | Description                   |
+| ------------------------------ | ----------------------------- |
+| Stronger Security              | Protects data-in-use          |
+| Compliance                     | Helps regulatory requirements |
+| Reduced Insider Risk           | Isolated workload execution   |
+| Secure Multi-Tenant Processing | Shared cloud protection       |
+
+---
+
+# Confidential VM vs Standard VM
+
+| Feature                      | Standard VM | Confidential VM |
+| ---------------------------- | ----------- | --------------- |
+| Memory Encryption            | Limited     | Full            |
+| Secure Enclave               | No          | Yes             |
+| Protection During Processing | No          | Yes             |
+
+---
+
+# Interview Tip
+
+Azure Confidential Computing protects sensitive workloads by encrypting and isolating data during processing using hardware-based secure enclaves.
+
+---
+
+# 77. What is Trusted Launch for VMs?
+
+Trusted Launch is an advanced security feature in Microsoft Azure that protects Virtual Machines against:
+
+* Bootkits
+* Rootkits
+* Firmware attacks
+* Malware during boot process
+
+It enhances VM security at the:
+
+* Boot level
+* OS level
+* Firmware level
+
+---
+
+# Components of Trusted Launch
+
+| Component            | Purpose                           |
+| -------------------- | --------------------------------- |
+| Secure Boot          | Prevent unauthorized boot loaders |
+| vTPM                 | Virtual Trusted Platform Module   |
+| Integrity Monitoring | Detect tampering                  |
+
+---
+
+# A. Secure Boot
+
+Ensures only trusted and signed operating system components are loaded during startup.
+
+---
+
+## Prevents
+
+* Malicious boot loaders
+* Unauthorized kernel modules
+
+---
+
+# B. vTPM (Virtual TPM)
+
+Trusted Platform Module implemented virtually.
+
+Provides:
+
+* Secure key storage
+* Encryption support
+* Measured boot verification
+
+---
+
+# C. Integrity Monitoring
+
+Continuously checks:
+
+* Boot chain integrity
+* Firmware consistency
+
+using Microsoft Defender.
+
+---
+
+# Architecture Example
+
+```text id="h4w8zx"
+Secure Boot → vTPM → VM Startup Validation
+```
+
+---
+
+# Benefits
+
+| Benefit              | Description                   |
+| -------------------- | ----------------------------- |
+| Boot-Level Security  | Secure startup                |
+| Malware Protection   | Detect tampering              |
+| Compliance           | Supports enterprise standards |
+| Defender Integration | Continuous monitoring         |
+
+---
+
+# Real-Time Example
+
+Production banking VM:
+
+* Trusted Launch enabled
+* Secure Boot active
+* Defender monitors integrity
+
+This prevents unauthorized firmware-level attacks.
+
+---
+
+# Trusted Launch vs Standard VM
+
+| Feature             | Standard VM | Trusted Launch VM |
+| ------------------- | ----------- | ----------------- |
+| Secure Boot         | Optional/No | Yes               |
+| vTPM                | No          | Yes               |
+| Firmware Protection | Limited     | Strong            |
+
+---
+
+# Use Cases
+
+* Financial applications
+* Government workloads
+* Regulated environments
+* Zero-trust architectures
+
+---
+
+# Interview Tip
+
+Trusted Launch secures Azure VMs from boot-level attacks using Secure Boot, vTPM, and integrity monitoring.
+
+---
+
+# 78. What are Azure Availability Zone-aware services?
+
+Availability Zone-aware services are Azure services designed to distribute resources automatically across multiple Availability Zones for:
+
+* High availability
+* Fault tolerance
+* Resiliency
+
+---
+
+# What are Availability Zones?
+
+Availability Zones are physically separate datacenters within a region.
+
+Each zone has:
+
+* Independent power
+* Cooling
+* Networking
+
+---
+
+# Purpose of Zone-Aware Services
+
+Protect workloads from:
+
+* Datacenter failures
+* Power outages
+* Cooling failures
+* Hardware failures
+
+---
+
+# Types of Zone Support
+
+| Type           | Description                |
+| -------------- | -------------------------- |
+| Zone-Redundant | Replicated across zones    |
+| Zone-Pinned    | Specific zone deployment   |
+| Zone-Aware     | Understands zone placement |
+
+---
+
+# Examples of Zone-Aware Services
+
+| Azure Service          | Zone Support |
+| ---------------------- | ------------ |
+| Virtual Machines       | Yes          |
+| VM Scale Sets          | Yes          |
+| Azure SQL Database     | Yes          |
+| Standard Load Balancer | Yes          |
+| Application Gateway v2 | Yes          |
+| AKS                    | Yes          |
+| Managed Disks          | Yes          |
+| Cosmos DB              | Yes          |
+
+---
+
+# Real-Time Example
+
+AKS cluster deployed across:
+
+```text id="f1x9me"
+Zone1 + Zone2 + Zone3
+```
+
+If Zone1 fails:
+
+* Applications continue running in remaining zones.
+
+---
+
+# Architecture Example
+
+```text id="m8p4tz"
+Users → Load Balancer → VMs Across Multiple Zones
+```
+
+---
+
+# Benefits
+
+| Benefit                   | Description                 |
+| ------------------------- | --------------------------- |
+| Higher SLA                | Up to 99.99%                |
+| Improved Resiliency       | Datacenter fault protection |
+| Business Continuity       | Reduced downtime            |
+| Better Disaster Tolerance | Multi-zone redundancy       |
+
+---
+
+# Availability Set vs Availability Zone
+
+| Availability Set      | Availability Zone           |
+| --------------------- | --------------------------- |
+| Same datacenter       | Different datacenters       |
+| Rack-level protection | Datacenter-level protection |
+| Lower resiliency      | Higher resiliency           |
+
+---
+
+# Interview Tip
+
+Availability Zone-aware services automatically leverage multiple datacenters within a region to improve resiliency and uptime.
+
+---
+
+# 79. What is Azure Dedicated Host?
+
+Microsoft Azure Dedicated Host provides physical servers dedicated entirely to a single customer.
+
+Unlike normal Azure infrastructure:
+
+* No other customer shares the physical server.
+
+---
+
+# Purpose
+
+Used for:
+
+* Regulatory compliance
+* Hardware isolation
+* Bring-your-own-license (BYOL)
+* Specialized security requirements
+
+---
+
+# Key Features
+
+| Feature                | Description               |
+| ---------------------- | ------------------------- |
+| Single-Tenant Hardware | Dedicated physical server |
+| VM Placement Control   | Choose host placement     |
+| License Optimization   | Use existing licenses     |
+| Isolation              | No multi-tenant sharing   |
+| Compliance Support     | Regulatory workloads      |
+
+---
+
+# Use Cases
+
+## 1. Compliance Requirements
+
+Government or banking workloads needing isolated infrastructure.
+
+---
+
+## 2. Licensing Benefits
+
+Use existing Windows Server or SQL Server licenses.
+
+---
+
+## 3. Security Isolation
+
+Prevent noisy-neighbor scenarios.
+
+---
+
+# Architecture Example
+
+```text id="p5m2wc"
+Dedicated Host → Multiple Customer VMs
+```
+
+No external tenant VMs run on same hardware.
+
+---
+
+# Dedicated Host vs Standard VM
+
+| Feature            | Standard VM | Dedicated Host |
+| ------------------ | ----------- | -------------- |
+| Shared Hardware    | Yes         | No             |
+| Physical Isolation | Limited     | Full           |
+| Licensing Control  | Limited     | Better         |
+| Cost               | Lower       | Higher         |
+
+---
+
+# Real-Time Enterprise Example
+
+Large enterprise migrates:
+
+* Oracle workloads
+* SQL workloads
+
+to Dedicated Hosts to maintain licensing compliance.
+
+---
+
+# Benefits
+
+| Benefit                 | Description          |
+| ----------------------- | -------------------- |
+| Compliance              | Regulatory alignment |
+| Predictable Performance | Dedicated resources  |
+| Hardware Isolation      | Increased security   |
+| Cost Savings            | BYOL licensing       |
+
+---
+
+# Interview Tip
+
+Azure Dedicated Host provides isolated physical servers dedicated to one organization for compliance, licensing, and security needs.
+
+---
+
+# 80. What is the difference between Proximity Placement Groups and Availability Sets?
+
+| Feature         | Proximity Placement Group (PPG) | Availability Set     |
+| --------------- | ------------------------------- | -------------------- |
+| Goal            | Reduce latency                  | Improve availability |
+| VM Placement    | Close together                  | Spread apart         |
+| Performance     | Low network latency             | Fault isolation      |
+| Use Case        | HPC/SAP                         | HA applications      |
+| Fault Tolerance | Limited                         | Strong               |
+
+---
+
+# Proximity Placement Group (PPG)
+
+A PPG ensures Azure places VMs physically close together within the datacenter.
+
+---
+
+# Purpose
+
+Reduce:
+
+* Network latency
+* Inter-VM communication delay
+
+---
+
+# Best Use Cases
+
+| Workload            | Reason                  |
+| ------------------- | ----------------------- |
+| SAP HANA            | Low latency             |
+| HPC                 | Fast node communication |
+| Real-Time Analytics | High-speed processing   |
+
+---
+
+# Example
+
+```text id="w3n8zp"
+App VM ↔ DB VM
+```
+
+placed extremely close for minimal latency.
+
+---
+
+# Availability Set
+
+Availability Set spreads VMs across:
+
+* Fault Domains
+* Update Domains
+
+to improve:
+
+* High availability
+* Fault tolerance
+
+---
+
+# Purpose
+
+Protect applications from:
+
+* Hardware failures
+* Planned maintenance
+
+---
+
+# Example
+
+```text id="q9x2mf"
+VM1 → Fault Domain 1
+VM2 → Fault Domain 2
+```
+
+---
+
+# Key Difference
+
+## PPG
+
+Optimizes:
+
+```text id="r6m1dy"
+Performance and low latency
+```
+
+---
+
+## Availability Set
+
+Optimizes:
+
+```text id="n4v7qc"
+High availability and resiliency
+```
+
+---
+
+# Can They Be Used Together?
+
+Yes.
+
+Example:
+
+* SAP application using:
+
+  * Availability Set for HA
+  * PPG for low latency
+
+---
+
+# Real-Time Enterprise Scenario
+
+SAP Landscape:
+
+* App servers in Availability Set
+* Database and app VMs inside PPG
+
+This provides:
+
+* High availability
+* Low-latency communication
+
+---
+
+# Interview Tip
+
+Proximity Placement Groups reduce latency by placing VMs close together, while Availability Sets improve resiliency by distributing VMs across fault domains.
+
