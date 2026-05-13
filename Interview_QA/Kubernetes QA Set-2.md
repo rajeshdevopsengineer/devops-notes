@@ -13342,3 +13342,6951 @@ You want to scale or investigate before it becomes critical.
 
 5. **Logging library spinning**: Application's log shipper had a bug causing infinite CPU on log file rotation. Fix: upgrade the library, monitor sidecar CPU separately.
 
+
+# Kubernetes Troubleshooting Scenarios (111-120)
+
+## 111. Pods are evicted due to memory pressure
+
+Pod eviction due to memory pressure means the kubelet decided that the node's memory situation was bad enough that killing pods was necessary to preserve node stability. The evicted pods show status `Evicted` and a message about memory pressure.
+
+**Step 1: Confirm the eviction**
+
+```bash
+kubectl get pods --all-namespaces | grep Evicted
+# NAMESPACE   NAME              READY   STATUS    RESTARTS   AGE
+# default     app-xyz           0/1     Evicted   0          1h
+
+kubectl describe pod <evicted-pod>
+# Status:        Failed
+# Reason:        Evicted
+# Message:       The node was low on resource: memory. Container app was using
+#                1500Mi, which exceeds its request of 100Mi.
+```
+
+The `Message` field tells you which container exceeded which threshold. Note the gap between request (100Mi) and actual usage (1500Mi); this pod was a major reason for the eviction.
+
+**Step 2: Understand who got evicted and why**
+
+Eviction order (covered in Q83):
+
+1. **BestEffort pods first** (no requests/limits)
+2. **Burstable pods exceeding requests** (sorted by usage above request, scaled by priority)
+3. **Guaranteed pods last** (only if they're exceeding their guarantee, which shouldn't happen normally)
+
+Check the QoS class of evicted pods:
+
+```bash
+kubectl get pod <evicted-pod> -o jsonpath='{.status.qosClass}'
+```
+
+If BestEffort pods are getting evicted, the system is working as designed; consider whether those pods should have requests set.
+
+If Guaranteed pods got evicted, something is seriously wrong (likely the node's actual capacity is less than reported, or system processes are using more than reserved).
+
+**Step 3: Find the memory consumer that triggered eviction**
+
+```bash
+# Which pod was using the most memory before eviction?
+# Check Prometheus historical data:
+# container_memory_working_set_bytes{node="<node>"} sorted desc, just before the eviction time
+
+# Check node-level memory pressure event:
+kubectl get events --field-selector reason=NodeHasInsufficientMemory
+```
+
+The pod that caused the pressure isn't always the one evicted. A Guaranteed pod can cause pressure (using up to its limit), but BestEffort pods are evicted first.
+
+**Step 4: Investigate the node's overall state**
+
+```bash
+kubectl describe node <node-name>
+# Look at:
+# Capacity:
+#   memory: 16Gi
+# Allocatable:
+#   memory: 14Gi      ← What pods can actually use (after reservations)
+# Allocated resources:
+#   memory: 13.5Gi    ← Sum of all pod requests
+```
+
+If `Allocated` is close to `Allocatable`, the node is oversubscribed by requests. If actual usage is exceeding requests significantly, eviction is inevitable when totals hit the threshold.
+
+**Step 5: Categorize the root cause**
+
+**Cause A: Memory limit too generous, request too low**
+
+```yaml
+resources:
+  requests:
+    memory: 100Mi    # Scheduler used this
+  limits:
+    memory: 4Gi      # Actual usage grew here
+```
+
+This pod was scheduled as if it needs 100Mi, but actually uses gigabytes. Many such pods on a node cause eviction when their real usage adds up.
+
+**Fix:** Set requests close to typical usage. Use VPA in recommendation mode to get historical data.
+
+**Cause B: Memory leak**
+
+The application's memory usage grows over time. Initially the node had headroom; eventually pressure built up.
+
+**Fix:** Profile the app, fix the leak. As a stopgap, set a memory limit to force restarts.
+
+**Cause C: Burstable workload spike**
+
+A batch job started consuming significantly more memory than usual (large file processing, database snapshot, etc.).
+
+**Fix:** Schedule predictable spike workloads to dedicated nodes via taints/tolerations, or use larger nodes for such workloads.
+
+**Cause D: System memory consumption underestimated**
+
+The kubelet's `--system-reserved` and `--kube-reserved` don't actually match system needs. The "free" memory shown to pods isn't really free.
+
+```bash
+# On the node, see actual memory usage by category:
+free -h
+cat /proc/meminfo | head -20
+ps aux --sort=-rss | head -20   # Top non-container memory consumers
+```
+
+Fix: increase reservations to match observed system usage with headroom.
+
+**Cause E: Cache and buffers misinterpreted**
+
+This is less common since kubelet uses working set (RSS + active cache), but excessive page cache can sometimes trigger pressure. Generally not the cause unless reservations are misconfigured.
+
+**Step 6: Prevent recurrence**
+
+**Set proper requests on all pods:**
+
+A pod without a memory request is BestEffort and will be evicted first. Setting a realistic request both prevents BestEffort classification and provides the scheduler with accurate data.
+
+**Set memory limits where appropriate:**
+
+Limits prevent runaway consumption but cause OOMKill (Q85) instead of eviction. For predictable workloads, limits equal to requests (Guaranteed class) gives the strongest protection.
+
+**Use ResourceQuota and LimitRange:**
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+spec:
+  limits:
+    - default:
+        memory: 512Mi
+      defaultRequest:
+        memory: 256Mi
+      type: Container
+```
+
+This forces every pod in the namespace to have requests/limits, preventing accidental BestEffort pods.
+
+**Configure cluster autoscaler:**
+
+If memory pressure is recurring, you may not have enough nodes. Cluster autoscaler can add nodes when pods are evicted or pending due to memory.
+
+**Monitor and alert:**
+
+```promql
+# Alert when node memory usage approaches eviction threshold:
+(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes > 0.85
+```
+
+**Clean up evicted pods:**
+
+Evicted pods stay around as failed pods, eating etcd space:
+
+```bash
+kubectl delete pods --all-namespaces --field-selector status.phase=Failed
+```
+
+Better: set a CronJob to clean these up periodically.
+
+---
+
+## 112. Why are Pods stuck in ContainerCreating state?
+
+ContainerCreating means the pod has been scheduled to a node and the kubelet has accepted it, but the actual container hasn't started yet. The kubelet is doing setup work that's either taking a long time or failing.
+
+**Step 1: Get the detailed events**
+
+```bash
+kubectl describe pod <pod-name>
+# Events section shows where it's stuck
+```
+
+The kubelet emits events for each setup phase failure. Common patterns:
+
+**Step 2: Identify the failing phase**
+
+Setup phases the kubelet does in order:
+
+1. Pull images (if not present)
+2. Set up sandbox (pause container, network namespace)
+3. CNI plugin call (assign pod IP)
+4. Mount volumes
+5. Create and start each container
+
+Each phase can stall or fail independently.
+
+**Cause A: Image pull**
+
+```
+Events:
+  Warning  Failed     2m   kubelet  Failed to pull image "myrepo/app:v1":
+                          rpc error: code = NotFound desc = failed to pull and unpack image
+```
+
+Status often shows ContainerCreating briefly before moving to ImagePullBackOff. If it stays in ContainerCreating, the pull is slow but progressing. Check:
+
+```bash
+# On the node:
+crictl images | grep <image-name>
+# Check if image is partially pulled
+
+journalctl -u kubelet | grep -i pull
+```
+
+For large images on slow networks, this can legitimately take minutes. See Q113 for image pull troubleshooting.
+
+**Cause B: CNI plugin failure**
+
+```
+Warning  FailedCreatePodSandBox  1m  kubelet  Failed to create pod sandbox:
+  rpc error: code = Unknown desc = failed to setup network for sandbox:
+  plugin type="calico" failed (add): error getting ClusterInformation
+```
+
+The CNI plugin can't allocate an IP or set up network for the pod. Common causes:
+
+- CNI plugin DaemonSet pod not running on this node
+- CNI configuration file missing or malformed on the node
+- IP pool exhausted in the CNI (Calico IPAM, AWS VPC CNI ENI limits)
+- Network controller (Calico controller, etc.) failing
+
+```bash
+# Check CNI pods:
+kubectl get pods -n kube-system -l k8s-app=calico-node -o wide   # Or your CNI
+# Is there one running on the failing node?
+
+# On the node:
+ls /etc/cni/net.d/    # Should have CNI config files
+ls /opt/cni/bin/      # Should have CNI plugin binaries
+
+# CNI logs (Calico example):
+kubectl logs -n kube-system <calico-node-pod-on-failing-node>
+```
+
+**AWS VPC CNI specific issue:**
+
+```
+Warning  FailedCreatePodSandBox  ...
+  failed to assign an IP address to container
+```
+
+This usually means ENI/IP exhaustion. AWS instances have limits on ENIs and IPs per ENI. When the node has too many pods, no more IPs available. Solutions:
+- Use prefix delegation (`ENABLE_PREFIX_DELEGATION=true`)
+- Use a larger instance type
+- Set custom networking
+
+**Cause C: Volume mount failure**
+
+```
+Warning  FailedMount  1m  kubelet  MountVolume.SetUp failed for volume "config":
+  configmap "app-config" not found
+```
+
+The pod references a ConfigMap, Secret, or PVC that doesn't exist or isn't ready. Check:
+
+```bash
+# Look for the volume references:
+kubectl get pod <pod> -o yaml | grep -A 10 volumes
+
+# Verify each referenced object exists:
+kubectl get configmap <name>
+kubectl get secret <name>
+kubectl get pvc <name>
+```
+
+Volume mount failures can also be from CSI driver issues (Q107), permissions, or filesystem errors.
+
+**Cause D: Sandbox creation hung**
+
+```
+Events:  (none recent)
+Status:  ContainerCreating  
+```
+
+Sometimes there are no events, just stalled state. This often points to the container runtime being slow or hung:
+
+```bash
+# On the node:
+crictl pods | grep <pod-name>     # Is there a sandbox?
+crictl ps -a | grep <pod-name>    # Containers?
+
+# Check runtime:
+systemctl status containerd
+journalctl -u containerd --since "10 minutes ago" | tail -50
+```
+
+If `crictl` commands hang, the runtime is stuck. Restart the runtime as last resort:
+
+```bash
+systemctl restart containerd
+# Note: This restarts all containers on the node
+```
+
+**Cause E: Secret/ConfigMap not yet propagated**
+
+In rare cases, especially right after creating a Secret and then a Pod that uses it, there's a propagation delay. The Pod can't find the Secret briefly. This usually self-resolves within seconds.
+
+**Cause F: Image pull secret issues**
+
+For private registries:
+
+```
+Warning  Failed  ... Failed to pull image "private.registry/app":
+  rpc error: ... pull access denied, repository does not exist or may require authentication
+```
+
+Check:
+
+```bash
+# Does the pod reference an imagePullSecret?
+kubectl get pod <pod> -o yaml | grep -A 3 imagePullSecrets
+
+# Does the secret exist?
+kubectl get secret <pull-secret-name>
+
+# Is it the correct type?
+kubectl get secret <pull-secret-name> -o yaml
+# type: kubernetes.io/dockerconfigjson
+```
+
+**Cause G: Init container hung or failing**
+
+If the pod has init containers, the main container won't start until all inits succeed:
+
+```bash
+kubectl describe pod <pod> | grep -A 10 "Init Containers"
+# Each init container has its own status
+
+kubectl logs <pod> -c <init-container-name>
+```
+
+Common init container issues: waiting for an external service that's unavailable, waiting for a config that's missing.
+
+**Step 3: Time-based stuck states**
+
+If the pod has been ContainerCreating for:
+
+- **< 1 minute**: Probably normal, wait
+- **1-5 minutes**: Likely a slow image pull or CNI delay, check events
+- **> 10 minutes**: Definite problem, won't self-resolve
+
+**Step 4: Node-level investigation**
+
+If multiple pods on the same node are stuck:
+
+```bash
+# Check node:
+kubectl describe node <node-name>
+# Conditions, taints, recent events
+
+# On the node:
+journalctl -u kubelet --since "10 minutes ago" | grep -i error
+```
+
+**Production scenarios I've seen:**
+
+1. **Calico calico-node DaemonSet rolling out**: Pods created during the rollout briefly failed CNI setup. Self-resolved once Calico stabilized.
+
+2. **EFS CSI driver stuck**: An EFS mount took 5+ minutes because the mount target was overwhelmed. Mass pod restarts had created a thundering herd.
+
+3. **A bug in containerd 1.6.x** where namespace creation occasionally hung indefinitely. Required runtime restart.
+
+4. **Image registry rate-limiting**: After mass scaling, Docker Hub rate-limited the cluster's IP. All new pods got stuck pulling images. Fixed by using a pull-through cache.
+
+5. **Pod with hostPath volume to non-existent directory**: kubelet kept retrying mount, never succeeded.
+
+---
+
+## 113. How do you debug ImagePullBackOff?
+
+ImagePullBackOff means the kubelet tried to pull the image, failed, and is now waiting before retrying (exponential backoff up to 5 minutes). The failure is usually obvious from events, but the root cause varies.
+
+**Step 1: Get the specific error**
+
+```bash
+kubectl describe pod <pod-name> | grep -A 5 -i "failed"
+# Events:
+#   Failed to pull image "myrepo/app:v2":
+#     rpc error: code = NotFound desc = failed to pull and unpack image "myrepo/app:v2":
+#     failed to resolve reference: not found
+```
+
+The error message after "failed to pull" tells you exactly what's wrong.
+
+**Step 2: Match the error pattern**
+
+**Pattern 1: `not found` or `manifest unknown`**
+
+```
+failed to resolve reference "registry/image:tag": not found
+manifest for image:tag not found
+```
+
+The image doesn't exist at the specified location, or the tag is wrong.
+
+Check:
+- Typo in image name (`nignx` instead of `nginx`)
+- Wrong tag (`v1.0.0` doesn't exist, maybe it's `1.0.0` or `v1.0`)
+- Image was deleted from the registry
+- Wrong registry (referring to `mycompany/app` instead of `registry.mycompany.com/app`)
+
+Verify by pulling manually:
+
+```bash
+docker pull <image>:<tag>
+# Or on a node:
+crictl pull <image>:<tag>
+```
+
+**Pattern 2: `unauthorized` or `pull access denied`**
+
+```
+pull access denied, repository does not exist or may require authentication
+unauthorized: authentication required
+```
+
+The kubelet can't authenticate to the registry. Causes:
+
+- No imagePullSecret on the pod or ServiceAccount
+- imagePullSecret has wrong credentials
+- Credentials expired
+- Registry permissions changed (user/token revoked)
+- Image is in a different organization than expected
+
+Check the pull secret:
+
+```bash
+kubectl get pod <pod> -o yaml | grep -A 3 imagePullSecrets
+# or check ServiceAccount:
+kubectl get sa <sa-name> -o yaml | grep imagePullSecrets
+
+# Decode the secret to verify:
+kubectl get secret <pull-secret> -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d | jq
+# Should contain:
+# {
+#   "auths": {
+#     "myregistry.com": {
+#       "auth": "base64-encoded-user:password"
+#     }
+#   }
+# }
+```
+
+Test the credentials manually:
+
+```bash
+echo <base64-auth> | base64 -d
+# user:password
+docker login myregistry.com -u user -p password
+```
+
+**Pattern 3: `connection refused` or `no such host`**
+
+```
+dial tcp: lookup registry.example.com: no such host
+connect: connection refused
+```
+
+Network connectivity from the node to the registry is broken.
+
+```bash
+# From the node:
+nslookup registry.example.com
+curl -v https://registry.example.com/v2/
+# Should return 401 or 200, not connection error
+```
+
+Causes:
+- Firewall blocking outbound HTTPS from nodes
+- DNS resolution issue
+- Registry actually down
+- Cloud VPC routing changed
+
+**Pattern 4: `x509: certificate signed by unknown authority`**
+
+```
+x509: certificate signed by unknown authority
+tls: failed to verify certificate
+```
+
+The registry uses a TLS certificate that the node doesn't trust (self-signed, internal CA).
+
+Fix: install the CA cert on all nodes, or configure the container runtime to skip verification (NOT recommended for production):
+
+```toml
+# containerd config:
+[plugins."io.containerd.grpc.v1.cri".registry.configs."registry.internal.com".tls]
+  ca_file = "/etc/ssl/internal-ca.crt"
+```
+
+**Pattern 5: `429 Too Many Requests` (Docker Hub rate limit)**
+
+```
+toomanyrequests: You have reached your pull rate limit
+```
+
+Docker Hub rate-limits anonymous and free-tier pulls. After mass scaling or rolling restarts, the cluster IP hits the limit.
+
+Fix:
+- Authenticate to Docker Hub (free tier gets 200 pulls/6h authenticated vs 100/6h anonymous)
+- Use a pull-through cache (Harbor, Artifactory, ECR cache)
+- Mirror images to a private registry
+
+**Pattern 6: Timeout**
+
+```
+context deadline exceeded
+```
+
+Image is too large or network too slow. The pull is failing on timeout. Default timeout is generous, so this means the connection is very slow or stalled.
+
+Check:
+- Network bandwidth from node to registry
+- Image size (multi-GB images need patience and good network)
+- Registry health
+
+**Step 3: Test pulling manually on the node**
+
+```bash
+# SSH to the node, then:
+crictl pull <image>:<tag>
+```
+
+This bypasses Kubernetes and shows the raw error. Often more verbose than the kubelet event.
+
+**Step 4: Check imagePullPolicy**
+
+```yaml
+spec:
+  containers:
+    - name: app
+      image: myrepo/app:v1
+      imagePullPolicy: Always   # vs IfNotPresent or Never
+```
+
+- `Always`: Pull every time. Hits network even for already-present images.
+- `IfNotPresent`: Pull only if not on the node. Default for non-`latest` tags.
+- `Never`: Don't pull, must be pre-present. Used for locally-built images.
+
+If using `Never` and the image isn't pre-loaded on the node, you get `ErrImageNeverPull`. Different error, same family of issues.
+
+**Step 5: Special case — `:latest` tag**
+
+The `:latest` tag (or no tag) defaults to `imagePullPolicy: Always`. The image might be there but kubelet wants to re-pull. If the registry is unreachable, this fails even though a working version exists locally.
+
+Recommendation: never use `:latest` in production. Use immutable tags.
+
+**Step 6: Production patterns to prevent ImagePullBackOff**
+
+**Use a registry mirror or pull-through cache:**
+
+For Docker Hub:
+
+```yaml
+# containerd config on each node:
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+  endpoint = ["https://mirror.gcr.io", "https://registry-1.docker.io"]
+```
+
+**Pre-pull critical images:**
+
+Use a DaemonSet or `imagePullJob` to pre-pull images to all nodes, so cold-start pulls don't block scheduling.
+
+**Use stable image tags:**
+
+Tag releases with immutable identifiers (commit SHA, semver). Mutable tags like `latest` or `stable` cause unpredictable behavior.
+
+**Set proper imagePullSecret on ServiceAccounts:**
+
+Instead of every pod referencing pull secrets, put them on the default ServiceAccount per namespace:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+imagePullSecrets:
+  - name: registry-credentials
+```
+
+**Monitor and alert:**
+
+```promql
+# Alert on persistent ImagePullBackOff:
+kube_pod_container_status_waiting_reason{reason="ImagePullBackOff"} == 1
+```
+
+---
+
+## 114. Explain CrashLoopBackOff troubleshooting approach
+
+CrashLoopBackOff (touched on in Q103) deserves a deeper, structured approach because it's so common in production. The state means kubelet is restarting a container repeatedly, with increasing backoff (10s, 20s, 40s, 80s, 160s, max 300s).
+
+**The systematic approach:**
+
+**Step 1: Get baseline information**
+
+```bash
+kubectl get pod <pod-name> -o wide
+# RESTARTS column shows how many times. Rising means active issue.
+
+kubectl describe pod <pod-name>
+# Look at:
+#   - Last State (Terminated): reason and exit code
+#   - Events
+#   - Restart count per container
+```
+
+**Step 2: Read previous logs**
+
+```bash
+kubectl logs <pod-name> --previous
+# Critical: --previous shows the LAST CRASHED instance, not the one currently starting
+
+# If pod has multiple containers:
+kubectl logs <pod-name> --previous -c <container-name>
+```
+
+If `--previous` returns nothing, the container crashed before producing logs. This points to startup failures (config parsing, missing files).
+
+**Step 3: Classify by exit code**
+
+The exit code in `Last State` is your first major clue:
+
+| Exit Code | Meaning | Common Causes |
+|-----------|---------|---------------|
+| 0 | Clean exit | Main process exited normally but shouldn't have; misconfigured entry point |
+| 1 | Application error | Generic crash; check logs for stack trace |
+| 2 | Misuse of shell built-ins | Bad command syntax in entrypoint script |
+| 126 | Cannot execute | Permission issue on executable |
+| 127 | Command not found | Wrong path in command/args |
+| 130 | Container terminated (Ctrl+C / SIGINT) | Manual interruption |
+| 137 | SIGKILL (often OOM) | Memory exceeded, or kubelet killed it |
+| 139 | Segmentation fault | Native crash, often C/C++ apps or JVM native code |
+| 143 | SIGTERM | Container shutting down (might be intentional) |
+| 255 | Container error | Generic; check application |
+
+**Step 4: Branch by exit code**
+
+**Branch A: Exit 0 (clean exit)**
+
+The application thinks it's done. For long-running services, this is wrong.
+
+Common causes:
+- Misconfigured entrypoint (e.g., `command: ["bash"]` instead of `command: ["bash", "-c", "while true; do app; sleep 5; done"]`)
+- Application reads config, validates, exits because validation passed but there's no `run` step
+- Init logic completed but main loop wasn't started
+
+Investigate:
+```bash
+kubectl get pod <pod> -o yaml | grep -A 5 -E "command|args"
+```
+
+Verify the entrypoint actually starts a long-running process.
+
+**Branch B: Exit 1 (application error)**
+
+Read the logs carefully. Stack traces, panic messages, fatal errors are the clue.
+
+```bash
+kubectl logs <pod> --previous --tail=100
+```
+
+Common patterns in logs:
+
+- `Connection refused`: dependency (DB, cache, API) not reachable
+- `permission denied`: file system or capability issue
+- `panic:` / `Exception in thread "main"`: application bug
+- `parsing config`: malformed ConfigMap or env var
+
+**Branch C: Exit 137 (OOMKilled)**
+
+```bash
+kubectl describe pod <pod> | grep -i oomkilled
+# If present, confirmed OOM
+```
+
+Follow Q85 troubleshooting (memory limit too low, leak, JVM heap misconfiguration).
+
+**Branch D: Exit 139 (segfault)**
+
+Native crash. Hard to debug in containers without core dumps.
+
+```bash
+# Enable core dumps (on the node):
+echo "/cores/core.%e.%p" > /proc/sys/kernel/core_pattern
+
+# Have the pod write cores to a hostPath, then analyze with gdb
+```
+
+For JVM segfaults, check `hs_err_pid*.log` files (configure JVM to write them to a known location). Common causes: JNI library bugs, hardware issues, JVM bugs.
+
+**Branch E: No logs at all (immediate crash)**
+
+The container exits before producing any output. This is one of the trickier cases.
+
+Possible causes:
+
+1. **Wrong command**: Image's entrypoint expects different args than provided.
+   ```bash
+   # Run the image interactively to see what it expects:
+   kubectl run debug --image=<same-image> --command -- sleep 3600
+   kubectl exec -it debug -- sh
+   # Then manually run what the failing pod runs
+   ```
+
+2. **Architecture mismatch**: ARM image on x86 node or vice versa. Look for:
+   ```
+   exec format error
+   ```
+   in events.
+
+3. **Missing dependencies**: Image expects an env var or volume that isn't provided.
+
+4. **Read-only filesystem**: App tries to write to a path that's mounted read-only.
+
+5. **Init system / signal handling**: If the entrypoint is a script that runs a process in the background and exits, the container exits immediately.
+
+**Step 5: Investigate health probes**
+
+Liveness probe failures can cause CrashLoopBackOff:
+
+```bash
+kubectl describe pod <pod> | grep -A 3 "Liveness"
+# Liveness:    http-get http://:8080/health delay=0s timeout=1s period=10s
+```
+
+Check events for probe failures:
+
+```bash
+kubectl describe pod <pod> | grep -i probe
+# Warning  Unhealthy  ...  Liveness probe failed: ...
+```
+
+If probes are too aggressive:
+- `initialDelaySeconds` too low: kills the pod before it's ready to serve
+- `timeoutSeconds` too low: kills the pod on slow responses
+- `failureThreshold` too low: kills on transient issues
+
+The pod may actually be fine, just slow to respond. Fix by tuning probes.
+
+**Step 6: Get inside the container if possible**
+
+If the pod sometimes runs briefly before crashing:
+
+```bash
+# Catch it during the brief running window:
+kubectl exec -it <pod> -- sh
+
+# Or use ephemeral containers (1.25+):
+kubectl debug -it <pod> --image=busybox --target=<container-name>
+```
+
+If the container never starts long enough:
+
+```bash
+# Override the command to keep it alive:
+kubectl run debug --image=<same-image> --command -- sleep 3600
+kubectl exec -it debug -- sh
+# Manually reproduce the startup
+```
+
+Or modify the deployment temporarily:
+
+```yaml
+command: ["sleep", "3600"]
+```
+
+Then exec in and run the original command manually to see what fails.
+
+**Step 7: Check resource limits and node state**
+
+```bash
+kubectl describe pod <pod> | grep -A 5 Limits
+kubectl describe node <node-pod-is-on>
+```
+
+Container starts but quickly gets killed by:
+- Memory limit (OOM)
+- CPU limit (extreme throttling causing health probe failures)
+- ephemeral-storage limit
+
+**Step 8: Production reproduction**
+
+For tough cases, reproduce locally:
+
+```bash
+# Pull the same image:
+docker pull <same-image>
+
+# Run with the same env vars and config:
+docker run --rm -e VAR=value -v /local/config:/etc/app/config <image>
+```
+
+This eliminates Kubernetes-specific factors and lets you debug interactively.
+
+**Real-world cases:**
+
+1. **Database migration on startup**: App ran migrations at startup, migrations took 6 minutes, liveness probe killed it at 30 seconds. Fix: use `startupProbe` or run migrations in init container.
+
+2. **Config file in ConfigMap had Windows line endings**: App couldn't parse the config, crashed immediately. Visible only after `od -c config-file` showed `\r\n`.
+
+3. **Memory limit set in K8s but JVM not container-aware**: `-Xmx` was 2GB, container limit was 1GB. JVM tried to allocate 2GB heap, immediate OOM. Fix: `-XX:+UseContainerSupport` (default in newer JVMs) or set `-Xmx` to 60-70% of container limit.
+
+4. **Secret value contained shell special chars**: Env var was set from secret, contained `$`, app's shell wrapper script interpreted it as variable expansion, command became malformed.
+
+5. **Pod's ServiceAccount lacked permission to read its own ConfigMap**: App startup failed reading config. Subtle because the error was a 403 from API server, not "file not found".
+
+---
+
+## 115. Service is unreachable inside cluster
+
+When a Service IP can't be reached from within the cluster, the issue could be at multiple layers: Service definition, Endpoints, DNS, kube-proxy, or network policies. Diagnose systematically.
+
+**Step 1: Confirm the symptom**
+
+From a pod in the same namespace:
+
+```bash
+kubectl run -it --rm debug --image=nicolaka/netshoot --restart=Never -- bash
+
+# Inside debug pod:
+nslookup my-service
+curl -v http://my-service:8080/health
+```
+
+Common symptoms:
+- `nslookup` fails → DNS issue
+- `nslookup` works, `curl` hangs → routing or backend issue
+- `curl` returns "Connection refused" → backend not listening on that port
+- `curl` works sometimes → partial endpoint failure
+
+**Step 2: Verify the Service exists and is correctly defined**
+
+```bash
+kubectl get svc my-service -o yaml
+```
+
+Check:
+- `spec.selector` matches the labels of pods you expect to back this service
+- `spec.ports` has correct `port` and `targetPort`
+- `spec.type` (ClusterIP is default, LoadBalancer/NodePort have different paths)
+- `metadata.namespace` matches where you're querying
+
+**Step 3: Check Endpoints / EndpointSlices**
+
+The Service is backed by Endpoints (now EndpointSlices). If empty, no pods to send traffic to.
+
+```bash
+kubectl get endpoints my-service
+# NAME         ENDPOINTS                       AGE
+# my-service   10.244.1.5:8080,10.244.2.3:8080  5m
+
+# Or new API:
+kubectl get endpointslices -l kubernetes.io/service-name=my-service
+```
+
+If `ENDPOINTS` shows `<none>`, no pods match the service selector AND are ready.
+
+```bash
+# Find pods matching the selector:
+kubectl get pods -l <key>=<value>
+# Are they Ready? Right namespace?
+
+# Check pod readiness:
+kubectl get pods -l <key>=<value> -o wide
+```
+
+**Common reasons Endpoints is empty:**
+
+1. **Selector mismatch**: Service selector doesn't match pod labels.
+   ```bash
+   # Service selector:
+   kubectl get svc my-service -o jsonpath='{.spec.selector}'
+   # Pod labels:
+   kubectl get pods --show-labels
+   ```
+
+2. **Pods not Ready**: Pods exist and match labels but aren't passing readiness probes. Only Ready pods become endpoints (unless `publishNotReadyAddresses: true`).
+
+3. **Pods in wrong namespace**: Service is in namespace A, pods in namespace B. They can't be linked.
+
+4. **Pods exist but were just deleted**: Endpoints take a brief moment to update.
+
+**Step 4: Verify DNS resolution**
+
+```bash
+# Inside debug pod:
+nslookup my-service.<namespace>.svc.cluster.local
+# Should return the ClusterIP of the service
+
+# If DNS fails entirely, see Q104
+
+# Test with the cluster IP directly to isolate DNS:
+kubectl get svc my-service -o jsonpath='{.spec.clusterIP}'
+curl http://<cluster-ip>:8080/
+```
+
+**Step 5: Test from different scopes**
+
+This narrows down where the failure is:
+
+```bash
+# From a pod on the same node as the target:
+kubectl run -it --rm debug-1 --image=nicolaka/netshoot --restart=Never \
+  --overrides='{"spec":{"nodeName":"<target-node>"}}' -- curl http://my-service:8080
+
+# From a pod on a different node:
+kubectl run -it --rm debug-2 --image=nicolaka/netshoot --restart=Never \
+  --overrides='{"spec":{"nodeName":"<other-node>"}}' -- curl http://my-service:8080
+
+# Directly to a backing pod IP:
+kubectl get endpoints my-service
+curl http://<endpoint-ip>:8080/
+```
+
+Interpretation:
+- Same node works, other node fails → cross-node networking (CNI) problem
+- Direct pod IP works, service IP doesn't → kube-proxy / iptables issue
+- Nothing works → application listening issue
+
+**Step 6: Check NetworkPolicies**
+
+NetworkPolicies can silently block traffic:
+
+```bash
+kubectl get networkpolicy -n <namespace>
+kubectl describe networkpolicy <policy-name>
+```
+
+If a NetworkPolicy applies to the target pods, it might be blocking ingress from the source. Look for:
+- `policyTypes: Ingress` (filtering inbound)
+- `ingress: from:` rules; if specific pod selectors, source pod must match
+
+A default-deny NetworkPolicy is a common source of "unreachable" services. Verify by temporarily allowing all traffic or testing without the policy.
+
+**Step 7: Check kube-proxy**
+
+kube-proxy programs the iptables (or IPVS) rules that route Service IPs to pod IPs. If kube-proxy is broken on a node, services don't work from that node.
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=kube-proxy -o wide
+# Is there one running on the affected node?
+
+kubectl logs -n kube-system <kube-proxy-pod>
+```
+
+Check iptables rules on the affected node:
+
+```bash
+# On the node:
+iptables-save | grep <service-cluster-ip>
+# Should show DNAT rules
+
+iptables -t nat -L KUBE-SERVICES | grep <service-name>
+```
+
+If rules are missing, kube-proxy isn't programming them. Restart kube-proxy:
+
+```bash
+kubectl delete pod -n kube-system <kube-proxy-pod>
+```
+
+**Step 8: Check the backing application**
+
+If endpoints exist and network is fine, the app itself might not be listening:
+
+```bash
+# Get a backing pod IP:
+kubectl get endpoints my-service
+
+# Test directly:
+curl -v http://<pod-ip>:<target-port>/
+
+# Exec into a backing pod and check listening:
+kubectl exec -it <backing-pod> -- ss -tlnp
+# Or:
+kubectl exec -it <backing-pod> -- netstat -tlnp
+```
+
+Common app issues:
+- App listening on `127.0.0.1` instead of `0.0.0.0` (only accepts localhost connections)
+- App listening on wrong port
+- App's binding failed (port already in use, permission denied for low ports)
+
+**Step 9: Check Service port vs. targetPort**
+
+```yaml
+spec:
+  ports:
+    - port: 80           # The service port (what clients use)
+      targetPort: 8080   # The pod port (what app listens on)
+```
+
+If `targetPort: 8080` but the app listens on 8000, connections fail. Match these carefully. If `targetPort` is a named port (`targetPort: http`), ensure the pod has that named port:
+
+```yaml
+# In pod spec:
+ports:
+  - name: http
+    containerPort: 8080
+```
+
+**Production scenarios:**
+
+1. **Stale endpoints during rolling update**: All endpoints briefly invalid as pods rotated. Fixed by readiness probes and slower rollout (`maxUnavailable: 1`).
+
+2. **NetworkPolicy missing egress rule**: Source pods couldn't make outbound calls to anywhere. Fix: add egress rule allowing target service.
+
+3. **iptables corruption on a node**: kube-proxy logs showed errors. Restarting kube-proxy on the node fixed it.
+
+4. **CNI broken on one node**: All pods on that node could reach services on other nodes' pods, but inbound to its own pods failed. Fix: reinstall CNI on that node.
+
+5. **Service of type ExternalName misconfigured**: Service was an ExternalName pointing to wrong DNS. Failed when trying to resolve.
+
+---
+
+## 116. External traffic cannot reach application
+
+External traffic flows: Internet → Load Balancer → NodePort/Ingress → Service → Pod. Failure can occur at any hop.
+
+**Step 1: Identify the entry path**
+
+How is the application exposed externally?
+
+- **Service type LoadBalancer**: Cloud provider provisions a load balancer
+- **Service type NodePort**: Traffic comes to any node's port
+- **Ingress**: Layer-7 routing through an Ingress controller
+- **API Gateway / mesh**: External proxy like Istio Gateway, Kong
+
+Each has different troubleshooting paths.
+
+**Step 2: Test layer by layer from outside in**
+
+**Test 1: DNS resolution from outside the cluster**
+
+```bash
+# From your laptop:
+nslookup myapp.example.com
+dig myapp.example.com
+```
+
+Does DNS resolve to a sensible IP? If not, fix DNS records first. The IP should match what cloud provider provisioned (for LB) or your Ingress endpoint.
+
+**Test 2: TCP reachability**
+
+```bash
+nc -zv myapp.example.com 443
+nc -zv myapp.example.com 80
+```
+
+If TCP connect fails:
+- Firewall/security group blocking
+- Load balancer health checks failing (so LB returns no healthy targets)
+- LB doesn't exist yet (creation pending)
+
+**Test 3: HTTPS handshake**
+
+```bash
+curl -v https://myapp.example.com
+```
+
+If TLS fails:
+- Wrong certificate
+- Cert expired
+- SNI mismatch
+- Cert isn't installed on the LB
+
+**Test 4: HTTP response**
+
+If you get 502, 503, 504 from the LB or Ingress, the LB reached the cluster but the backend failed (see Q106).
+
+**Step 3: For LoadBalancer service**
+
+```bash
+kubectl get svc <service-name>
+# NAME         TYPE           CLUSTER-IP    EXTERNAL-IP      PORT(S)
+# myapp        LoadBalancer   10.0.5.42     34.123.45.67     80:31234/TCP
+```
+
+If `EXTERNAL-IP` is `<pending>`:
+- Cloud controller manager not running, or no permissions
+- Cloud provider quota exceeded (can't create more LBs)
+- Subnet doesn't allow LB creation
+- IP address pool exhausted
+
+Check events:
+
+```bash
+kubectl describe svc <service-name>
+# Events show creation status from cloud controller
+```
+
+If `EXTERNAL-IP` is set but unreachable, the LB exists but health checks may be failing:
+
+```bash
+# AWS example - check target group health:
+aws elbv2 describe-target-health --target-group-arn <arn>
+
+# GCP example:
+gcloud compute backend-services get-health <name>
+```
+
+LB health checks usually hit a NodePort or directly Pod IPs. If they fail:
+- The health check path returns non-200
+- Security group blocks the LB's health check source
+- App not listening on the checked port
+
+**Step 4: For NodePort service**
+
+```bash
+kubectl get svc <service-name>
+# NAME    TYPE       CLUSTER-IP    EXTERNAL-IP   PORT(S)
+# myapp   NodePort   10.0.5.42     <none>        80:31234/TCP
+```
+
+Traffic must hit a node's IP on port 31234.
+
+Check from outside:
+
+```bash
+nc -zv <any-node-public-ip> 31234
+```
+
+If failing:
+- Cloud security group / firewall doesn't allow inbound on 31234
+- Node doesn't have public IP
+- kube-proxy not routing the NodePort
+
+NodePort works on every node, even ones without the pod (kube-proxy proxies internally). If only some nodes work, there's a per-node issue.
+
+**Step 5: For Ingress**
+
+```bash
+kubectl get ingress
+# NAME    CLASS   HOSTS                  ADDRESS         PORTS
+# myapp   nginx   myapp.example.com      34.123.45.67    80, 443
+
+kubectl describe ingress myapp
+```
+
+Common Ingress issues:
+
+**Issue A: ADDRESS empty**
+
+The Ingress controller hasn't reconciled it, or the LB for the controller isn't provisioned. Check:
+
+```bash
+kubectl get pods -n ingress-nginx   # Or wherever your controller runs
+kubectl logs -n ingress-nginx <controller-pod>
+```
+
+**Issue B: ADDRESS set but DNS doesn't match**
+
+Your DNS record for `myapp.example.com` must point to the Ingress's ADDRESS. Verify:
+
+```bash
+nslookup myapp.example.com
+# Should return the Ingress ADDRESS
+```
+
+**Issue C: TLS certificate issues**
+
+```bash
+kubectl describe ingress myapp | grep -A 5 TLS
+# Should reference a Secret containing tls.crt and tls.key
+
+kubectl get secret <tls-secret> -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text | grep -A 2 Validity
+# Check expiry
+```
+
+If using cert-manager:
+
+```bash
+kubectl get certificate
+kubectl describe certificate <name>
+# Status conditions show issuance progress and errors
+```
+
+**Issue D: Wrong backend service**
+
+```bash
+kubectl get ingress myapp -o yaml | grep -A 5 backend
+# Verify service name and port are correct
+```
+
+The Ingress controller routes by host/path to the named backend. Misnamed = no traffic flow.
+
+**Step 6: Check Ingress controller logs**
+
+```bash
+kubectl logs -n ingress-nginx <controller-pod> --tail=100 | grep -i error
+```
+
+Look for:
+- Backend connection failures (502)
+- TLS errors
+- Configuration reload failures (some change in Ingress definition is invalid)
+- Rate limiting messages
+
+**Step 7: Cloud-specific issues**
+
+**AWS:**
+
+- Security groups: nodes must allow inbound from ALB/NLB security group
+- Target group: instance/IP mode? If IP mode, pods must be in VPC-routable subnets
+- Subnet tags: subnets need `kubernetes.io/cluster/<name>: shared` and `kubernetes.io/role/elb: 1`
+
+**GCP:**
+
+- Firewall rules: GKE creates these automatically usually, but custom firewalls can interfere
+- Health checks come from specific source ranges (`130.211.0.0/22`, `35.191.0.0/16`)
+- BackendConfig and FrontendConfig CRDs for advanced settings
+
+**Azure:**
+
+- Network Security Groups
+- Application Gateway vs Standard LB choice
+- Pod CIDR overlap with VNet
+
+**Step 8: Trace the connection path**
+
+Use distributed tracing if available. Otherwise, add `X-Request-ID` headers and grep through:
+
+1. Client logs / browser network tab
+2. Cloud LB access logs
+3. Ingress controller access logs
+4. Application logs
+
+Where does the request appear last? That's where it failed.
+
+**Production scenarios:**
+
+1. **Cloud LB security group not updated after VPC change**: LB existed but couldn't reach node ports. Updated SG to allow LB→nodes on NodePort range (30000-32767).
+
+2. **`externalTrafficPolicy: Local` with imbalanced pods**: With Local policy, traffic to a node without a backing pod is dropped. Pods on 2 of 10 nodes meant 80% of traffic hit nodes with no backend → connection failures. Fix: scale up pods or use `externalTrafficPolicy: Cluster`.
+
+3. **Wrong Ingress class**: Multiple Ingress controllers in cluster, my Ingress had no class annotation, was being processed by the wrong controller (or ignored). Fix: set `ingressClassName`.
+
+4. **TLS cert expired on weekend**: cert-manager renewal had been failing silently for 60 days. Monitor cert expiry separately as a safety net.
+
+5. **NLB stickiness causing issues**: Connection stickiness routed all of a particular client's traffic to one pod, which died, and stickiness kept retrying the dead target until timeout.
+
+---
+
+## 117. PersistentVolume remains in Released state
+
+A PV in `Released` state means the PVC that was bound to it was deleted, but the PV still has data and hasn't been cleaned up or made available for reuse. The PV is essentially orphaned.
+
+**Step 1: Understand PV states**
+
+- **Available**: PV is created but not yet bound to a PVC
+- **Bound**: PV is currently in use by a PVC
+- **Released**: The PVC was deleted, but the PV still has data
+- **Failed**: Automatic reclamation failed
+
+**Step 2: Check the PV**
+
+```bash
+kubectl get pv
+# NAME      CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS     CLAIM
+# pv-abc    10Gi       RWO            Retain           Released   default/data-mysql-0
+
+kubectl describe pv pv-abc
+```
+
+Key fields:
+- `Reclaim Policy`: What should happen when the PVC is deleted
+- `Claim`: Which PVC was bound (now-deleted)
+- `Status`: Released
+- `Source`: Where the actual data lives (EBS volume, NFS path, etc.)
+
+**Step 3: Understand reclaim policies**
+
+This determines why the PV is in Released:
+
+**`Retain`**: PV stays as-is after PVC deletion. Status becomes Released. **Manual cleanup required.** This is intentional — preserves data.
+
+**`Delete`**: PV and underlying storage are deleted when PVC is deleted. Should never end up in Released (it gets deleted).
+
+**`Recycle`**: Deprecated. Used to wipe the volume and make it Available. Don't use.
+
+If your PV is Released with Retain policy, that's expected behavior. The question is what to do next.
+
+**Step 4: Decide what to do with the data**
+
+Three options:
+
+**Option A: Discard the data and reclaim**
+
+You don't need the data. Delete the PV; the underlying storage (e.g., EBS volume) may also need manual deletion depending on driver.
+
+```bash
+kubectl delete pv pv-abc
+
+# If using cloud volume, delete it manually:
+aws ec2 delete-volume --volume-id vol-xxx
+```
+
+**Option B: Reuse the PV with a new PVC**
+
+You want a new PVC to bind to this existing PV (with its data).
+
+The PV's `claimRef` still points to the old (deleted) PVC. Remove that reference:
+
+```bash
+kubectl edit pv pv-abc
+# Delete the entire spec.claimRef section
+# Save and exit
+```
+
+After this, the PV's status becomes Available. Now create a PVC that matches the PV:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: new-data-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+  volumeName: pv-abc          # Explicitly bind to this PV
+  storageClassName: ""        # Empty if PV has empty/no storage class
+```
+
+**Option C: Migrate data and clean up**
+
+You want to keep the data but in a different volume. Mount the PV's underlying storage to a temporary pod, copy data out, then delete.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: data-rescue
+spec:
+  containers:
+    - name: rescue
+      image: busybox
+      command: ["sleep", "3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: rescue-pvc
+```
+
+Then `kubectl cp` the data out, save it to your destination, and delete the PV.
+
+**Step 5: Understand why this happens**
+
+**Common scenarios that leave Released PVs:**
+
+1. **StatefulSet deletion without cleanup**: Deleting a StatefulSet doesn't delete its PVCs (intentional, to preserve data). But if you `kubectl delete pvc` manually, the PVs go Released with Retain policy.
+
+2. **Wrong reclaim policy choice**: Using Retain for ephemeral data, then accumulating Released PVs forever.
+
+3. **Manual PVC deletion during testing**: Devs delete PVCs in test environments, PVs pile up.
+
+4. **Failed dynamic provisioning followed by manual cleanup**: Sometimes a PV gets stuck in a weird state and someone manually adjusts the claimRef.
+
+**Step 6: Storage cleanup automation**
+
+For environments with many ephemeral workloads, consider:
+
+- **StorageClass with `Delete` reclaim**: For non-persistent data (caches, scratch space)
+- **StorageClass with `Retain` reclaim**: For databases and other critical data
+- **Different StorageClasses for different needs**: Don't use one policy for everything
+
+Example StorageClass configuration:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ephemeral
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: persistent
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+```
+
+**Step 7: Cost implications**
+
+Released PVs with Retain policy don't get reclaimed, meaning the underlying storage (EBS, GP, etc.) keeps incurring costs. In large environments, this can be hundreds of dollars per month of orphaned volumes.
+
+Set up monitoring:
+
+```bash
+# How many Released PVs?
+kubectl get pv --field-selector status.phase=Released
+
+# Total capacity locked in Released PVs:
+kubectl get pv --field-selector status.phase=Released -o jsonpath='{range .items[*]}{.spec.capacity.storage}{"\n"}{end}'
+```
+
+Periodically review and clean up.
+
+**Step 8: Special case — Statically provisioned PVs**
+
+If you pre-create PVs (static provisioning) and PVCs claim them, when the PVC is deleted, the PV's claimRef points to a non-existent PVC. The PV is Released but you want to make it Available again for the next PVC.
+
+Two approaches:
+
+1. **Delete the claimRef** as shown above (manual but precise)
+
+2. **Use a PV reclaim controller**: Some operators automate this for specific patterns
+
+**Production scenario I've seen:**
+
+A cluster accumulated 200+ Released PVs over a year, mostly from StatefulSet test deployments where PVCs were manually deleted. Total wasted EBS storage: 8TB. Lesson: monitor Released PVs and have a cleanup process. Use `Delete` reclaim for non-critical data.
+
+---
+
+## 118. Why are Pods not distributed evenly across nodes?
+
+When pods cluster on a few nodes while others sit empty, it's usually due to scheduler decisions you didn't explicitly request but that follow from defaults and constraints.
+
+**Step 1: Observe the imbalance**
+
+```bash
+kubectl get pods -o wide --all-namespaces | awk '{print $8}' | sort | uniq -c | sort -rn
+# Output shows count of pods per node
+```
+
+```bash
+# Or for a specific app:
+kubectl get pods -l app=myapp -o wide
+# NODE column tells you the distribution
+```
+
+**Step 2: Understand why the scheduler made these choices**
+
+Kubernetes scheduling has two main phases: **filtering** (which nodes are eligible) and **scoring** (which eligible node is best). Imbalance comes from scoring decisions.
+
+Default scoring favors:
+- Nodes with most available resources (least-allocated)
+- Nodes already running pods of the same service (image locality, but this is a tiebreaker)
+- Anti-affinity, taints, and other explicit user preferences
+
+**Common causes of imbalance:**
+
+**Cause A: Pod requests are very small or unset**
+
+If pods have tiny or no requests, the scheduler considers all nodes equally suitable. Without strong scoring differentiation, pods can cluster on the first node it considers.
+
+```bash
+kubectl get pod <pod> -o jsonpath='{.spec.containers[*].resources.requests}'
+# If empty, scheduler has limited signal
+```
+
+**Fix**: Set realistic resource requests. The scheduler then spreads pods to balance resource utilization.
+
+**Cause B: Image locality scoring**
+
+When a pod's image is already pulled on a node, the scheduler slightly prefers that node. After repeated deployments, the same nodes accumulate pods because they have the images cached.
+
+This is usually a small effect but can compound.
+
+**Cause C: Recent scheduling decisions create momentum**
+
+A node that just had a pod placed appears slightly less attractive (more allocated). But if the request size is small relative to node capacity, multiple pods can land on the same node before another becomes more attractive.
+
+**Cause D: Topology Spread Constraints not set**
+
+By default, there's no enforcement that pods of a deployment spread across nodes/zones. Without explicit constraints, the scheduler optimizes for resource balance, not failure-domain distribution.
+
+**Fix**: Add `topologySpreadConstraints`:
+
+```yaml
+spec:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app: myapp
+```
+
+This enforces that pods of `app: myapp` are spread across nodes such that the difference between any two nodes' counts is at most 1.
+
+For zone-aware spreading:
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: myapp
+```
+
+**Cause E: Pod affinity drives clustering**
+
+If your pod has `podAffinity` rules (vs. `podAntiAffinity`), it actively wants to co-locate with other pods, creating clustering by design.
+
+```bash
+kubectl get pod <pod> -o yaml | grep -A 20 affinity
+```
+
+Audit affinity rules — sometimes they're inherited from base manifests or default templates.
+
+**Cause F: Taints and tolerations**
+
+If some nodes have taints that only certain pods tolerate, those pods cluster there.
+
+```bash
+# Which nodes have taints?
+kubectl get nodes -o json | jq '.items[] | {name:.metadata.name, taints:.spec.taints}'
+
+# Which pods have tolerations?
+kubectl get pod <pod> -o yaml | grep -A 5 tolerations
+```
+
+For example, GPU pods toleration `nvidia.com/gpu` taint clusters them on GPU nodes — intentional. But sometimes taint inheritance from old node groups leaves some nodes incidentally exclusive.
+
+**Cause G: Node affinity / selector**
+
+If pods have `nodeAffinity` or `nodeSelector` that match only a subset of nodes, they're constrained to that subset:
+
+```bash
+kubectl get pod <pod> -o yaml | grep -A 10 -E "nodeSelector|nodeAffinity"
+```
+
+This is often legitimate (workload tied to specific node pool) but sometimes leftover from old configs.
+
+**Cause H: PodDisruptionBudgets and existing pod placement**
+
+A PDB doesn't directly cause imbalance, but combined with `whenUnsatisfiable: DoNotSchedule` topology constraints, it can prevent rebalancing.
+
+**Cause I: Cluster autoscaler scaling pattern**
+
+When the autoscaler adds nodes, new pods get scheduled there (lowest allocation). But existing pods don't migrate. Over time:
+
+1. Cluster grows from 5 to 20 nodes
+2. Old 5 nodes are heavily packed
+3. New 15 nodes are lightly used
+4. Result: imbalance
+
+Kubernetes doesn't automatically rebalance after scaling.
+
+**Step 3: Detect why a specific pod went where it did**
+
+```bash
+kubectl get pod <pod> -o yaml | grep nodeName
+# Confirmed node placement
+
+# Recent scheduling events:
+kubectl get events --field-selector reason=Scheduled --sort-by='.lastTimestamp'
+```
+
+For scheduler decision details (kube-scheduler logs):
+
+```bash
+kubectl logs -n kube-system <kube-scheduler-pod> | grep <pod-name>
+```
+
+Verbose scheduler logs show scoring per node, which reveals why one was picked.
+
+**Step 4: Fix the imbalance**
+
+**Approach 1: Add topology spread constraints**
+
+The single most effective tool for new pods. Existing pods won't move, but new pods will balance.
+
+**Approach 2: Use pod anti-affinity**
+
+```yaml
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [myapp]
+          topologyKey: kubernetes.io/hostname
+```
+
+This makes pods prefer different nodes.
+
+**Approach 3: Descheduler**
+
+The [Descheduler](https://github.com/kubernetes-sigs/descheduler) is a separate component that evicts pods based on policies, allowing the scheduler to re-place them on better nodes:
+
+```yaml
+# Policy: evict pods violating topology spread
+strategies:
+  RemovePodsViolatingTopologySpreadConstraint:
+    enabled: true
+  LowNodeUtilization:
+    enabled: true
+    params:
+      nodeResourceUtilizationThresholds:
+        thresholds:
+          cpu: 20
+          memory: 20
+        targetThresholds:
+          cpu: 50
+          memory: 50
+```
+
+The descheduler runs on a schedule (CronJob) or continuously, gradually rebalancing the cluster.
+
+**Approach 4: Manual rebalance**
+
+```bash
+# Evict pods on overloaded nodes:
+kubectl drain <overloaded-node> --ignore-daemonsets --delete-emptydir-data
+
+# Uncordon after pods reschedule:
+kubectl uncordon <overloaded-node>
+```
+
+Use cautiously; respects PDBs but causes brief disruption.
+
+**Approach 5: Rolling restart**
+
+For a Deployment, restarting forces re-scheduling:
+
+```bash
+kubectl rollout restart deployment/<name>
+```
+
+New pods are placed based on current cluster state, ideally distributing more evenly.
+
+**Step 5: Prevent recurrence**
+
+- **Set requests properly**: Without them, scheduler has poor input
+- **Always use topology spread constraints for HA workloads**
+- **Run descheduler** if the cluster autoscales frequently
+- **Monitor distribution**: alert when one node has 3x average pod count
+
+```promql
+max by (node) (count(kube_pod_info{node!=""}) by (node)) /
+  avg(count(kube_pod_info{node!=""}) by (node)) > 3
+```
+
+**Production scenarios:**
+
+1. **GPU pods preferring same node**: Image locality scoring + small request sizes caused new GPU jobs to land on one node until full. Fix: explicit topology spread on GPU label.
+
+2. **Node group scaling created cold nodes**: Cluster autoscaler added 10 nodes for a batch job, then the job finished. New unrelated workloads landed on cold nodes (lowest allocation), but most pods stayed on original nodes. Fix: descheduler with LowNodeUtilization strategy.
+
+3. **A specific zone got overweighted**: All pods of a service ended up in zone us-east-1a because that zone had more capacity at the time of scheduling. Fix: zone topology spread constraint with `maxSkew: 1`.
+
+4. **DaemonSets skewed the count**: One node had a system DaemonSet that others didn't, making it "less attractive" in absolute terms but not in proportional usage.
+
+---
+
+## 119. How do you debug kube-proxy issues?
+
+kube-proxy translates Service definitions into network routing on each node. When it's broken, Services don't work even if pods are healthy.
+
+**Step 1: Understand the symptoms**
+
+kube-proxy issues typically present as:
+- Service ClusterIPs not reachable from some/all nodes
+- NodePort not responding on some nodes
+- Sessions inexplicably failing or load-balancing weirdly
+- New services not getting routed (kube-proxy not picking up Service changes)
+
+**Step 2: Verify kube-proxy is running**
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=kube-proxy -o wide
+# Should be one pod per node, all Running
+
+# Or check non-pod kube-proxy (e.g., kube-proxy as systemd service):
+# On node:
+systemctl status kube-proxy
+```
+
+If pods are missing on some nodes:
+
+```bash
+kubectl get ds -n kube-system kube-proxy
+# Check the DaemonSet's status: desired vs current
+```
+
+A node not running kube-proxy means no Service routing on that node — all Services will fail from that node.
+
+**Step 3: Check kube-proxy logs**
+
+```bash
+kubectl logs -n kube-system <kube-proxy-pod>
+```
+
+Look for:
+- Sync errors
+- Failed to update rules
+- Errors connecting to API server
+- Mode initialization errors
+
+Common error patterns:
+
+```
+E0510 ... Failed to execute iptables-restore: exit status 1
+E0510 ... Failed to list *v1.EndpointSlice: ... connection refused
+W0510 ... Failed to load kernel module nf_conntrack
+```
+
+**Step 4: Identify kube-proxy mode**
+
+kube-proxy can run in iptables, IPVS, or kernelspace modes. Each has different debugging approaches.
+
+```bash
+kubectl logs -n kube-system <kube-proxy-pod> | head -20
+# Look for "Using iptables Proxier" or "Using ipvs Proxier"
+
+# Or check config:
+kubectl get cm -n kube-system kube-proxy -o yaml | grep mode
+```
+
+**Step 5: Debug by mode**
+
+**iptables mode:**
+
+```bash
+# On the affected node:
+# Check that Service IP has rules:
+iptables -t nat -L KUBE-SERVICES -n | grep <service-cluster-ip>
+# Expected: jump to KUBE-SVC-XXXXX
+
+# Check the service chain:
+iptables -t nat -L KUBE-SVC-XXXXX -n
+# Should show random distribution to KUBE-SEP-YYYYY chains
+
+# Check endpoint chains:
+iptables -t nat -L KUBE-SEP-YYYYY -n
+# Should show DNAT to pod IP
+```
+
+If rules are missing:
+
+```bash
+# Get the service:
+kubectl get svc <service> -o wide
+
+# Get endpoints:
+kubectl get endpoints <service>
+# Or: kubectl get endpointslices -l kubernetes.io/service-name=<service>
+
+# Force kube-proxy to resync:
+kubectl delete pod -n kube-system <kube-proxy-pod-on-node>
+# New pod restarts and rebuilds all rules
+```
+
+**IPVS mode:**
+
+```bash
+# Check IPVS rules:
+ipvsadm -L -n
+
+# For specific service:
+ipvsadm -L -n | grep <service-cluster-ip>
+
+# Connection stats:
+ipvsadm -L -n --stats
+```
+
+If a Service's IPVS entry is missing or has wrong backends:
+
+```bash
+# Check ipset (kube-proxy IPVS uses ipset for KUBE-* chains):
+ipset list KUBE-CLUSTER-IP
+ipset list KUBE-LOAD-BALANCER
+
+# Restart kube-proxy on the node:
+kubectl delete pod -n kube-system <kube-proxy-pod-on-node>
+```
+
+**Step 6: Test connectivity at each layer**
+
+```bash
+# From a debug pod on the affected node:
+kubectl run -it --rm debug --image=nicolaka/netshoot --restart=Never \
+  --overrides='{"spec":{"nodeName":"<affected-node>"}}' -- bash
+
+# Inside:
+# Test direct pod IP:
+curl http://<pod-ip>:<target-port>/
+
+# Test cluster IP:
+curl http://<cluster-ip>:<service-port>/
+
+# Test DNS:
+nslookup <service-name>
+
+# Test from kube-proxy's view:
+ip route   # Routing table
+iptables-save | wc -l   # How many rules?
+```
+
+If pod IP works but cluster IP doesn't, kube-proxy isn't routing correctly.
+
+**Step 7: Check kube-proxy's API server connection**
+
+kube-proxy watches Services and EndpointSlices from the API server. If that watch breaks, kube-proxy stops getting updates.
+
+```bash
+kubectl logs -n kube-system <kube-proxy-pod> | grep -i "watch\|reflector\|connection"
+# Look for repeated reconnections or errors
+```
+
+Common API connection issues:
+- kube-proxy's ServiceAccount token expired or rotated incorrectly
+- API server unreachable from node
+- TLS cert issues
+
+**Step 8: Check kube-proxy config**
+
+```bash
+kubectl get cm -n kube-system kube-proxy -o yaml
+```
+
+Important fields:
+- `mode`: iptables / ipvs
+- `clusterCIDR`: should match cluster's pod CIDR
+- `iptables.syncPeriod`: how often to refresh rules (default 30s)
+- `iptables.minSyncPeriod`: minimum interval between syncs
+- `nodePortAddresses`: which interfaces to bind NodePorts on
+
+A wrong clusterCIDR can cause kube-proxy to mismatch masquerading rules, breaking pod-to-pod through services.
+
+**Step 9: Performance issues**
+
+kube-proxy can become slow or stalled in large clusters.
+
+**iptables mode in big clusters:**
+
+With 5000+ services, iptables rule count grows large. Each rule update requires regenerating and applying the entire ruleset. Symptoms:
+- New Services take long to start routing
+- kube-proxy CPU usage spikes during updates
+- Sync time visible in metrics: `kubeproxy_sync_proxy_rules_duration_seconds`
+
+```promql
+histogram_quantile(0.99,
+  rate(kubeproxy_sync_proxy_rules_duration_seconds_bucket[5m])
+)
+# If > 10s, kube-proxy is struggling
+```
+
+Fix: switch to IPVS mode for large clusters.
+
+**Stale connections after kube-proxy update:**
+
+After kube-proxy updates iptables (e.g., pod IP changed), existing connections still use old conntrack entries. These eventually time out, but until then, traffic may go to wrong pod.
+
+Fix: kube-proxy has `--conntrack-tcp-timeout-established` tuning. Also, applications should handle connection failures gracefully.
+
+**Step 10: Operational issues**
+
+**Issue: kube-proxy missing kernel modules**
+
+```
+Failed to load kernel module nf_conntrack
+```
+
+The node's kernel doesn't have required netfilter modules loaded. On the node:
+
+```bash
+modprobe nf_conntrack
+modprobe ip_vs   # If using IPVS
+modprobe ip_vs_rr
+modprobe ip_vs_wrr
+modprobe ip_vs_sh
+```
+
+Make this persistent via /etc/modules-load.d/.
+
+**Issue: kube-proxy running but using stale config**
+
+A ConfigMap change requires restarting kube-proxy pods to pick up new config:
+
+```bash
+kubectl rollout restart ds/kube-proxy -n kube-system
+```
+
+**Production scenarios:**
+
+1. **iptables-restore failures in large cluster**: kube-proxy logs showed iptables-restore failing because the rule set exceeded a buffer. Increased kernel parameter `--iptables-min-sync-period=10s` to batch updates, fixed by upgrading to IPVS mode.
+
+2. **kube-proxy pod evicted on a node**: Node had memory pressure, kube-proxy was BestEffort, got evicted. Other pods continued running but lost Service routing. Fix: set requests on kube-proxy (Burstable QoS).
+
+3. **Wrong NodePort range**: kube-proxy default is 30000-32767. Some Services were configured with NodePorts outside this range, silently not routed.
+
+4. **IPVS stale entries**: After scaling down, IPVS connections to non-existent pods persisted. New traffic occasionally hit zombie entries. Fix: tuned IPVS timeouts, also `expire_nodest_conn=1`.
+
+5. **kube-proxy v1.x bug**: Specific version had a memory leak when watching EndpointSlices. Eventually OOMed, lost routing. Upgrade resolved it.
+
+---
+
+## 120. Application latency increased after scaling
+
+You added more pods (or HPA scaled up) and latency got *worse*, not better. This counterintuitive scenario has several common causes.
+
+**Step 1: Confirm the correlation**
+
+```bash
+# When did scaling happen?
+kubectl describe hpa <hpa-name>
+# Recent events show scale-up timestamps
+
+kubectl get rs -l app=myapp
+# Check AGE and DESIRED of recent ReplicaSets
+
+# When did latency increase?
+# Check Prometheus/APM for timestamps
+```
+
+If latency increased *during* or *shortly after* scaling, the scaling is correlated. If it preceded scaling (and scaling was a response), the issue is different.
+
+**Step 2: Diagnose categories of post-scale latency**
+
+**Category A: Database / downstream saturation**
+
+This is the most common cause. Scaling the app exposes a bottleneck in dependencies.
+
+Before scaling: 5 pods, each with 10 DB connections = 50 connections. DB happy.
+After scaling: 20 pods, each with 10 DB connections = 200 connections. DB connection pool exhausted, queries queue.
+
+Check:
+
+```bash
+# Database connection metrics (if exposed):
+# pg_stat_activity for PostgreSQL
+# show processlist for MySQL
+
+# Application's connection pool metrics:
+# Look for active/idle/waiting connections
+```
+
+Symptoms:
+- DB CPU spike
+- Query latency increase across the board
+- Connection pool wait times rise
+
+Fix:
+- Use connection poolers (PgBouncer, ProxySQL) in front of the DB
+- Reduce per-pod connection pool size
+- Scale the database
+- Add caching layers
+
+**Category B: Cache cold-start**
+
+After scaling, new pods have empty in-memory caches. They serve initial requests slowly until caches warm up.
+
+Symptoms:
+- Latency P99 spike right after new pod becomes Ready
+- New pods specifically slow, old pods fine
+- Latency normalizes after a few minutes
+
+Fix:
+- Use shared cache (Redis, Memcached) instead of in-memory
+- Implement cache pre-warming on startup (load top N items)
+- Use readiness probes that check cache warm status before accepting traffic
+
+**Category C: Increased coordination overhead**
+
+For stateful or coordinating workloads (Kafka consumers, leader-elected services, distributed locks), more pods means more coordination.
+
+- Kafka: rebalancing when consumer group expands; brief pause during rebalance
+- ZooKeeper / etcd clients: more watchers = more notifications
+- Distributed locks: more contention if locks are heavily contested
+
+Fix:
+- Tune coordination parameters
+- Use partition-aware scaling (Kafka: scale only if you have unused partitions)
+- Reduce lock contention with finer-grained locks
+
+**Category D: Shared resource contention**
+
+Pods aren't truly isolated. They share node resources:
+
+- Disk I/O on a node: if multiple pods land on the same node, they compete for I/O
+- Network bandwidth: same
+- CPU caches: noisy-neighbor effects
+
+After scaling, pod density per node goes up (until autoscaler adds nodes). Higher density = more contention.
+
+```bash
+# Are new pods crammed onto existing nodes?
+kubectl get pods -l app=myapp -o wide | awk '{print $7}' | sort | uniq -c
+```
+
+Fix:
+- Topology spread constraints to distribute across nodes
+- Anti-affinity to limit pods per node
+- Trigger node scaling before pod scaling
+
+**Category E: Load balancer / Service issue**
+
+When pods scale up, the Service's endpoints change. Different load balancing scenarios can cause issues:
+
+- **iptables mode kube-proxy**: random load balancing, statistically uneven for small request counts
+- **Connection-based stickiness**: existing connections stay on old pods, new connections go to new pods; if your app is connection-pooled, new pods may get a thundering herd while old ones idle
+- **Slow EndpointSlice propagation**: in large clusters, EndpointSlice updates take time to propagate to all nodes' kube-proxies
+
+Symptoms:
+- Some pods overloaded, others underutilized
+- New pods getting weird traffic patterns
+
+Check:
+
+```bash
+kubectl exec -it <pod> -- ss -tn | wc -l
+# Compare connection counts across pods
+```
+
+Fix:
+- Use IPVS mode for better load distribution
+- Use a real load balancer (Envoy-based proxy) for L7-aware load balancing
+- Reset connections periodically (force redistribution)
+
+**Category F: Cluster-level scheduling issues**
+
+After scaling, the scheduler may have placed new pods on suboptimal nodes:
+
+- High-latency nodes (cross-AZ to dependencies)
+- Resource-starved nodes
+- Nodes with noisy neighbors
+
+```bash
+kubectl get pods -l app=myapp -o wide
+# Check zone distribution
+
+# Are new pods in a different zone than the database?
+```
+
+**Category G: Application bug exposed by parallelism**
+
+The app worked at lower scale because contention was rare. At higher scale, locks, race conditions, and contention emerge:
+
+- Database deadlocks
+- Optimistic locking retries
+- Distributed lock contention
+- Application-level mutex contention
+
+Symptoms:
+- High retry rates
+- Deadlock-related errors in logs
+- CPU usage doesn't scale linearly with pod count
+
+**Category H: Resource limits causing throttling**
+
+Newly scaled pods have the same limits, but if `requests` and `limits` were set tight for the original count and the workload-per-pod increases (e.g., HPA target wasn't tuned), CPU throttling can hit.
+
+```promql
+rate(container_cpu_cfs_throttled_periods_total[5m]) /
+  rate(container_cpu_cfs_periods_total[5m])
+```
+
+If throttling ratio is high, requests/limits are too tight.
+
+**Step 3: Diagnose new pods vs. old pods**
+
+A useful diagnostic: are new pods slower than old pods?
+
+```bash
+# Get latency by pod from APM, or:
+# For HTTP server logs, group by pod IP and compute P99
+
+# Compare:
+# - New pods (recently started)
+# - Old pods (running for hours/days)
+```
+
+If new pods are slower:
+- Cache cold-start
+- Initialization not complete
+- Slower startup state
+
+If all pods are equally slow:
+- Downstream bottleneck (DB, cache)
+- Shared resource saturation
+- Coordination overhead
+
+**Step 4: Check downstream services**
+
+```bash
+# Are downstream services also slow?
+# Trace a single request to see where time is spent
+
+# Check downstream service metrics:
+# - DB query time
+# - Cache hit ratio
+# - External API latency
+```
+
+A bottleneck downstream can manifest as latency in the upstream app, even though the upstream is fine.
+
+**Step 5: Check HPA configuration**
+
+If HPA triggered the scaling, was it the right metric?
+
+```bash
+kubectl describe hpa <hpa-name>
+# Current/Target metric values
+# Recent events
+```
+
+Common HPA misconfigurations:
+- Target CPU set too aggressively (e.g., 50%), causing oversealing
+- Cooldown periods too short, causing flapping
+- Scaling on wrong metric (e.g., scaling on CPU when bottleneck is downstream)
+
+**Step 6: Test by manually scaling down**
+
+If feasible:
+
+```bash
+kubectl scale deployment/<name> --replicas=<lower-count>
+```
+
+Does latency improve? If yes, you confirmed the scale-out caused the issue.
+
+**Production scenarios:**
+
+1. **The "scale out, scale down DB" problem**: App scaled from 10 to 40 pods during peak. Each pod opened 5 DB connections. DB connection limit hit. New connections queued. App latency tripled. Fix: introduced PgBouncer, set per-pod pool size to 2.
+
+2. **Cache warming nightmare**: App used local in-memory cache. After autoscaling event, 50% of pods were "new" with cold caches. P99 latency 10x higher for 20 minutes. Fix: moved hot data to Redis.
+
+3. **Kafka consumer rebalancing**: HPA added 5 consumer pods. Triggered Kafka consumer group rebalance, paused all consumers for 30s. SLO breached. Fix: cooperative rebalancing (incremental, no full pause).
+
+4. **Cross-AZ traffic costs and latency**: Scaling added pods in a zone where the database wasn't. Cross-AZ DB calls added 2ms latency. Fix: topology spread constraints with zone awareness, plus database read replicas per zone.
+
+5. **Distributed lock contention**: An app used Redis-based distributed lock for an aggregation. With 5 pods, lock contention was rare. With 50 pods, every pod constantly waited for the lock. Fix: redesigned to use atomic operations or partitioned the work to avoid the lock.
+
+6. **Application thread pool exhaustion**: Each pod had a fixed thread pool. Scaling increased total parallelism, but per-pod thread pool was the bottleneck. CPU was idle but threads were saturated. Fix: thread pool tuning per pod, or async processing model.
+
+**Prevention patterns:**
+
+- **Load test at target scale**: Don't assume linear scaling. Test at 2x, 5x, 10x expected load.
+- **Identify bottlenecks first**: Use APM and distributed tracing to find downstream constraints before scaling.
+- **Scale dependencies together**: When the app scales, ensure DBs, caches, downstream services can handle the multiplied load.
+- **Use connection pooling and rate limiting**: Don't let scaled-out apps overwhelm downstreams.
+- **Implement graceful degradation**: When latency spikes, shed load or return cached/degraded responses rather than queueing requests.
+- **Monitor "per-pod" metrics**: Watch metrics by pod to catch outliers; new pods being slow is a useful signal.
+
+# Kubernetes Troubleshooting Scenarios (121-140)
+
+## 121. How do you troubleshoot network packet drops?
+
+Packet drops in Kubernetes can occur at multiple layers: NIC, kernel, conntrack, iptables, CNI, application sockets. Each has distinct symptoms and tooling.
+
+**Step 1: Identify where drops are happening**
+
+Start from the lowest layer up.
+
+**NIC-level drops:**
+
+```bash
+# On the node:
+ip -s link show
+# Look for RX dropped, TX dropped counters
+
+ethtool -S eth0 | grep -iE "drop|error|discard"
+# rx_dropped, tx_dropped, rx_missed_errors, etc.
+```
+
+NIC drops usually mean:
+- Hardware buffer overrun (interrupts not serviced fast enough)
+- Bad cable / link issues
+- MTU mismatch (jumbo frames vs. standard)
+
+**Kernel-level drops:**
+
+```bash
+# Overall:
+cat /proc/net/softnet_stat
+# Column format: processed dropped time_squeeze cpu_collision received_rps flow_limit_count
+
+# More readable:
+netstat -s | grep -iE "drop|error"
+# Look at TCP, UDP, IP-level drop counters
+
+# Per-interface kernel drops:
+cat /sys/class/net/eth0/statistics/rx_dropped
+```
+
+Kernel drops can indicate:
+- Receive queue overflow (net.core.rmem_max too low)
+- Backlog overflow (netdev_max_backlog too low)
+- Socket buffer overflow
+
+**Conntrack drops:**
+
+```bash
+# Conntrack table fullness:
+sysctl net.netfilter.nf_conntrack_count
+sysctl net.netfilter.nf_conntrack_max
+
+# Conntrack drops:
+dmesg | grep -i "nf_conntrack: table full"
+cat /proc/net/stat/nf_conntrack
+```
+
+If conntrack is full, new connections fail. Covered in Q78.
+
+**iptables drops:**
+
+```bash
+# Counters on iptables rules:
+iptables -L -v -n
+# Look for rules with high packet/byte counts in DROP chains
+```
+
+If NetworkPolicies or Calico are dropping intentionally, those drops show up in iptables counters.
+
+**Step 2: Distinguish ingress vs. egress drops**
+
+```bash
+# On node, watch counters over time:
+watch -n 1 'cat /proc/net/dev | grep eth0'
+# RX and TX columns; look for drops growing
+```
+
+If RX drops growing: incoming traffic exceeded receive capacity.
+If TX drops growing: outgoing queue saturation (sender too fast for NIC).
+
+**Step 3: Use tcpdump and pwru for visibility**
+
+```bash
+# Capture on the node (host network):
+tcpdump -i eth0 host <pod-ip> -nn -w /tmp/capture.pcap
+
+# In a specific pod's network namespace:
+nsenter -t <pod-pid> -n tcpdump -i eth0 -nn
+
+# Modern tool: pwru (packets where r u) - eBPF-based packet tracing
+pwru "host 10.244.1.5"
+```
+
+`pwru` is invaluable: it shows every kernel function a packet passes through, revealing where exactly it's dropped.
+
+**Step 4: Check CNI-specific drops**
+
+Different CNIs have their own drop reasons:
+
+**Calico:**
+
+```bash
+# Get Felix logs:
+kubectl logs -n kube-system <calico-node-pod>
+
+# Drops due to policy:
+iptables -L -v -n | grep cali
+
+# Calico can log dropped packets:
+calicoctl get felixconfiguration default -o yaml
+# Set logSeverityScreen: Debug to see drops
+```
+
+**Cilium:**
+
+```bash
+# Hubble shows flow details:
+hubble observe --pod <namespace>/<pod> --verdict DROPPED
+# Tells you exactly which policy or reason caused the drop
+
+cilium monitor --type drop
+```
+
+Cilium with Hubble gives the best drop visibility in modern setups.
+
+**Step 5: Common drop patterns**
+
+**Pattern A: MTU mismatch**
+
+Symptoms: large packets fail, small ones work. TCP handshake works but data transfer fails. Connections "hang" intermittently.
+
+```bash
+# Check MTU on interfaces:
+ip link show
+# Pod interface MTU should match overlay MTU minus encapsulation overhead
+
+# Test with specific packet size:
+ping -M do -s 1472 <target>   # 1472 + 28 = 1500 (typical Ethernet MTU)
+```
+
+Overlay networks (VXLAN, IPIP) add overhead. With VXLAN, pod MTU should be node MTU - 50 (or 100 for IPv6-encapsulated).
+
+**Pattern B: Conntrack exhaustion**
+
+```bash
+dmesg | grep -i "nf_conntrack: table full"
+```
+
+Fix: increase `nf_conntrack_max`, reduce timeouts. Covered in Q78.
+
+**Pattern C: SYN flood / overflow**
+
+```bash
+netstat -s | grep -i "syn"
+# Listen overflow indicates app's accept queue is full
+
+ss -lnt
+# Recv-Q for listening sockets shows pending connections
+```
+
+If `Recv-Q` is at `Send-Q` limit, the app isn't accepting fast enough. Increase `somaxconn` and the app's listen backlog.
+
+**Pattern D: NetworkPolicy unexpectedly dropping**
+
+```bash
+kubectl get networkpolicy -A
+# A new restrictive policy may be blocking traffic
+
+# Test by temporarily allowing all:
+kubectl run -it --rm debug --image=nicolaka/netshoot -- nc -zv <target> 80
+# If this fails but no policy seems to apply, check default-deny policies
+```
+
+**Pattern E: ECMP / load balancer hash issues**
+
+Asymmetric routing can cause drops via reverse path filtering:
+
+```bash
+sysctl net.ipv4.conf.all.rp_filter
+# 1 = strict (drops asymmetric)
+# 2 = loose (allows)
+```
+
+In multi-NIC setups, set `rp_filter=2`.
+
+**Step 6: Real-time monitoring**
+
+```bash
+# Use ss for socket stats:
+ss -s
+# Total/TCP/UDP socket counts
+
+# Drops per second:
+sar -n EDEV 1
+# Watch idrop and odrop columns
+
+# Per-CPU softirq drops:
+mpstat -P ALL 1
+# %soft column; if a CPU is saturated handling network, drops follow
+```
+
+**Step 7: Application-level drops**
+
+Sometimes the "network" drops are application drops:
+
+- App's accept queue full: `netstat -s | grep "listen queue"`
+- App not reading socket fast enough: `Recv-Q` building
+- App connection rejected: app logs show TCP RST sent
+
+**Production scenarios:**
+
+1. **VXLAN MTU misconfiguration**: Cluster MTU was 1500 on the underlay but pod MTU also 1500. VXLAN encapsulation overflowed. Fix: set pod MTU to 1450.
+
+2. **EC2 PPS limit**: AWS instances have a packets-per-second limit. Burst of small packets hit the cap, drops appeared as NIC drops. Fix: larger instance type or aggregate connections.
+
+3. **Cilium identity exhaustion**: After mass scaling, Cilium ran out of identity slots, new pods couldn't get policies, traffic dropped silently. Fix: increase identity allocation range.
+
+4. **kube-proxy reload race**: During Service update, iptables briefly had inconsistent rules, packets to that Service dropped for a few hundred ms. Mitigation: connection retry in clients.
+
+5. **softirq saturation on a single CPU**: All network interrupts going to CPU 0, which was saturated. Other CPUs idle. Fix: RPS (Receive Packet Steering) and RSS (Receive Side Scaling).
+
+---
+
+## 122. Cluster autoscaler is not scaling nodes
+
+Cluster Autoscaler (CA) adds nodes when pods are Pending due to insufficient resources, and removes nodes when they're underutilized. When it doesn't, pods stay Pending or expensive nodes don't get reclaimed.
+
+**Step 1: Identify whether scale-up or scale-down is failing**
+
+```bash
+# Scale-up failure: pods Pending, no new nodes
+kubectl get pods --field-selector=status.phase=Pending
+
+# Scale-down failure: nodes underutilized but not removed
+kubectl top nodes
+# Are some nodes at 10% utilization but persist?
+```
+
+**Step 2: Check Cluster Autoscaler logs**
+
+```bash
+kubectl logs -n kube-system <cluster-autoscaler-pod>
+```
+
+CA logs are verbose and informative. Key things to look for:
+
+```
+No matching node group found for unscheduled pod  → No node pool can satisfy this pod
+Pod can't be scheduled on group X, removing it from consideration  → Pool reached size/quota limit
+Skipping group X because it's at maximum size  → Hit max nodes config
+Node X is not needed, but cannot remove: ...  → Scale-down blocked
+```
+
+**Step 3: Diagnose scale-up failures**
+
+**Cause A: No matching node group**
+
+CA evaluates each node group's template (instance type, labels, taints) against the Pending pod's requirements. If no group could host the pod, CA refuses to scale.
+
+Common mismatches:
+- Pod requests resources no node group has (e.g., 100GB memory but max is 64GB)
+- Pod has nodeSelector/affinity matching no node group
+- Pod tolerates a taint but no group has that taint
+
+Check:
+
+```bash
+kubectl describe pod <pending-pod>
+# Look at: nodeSelector, affinity, tolerations, resources
+
+# Get node group configurations from cloud provider
+```
+
+**Cause B: Max nodes reached**
+
+```bash
+# CA config:
+kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml
+# Or check the autoscaler deployment args
+```
+
+Each node group has `--nodes=<min>:<max>:<group-name>`. If max is reached, CA can't add more.
+
+**Cause C: Cloud provider quota / limit**
+
+CA asks the cloud provider to add a VM; the cloud provider refuses (quota, capacity, IP exhaustion).
+
+Check cloud-side:
+- AWS: ASG events, EC2 quotas, capacity in AZ
+- GCP: instance group events, region capacity
+- Azure: VMSS events
+
+CA logs typically mention these as errors from the cloud API.
+
+**Cause D: PodDisruptionBudget / scheduling constraints**
+
+Sometimes the pod *could* fit on existing nodes if some other pod moved, but CA won't trigger pod movement; it only adds nodes when pods are unschedulable as-is.
+
+If you have pods that *could* fit but don't due to fragmentation, CA won't help. Descheduler is needed.
+
+**Cause E: CA simulation flaw**
+
+CA does a simulation: "if I add a node from group X, would this pod fit?" If the simulation doesn't match reality (e.g., DaemonSet taking unexpected resources, kernel reservations differing from template), CA may misjudge.
+
+**Cause F: Scale-up cooldown**
+
+CA has cooldown periods between actions:
+- `--scale-down-delay-after-add`: after scaling up, wait before scaling down
+- `--max-node-provision-time`: how long to wait for a node to be Ready
+
+If CA recently scaled up and is waiting for nodes to become Ready, it doesn't scale more.
+
+**Step 4: Diagnose scale-down failures**
+
+```bash
+kubectl logs -n kube-system <ca-pod> | grep -i "scale-down\|unneeded"
+```
+
+**Cause A: Pods can't be evicted**
+
+CA must evict pods from a node before removing it. Blockers:
+
+- **Pod has no controller**: Naked pods (not from Deployment/ReplicaSet) can't be rescheduled, so CA won't evict.
+- **PodDisruptionBudget**: PDB doesn't allow further disruptions.
+- **Pod uses local storage** (emptyDir, hostPath): would lose data.
+- **Annotation `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`**: explicit don't-evict.
+
+Check what's pinning the node:
+
+```bash
+kubectl get pods -o wide --all-namespaces --field-selector spec.nodeName=<node>
+# Look for kube-system pods, naked pods, daemon set pods
+
+# Pods with safe-to-evict false:
+kubectl get pods -A -o json | jq '.items[] | select(.metadata.annotations["cluster-autoscaler.kubernetes.io/safe-to-evict"]=="false") | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+**Cause B: Node not actually underutilized**
+
+CA looks at requested resources, not actual usage. A node with 60% requests but 10% actual usage is "not underutilized" to CA.
+
+`--scale-down-utilization-threshold` (default 0.5) is the threshold. Below this, the node is candidate for removal.
+
+**Cause C: Recently added**
+
+If a node was added in the last `--scale-down-unneeded-time` (default 10 minutes), CA won't remove it.
+
+**Cause D: System pods or critical DaemonSets**
+
+Some DaemonSet pods (CNI, kube-proxy, monitoring) effectively pin the node. CA respects them by default but won't remove a node if doing so leaves the cluster broken.
+
+**Cause E: Local storage**
+
+```yaml
+# This pod pins the node:
+volumes:
+  - name: data
+    emptyDir: {}
+```
+
+By default, CA won't evict pods with local storage (data would be lost). Override with annotation:
+
+```yaml
+metadata:
+  annotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+```
+
+But only do this if you've confirmed the pod tolerates restart.
+
+**Step 5: Verify CA is even running**
+
+```bash
+kubectl get deploy -n kube-system cluster-autoscaler
+# Ready replicas?
+
+kubectl describe deploy -n kube-system cluster-autoscaler | grep -i image
+# Right version?
+```
+
+Check CA has proper IAM/permissions for the cloud:
+
+```bash
+# AWS - check it can describe ASGs and instances:
+kubectl logs -n kube-system <ca-pod> | grep -i "auth\|unauthorized"
+```
+
+**Step 6: Check expander configuration**
+
+When multiple node groups could satisfy a pending pod, CA chooses based on `--expander`:
+
+- `random`: Pick random group
+- `most-pods`: Group that fits most pending pods
+- `least-waste`: Group with least leftover resources
+- `priority`: User-defined priorities
+- `price` (cloud-specific): Cheapest
+
+If expander chooses suboptimal groups, configure priority:
+
+```yaml
+# ConfigMap: cluster-autoscaler-priority-expander
+priorities:
+  10:
+    - .*spot.*       # Prefer spot instances
+  5:
+    - .*on-demand.*  # Fall back to on-demand
+```
+
+**Step 7: Karpenter as alternative**
+
+Cluster Autoscaler works at the node group level. **Karpenter** (AWS, then others) provisions nodes more dynamically based on pod requirements directly, without predefined groups. It can:
+- Pick instance type matching pod needs exactly
+- Consolidate workloads onto fewer nodes
+- Choose spot vs. on-demand automatically
+
+For complex scaling needs, Karpenter often outperforms CA.
+
+**Production scenarios:**
+
+1. **kube-system pod blocking scale-down**: A monitoring DaemonSet had a pod without PDB-respecting eviction. CA wouldn't drain. Fix: added `safe-to-evict: true` annotation.
+
+2. **ASG max size hit silently**: Pods Pending for hours; ASG was at configured max but no alerting. Fix: alert when ASG capacity is near max.
+
+3. **CA stuck on stale node**: A failed node was draining for 30 min, CA wouldn't proceed. Fix: manual force-delete pods, terminate instance.
+
+4. **Spot interruption cascade**: Spot instances reclaimed, pods Pending, CA tried to scale spot but capacity unavailable, no on-demand fallback. Fix: priority expander with on-demand fallback.
+
+5. **CA simulation underestimating system reserved**: Template said node has 8GB allocatable but actual was 7GB after DaemonSets. Pods scheduled per simulation didn't fit. Fix: tuned `--system-reserved` and CA's node template to match.
+
+---
+
+## 123. HPA is not scaling Pods correctly
+
+Horizontal Pod Autoscaler scales pods based on metrics. Failure modes: not scaling when it should, scaling too aggressively, oscillating up and down, or scaling on wrong signals.
+
+**Step 1: Check HPA status**
+
+```bash
+kubectl get hpa
+# NAME    REFERENCE              TARGETS         MINPODS   MAXPODS   REPLICAS
+# app     Deployment/app         45%/70%         2         10        3
+
+kubectl describe hpa app
+# Look at Events section and Conditions
+```
+
+The `TARGETS` column shows current vs. target. If it shows `<unknown>/70%`, the HPA can't read metrics.
+
+**Step 2: Common conditions and their meanings**
+
+In `kubectl describe hpa`:
+
+- `AbleToScale: True` → HPA can scale (no cooldown blocking)
+- `ScalingActive: False, Reason: FailedGetResourceMetric` → Metrics unavailable
+- `ScalingLimited: True, Reason: TooManyReplicas` → Hit maxReplicas
+
+**Cause A: Metrics not available**
+
+```
+ScalingActive  False  FailedGetResourceMetric  unable to get metrics for resource cpu: 
+                                                 no metrics returned from resource metrics API
+```
+
+Metrics-server isn't returning data for this pod.
+
+Check metrics-server:
+
+```bash
+kubectl top pods
+# If this fails, metrics-server is broken (Q124)
+
+kubectl top pod <pod>
+# If specific pods missing, the pod hasn't been running long enough for metrics
+```
+
+New pods need ~1 minute before metrics-server has data.
+
+**Cause B: No resource requests**
+
+CPU-based HPA computes utilization as `usage / request`. If a container has no CPU request, utilization is undefined and HPA can't function.
+
+```bash
+kubectl get deployment <name> -o yaml | grep -A 5 resources
+# Must have requests.cpu set
+```
+
+Without requests, HPA on CPU silently doesn't work.
+
+**Cause C: Wrong scale target**
+
+```bash
+kubectl describe hpa <name> | grep -A 3 "Reference"
+# Reference:  Deployment/app
+```
+
+The HPA targets a Deployment, StatefulSet, or ReplicaSet. If misspelled or wrong kind, HPA can't scale anything:
+
+```
+AbleToScale  False  FailedGetScale  the HPA was unable to compute the replica count
+```
+
+**Cause D: Min/max bounds preventing scaling**
+
+```yaml
+spec:
+  minReplicas: 2
+  maxReplicas: 10
+```
+
+If `currentReplicas == maxReplicas` and load is high, no more scaling. HPA shows `ScalingLimited: True`.
+
+Bump maxReplicas if you expect higher load.
+
+**Cause E: Stabilization window / cooldown**
+
+```yaml
+spec:
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Wait 5 min before scaling down
+    scaleUp:
+      stabilizationWindowSeconds: 0
+```
+
+HPA v2 has configurable stabilization. If you see it not scaling down despite low load, check this window.
+
+**Cause F: Metric definition wrong**
+
+For custom metrics:
+
+```yaml
+metrics:
+  - type: External
+    external:
+      metric:
+        name: queue_depth
+        selector:
+          matchLabels:
+            queue: my-queue
+      target:
+        type: AverageValue
+        averageValue: "30"
+```
+
+Common issues:
+- Metric name doesn't exist in custom metrics API
+- Selector matches no metric
+- Target type wrong (AverageValue vs. Value)
+
+```bash
+# List available external metrics:
+kubectl get --raw "/apis/external.metrics.k8s.io/v1beta1" | jq
+
+# Query specific metric:
+kubectl get --raw "/apis/external.metrics.k8s.io/v1beta1/namespaces/default/queue_depth" | jq
+```
+
+**Step 3: Diagnose oscillation (scaling up, then down, then up)**
+
+If HPA flaps:
+
+**Cause A: Metric inherently noisy**
+
+CPU usage fluctuates; with a tight target (e.g., 70%), small variations trigger scaling.
+
+Fix: increase stabilization window, raise target slightly.
+
+**Cause B: New pods affect average**
+
+When a new pod starts, it has low usage (warming up). The average drops, HPA scales down. Now load increases again, scales up.
+
+Fix: longer `scaleDown.stabilizationWindowSeconds`; consider `scaleDown.policies` to limit rate.
+
+**Cause C: Scaling response causes the metric**
+
+For latency-based scaling: scaling up reduces per-pod load and latency, which then signals to scale down. Without hysteresis, oscillation.
+
+Fix: use behavior policies to limit scaling rate, longer windows.
+
+**Step 4: Diagnose under-scaling**
+
+HPA is scaling but not enough:
+
+**Cause A: Target is per-pod average**
+
+```yaml
+metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+This is the *average* across pods. If you have 3 pods at 90%, 90%, 30%, average is 70% → no scaling. The 90% pods are still in trouble.
+
+Fix: use `AverageValue` or scale on P99 latency / queue depth.
+
+**Cause B: Scaling rate limited**
+
+```yaml
+behavior:
+  scaleUp:
+    policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60     # Can double pods every 60s
+      - type: Pods
+        value: 4
+        periodSeconds: 60     # Or add 4 per minute
+    selectPolicy: Max
+```
+
+If policy is too conservative, HPA scales slower than load grows. Increase the limits.
+
+**Cause C: minReplicas too low for spikes**
+
+If the workload has sudden bursts, scaling from minReplicas reactively is too slow. Solutions:
+- Predictive scaling (KEDA, custom controllers)
+- Higher minReplicas
+- Pre-warm before known traffic spikes
+
+**Step 5: Custom and external metrics**
+
+For non-CPU/memory scaling (queue depth, custom app metrics, external service metrics), you need:
+
+1. **Metrics adapter**: Prometheus Adapter, Datadog Cluster Agent, or KEDA
+2. **Metric registration**: Adapter exposes metrics via `custom.metrics.k8s.io` or `external.metrics.k8s.io`
+
+Common stack: Prometheus + Prometheus Adapter.
+
+```bash
+# Verify adapter is running:
+kubectl get deployment -n monitoring prometheus-adapter
+
+# Check exposed metrics:
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1" | jq
+```
+
+**KEDA for advanced scaling:**
+
+KEDA (Kubernetes Event-Driven Autoscaler) provides scaling on diverse external signals (Kafka lag, Redis queue, AWS SQS, Azure Service Bus, etc.). For non-trivial event-driven workloads, KEDA is much more flexible than vanilla HPA.
+
+**Step 6: Verify with manual stress**
+
+```bash
+# Generate load and watch HPA respond:
+kubectl run -it --rm load --image=busybox -- sh -c "while true; do wget -q -O- http://app-service; done"
+
+# In another terminal:
+kubectl get hpa -w
+kubectl get pods -l app=<app> -w
+```
+
+If HPA scales correctly under known load, the issue may be real-world load patterns vs. metrics chosen.
+
+**Production scenarios:**
+
+1. **HPA on CPU when bottleneck was DB**: App's CPU was low (waiting on DB), latency high. HPA didn't scale because CPU target wasn't met. Fix: switched to scaling on request latency (custom metric).
+
+2. **Cold start oscillation**: New pods took 60s to start serving traffic. Scale-up triggered, but during warmup, average CPU dropped (new pods at 0%), triggering scale-down. Fix: longer stabilization, readiness probe gating traffic.
+
+3. **maxReplicas too low**: Black Friday traffic exceeded historical baseline by 5x. maxReplicas was 20, needed 100. Fix: regular review of max limits before peak events.
+
+4. **Metric adapter throttled**: Prometheus Adapter was rate-limited by Prometheus, returned stale metrics. HPA based decisions on minutes-old data. Fix: dedicated Prometheus for HPA metrics.
+
+5. **HPA disabled by ResourceQuota**: Namespace quota hit `count/pods` limit. HPA could scale, but new pods rejected. Fix: increase quota.
+
+---
+
+## 124. Metrics Server stops working
+
+Metrics Server is the core component providing `kubectl top` and HPA functionality. When it breaks, HPA stops scaling and metrics-based debugging tools fail.
+
+**Step 1: Confirm the failure**
+
+```bash
+kubectl top nodes
+# Error from server (ServiceUnavailable): the server is currently unable to handle the request
+
+kubectl top pods
+# Same error
+
+kubectl get apiservices | grep metrics
+# v1beta1.metrics.k8s.io   kube-system/metrics-server   True/False
+```
+
+If the APIService shows `False`, the aggregated API is failing to reach metrics-server.
+
+**Step 2: Check metrics-server pod**
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=metrics-server
+# Status?
+
+kubectl describe pod -n kube-system <metrics-server-pod>
+# Events, Conditions
+
+kubectl logs -n kube-system <metrics-server-pod>
+```
+
+**Step 3: Common failure modes**
+
+**Cause A: TLS errors connecting to kubelets**
+
+```
+Error: x509: cannot validate certificate for 10.0.1.5 because it doesn't contain any IP SANs
+Error: tls: failed to verify certificate: x509: certificate signed by unknown authority
+```
+
+Metrics-server connects to each node's kubelet over HTTPS. Kubelet certificates often:
+- Are self-signed
+- Don't have node IP in SANs
+- Are signed by a CA metrics-server doesn't trust
+
+Common fix: add `--kubelet-insecure-tls` flag to metrics-server (acceptable for many clusters where kubelet certs aren't strictly verified):
+
+```yaml
+args:
+  - --kubelet-insecure-tls
+  - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+```
+
+Better fix: configure kubelet with proper certs signed by cluster CA, and metrics-server trusts that CA.
+
+**Cause B: Network connectivity to kubelets**
+
+Metrics-server runs as a pod, connects to kubelet on port 10250. If NetworkPolicy or firewall blocks this:
+
+```bash
+kubectl exec -n kube-system <metrics-server-pod> -- wget -O- --no-check-certificate https://<node-ip>:10250/metrics/resource
+# Should return prometheus-format metrics
+```
+
+If connection refused or timeout, networking is the issue.
+
+**Cause C: Kubelet not exposing metrics**
+
+```bash
+# On node:
+curl -k https://localhost:10250/metrics/resource
+# Should return container_cpu_usage_seconds_total etc.
+```
+
+If kubelet's metrics endpoint is disabled or broken, no metrics flow.
+
+**Cause D: Aggregated API not configured**
+
+Metrics-server uses the aggregated API layer. This requires:
+
+```bash
+kubectl get apiservices v1beta1.metrics.k8s.io -o yaml
+# Spec should show:
+# service:
+#   name: metrics-server
+#   namespace: kube-system
+# group: metrics.k8s.io
+# version: v1beta1
+```
+
+If missing, metrics-server installation didn't complete properly.
+
+API server must be configured with aggregation enabled (default in modern versions, but check):
+
+```bash
+# In kube-apiserver args:
+--enable-aggregator-routing=true
+--requestheader-allowed-names=front-proxy-client
+--requestheader-extra-headers-prefix=X-Remote-Extra-
+--requestheader-group-headers=X-Remote-Group
+--requestheader-username-headers=X-Remote-User
+--proxy-client-cert-file=...
+--proxy-client-key-file=...
+```
+
+**Cause E: metrics-server crash**
+
+```bash
+kubectl logs -n kube-system <metrics-server-pod> --previous
+# What killed it?
+```
+
+Common causes:
+- OOM (default limits often too low for large clusters)
+- Crashed because too many kubelets unreachable, error rate exceeded threshold
+
+For large clusters, increase memory:
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 200Mi
+  limits:
+    cpu: 1000m
+    memory: 1000Mi
+```
+
+**Cause F: Too many node failures**
+
+Metrics-server doesn't tolerate many failed kubelets. If half your nodes are unreachable, metrics-server may report itself unhealthy and stop serving.
+
+Check from metrics-server logs:
+
+```
+unable to fully scrape metrics from source kubelet_summary:<node>: ...
+```
+
+If many of these, fix the unreachable nodes first.
+
+**Step 4: Verify metrics endpoint**
+
+```bash
+# Direct API call:
+kubectl get --raw "/apis/metrics.k8s.io/v1beta1/nodes" | jq
+kubectl get --raw "/apis/metrics.k8s.io/v1beta1/pods" | jq
+
+# These should return JSON of metrics
+```
+
+**Step 5: Validate the chain**
+
+Full data flow:
+
+1. **cAdvisor** (in kubelet) → 2. **kubelet `/metrics/resource`** → 3. **metrics-server scrapes** → 4. **metrics-server exposes via Aggregated API** → 5. **kubectl top / HPA reads**
+
+Test each link:
+
+```bash
+# Link 1-2: Kubelet metrics
+ssh <node>
+curl -k https://localhost:10250/metrics/resource
+
+# Link 3: metrics-server cache
+kubectl logs -n kube-system <metrics-server-pod> | tail -20
+
+# Link 4-5: Aggregated API
+kubectl get --raw "/apis/metrics.k8s.io/v1beta1/nodes" | jq
+```
+
+**Step 6: Reinstall if needed**
+
+If metrics-server is misconfigured beyond easy fix:
+
+```bash
+# Remove:
+kubectl delete -f metrics-server.yaml
+
+# Reinstall (use the version matching your cluster version):
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# May need to add --kubelet-insecure-tls for clusters with self-signed kubelet certs
+```
+
+**Step 7: Alternative metrics sources**
+
+For production reliability, consider:
+
+- **Prometheus Adapter**: serves metrics.k8s.io and custom.metrics.k8s.io from Prometheus. More resilient since Prometheus stores history.
+- **Datadog Cluster Agent**: serves metrics for HPA based on Datadog data.
+- **Multiple replicas**: Run 2+ metrics-server replicas with HA.
+
+**Production scenarios:**
+
+1. **Self-signed kubelet certs after cluster upgrade**: Upgrade rotated kubelet certs, metrics-server didn't trust new CA. Quick fix: `--kubelet-insecure-tls`. Better: configure cert verification.
+
+2. **OOM in 200-node cluster**: Default 200Mi memory was insufficient. Increased to 1Gi, fixed.
+
+3. **NetworkPolicy blocking kubelet access**: Default-deny NetworkPolicy in kube-system blocked metrics-server's outbound to nodes. Fix: allow egress to nodes.
+
+4. **kubelet behind a proxy / weird network**: Metrics-server couldn't resolve node addresses. Fix: `--kubelet-preferred-address-types=InternalIP`.
+
+5. **Aggregation layer auth misconfigured**: After custom kube-apiserver config, proxy-client cert was wrong, all aggregated APIs (including metrics-server) failed. Fix: restored correct cert configuration.
+
+---
+
+## 125. Ingress controller crashes under high load
+
+Ingress controllers are the gateway for external traffic. When they crash under load, the entire application surface becomes unavailable. This is a high-impact, time-sensitive failure mode.
+
+**Step 1: Confirm crash and pattern**
+
+```bash
+kubectl get pods -n ingress-nginx
+# RESTARTS column high? Recent restart?
+
+kubectl describe pod -n ingress-nginx <controller-pod>
+# Last State: Terminated, Reason: OOMKilled?
+# Or Liveness probe failed?
+```
+
+Patterns:
+- **OOMKilled**: memory exhaustion
+- **Liveness probe failed**: controller hung or slow to respond
+- **Exit 1**: application error
+- **Exit 137 (not OOMKilled)**: external termination
+
+**Step 2: Check logs**
+
+```bash
+kubectl logs -n ingress-nginx <controller-pod> --previous
+```
+
+For NGINX Ingress, common errors under load:
+
+```
+worker_connections are not enough
+upstream timed out
+no live upstreams while connecting to upstream
+1024 worker_connections exceeded
+SSL_do_handshake() failed
+```
+
+**Step 3: Categorize the failure**
+
+**Cause A: Worker connections / file descriptors exhausted**
+
+NGINX has `worker_connections` per worker. Default is often 1024 or 16384. Each connection (and each upstream connection) consumes one.
+
+```bash
+kubectl exec -n ingress-nginx <controller-pod> -- cat /etc/nginx/nginx.conf | grep worker_connections
+```
+
+Under load, you can exhaust this. Symptoms:
+- New connections rejected
+- Logs show "worker_connections are not enough"
+
+Fix in NGINX Ingress ConfigMap:
+
+```yaml
+data:
+  max-worker-connections: "65536"
+  max-worker-open-files: "65536"
+```
+
+Also check OS limits:
+
+```bash
+kubectl exec -n ingress-nginx <pod> -- ulimit -n
+# Should be high (65536+)
+```
+
+**Cause B: CPU saturation**
+
+NGINX is fast but TLS termination and complex routing costs CPU.
+
+```bash
+kubectl top pods -n ingress-nginx
+# CPU at 100%?
+
+# Per worker:
+kubectl exec -n ingress-nginx <pod> -- top -bn1 | head
+```
+
+If at limit:
+- Increase CPU limits
+- Scale horizontally (more replicas)
+- Offload TLS to a load balancer in front
+- Disable expensive features (request body access, complex regex rewrites)
+
+**Cause C: Memory exhaustion (OOMKilled)**
+
+```bash
+kubectl describe pod -n ingress-nginx <pod> | grep -i OOMKilled
+```
+
+NGINX memory grows with:
+- Number of upstreams (each adds memory for connection pools)
+- Buffer sizes for large requests/responses
+- Cached SSL sessions
+- Large number of configuration entries
+
+Fix:
+- Increase memory limit
+- Tune buffer sizes (smaller buffers for many small requests; larger for fewer big requests)
+- Reduce SSL session cache size if appropriate
+
+**Cause D: Configuration reload taking too long**
+
+NGINX Ingress reloads NGINX config on every Ingress/Service/Endpoint change. With thousands of Ingresses, reloads can take seconds and freeze traffic processing.
+
+```bash
+kubectl exec -n ingress-nginx <pod> -- ls -la /etc/nginx/nginx.conf
+# How big is the generated config?
+
+kubectl logs -n ingress-nginx <pod> | grep -i reload
+```
+
+Optimizations:
+- Use Lua-based dynamic configuration (NGINX Plus or NGINX Ingress with `lua-resty-balancer`)
+- Reduce reload frequency: `worker-shutdown-timeout`, `controller.config.maxReloadFrequency`
+- Migrate to controllers that don't require reloads (Envoy-based: Contour, Emissary, Istio Gateway)
+
+**Cause E: Slow upstream responses**
+
+If upstreams are slow, NGINX workers wait, consuming worker slots. New connections can't get workers.
+
+Symptoms:
+- Logs show upstream timeouts
+- 504 errors increase
+- Connection counts climb but throughput doesn't
+
+Fix:
+- Tune upstream timeouts (don't wait 60s for a hung backend)
+- Add upstream health checks
+- Fix the slow upstream (often the root cause)
+
+**Cause F: Liveness probe causing false kills**
+
+The liveness probe checks NGINX is responsive. If NGINX is busy (high load but functional), the probe might time out.
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 10254
+  timeoutSeconds: 1     # Too aggressive
+  failureThreshold: 3
+```
+
+Under load, /healthz can be slow to respond, getting killed. Fix: increase `timeoutSeconds`, `failureThreshold`.
+
+**Cause G: SSL/TLS overhead**
+
+TLS handshakes are CPU-intensive. Under DDoS or genuine traffic spikes, TLS can dominate.
+
+Mitigations:
+- TLS session resumption (cache sessions)
+- HTTP/2 (multiplexes connections, fewer handshakes)
+- Offload TLS to a hardware load balancer or AWS NLB
+
+**Step 4: Scale the Ingress controller**
+
+```bash
+kubectl scale -n ingress-nginx deployment/ingress-nginx-controller --replicas=5
+```
+
+But ensure:
+- The Service in front (LoadBalancer or NodePort) actually distributes to all replicas
+- Pod anti-affinity spreads them across nodes/AZs
+
+For very high traffic, run Ingress controller as DaemonSet with `hostNetwork: true` for max throughput (one per node).
+
+**Step 5: Use a different architecture**
+
+If NGINX Ingress is consistently struggling:
+
+**Envoy-based ingress (Contour, Emissary-ingress):**
+- Hot reload without restart
+- Better observability
+- Native gRPC support
+
+**Service mesh gateway (Istio Gateway, Linkerd):**
+- More features but more complexity
+
+**Cloud-native ingress (AWS ALB Ingress, GKE Ingress):**
+- Offloads to cloud load balancer
+- No in-cluster pod resource consumption for L7 routing
+
+**Step 6: Real-time mitigation during a crash**
+
+If Ingress is currently down:
+
+```bash
+# Scale replicas immediately:
+kubectl scale -n ingress-nginx deployment/ingress-nginx-controller --replicas=10
+
+# If pods OOMKilling, increase memory temporarily:
+kubectl set resources -n ingress-nginx deployment/ingress-nginx-controller \
+  --limits=memory=2Gi --requests=memory=1Gi
+
+# Cordon affected nodes if a node-level issue:
+kubectl cordon <node>
+
+# Drop non-essential traffic (rate limit at edge / CDN):
+# Action at CloudFront, Cloudflare, etc.
+```
+
+**Production scenarios:**
+
+1. **Reload storm**: Auto-scaling caused 50 pod replacements in 5 minutes. Each Endpoint change triggered NGINX reload. NGINX spent 60% of CPU reloading. Fix: dynamic upstream config via Lua.
+
+2. **TLS session cache too small**: SSL handshake CPU was dominating; session cache only 10MB. Increased to 50MB, handshake rate dropped 80%.
+
+3. **One slow backend pinning workers**: A misbehaving backend Service had 30s response times. Workers connecting there were stuck. After exhausting all workers, Ingress couldn't accept new connections. Fix: aggressive upstream timeout (5s), circuit breaker.
+
+4. **Liveness probe killing under load**: 1-second timeout, failureThreshold 3. Under heavy load, all 3 checks took >1s. Pod killed. New pod started under same load, died again. Cascade. Fix: timeout 5s, threshold 5.
+
+5. **NGINX config too large**: 5000 Ingresses generated a 50MB config. Reload took 8 seconds. Fix: split into multiple Ingress controllers handling different namespace sets.
+
+---
+
+## 126. How do you debug certificate expiration issues?
+
+Certificate expiration causes a wide range of failures from full cluster outage to subtle "intermittent" issues. Kubernetes uses certificates extensively: API server, kubelet, etcd, ServiceAccounts, controller-manager, webhooks, ingress TLS.
+
+**Step 1: Identify which cert is causing trouble**
+
+Symptoms by cert type:
+
+- **API server cert expired**: kubectl fails with x509 error, all components break
+- **kubelet client cert expired**: nodes become NotReady ("Unauthorized")
+- **etcd cert expired**: API server can't talk to etcd, control plane down
+- **ServiceAccount token signing cert expired**: pods can't authenticate to API server
+- **Webhook server cert expired**: admission webhooks fail, blocking some operations
+- **Ingress TLS cert expired**: external users see browser warnings, HTTPS fails
+
+**Step 2: Check kubeadm-managed cluster certs**
+
+For kubeadm clusters:
+
+```bash
+kubeadm certs check-expiration
+# Shows all control plane certs with expiry dates:
+# CERTIFICATE                EXPIRES                  RESIDUAL TIME   CERTIFICATE AUTHORITY
+# admin.conf                 Jan 15, 2025 12:00 UTC   30d
+# apiserver                  Jan 15, 2025 12:00 UTC   30d
+# apiserver-etcd-client      Jan 15, 2025 12:00 UTC   30d
+# ...
+```
+
+By default, kubeadm certs expire after 1 year. If your cluster has been running over a year without upgrades, certs may be expired.
+
+**Renewal:**
+
+```bash
+kubeadm certs renew all
+# Then restart static pods:
+mv /etc/kubernetes/manifests/*.yaml /tmp/
+sleep 30
+mv /tmp/*.yaml /etc/kubernetes/manifests/
+```
+
+**Step 3: Check individual cert expiry**
+
+```bash
+# Check a specific cert file:
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -dates
+# notBefore=...
+# notAfter=Apr 15 12:00:00 2025 GMT
+
+# Or for a cert in a Secret:
+kubectl get secret <name> -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates
+
+# Or check a live endpoint:
+echo | openssl s_client -connect myapp.example.com:443 2>/dev/null | openssl x509 -noout -dates
+```
+
+**Step 4: Check kubelet client cert**
+
+Kubelet auto-rotates its client cert with the API server, but rotation can fail.
+
+```bash
+# On a node:
+ls -la /var/lib/kubelet/pki/
+# kubelet-client-current.pem (symlink to current)
+# kubelet-client-<timestamp>.pem
+
+openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates
+
+# Check rotation status:
+journalctl -u kubelet | grep -i "rotating\|certificate"
+```
+
+If rotation is failing:
+
+```
+Failed to rotate client certificate: an error occurred while waiting for the new certificate
+```
+
+Causes:
+- Controller-manager not signing requests (CSR controller broken)
+- Network issue to API server
+- Permissions issue on the CSR
+
+```bash
+# Check pending CSRs:
+kubectl get csr
+# If there are Pending ones from the node, approve them:
+kubectl certificate approve <csr-name>
+```
+
+For automated approval (default behavior should be in place):
+
+```bash
+# Check the auto-approver is running:
+kubectl get pods -n kube-system | grep controller-manager
+
+# Check controller-manager flags include --cluster-signing-cert-file
+```
+
+**Step 5: Check ServiceAccount token signing cert**
+
+The API server signs ServiceAccount tokens. If its signing cert expires/changes, existing tokens become invalid.
+
+```bash
+# Check API server's service account key:
+openssl x509 -in /etc/kubernetes/pki/sa.pub -noout -dates  # Public key, no expiry
+# But the cert used to sign may have one
+```
+
+For projected ServiceAccount tokens (default in 1.24+), tokens auto-rotate. For legacy non-projected tokens, manual rotation may be needed.
+
+**Step 6: Check webhook server certs**
+
+```bash
+kubectl get validatingwebhookconfigurations -o yaml | grep -A 5 caBundle
+kubectl get mutatingwebhookconfigurations -o yaml | grep -A 5 caBundle
+```
+
+The caBundle contains the CA cert that signs the webhook's server cert. If the webhook's actual server cert has expired:
+
+```bash
+# Find the webhook service:
+kubectl get validatingwebhookconfiguration <name> -o jsonpath='{.webhooks[*].clientConfig.service}'
+
+# Connect to it:
+kubectl run -it --rm debug --image=nicolaka/netshoot -- bash
+openssl s_client -connect <service-name>.<namespace>.svc:443 -showcerts
+```
+
+If using cert-manager for webhook certs (recommended):
+
+```bash
+kubectl get certificate -A | grep webhook
+kubectl describe certificate <name> -n <namespace>
+# Status conditions show renewal status
+```
+
+**Step 7: Check Ingress TLS certs**
+
+```bash
+# Direct test:
+echo | openssl s_client -connect myapp.example.com:443 -servername myapp.example.com 2>/dev/null | openssl x509 -noout -dates
+
+# Via cert-manager:
+kubectl get certificate -A
+# Status: Ready=True means cert is valid
+
+kubectl describe certificate <name> -n <namespace>
+# Events show renewal attempts
+```
+
+If cert-manager isn't renewing:
+
+```bash
+kubectl logs -n cert-manager -l app=cert-manager
+# Look for renewal errors
+
+# Common: rate limited by Let's Encrypt
+# Common: HTTP-01 challenge failing (DNS or Ingress issue)
+# Common: DNS-01 challenge failing (DNS provider creds wrong)
+```
+
+**Step 8: Renew expired certs**
+
+**For kubeadm clusters:**
+
+```bash
+kubeadm certs renew all
+systemctl restart kubelet
+# Restart static pods by touching manifests
+```
+
+**For manual cert management:**
+
+Each cert needs its own renewal process. Have a runbook documenting:
+- Which CA signs each cert
+- How to generate CSRs
+- How to install renewed certs and reload services
+
+**For cert-manager:**
+
+```bash
+# Force renewal:
+kubectl annotate certificate <name> -n <namespace> cert-manager.io/issue-temporary-certificate="true"
+
+# Or delete and recreate:
+kubectl delete certificate <name>
+kubectl apply -f <cert-yaml>
+```
+
+**Step 9: Prevent recurrence**
+
+**Monitor cert expiry:**
+
+```promql
+# For Prometheus, exporting cert metrics:
+(cert_expiry_seconds - time()) / 86400 < 30
+# Alert when any cert expires within 30 days
+
+# kubeadm cluster:
+# Use a CronJob to run "kubeadm certs check-expiration" and parse output
+```
+
+**Automate renewal:**
+
+- kubeadm: schedule `kubeadm certs renew all` quarterly
+- cert-manager: handles automatic renewal (default 2/3 of cert lifetime)
+- Cloud-managed clusters (EKS, GKE, AKS): control plane certs handled by provider
+
+**Cluster upgrades renew certs:**
+
+If you upgrade your kubeadm cluster regularly, certs are renewed as part of `kubeadm upgrade apply`. Long-running clusters that never upgrade are at risk.
+
+**Production scenarios:**
+
+1. **One-year-old cluster suddenly broke**: Default kubeadm cert validity is 1 year. Cluster reached 365 days uptime, certs expired overnight, API server stopped. Fix: kubeadm certs renew all, restart components.
+
+2. **Webhook cert expired**: Self-signed cert in a webhook deployment expired. Admission webhook started failing. Mutating webhook failurePolicy was Fail, blocked pod creation. Fix: rotated cert, switched to cert-manager.
+
+3. **Ingress cert renewal stuck**: cert-manager Let's Encrypt renewal failed for 60 days (DNS provider key rotated). Cert expired, users got browser warnings. Fix: updated DNS provider creds, forced renewal.
+
+4. **etcd-apiserver cert expired**: API server couldn't read/write to etcd. Cluster completely frozen (existing pods ran, but no changes possible). Fix: regenerated and copied to /etc/kubernetes/pki, restarted API server.
+
+5. **ServiceAccount tokens "expiring"**: Wasn't truly expired, but API server rotated its signing key without grace period. All existing pods' tokens invalid. Pods couldn't authenticate. Fix: roll all pods to get new tokens; in the future, use projected tokens which rotate.
+
+---
+
+## 127. API requests fail with x509 certificate errors
+
+x509 errors are TLS verification failures. The client receives a cert and rejects it because of issues with the cert itself or the client's trust configuration.
+
+**Step 1: Identify the exact error**
+
+x509 errors are specific. Get the full message:
+
+```
+error: You must be logged in to the server (the server has asked for the client to provide credentials)
+
+Unable to connect to the server: x509: certificate signed by unknown authority
+
+x509: certificate has expired or is not yet valid: current time YYYY-MM-DD is after YYYY-MM-DD
+
+x509: cannot validate certificate for 1.2.3.4 because it doesn't contain any IP SANs
+
+tls: failed to verify certificate: x509: certificate is valid for X, Y, Z, not <hostname>
+```
+
+**Step 2: Match error to cause**
+
+**Error: "signed by unknown authority"**
+
+The client doesn't trust the CA that signed the server's cert.
+
+Causes:
+- Client's kubeconfig has wrong `certificate-authority-data`
+- CA was rotated, client config not updated
+- Connecting to a different cluster (wrong kubeconfig context)
+
+Check:
+
+```bash
+kubectl config view --raw -o jsonpath='{.clusters[*].cluster.certificate-authority-data}' | base64 -d | openssl x509 -noout -subject -issuer
+
+# Compare with actual API server cert:
+openssl s_client -connect <api-server>:6443 -showcerts 2>/dev/null < /dev/null | openssl x509 -noout -subject -issuer
+```
+
+If the issuer in your kubeconfig doesn't match what API server presents, you have wrong/stale CA.
+
+Fix: re-fetch kubeconfig from the cluster admin or rerun the cluster's auth setup (`aws eks update-kubeconfig`, `gcloud container clusters get-credentials`, etc.).
+
+**Error: "certificate has expired"**
+
+The cert itself is expired. Q126 covers renewal.
+
+Quick check on which cert:
+
+```bash
+openssl s_client -connect <api-server>:6443 -showcerts 2>/dev/null < /dev/null | openssl x509 -noout -dates
+```
+
+Or for kubelet:
+
+```bash
+openssl s_client -connect <node-ip>:10250 -showcerts 2>/dev/null < /dev/null | openssl x509 -noout -dates
+```
+
+**Error: "cannot validate certificate for X because it doesn't contain any IP SANs"**
+
+The cert was issued for a hostname (DNS name) but you're connecting via IP. Modern TLS requires the IP to be in the SAN (Subject Alternative Name) extension.
+
+Common when:
+- Cert was issued for `kubernetes.default.svc` but you connect via 10.0.5.42
+- kubelet cert is for hostname but client uses IP
+
+Fix options:
+- Connect via the DNS name in the cert
+- Reissue cert with both DNS names and IP addresses in SANs
+- For metrics-server / kubelet: use `--kubelet-insecure-tls` or fix kubelet cert generation
+
+**Error: "certificate is valid for X, Y, Z, not <hostname>"**
+
+Same family — the cert's SANs don't include the hostname you're using.
+
+**Error: "tls: handshake failure"**
+
+Less specific; could be:
+- TLS version mismatch (client too old, server requires TLS 1.2+)
+- Cipher suite mismatch
+- Server doesn't support the requested SNI
+
+Check with explicit TLS version:
+
+```bash
+openssl s_client -connect <server>:443 -tls1_2
+```
+
+**Step 3: Time skew**
+
+Cert validation is time-sensitive. If your machine's clock is wrong:
+
+```
+x509: certificate has expired or is not yet valid: current time 2025-05-15 is before 2025-05-16
+```
+
+Wait — that's "not yet valid". Means the cert's notBefore is in the future according to your clock. Your clock is wrong.
+
+```bash
+date
+# Check time
+ntpq -p
+# Or:
+chronyc tracking
+# Is NTP working?
+```
+
+Common in:
+- VMs that paused and lost time sync
+- Air-gapped environments without NTP
+- Containers with clock drift
+
+**Step 4: Identify which component is failing**
+
+Different components yielding x509 errors:
+
+**kubectl fails:**
+
+Your client config is wrong, or the API server cert changed.
+
+```bash
+kubectl get nodes -v=9 2>&1 | grep -i tls
+# Verbose output shows TLS details
+```
+
+**Pod's API access fails:**
+
+The ServiceAccount token or CA bundle mounted into the pod is wrong.
+
+```bash
+# In the pod:
+ls /var/run/secrets/kubernetes.io/serviceaccount/
+# Should have: ca.crt, namespace, token
+
+# Test:
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+curl -k --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  -H "Authorization: Bearer $TOKEN" \
+  https://kubernetes.default.svc/api/v1/namespaces
+```
+
+If `ca.crt` doesn't match what API server presents:
+- ServiceAccount needs new token (`kubectl rollout restart` to get new mount)
+- Cluster root CA was rotated, ServiceAccount tokens being recreated
+
+**Webhook validation fails:**
+
+API server can't validate the webhook's cert.
+
+```bash
+kubectl logs -n kube-system <kube-apiserver-pod> | grep -i webhook
+# Look for "failed calling webhook" with x509 details
+```
+
+The `caBundle` in the webhook configuration must include the CA that signed the webhook's server cert.
+
+**Metric-server / aggregated API fails:**
+
+```bash
+kubectl get apiservices | grep False
+kubectl describe apiservice v1beta1.metrics.k8s.io
+# Shows TLS errors
+```
+
+**Step 5: Detailed cert inspection**
+
+```bash
+# Get full cert details from a live endpoint:
+openssl s_client -connect <server>:<port> -showcerts < /dev/null 2>/dev/null | \
+  awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' | \
+  openssl x509 -noout -text
+
+# Look at:
+# - Subject (CN)
+# - Issuer
+# - Validity (Not Before, Not After)
+# - Subject Alternative Name
+# - Key Usage
+```
+
+**Step 6: Trust chain debugging**
+
+A server presents a chain: server cert → intermediate CA → root CA. Each must validate.
+
+```bash
+openssl s_client -connect <server>:443 -showcerts < /dev/null 2>/dev/null
+# Shows full chain
+```
+
+If chain is incomplete:
+- Client might have intermediate CA installed locally and not need it
+- Or client trust is broken because of missing intermediate
+
+Verify trust:
+
+```bash
+openssl verify -CAfile <ca-bundle.crt> <server-cert.crt>
+```
+
+**Production scenarios:**
+
+1. **Cluster CA rotated, kubeconfig not updated**: Admin rotated CA but only updated some teams' kubeconfigs. Other teams started getting x509 errors. Fix: distributed updated kubeconfigs.
+
+2. **VM time skew of 5 minutes**: NTP failed, VM clock drifted. New certs appeared "not yet valid". Fix: synced NTP.
+
+3. **Cert reissue without restart**: Replaced API server cert files but didn't restart kube-apiserver. Old cert still in memory. Restart loaded new cert.
+
+4. **kubelet cert for hostname, scraping via IP**: Migrated monitoring from hostname-based to IP-based, hit x509. Fix: changed monitoring config to use hostnames.
+
+5. **Self-signed cert in a CI pipeline**: CI's kubectl used `--insecure-skip-tls-verify` to bypass. When that flag was removed for security, all CI failed. Fix: proper CA in CI's kubeconfig.
+
+---
+
+## 128. How do you troubleshoot CoreDNS CrashLoopBackOff?
+
+CoreDNS in CrashLoopBackOff brings down cluster DNS, which cascades to almost every service. This is one of the most disruptive failures.
+
+**Step 1: Get the immediate state**
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+# NAME              READY   STATUS             RESTARTS
+# coredns-xxx       0/1     CrashLoopBackOff   5
+
+kubectl describe pod -n kube-system <coredns-pod>
+# Look at Last State and Events
+
+kubectl logs -n kube-system <coredns-pod> --previous
+```
+
+**Step 2: Common CoreDNS crash causes**
+
+**Cause A: Corefile parse error**
+
+```
+plugin/loop: Loop (127.0.0.1:51962 -> :53) detected for zone "."
+```
+
+This is the famous "loop detected" issue. CoreDNS detected it would forward queries back to itself, refused to start.
+
+Cause: CoreDNS's upstream (from `/etc/resolv.conf`) is `127.0.0.1` or the CoreDNS service itself.
+
+```bash
+# On the node where CoreDNS runs:
+cat /etc/resolv.conf
+# If nameserver is 127.0.0.1 or 127.0.0.53, that's the problem
+```
+
+Common scenarios:
+- Node uses systemd-resolved (127.0.0.53)
+- Node uses dnsmasq (127.0.0.1)
+- Cluster DNS service IP was somehow set as the node's resolver
+
+Fix: change kubelet's `--resolv-conf` to point to the real upstream resolver:
+
+```yaml
+# kubelet config:
+resolvConf: /run/systemd/resolve/resolv.conf
+# Instead of the default /etc/resolv.conf
+```
+
+Or fix the node's /etc/resolv.conf to use real DNS (e.g., 8.8.8.8 or cloud DNS).
+
+**Cause B: Corefile syntax error**
+
+```
+plugin/forward: parsing forward block: ...
+```
+
+A change to the Corefile ConfigMap introduced invalid syntax.
+
+```bash
+kubectl get cm -n kube-system coredns -o yaml
+```
+
+Validate manually:
+
+```bash
+# Run coredns locally with the Corefile to validate
+docker run --rm -v $(pwd)/Corefile:/Corefile coredns/coredns -conf /Corefile
+```
+
+Fix: revert to previous version of Corefile.
+
+**Cause C: Health check failure**
+
+CoreDNS exposes `/health` on port 8080. If liveness probe fails:
+
+```bash
+kubectl exec -n kube-system <coredns-pod> -- curl -s localhost:8080/health
+# Should return "OK"
+```
+
+But the pod is crashing, so this only works if you catch it during the brief running window.
+
+**Cause D: Memory limit OOM**
+
+```bash
+kubectl describe pod -n kube-system <coredns-pod> | grep -i OOMKilled
+```
+
+CoreDNS memory grows with:
+- Cache size
+- Number of zones
+- Query rate (briefly)
+
+Default memory limit is often 170Mi, which can be insufficient in large clusters or with high query rate.
+
+Fix:
+
+```yaml
+resources:
+  limits:
+    memory: 500Mi
+  requests:
+    memory: 100Mi
+```
+
+**Cause E: Unable to bind to port**
+
+```
+listen tcp :53: bind: address already in use
+```
+
+Another process on the node is using port 53. With `hostNetwork: true` this is common; default CoreDNS doesn't use hostNetwork.
+
+Or:
+
+```
+listen tcp :53: bind: permission denied
+```
+
+Port 53 is privileged (<1024). CoreDNS needs CAP_NET_BIND_SERVICE or run as root or use a port >1024.
+
+Check security context:
+
+```yaml
+securityContext:
+  capabilities:
+    add: ["NET_BIND_SERVICE"]
+```
+
+**Cause F: Plugin-specific errors**
+
+Each CoreDNS plugin can fail:
+
+```
+plugin/kubernetes: error in API connection: Get "https://kubernetes.default:443/api/v1": x509: certificate signed by unknown authority
+
+plugin/kubernetes: Kubernetes API connection failure: ... not authorized to list services
+```
+
+The kubernetes plugin (which provides cluster DNS) needs API server access. Failures:
+- ServiceAccount token expired/wrong
+- RBAC permissions removed
+- API server unreachable
+
+```bash
+kubectl get sa -n kube-system coredns -o yaml
+kubectl get clusterrolebinding system:coredns
+```
+
+Verify RBAC:
+
+```yaml
+# Required permissions:
+apiGroups: [""]
+resources: ["endpoints", "services", "pods", "namespaces"]
+verbs: ["list", "watch"]
+```
+
+**Cause G: Cluster DNS service IP mismatch**
+
+CoreDNS pods use the cluster DNS service for self-discovery sometimes. If the service IP changed, things break.
+
+```bash
+kubectl get svc -n kube-system kube-dns
+# Note the ClusterIP
+
+# Check kubelet config:
+ps aux | grep kubelet | grep -i cluster-dns
+# --cluster-dns=10.96.0.10
+```
+
+These must match for pods to use CoreDNS.
+
+**Step 3: Recover quickly**
+
+If CoreDNS is down, cluster-wide DNS is broken. Quick recovery:
+
+```bash
+# Option A: Revert Corefile change
+kubectl rollout history daemonset/coredns -n kube-system  # If using DaemonSet
+# Or:
+kubectl get cm -n kube-system coredns -o yaml > /tmp/current-corefile.yaml
+# Edit to revert to known-good Corefile
+kubectl apply -f /tmp/current-corefile.yaml
+
+# Option B: Force pod recreation
+kubectl delete pod -n kube-system -l k8s-app=kube-dns
+
+# Option C: Deploy temporary DNS
+# Run a minimal pod with dnsmasq or another resolver as emergency DNS,
+# point pods at it via dnsConfig
+```
+
+**Step 4: Scale out for resilience**
+
+```bash
+kubectl scale deployment -n kube-system coredns --replicas=5
+```
+
+With more replicas (and proper anti-affinity), one CrashLoopBackOff pod doesn't take down DNS.
+
+**Step 5: Validate the fix**
+
+```bash
+# Test from a debug pod:
+kubectl run -it --rm debug --image=nicolaka/netshoot -- bash
+nslookup kubernetes.default
+nslookup google.com
+```
+
+Both should work.
+
+**Production scenarios:**
+
+1. **kubelet pointing to systemd-resolved**: Node's `/etc/resolv.conf` had `nameserver 127.0.0.53` (systemd-resolved stub). CoreDNS detected loop, crashed. Fix: `resolvConf: /run/systemd/resolve/resolv.conf` in kubelet config.
+
+2. **OOM after enabling caching plugin**: Added `cache 30 .` to Corefile to cache all queries. Cache grew unbounded with diverse queries. OOMKilled. Fix: limited cache size or excluded high-cardinality zones.
+
+3. **A custom forward plugin block**: New Corefile had `forward example.com 10.0.0.5` but 10.0.0.5 was unreachable. CoreDNS retried, queries timed out, but didn't crash; the symptom was DNS slowness, not crash. Still worth checking.
+
+4. **RBAC stripped during cleanup**: An admin removed unused ClusterRoleBindings, accidentally removing coredns binding. Pods crashed unable to list services. Fix: restored binding.
+
+5. **Cluster DNS service IP changed**: After a control plane reinstall, kube-dns service got a different IP. kubelet still pointed to old IP. Pods couldn't reach CoreDNS. Fix: updated kubelet config across nodes.
+
+---
+
+## 129. Explain node draining issues during maintenance
+
+Draining a node means safely evicting all pods so it can be taken offline (upgrade, replace, reboot). Issues during drain prolong maintenance and can cause incidents.
+
+**Step 1: The basic drain command**
+
+```bash
+kubectl drain <node> \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --grace-period=300 \
+  --timeout=10m
+```
+
+Without flags, drain fails on:
+- DaemonSet pods (need `--ignore-daemonsets`)
+- Pods with emptyDir (need `--delete-emptydir-data` to confirm data loss is OK)
+- Standalone pods (need `--force` and accept they won't come back)
+
+**Step 2: Common drain failures**
+
+**Failure A: PodDisruptionBudget blocks eviction**
+
+```
+error when evicting pod "X": Cannot evict pod as it would violate the pod's disruption budget
+```
+
+A PDB requires minAvailable or maxUnavailable. If draining would violate this, eviction is rejected.
+
+```bash
+kubectl get pdb -A
+kubectl describe pdb <name>
+# ALLOWED DISRUPTIONS: 0 means no more can be evicted right now
+```
+
+This is correct behavior, but blocks drain. Options:
+
+1. **Wait for other pods to be ready** elsewhere (scale up the deployment if running too few replicas)
+2. **Increase PDB max disruptions** temporarily
+3. **Delete the PDB** during maintenance (risky)
+4. **Force delete** with `--force` (bypasses PDB, may cause downtime)
+
+Best practice: have enough replicas that one node's worth of pods can be evicted within PDB limits.
+
+**Failure B: Pod not part of a controller**
+
+```
+cannot delete Pods declared as not managed: <pod>
+```
+
+A "naked" pod (not from Deployment, StatefulSet, etc.) won't be recreated. Drain refuses unless you use `--force`, which means accepting the pod won't come back.
+
+```bash
+# Find them:
+kubectl get pods --all-namespaces -o json | jq '.items[] | select(.metadata.ownerReferences | not) | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+Often these are leftover debug pods. Delete them manually before draining.
+
+**Failure C: Pod stuck in Terminating**
+
+After eviction sent, pod doesn't terminate within grace period. Drain waits.
+
+```bash
+kubectl get pods -o wide --field-selector spec.nodeName=<node>
+# Some pods stuck in Terminating
+```
+
+See Q130 for stuck Terminating troubleshooting.
+
+**Failure D: Pod with local storage**
+
+```
+cannot delete Pods with local storage (use --delete-emptydir-data to override)
+```
+
+EmptyDir data will be lost on drain. Pass `--delete-emptydir-data` if you've confirmed this is acceptable.
+
+**Failure E: ServiceAccount or Secret being created**
+
+Rarely: the API server is processing a creation that involves this node, blocking eviction. Usually self-resolves.
+
+**Step 3: Eviction vs. deletion**
+
+Drain uses the **Eviction API** (`/api/v1/.../pods/<name>/eviction`). This respects PDBs and graceful termination.
+
+If eviction is blocked indefinitely, you can:
+
+```bash
+# Force delete (bypasses PDB):
+kubectl delete pod <pod> --grace-period=0 --force
+```
+
+This:
+- Removes the pod from etcd immediately
+- Doesn't wait for the pod to terminate
+- Doesn't respect PDBs
+- May cause downtime
+- May leave orphaned resources (volumes still attached, etc.)
+
+Use only when:
+- Pod is genuinely stuck
+- You've accepted the consequences
+- You can't wait
+
+**Step 4: Long terminationGracePeriod**
+
+If pods have:
+
+```yaml
+terminationGracePeriodSeconds: 1800   # 30 minutes
+```
+
+Drain waits for each pod to complete its grace period. With many pods, this serializes:
+
+```bash
+# Drain timeout (default: indefinite):
+kubectl drain <node> --timeout=20m
+```
+
+Tune grace period to actual needs. Most apps don't need 30 minutes.
+
+**Step 5: Drain ordering and parallelism**
+
+Drain evicts pods one at a time (sequentially within a node). For complex workloads, this can take a while.
+
+For multi-node maintenance:
+
+- **Sequential**: drain one node at a time (safer for PDBs)
+- **Parallel**: drain multiple at once (faster, but risk PDB violations)
+
+Tools like `kured` (Kubernetes Reboot Daemon) drain one node at a time across the cluster for kernel updates.
+
+**Step 6: Cordon before drain**
+
+`kubectl drain` cordons automatically. But if doing multi-step maintenance:
+
+```bash
+# Mark node as unschedulable but don't evict yet:
+kubectl cordon <node>
+
+# ... do prep work ...
+
+# Then drain:
+kubectl drain <node> --ignore-daemonsets
+```
+
+After maintenance:
+
+```bash
+kubectl uncordon <node>
+```
+
+**Step 7: DaemonSet pods aren't evicted**
+
+DaemonSet pods are tied to the node. Drain doesn't evict them (with `--ignore-daemonsets`). They die when the node is removed/rebooted.
+
+If the DaemonSet pod's death matters (logging, monitoring), accept brief gaps during reboot.
+
+**Step 8: Stuck drain recovery**
+
+```bash
+# What's still on the node?
+kubectl get pods --field-selector spec.nodeName=<node> -o wide
+
+# For each stuck pod, decide:
+# - Force delete (accept downtime)
+# - Adjust PDB (if blocked there)
+# - Manually intervene
+
+# Cancel drain if needed:
+kubectl uncordon <node>
+# Stops the eviction loop
+```
+
+**Step 9: Production drain workflow**
+
+For zero-downtime maintenance:
+
+1. **Verify replica count** is sufficient (one node's pods evicted, others should handle)
+2. **Check PDB allows disruption**: `kubectl get pdb -A`
+3. **Cordon the node**
+4. **Wait briefly** for in-flight requests
+5. **Drain with reasonable timeout**
+6. **Monitor application health** during drain
+7. **Do maintenance**
+8. **Uncordon**
+
+**Step 10: Automate with proper tooling**
+
+For routine maintenance:
+
+- **kured**: handles reboots cluster-wide, one at a time
+- **Cluster autoscaler**: drains for scale-down
+- **Karpenter**: handles consolidation drains
+- **GitOps-driven node upgrades**: managed flows from Flux/ArgoCD
+
+**Production scenarios:**
+
+1. **PDB blocking forever**: Service had 3 replicas, PDB minAvailable=3. Could never drain because would always leave only 2. Fix: increased replicas to 5, PDB minAvailable=3.
+
+2. **Long-running batch jobs**: Drain blocked by a 4-hour batch job pod that won't be re-run automatically. Fix: special handling — wait for completion, force-delete during maintenance window.
+
+3. **CSI driver stuck on detach**: Drained pods, but volumes wouldn't detach. Node couldn't be terminated. Fix: manually deleted VolumeAttachments after confirming pods were truly gone.
+
+4. **Cascading PDB failure**: Drained 5 nodes simultaneously. Each had pods from a Service with PDB allowing 1 disruption. First node drained OK, second tried to evict and blocked all subsequent drains. Fix: drain sequentially.
+
+5. **DaemonSet with hostPath stuck**: A monitoring DaemonSet wrote to /var/log via hostPath. During drain, the DaemonSet pod stayed, kept file open. Reboot eventually freed it. Wasn't a real problem, just non-graceful.
+
+---
+
+## 130. Pods remain in Terminating state
+
+A pod stuck in Terminating means the API has been asked to delete it, but cleanup hasn't completed. The pod's grace period has expired, but something prevents removal.
+
+**Step 1: Verify it's stuck**
+
+```bash
+kubectl get pod <pod>
+# STATUS    Terminating
+# AGE       45m
+# (Terminating for 45 minutes is stuck)
+```
+
+A normal Terminating lasts seconds to terminationGracePeriodSeconds (default 30s).
+
+**Step 2: Understand the termination flow**
+
+When you delete a pod:
+
+1. API server sets `metadata.deletionTimestamp`
+2. Pod status becomes Terminating
+3. Endpoints controller removes pod from Services
+4. kubelet sends SIGTERM to containers
+5. Containers have `terminationGracePeriodSeconds` to exit gracefully
+6. If still running, kubelet sends SIGKILL
+7. kubelet cleans up volumes, network, etc.
+8. kubelet reports to API server that pod is gone
+9. API server removes pod from etcd
+
+A stuck Terminating means we're stuck at one of these steps.
+
+**Step 3: Identify the stuck phase**
+
+```bash
+kubectl describe pod <pod>
+```
+
+Look at:
+
+- **Status conditions**
+- **Events** (recent failures)
+- **Container statuses** (Last State if terminated)
+
+Common stuck causes:
+
+**Cause A: Finalizers**
+
+```bash
+kubectl get pod <pod> -o yaml | grep -A 5 finalizers
+# finalizers:
+# - some-controller/finalizer
+```
+
+Finalizers prevent deletion until removed. Custom controllers add finalizers to do cleanup before allowing the object to be deleted. If the controller is broken/missing, finalizers never get removed.
+
+Remove finalizers manually:
+
+```bash
+kubectl patch pod <pod> -p '{"metadata":{"finalizers":null}}'
+# Or:
+kubectl edit pod <pod>
+# Delete the finalizers section
+```
+
+This forces deletion even if the controller didn't finish cleanup. Use with caution.
+
+**Cause B: kubelet not running on node**
+
+If the node is NotReady, kubelet isn't reporting back, so the pod can't be confirmed terminated.
+
+```bash
+kubectl get node <node-pod-is-on>
+# Ready False?
+```
+
+If the node is dead:
+
+```bash
+# Force delete:
+kubectl delete pod <pod> --grace-period=0 --force
+# This removes from etcd without waiting for kubelet confirmation
+```
+
+**Cause C: Volume detach hung**
+
+The pod's volumes can't be unmounted/detached, often because:
+- CSI driver stuck
+- Cloud provider API issue
+- Underlying storage problem
+
+```bash
+kubectl describe pod <pod> | grep -A 5 Events
+# Warning  FailedDetachVolume  ...
+```
+
+Check VolumeAttachments:
+
+```bash
+kubectl get volumeattachment | grep <pv-name>
+kubectl describe volumeattachment <name>
+```
+
+Sometimes manual intervention needed:
+
+```bash
+# Delete the VolumeAttachment (cloud may need manual detach):
+kubectl delete volumeattachment <name>
+
+# Then force-delete the pod
+```
+
+**Cause D: Container won't exit**
+
+The container ignores SIGTERM, kubelet sends SIGKILL after grace period, but the process spawned children that aren't being killed.
+
+Or the container is stuck in an uninterruptible system call (D state):
+
+```bash
+# On node:
+ps aux | grep <container-pid> | awk '{print $8}'
+# D = uninterruptible sleep
+```
+
+D-state processes can't be killed normally. They're usually stuck on disk I/O. Sometimes:
+- Reboot the node
+- Resolve the underlying I/O issue (e.g., NFS server back online)
+
+**Cause E: Process not signaled correctly**
+
+If your container's entrypoint is a shell script, signals may not be forwarded to the actual app:
+
+```sh
+# Bad - shell receives signal, doesn't forward
+exec sh -c "myapp"
+
+# Good - exec replaces shell with app
+exec myapp
+```
+
+Without proper signal forwarding, SIGTERM goes to the shell, which terminates, but the app keeps running until SIGKILL. Pod stays in Terminating during grace period.
+
+Fix: use `exec` form in entrypoints, or use init systems like `tini`.
+
+**Cause F: PreStop hook hung**
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["sleep", "3600"]
+```
+
+The preStop hook runs before SIGTERM. If it's a long sleep or a stuck command, termination is blocked.
+
+Check the spec for preStop hooks; ensure they're bounded.
+
+**Cause G: Kubelet bug or stale state**
+
+Rarely, kubelet's internal state is corrupted and it can't properly report pod removal.
+
+Restarting kubelet on the node:
+
+```bash
+systemctl restart kubelet
+```
+
+usually clears stuck state.
+
+**Step 4: The nuclear option**
+
+When all else fails:
+
+```bash
+kubectl delete pod <pod> --grace-period=0 --force
+```
+
+This:
+- Immediately removes pod from etcd
+- Doesn't wait for kubelet to confirm
+- Doesn't run any cleanup
+- May leak resources (volumes still attached, network namespaces, etc.)
+
+After force delete, you may need to manually clean up:
+- VolumeAttachments
+- Cloud volumes
+- Container runtime artifacts on the node
+
+**Step 5: Diagnose root cause to prevent recurrence**
+
+After clearing the stuck pod, find why:
+
+```bash
+# Logs from kubelet on the node:
+journalctl -u kubelet --since "1 hour ago" | grep <pod-name>
+
+# Container runtime:
+journalctl -u containerd --since "1 hour ago" | grep <pod-name>
+```
+
+Look for repeated patterns suggesting systemic issues.
+
+**Step 6: Common patterns**
+
+**Pattern 1: Failed node**
+
+Node went NotReady. All its pods stuck Terminating. Need to force-delete them all if the node won't recover.
+
+Helper:
+
+```bash
+# Force delete all pods on a dead node:
+kubectl get pods --all-namespaces --field-selector spec.nodeName=<dead-node> -o json | \
+  jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name)"' | \
+  while read ns name; do
+    kubectl delete pod $name -n $ns --grace-period=0 --force
+  done
+```
+
+**Pattern 2: StatefulSet with stuck volume**
+
+StatefulSet pod can't be replaced because old pod is Terminating with stuck volume. New pod can't claim the same name. Manual intervention needed.
+
+**Pattern 3: Custom controller with broken finalizer**
+
+A controller adds finalizers but its reconcile loop has a bug. Pods accumulate in Terminating.
+
+Fix the controller, then mass-remove finalizers:
+
+```bash
+kubectl get pods -A -o json | \
+  jq -r '.items[] | select(.metadata.finalizers) | "\(.metadata.namespace) \(.metadata.name)"' | \
+  while read ns name; do
+    kubectl patch pod $name -n $ns -p '{"metadata":{"finalizers":null}}'
+  done
+```
+
+**Production scenarios:**
+
+1. **Custom operator left finalizers**: Operator was uninstalled but its CRD pods had finalizers. Pods couldn't be deleted. Fix: removed finalizers after confirming operator was truly gone.
+
+2. **EBS volume detach hung in AWS**: AWS API error caused detach to fail. VolumeAttachment was stuck. Pod stuck. Fix: AWS force-detach via console, then deleted VolumeAttachment manually.
+
+3. **Node hard-died (hardware failure)**: All pods stuck Terminating for 5 minutes (default toleration timeout). Used kubectl drain with force to force-delete all pods on that node.
+
+4. **PreStop hook calling external API that was down**: PreStop tried to deregister from service registry. Registry was down. PreStop hung until grace period expired (300s). Symptom: every pod took 5min to terminate. Fix: timeout in preStop script.
+
+5. **Long sleep in entrypoint**: Engineer added `sleep 60` in entrypoint for "graceful shutdown", but real app already handled SIGTERM. Pods always took 60s to terminate. Fix: removed the sleep.
+
+---
+
+## 131. How do you force delete stuck resources?
+
+When normal deletion doesn't complete, you sometimes need to force the issue. This is risky — it can leave orphaned resources — but is occasionally necessary.
+
+**Step 1: Identify why deletion is stuck**
+
+Before forcing, understand the cause. Different stuck resources require different forces.
+
+```bash
+kubectl get <resource> <name>
+# Check for deletionTimestamp:
+kubectl get <resource> <name> -o jsonpath='{.metadata.deletionTimestamp}'
+
+# Check finalizers:
+kubectl get <resource> <name> -o jsonpath='{.metadata.finalizers}'
+
+# Get full state:
+kubectl get <resource> <name> -o yaml
+```
+
+**Step 2: Remove finalizers**
+
+Finalizers are the most common reason for stuck deletion. They're meant to ensure cleanup happens, but a broken controller leaves them indefinitely.
+
+```bash
+# Method 1: Patch
+kubectl patch <resource> <name> -p '{"metadata":{"finalizers":null}}' --type=merge
+
+# Method 2: Patch with JSON patch
+kubectl patch <resource> <name> --type json --patch='[{"op": "remove", "path": "/metadata/finalizers"}]'
+
+# Method 3: Edit
+kubectl edit <resource> <name>
+# Delete the finalizers section, save
+```
+
+**For cluster-scoped resources** (Namespaces, PVs, ClusterRoles):
+
+```bash
+kubectl patch namespace <name> -p '{"metadata":{"finalizers":null}}'
+```
+
+**Special case for Namespaces**:
+
+A stuck Namespace often needs the `kubernetes` finalizer removed in a specific way:
+
+```bash
+# Get the namespace JSON:
+kubectl get namespace <name> -o json > ns.json
+
+# Remove the finalizer from the spec section (not just metadata):
+# Edit ns.json, remove the "kubernetes" entry from spec.finalizers
+
+# Apply via the finalize subresource:
+kubectl proxy &
+curl -X PUT \
+  -H "Content-Type: application/json" \
+  --data-binary @ns.json \
+  http://127.0.0.1:8001/api/v1/namespaces/<name>/finalize
+```
+
+**Step 3: Force delete pods**
+
+```bash
+kubectl delete pod <name> --grace-period=0 --force
+```
+
+This:
+- Sets grace period to 0 (no time for graceful shutdown)
+- Forces removal from etcd
+- Doesn't wait for kubelet to confirm cleanup
+
+May leave behind:
+- Container running on the node (if kubelet is alive, it'll clean up; if dead, container may persist)
+- Mounted volumes still attached
+- Network resources
+
+**Step 4: Force delete other resources**
+
+For most resources, just removing finalizers and re-deleting works:
+
+```bash
+kubectl patch <kind> <name> -p '{"metadata":{"finalizers":null}}' --type=merge
+kubectl delete <kind> <name> --grace-period=0 --force
+```
+
+**Step 5: PersistentVolumeClaim stuck**
+
+```bash
+kubectl get pvc <name>
+# Status: Terminating
+
+# Common: a pod still uses it
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] | select(.spec.volumes[]?.persistentVolumeClaim.claimName=="<pvc-name>") | "\(.metadata.namespace)/\(.metadata.name)"'
+
+# Delete those pods first, or force-delete:
+kubectl delete pvc <name> --grace-period=0 --force
+kubectl patch pvc <name> -p '{"metadata":{"finalizers":null}}'
+```
+
+After force delete, check the PV:
+
+```bash
+kubectl get pv | grep <pv-name>
+# May be Released or Failed
+# Clean up the underlying storage manually if reclaim policy is Retain
+```
+
+**Step 6: Stuck namespace**
+
+A namespace stuck Terminating usually has resources inside that can't be deleted.
+
+```bash
+kubectl get namespace <name> -o yaml | grep -A 5 conditions
+# Look for: NamespaceDeletionContentFailure
+# message: "Some resources are remaining: pods. has 3 resource instances"
+# message: "Some content in the namespace has finalizers..."
+```
+
+Two issues:
+1. **Resources remain**: list and force-delete each
+2. **Resources have finalizers**: remove finalizers from those resources
+
+```bash
+# List all resources in the namespace:
+kubectl api-resources --verbs=list --namespaced -o name | \
+  xargs -n 1 kubectl get --show-kind --ignore-not-found -n <namespace>
+
+# Identify resources with finalizers, clear them, then delete
+```
+
+Sometimes a stuck Namespace has resources whose APIs no longer exist (CRDs removed but instances remain). Need to remove the orphaned instances directly via API.
+
+**Step 7: Stuck Custom Resources**
+
+If a CRD instance is stuck because its operator is gone:
+
+```bash
+kubectl patch <crd-instance> <name> -p '{"metadata":{"finalizers":null}}' --type=merge
+```
+
+If the CRD itself is being deleted but stuck:
+
+```bash
+kubectl patch crd <name> -p '{"metadata":{"finalizers":null}}'
+```
+
+But first ensure all instances are gone, otherwise you'll orphan them.
+
+**Step 8: Cluster-level stuck resources**
+
+For cluster-scoped resources like ClusterRoleBinding, PV, StorageClass:
+
+```bash
+kubectl patch <kind> <name> -p '{"metadata":{"finalizers":null}}'
+kubectl delete <kind> <name>
+```
+
+**Step 9: Direct etcd intervention (last resort)**
+
+If even API-level force doesn't work, edit etcd directly. **Extremely dangerous** — can corrupt the cluster.
+
+```bash
+# On a control plane node:
+ETCDCTL_API=3 etcdctl --endpoints=... get /registry/<kind>/<namespace>/<name>
+ETCDCTL_API=3 etcdctl --endpoints=... del /registry/<kind>/<namespace>/<name>
+```
+
+Use only with backups in hand and full understanding of consequences.
+
+**Step 10: Clean up orphaned resources after force delete**
+
+After force-deleting, check for orphans:
+
+**Orphaned VolumeAttachments:**
+
+```bash
+kubectl get volumeattachment
+# Any referring to PVs that no longer exist?
+kubectl delete volumeattachment <name>
+```
+
+**Orphaned cloud resources:**
+
+EBS volumes, cloud load balancers, etc., may persist if Kubernetes resources were force-deleted before their cleanup ran. Check the cloud console.
+
+**Orphaned objects on nodes:**
+
+If you force-deleted pods on a node that was unreachable:
+
+```bash
+# When node comes back, kubelet may try to start "ghost" pods
+# Or containers may be stuck running
+
+# On the node:
+crictl ps -a   # All containers
+crictl rm <id> # Remove orphans
+```
+
+**Step 11: Best practices**
+
+**Avoid force delete when possible.** It's a sign something else is broken.
+
+**Document forced deletions** in incident logs — they often correlate with later issues.
+
+**Don't use force as routine.** If pods regularly stick, fix the root cause.
+
+**Backup before mass-cleanup.** etcd snapshot before bulk operations.
+
+**Production scenarios:**
+
+1. **Namespace deletion stuck for days**: A custom resource had a finalizer pointing to a controller that was deleted months ago. Namespace deletion waiting forever. Fix: removed finalizers from the orphaned CR instances.
+
+2. **PV won't delete because PVC won't delete because pod won't delete**: Cascade of stuck resources. Worked backward: force-deleted pod, then PVC, then PV.
+
+3. **Cert-manager Certificate stuck**: Finalizer was for cert-manager's CertificateRequest, but the request was already gone. Removed finalizer manually.
+
+4. **CRD deletion took down dependent CRD**: Deleted parent CRD while child instances existed. Child instances were orphaned, future kubectl get failed. Fix: manually deleted child instances via etcd, then recreated CRD properly.
+
+5. **Force-deleted pods but volumes attached**: Force-deleted pods on a dead node. EBS volumes remained attached in AWS. Next pod scheduling failed because volumes were "already attached." Fix: AWS force-detach.
+
+---
+
+## 132. Explain troubleshooting StatefulSet split-brain issues
+
+Split-brain is a distributed systems failure where multiple instances think they're the leader/primary, leading to data divergence. In StatefulSets, this can happen during partitions or failovers.
+
+**Step 1: Understand what split-brain means**
+
+In a database StatefulSet (etcd, Redis, PostgreSQL, MongoDB), there should be exactly one primary at a time. Split-brain occurs when:
+
+1. Network partition isolates the primary
+2. Secondaries elect a new primary among themselves
+3. Network heals — now two primaries exist
+4. Both accept writes — data diverges
+5. Reconciliation is complex; data loss may be required
+
+**Step 2: Detect split-brain**
+
+Symptoms:
+- Conflicting writes succeeding on different replicas
+- Replication lag continuously high or growing
+- Database reports multiple primaries (in tools like `mongo --eval "rs.status()"`)
+- Application sees stale or conflicting data
+
+For specific systems:
+
+**etcd:**
+
+```bash
+etcdctl endpoint status --cluster
+# Shows IS LEADER for each member - should be exactly one
+```
+
+**MongoDB:**
+
+```javascript
+rs.status()
+// Shows current primary; check for "stateStr: PRIMARY" on multiple
+```
+
+**PostgreSQL with Patroni:**
+
+```bash
+patronictl list
+# Shows role of each member
+```
+
+**Step 3: How split-brain happens in Kubernetes**
+
+Specifically Kubernetes-relevant scenarios:
+
+**Scenario A: Node failure with stuck pod**
+
+1. Node fails (network or hardware)
+2. Kubernetes waits the `tolerations` time (default 5 min for node-not-ready), then marks pods for deletion
+3. New pod scheduled on healthy node
+4. **But**: the old pod might still be running on the unhealthy node (network partition, not actual death)
+5. Two pods, same identity, both think they're the StatefulSet replica
+
+This is the classic split-brain in StatefulSet context.
+
+**Scenario B: PVC reuse without proper fencing**
+
+1. StatefulSet uses a PVC bound to a PV
+2. Old pod's volume is force-detached
+3. New pod starts with the same volume
+4. Old pod (still on unreachable node) writes locally cached data
+5. Data inconsistency
+
+Most CSI drivers fence properly (RWO ensures single attachment), but edge cases exist.
+
+**Scenario C: External system perceives both as alive**
+
+Even without dual-running pods, external systems (DNS, service registries) may briefly see both old and new pod's IPs. Some clients connect to old, some to new.
+
+**Step 4: Prevention strategies**
+
+**Use Pod-level fencing (PodReadinessGate or NodeOutOfService taint):**
+
+The `node.kubernetes.io/out-of-service` taint, applied to a node, signals "this node is truly dead, force volume detach, force pod cleanup." Tolerable risk because admin explicitly marks the node out of service.
+
+```bash
+# Mark node as out of service:
+kubectl taint node <node> node.kubernetes.io/out-of-service=nodeshutdown:NoExecute
+```
+
+Volumes are then force-detached, pods rescheduled cleanly.
+
+**Use distributed consensus:**
+
+For systems that need strong consistency (etcd, Consul, CockroachDB), use protocols like Raft or Paxos. Split-brain is impossible if a majority is required for any decision.
+
+For 3-replica systems, partition isolating 1 replica means that one can't make decisions; the other 2 (majority) continue.
+
+For 2-replica systems: don't run 2 replicas for consensus. Use 3 minimum.
+
+**Use leader election with leases:**
+
+```go
+// Each replica:
+1. Try to acquire/renew lease via Kubernetes API
+2. Only the leaseholder is "primary"
+3. Lease expires if not renewed (TTL)
+4. After expiry, another replica can acquire
+```
+
+Old primary, when its lease expires due to partition, must step down (not be primary anymore). New primary takes over.
+
+The critical assumption: old primary actually does step down. If it doesn't (because of clock skew or bug), split-brain.
+
+**Use fencing tokens:**
+
+Each leader gets a monotonically increasing token. Storage layer accepts writes only from the highest token seen. Old leaders with lower tokens are rejected.
+
+**Step 5: Specific system patterns**
+
+**etcd:**
+
+Raft prevents split-brain by requiring majority for commits. A partitioned minority can't make progress. When healed, minority joins back, accepts the majority's log.
+
+```bash
+# Always run odd number (3, 5, 7) for tolerance:
+# 3 members: tolerates 1 failure
+# 5 members: tolerates 2 failures
+```
+
+**PostgreSQL with Patroni:**
+
+Patroni uses DCS (Distributed Configuration Store - etcd/ZooKeeper/Consul) to coordinate. Only the holder of the leader lock in DCS is primary.
+
+If a primary loses DCS connectivity:
+- Patroni demotes it (via `pg_ctl stop` then start as replica)
+- Other replicas race for the leader lock
+- One wins, becomes new primary
+
+Split-brain happens if old primary can't be demoted (Patroni crashed) or if DCS itself splits.
+
+**MongoDB:**
+
+Replica sets use majority-based primary election. A primary that loses quorum steps down to secondary. New election among the majority.
+
+Split-brain rare in MongoDB; mostly happens with misconfiguration.
+
+**Step 6: Recovering from split-brain**
+
+Once detected, recovery is data-dependent.
+
+**For etcd-like systems (Raft):**
+
+- Determine which member has the canonical state (usually the majority side, or the one with highest committed index)
+- Take a snapshot of the canonical state
+- Wipe the divergent members
+- Bootstrap them from snapshot
+- Restart cluster
+
+**For PostgreSQL/MySQL:**
+
+- Identify which instance has more critical writes (often the original primary that just got partitioned)
+- Reconcile diverged data manually (compare WAL/binlogs)
+- Take a backup
+- Force one as primary, rebuild others from base backup
+- Replay any reconciled changes
+
+**For MongoDB:**
+
+```javascript
+// Force reconfig:
+rs.reconfig(newConfig, { force: true })
+```
+
+Then re-sync diverged secondaries from the chosen primary.
+
+**Step 7: Verify after recovery**
+
+- Run consistency checks specific to your database
+- Compare counts, checksums of critical tables
+- Have application validate critical invariants
+- Monitor replication lag returning to normal
+
+**Step 8: Postmortem analysis**
+
+After split-brain:
+
+1. **Why did the partition happen?** Network issues? Node failure? Kubernetes upgrade?
+2. **Why didn't the existing fencing prevent split-brain?** Wrong configuration? Bug?
+3. **What data was lost or corrupted?** From logs and reconciliation.
+4. **How long was the split-brain in effect?** Time-from-detection.
+5. **Why was detection slow?** Missing monitoring?
+
+**Production scenarios:**
+
+1. **Patroni split-brain during AZ outage**: Cross-AZ network blip; primary in AZ-A lost connection to etcd in AZ-B. New primary elected in AZ-B. Network healed; AZ-A primary tried to rejoin but had unreplicated writes. Lost ~30 seconds of writes; recoverable from app's idempotent retries.
+
+2. **MongoDB split-brain after force-delete**: A stuck primary pod was force-deleted. Replica set elected new primary. Force-deleted pod's volume was reattached to new pod with same name. Old data + new writes; needed to wipe and re-sync.
+
+3. **Custom database with no fencing**: A homegrown distributed cache had no proper fencing. Node partition caused split-brain. Manual reconciliation took hours; some writes lost. Lesson: don't write your own distributed systems; use battle-tested ones.
+
+4. **etcd quorum lost preventing split-brain**: 3-node etcd, 2 nodes failed. Cluster correctly halted (no quorum). Split-brain prevented at the cost of read/write availability. Restored from snapshot.
+
+5. **DNS-based primary discovery**: Apps discovered primary via DNS (`db-primary.svc.cluster.local`). DNS pointed to old primary briefly after failover. Some apps wrote to old primary (now demoted to secondary, rejected writes). Better: app-aware connection routing with health checks.
+
+---
+
+## 133. What happens if scheduler crashes?
+
+The Kubernetes scheduler (`kube-scheduler`) decides which node each Pending pod runs on. Its crash has specific, somewhat limited impact.
+
+**Step 1: Immediate impact**
+
+When the scheduler crashes:
+
+- **Existing running pods**: unaffected. They continue running.
+- **New pods**: stuck in Pending forever (until scheduler returns)
+- **Pending pods**: stay Pending
+- **kubectl operations**: mostly work; only scheduling-related are affected
+- **HPA scale-up**: creates new pods, which stay Pending
+- **Deployments rolling out**: stuck after creating new pods that can't be scheduled
+- **DaemonSets**: by default, the DaemonSet controller schedules its pods directly (without kube-scheduler), so they're typically not affected
+
+**Step 2: Recovery in HA setup**
+
+In a multi-master cluster, multiple `kube-scheduler` instances run, with one elected as leader.
+
+```bash
+kubectl get lease -n kube-system kube-scheduler
+# Shows current leader
+```
+
+If the leader crashes:
+
+1. Lease isn't renewed
+2. After `leaseDuration` (default 15s), lease becomes acquirable
+3. Standby schedulers race to acquire
+4. New leader starts scheduling
+
+So in HA, scheduler crash means a brief (~15s) gap in scheduling, then recovery.
+
+**Step 3: Single scheduler crash**
+
+Without HA (single master or single scheduler pod):
+
+```bash
+kubectl get pods -n kube-system | grep scheduler
+# kube-scheduler-master-1   CrashLoopBackOff
+```
+
+You need to recover it. While it's down:
+
+- New pods queue up Pending
+- Replicas can't scale up
+- Failed pods can't be rescheduled
+
+**Step 4: Diagnose scheduler crash**
+
+```bash
+kubectl logs -n kube-system <kube-scheduler-pod>
+# Or for kubeadm static pod:
+journalctl -u kubelet | grep scheduler
+# Static pod logs:
+cat /var/log/pods/kube-system_kube-scheduler-*/scheduler/*.log
+```
+
+Common crash causes:
+
+**Cause A: Invalid scheduler config**
+
+Custom scheduler profiles or extensions misconfigured:
+
+```
+error parsing config: ...
+```
+
+Revert to a known-good config.
+
+**Cause B: API server unreachable**
+
+Scheduler watches the API server. If unreachable, scheduler can't make decisions:
+
+```
+Failed to list *v1.Pod: ... connection refused
+```
+
+Fix API server availability.
+
+**Cause C: Resource constraints (rare)**
+
+OOM or CPU starvation on the master node:
+
+```bash
+dmesg | grep -i "killed process.*scheduler"
+```
+
+Increase scheduler resource allocations (in its static pod manifest).
+
+**Cause D: Bug in custom scheduler plugin**
+
+If you've installed scheduler plugins (e.g., NodeResourceTopology, Volcano), bugs there can crash the scheduler.
+
+```bash
+kubectl logs -n kube-system <scheduler-pod> --previous
+# Stack trace usually identifies plugin
+```
+
+Disable the problematic plugin in scheduler config and restart.
+
+**Step 5: Manual scheduling as a stopgap**
+
+If the scheduler is down for an extended time and you need to start a critical pod, manually assign a node:
+
+```yaml
+spec:
+  nodeName: <specific-node-name>   # Bypass scheduler entirely
+```
+
+The kubelet on that node will start the pod without going through the scheduler.
+
+This is brittle (no checks for fit, taints, etc.) but works when desperate.
+
+**Step 6: Custom schedulers**
+
+You can run multiple schedulers. Pods specify which scheduler:
+
+```yaml
+spec:
+  schedulerName: my-custom-scheduler
+```
+
+If you have a custom scheduler that crashed, only pods using it are stuck. The default scheduler handles pods without explicit `schedulerName`.
+
+This separation can isolate failures.
+
+**Step 7: Restart the scheduler**
+
+For kubeadm static pod:
+
+```bash
+# On master node:
+mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/
+# kubelet stops the pod
+sleep 30
+mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/
+# kubelet starts a new one
+```
+
+For managed control plane (EKS, GKE): the cloud provider auto-recovers the scheduler. You don't have direct access.
+
+**Step 8: Verify recovery**
+
+```bash
+# Pending pods should start scheduling:
+kubectl get pods --field-selector=status.phase=Pending
+# Watch as they transition to Running
+
+# Scheduler logs should show events:
+kubectl logs -n kube-system <kube-scheduler-pod> | tail
+```
+
+**Step 9: Prevention**
+
+- **Run HA control plane** with 3+ master nodes
+- **Monitor scheduler health**: alerts on lease holder changes, scheduler restarts
+- **Limit custom scheduler complexity**: each custom scheduler is a SPOF for its own pods
+- **Test scheduler restarts** during chaos engineering exercises
+
+**Production scenarios:**
+
+1. **Single-master cluster lost scheduler for 30 min**: kube-scheduler OOMed (memory leak in old version). 200 pods backed up Pending. Fix: increased memory limit, upgraded scheduler version.
+
+2. **Custom scheduler plugin panic**: A Volcano scheduler plugin had a nil pointer dereference for specific pod configurations. Crashed on every restart. Fix: avoided the triggering config until plugin updated.
+
+3. **HA failover slow**: Lease duration was 60s. Failed scheduler took 60s to fail over. Reduced to 15s for faster recovery.
+
+4. **Scheduler can't talk to API server**: API server was overwhelmed. Scheduler kept disconnecting and reconnecting, making no progress. Fix: API server resources increased.
+
+5. **Webhook timing out blocking scheduling**: A pod webhook (not admission, but a scheduler extender) was slow. Every scheduling decision waited for it. Schedule rate dropped 10x. Fix: tuned webhook timeout.
+
+---
+
+## 134. Control plane node becomes unavailable
+
+A control plane node failure has different implications based on cluster setup (single master vs. HA).
+
+**Step 1: Identify cluster topology**
+
+```bash
+kubectl get nodes -l node-role.kubernetes.io/control-plane
+# Or older label:
+kubectl get nodes -l node-role.kubernetes.io/master
+
+# Or check kubeadm config:
+kubectl get cm -n kube-system kubeadm-config -o yaml
+```
+
+How many control plane nodes? If just one (lab/test setup), the cluster is now mostly broken.
+
+**Step 2: Single master failure**
+
+If you have one control plane node and it's down:
+
+**What still works:**
+- Running pods continue (kubelet manages them, doesn't need control plane for steady state)
+- DNS works if CoreDNS pods are on worker nodes
+- Services work (kube-proxy on workers has the rules)
+- Persistent connections to apps continue
+
+**What's broken:**
+- kubectl commands (no API server)
+- New pods can't be scheduled
+- Failing pods aren't rescheduled
+- New Service or config changes can't be applied
+- Anything requiring the API server
+
+The cluster is essentially read-only and frozen.
+
+**Recovery for single master:**
+
+```bash
+# SSH to the master node (if reachable):
+systemctl status kubelet
+# Is kubelet running? Static pods (etcd, apiserver, scheduler, controller-manager) should auto-restart
+
+# Check static pod state:
+crictl ps | grep -E "etcd|apiserver"
+
+# If kubelet is down:
+systemctl start kubelet
+
+# If etcd data is intact, things recover automatically
+```
+
+If the master VM is dead beyond recovery, you have two options:
+
+**Option A: Restore from etcd backup**
+
+You did take regular etcd snapshots, right?
+
+```bash
+# On a new master node:
+ETCDCTL_API=3 etcdctl snapshot restore /backup/snapshot.db \
+  --data-dir /var/lib/etcd-restored
+
+# Reconfigure kubeadm with new etcd data dir
+# Restart static pods
+```
+
+**Option B: Rebuild cluster**
+
+If no backup, you may need to rebuild and redeploy all workloads.
+
+**Lesson:** never run single-master in production. Always HA.
+
+**Step 3: HA cluster — one master fails**
+
+With 3 masters, losing one is not critical:
+
+```bash
+kubectl get nodes
+# master-1   NotReady
+# master-2   Ready
+# master-3   Ready
+```
+
+What happens:
+
+- **API server**: clients connect to a load balancer fronting all 3. The LB routes to the remaining 2. kubectl still works.
+- **etcd**: 3-node etcd tolerates 1 failure. Remaining 2 form quorum. Reads/writes continue.
+- **Scheduler/controller-manager**: leader election handles failover. If the failed master was the leader, a new leader takes over within ~15s.
+
+**Step 4: HA cluster — two masters fail**
+
+Now things get serious:
+
+```bash
+# 3-node cluster, 2 down
+kubectl get nodes
+# master-1   NotReady
+# master-2   NotReady
+# master-3   Ready
+```
+
+**etcd loses quorum**: With only 1 of 3 members alive, no quorum, no writes accepted. The cluster becomes read-only at the etcd level.
+
+**API server**: 1 of 3 alive. The LB routes to it, but etcd can't accept writes, so all write requests fail.
+
+Recovery:
+- Restore the failed masters quickly (boot the VMs, restart etcd)
+- Or, if data on the failed masters is lost, restore etcd from snapshot
+
+**Step 5: Diagnose control plane node failure**
+
+```bash
+# Cloud VM down?
+# Check cloud console
+
+# Network unreachable?
+ping <master-node-ip>
+ssh <master-node>
+
+# Disk full?
+df -h    # If reachable
+
+# kubelet down?
+systemctl status kubelet
+
+# Static pods crashed?
+crictl ps -a
+```
+
+**Common causes:**
+
+- Disk full (etcd grew or logs accumulated)
+- OOM (especially with bin-packing on small master nodes)
+- Network partition (cloud-side)
+- VM crash or hardware failure (rare in cloud, common bare metal)
+- Cert expiration (Q126)
+
+**Step 6: Restore failed master**
+
+For kubeadm clusters:
+
+```bash
+# If master can be restarted:
+systemctl start kubelet
+# Static pods auto-recreate
+
+# If master VM was replaced (same hostname/IP):
+# Need to rejoin the cluster
+
+# On a working master:
+kubeadm token create --print-join-command
+# Generates a token + ca-hash
+
+# Plus get the cert key:
+kubeadm init phase upload-certs --upload-certs
+
+# On the new master:
+kubeadm join <api-endpoint>:6443 --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane --certificate-key <cert-key>
+```
+
+**Step 7: Restore from etcd backup**
+
+If etcd is corrupted on the failed master:
+
+```bash
+# Take a snapshot from a healthy master:
+ETCDCTL_API=3 etcdctl snapshot save /backup/healthy-snapshot.db
+
+# On the recovering master, restore:
+ETCDCTL_API=3 etcdctl snapshot restore /backup/healthy-snapshot.db \
+  --name etcd-recovering \
+  --initial-cluster <full-cluster-spec> \
+  --initial-advertise-peer-urls https://<this-master>:2380 \
+  --data-dir /var/lib/etcd-new
+
+# Update etcd static pod manifest to use new data dir
+```
+
+**Step 8: Monitor health after recovery**
+
+```bash
+# Cluster status:
+kubectl get nodes
+kubectl get cs    # Component status (deprecated but informative)
+
+# etcd health:
+ETCDCTL_API=3 etcdctl endpoint health --cluster
+
+# All static pods up?
+crictl ps | grep -E "etcd|apiserver|scheduler|controller-manager"
+```
+
+**Step 9: HA setup considerations**
+
+Best practices:
+
+- **3 or 5 control plane nodes**: tolerates 1 or 2 failures
+- **Spread across AZs**: one master per AZ
+- **Dedicated nodes**: don't run workloads on masters
+- **LB in front of API servers**: typically cloud LB or HAProxy
+- **etcd backups**: every 30 minutes, retained for 30 days
+- **Monitor leader election**: frequent changes indicate instability
+
+**Step 10: Cloud-managed control plane**
+
+For EKS, GKE, AKS, control plane is managed by the cloud provider. You don't see or operate control plane nodes. Failure is the cloud's problem; SLA covers availability.
+
+But you still see effects: brief API unavailability during upgrades, occasional throttling, etc.
+
+**Production scenarios:**
+
+1. **All 3 masters in same AZ, AZ failed**: Lost full control plane during AWS AZ issue. Worker nodes continued running pods, but no scheduling for 3 hours. Fix: redistributed masters across AZs.
+
+2. **etcd disk full on one master**: Disk full, etcd member crashed. Cluster ran on 2 of 3, kept working. Cleaned up disk space, restarted etcd, rejoined cluster.
+
+3. **kubeadm upgrade broke one master**: Upgrade rollback needed. Used etcd snapshot from before upgrade, restored.
+
+4. **API server LB misconfigured**: LB had stale target list. Routed to dead master. Symptoms: every Nth API request failed. Fix: corrected LB health checks.
+
+5. **etcd member with corrupt data**: One member's data files got corrupted (disk issue). Removed it from cluster, replaced disk, re-added as fresh member. Auto-synced from leader.
+
+---
+
+## 135. etcd quorum is lost. What next?
+
+Loss of etcd quorum is one of the most serious Kubernetes failures. The cluster becomes read-only and can only be restored carefully.
+
+**Step 1: Understand quorum**
+
+etcd uses Raft consensus. Writes require a majority of members to acknowledge.
+
+- **3-member cluster**: needs 2 alive (tolerates 1 failure)
+- **5-member cluster**: needs 3 alive (tolerates 2 failures)
+- **7-member cluster**: needs 4 alive (tolerates 3 failures)
+
+If majority is lost:
+- No writes accepted (cluster is frozen for changes)
+- Reads may still work from any member (last known state)
+- Leader election fails (can't elect without majority)
+
+**Step 2: Verify quorum is lost**
+
+```bash
+# From a node that can reach etcd:
+ETCDCTL_API=3 etcdctl --endpoints=https://etcd-1:2379,https://etcd-2:2379,https://etcd-3:2379 \
+  --cacert=... --cert=... --key=... \
+  endpoint status --cluster
+
+# Output shows each member's status:
+# +--------------------+------------------+---------+---------+-----------+
+# | ENDPOINT           | ID               | VERSION | DB SIZE | IS LEADER |
+# +--------------------+------------------+---------+---------+-----------+
+# | https://etcd-1:... | ...              | ...     | ...     | false     |
+# | (timeout / error)  | etcd-2 down      |         |         |           |
+# | (timeout / error)  | etcd-3 down      |         |         |           |
+
+# Check health:
+ETCDCTL_API=3 etcdctl endpoint health --cluster
+# If majority is unhealthy, quorum is lost
+```
+
+**Step 3: Diagnose the cause**
+
+How did this happen?
+
+**Cause A: Multiple node failures**
+
+```bash
+# Check the etcd nodes:
+kubectl get nodes -l node-role.kubernetes.io/control-plane
+# Are 2 of 3 NotReady?
+
+# Or VMs are dead?
+```
+
+Common causes:
+- AZ outage (etcd nodes co-located)
+- Coordinated maintenance gone wrong
+- Cascading failures (one died, load on others overwhelmed them)
+
+**Cause B: Network partition**
+
+```bash
+# From a healthy etcd member:
+ping <other-etcd-member-ip>
+# Or:
+curl https://<other-etcd>:2379/health
+```
+
+If network between members is broken, they can't form quorum even if all VMs are up.
+
+**Cause C: Data corruption**
+
+One member's data is corrupted, it can't participate:
+
+```
+panic: db file is broken
+```
+
+Look in etcd logs.
+
+**Cause D: Disk full on majority**
+
+If the disk holding etcd data is full, etcd halts writes. With multiple members affected simultaneously, quorum is lost.
+
+```bash
+# On each etcd node:
+df -h /var/lib/etcd
+```
+
+**Step 4: Assess the situation**
+
+Critical questions:
+
+1. **Is data on the failed members recoverable?** (Disk fixable? Node bootable?)
+2. **Is there at least one healthy member?**
+3. **Is there a recent etcd backup?**
+
+These determine the recovery path.
+
+**Step 5: Recovery scenarios**
+
+**Scenario A: Failed members are recoverable**
+
+Most common case. The members aren't permanently dead, just offline.
+
+Actions:
+- Restore the failed nodes (boot them, fix network, free disk space)
+- etcd on those nodes will restart and rejoin
+- Once majority is back, quorum returns, writes resume
+
+This is the easiest case.
+
+```bash
+# After bringing failed members back:
+ETCDCTL_API=3 etcdctl endpoint health --cluster
+# All healthy
+
+ETCDCTL_API=3 etcdctl endpoint status --cluster
+# Leader elected
+```
+
+**Scenario B: Failed members are permanently gone**
+
+You need to rebuild the cluster from the surviving member(s).
+
+Steps:
+
+1. **On the surviving member, force restart in new cluster:**
+
+Edit the etcd command to add `--force-new-cluster`:
+
+```yaml
+# /etc/kubernetes/manifests/etcd.yaml
+spec:
+  containers:
+  - command:
+    - etcd
+    - --force-new-cluster
+    - --name=etcd-1
+    - --listen-client-urls=https://0.0.0.0:2379
+    - ...  # Other existing flags
+```
+
+This tells etcd: "you're the only member of a new cluster now." It elects itself leader and accepts writes.
+
+2. **Verify cluster is operational:**
+
+```bash
+ETCDCTL_API=3 etcdctl endpoint status
+# Should show this member as leader
+```
+
+3. **Remove --force-new-cluster after first start** (very important - otherwise it'll do this every restart):
+
+Edit the manifest again to remove that flag.
+
+4. **Add new members back:**
+
+```bash
+ETCDCTL_API=3 etcdctl member add etcd-2 --peer-urls=https://10.0.1.2:2380
+
+# Then on the new etcd-2 node, start etcd with --initial-cluster-state=existing
+# and the cluster spec from the add output
+```
+
+Repeat for additional members.
+
+**Scenario C: No healthy members - restore from snapshot**
+
+The worst case. All etcd members are dead or corrupted. You must restore from backup.
+
+1. **Get the most recent etcd snapshot:**
+
+```bash
+ls -la /backup/etcd-snapshots/
+# etcd-snapshot-2025-05-12-14-00.db
+```
+
+If no backup exists: you'll lose data not captured anywhere else. (Time to deeply regret not setting up backups.)
+
+2. **Provision new etcd nodes** (or repair existing ones with fresh disks).
+
+3. **On each etcd node, restore the snapshot:**
+
+```bash
+# On etcd-1:
+ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd-snapshot.db \
+  --name etcd-1 \
+  --initial-cluster etcd-1=https://10.0.1.1:2380,etcd-2=https://10.0.1.2:2380,etcd-3=https://10.0.1.3:2380 \
+  --initial-cluster-token new-cluster \
+  --initial-advertise-peer-urls https://10.0.1.1:2380 \
+  --data-dir /var/lib/etcd-restored
+
+# On etcd-2 (same snapshot, different name and advertise URL):
+ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd-snapshot.db \
+  --name etcd-2 \
+  --initial-cluster etcd-1=https://10.0.1.1:2380,etcd-2=https://10.0.1.2:2380,etcd-3=https://10.0.1.3:2380 \
+  --initial-cluster-token new-cluster \
+  --initial-advertise-peer-urls https://10.0.1.2:2380 \
+  --data-dir /var/lib/etcd-restored
+
+# And on etcd-3, similarly
+```
+
+All members restore from the same snapshot, but each with their unique identity.
+
+4. **Start all etcd members:**
+
+Update static pod manifests to use `/var/lib/etcd-restored` as data dir. Kubelet starts them. They form a new cluster from the snapshot.
+
+5. **Restart all API servers:**
+
+API servers may have cached state that's now stale. Restart them.
+
+```bash
+# On each master:
+mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/
+sleep 30
+mv /tmp/kube-apiserver.yaml /etc/kubernetes/manifests/
+```
+
+**Step 6: Verify post-recovery**
+
+```bash
+# Cluster basic health:
+kubectl get nodes
+kubectl get pods --all-namespaces
+
+# Are all expected resources present?
+# (Snapshot might be older than the latest cluster state — some recent changes lost)
+```
+
+Things that might be lost:
+- Pods created/updated after the snapshot
+- ConfigMap/Secret updates
+- Custom resources
+
+Workloads in steady state usually survive fine because pods running on workers don't depend on real-time etcd state.
+
+**Step 7: Reconcile lost state**
+
+After restore from old snapshot:
+
+- **Deployments**: pods may not match Deployment spec (Deployment thinks v1, pods running v2). Restart Deployments to reconcile.
+- **Manual operations between snapshot and restore are gone**: any kubectl apply done in that window must be redone.
+- **Logs from API server audit may help reconstruct** what happened in the gap.
+
+**Step 8: Prevention**
+
+The single most important practice: **regular etcd backups**.
+
+```bash
+# Cron job on each control plane node:
+*/30 * * * * ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-$(date +\%Y\%m\%d-\%H\%M).db
+```
+
+Keep:
+- Last 24 hours: every 30 min
+- Last 7 days: every 6 hours
+- Last month: daily
+
+Store backups **off the control plane nodes** (S3, separate storage). Otherwise, losing all control plane nodes loses backups too.
+
+Other prevention:
+- **Spread etcd members across AZs**: AZ failure only takes 1 member
+- **Monitor etcd quorum**: alert on member failures immediately
+- **Test restore procedure regularly**: practice in dev/staging
+- **Document recovery runbook**: don't figure it out during a crisis
+
+**Production scenarios:**
+
+1. **2 etcd disks filled simultaneously**: Audit log growth filled disks on 2 of 3 masters. Quorum lost. Fix: freed space on disks, etcd resumed. Lesson: monitor disk usage, separate audit log disk.
+
+2. **AZ outage took 2 of 3 masters**: Masters were across 2 AZs (2 in one, 1 in other). Wrong distribution. Fix: redistributed across 3 AZs.
+
+3. **Network partition isolated 2 masters**: Network issue between subnets. 2 masters could only see each other; 1 master isolated. Actually, this didn't lose quorum (2 of 3 still talked), but if it had been 1 + 1, would have. Lucky.
+
+4. **Restored from 6-hour-old snapshot**: All masters compromised by configuration error. Restored from snapshot. 6 hours of changes lost: redeployed via GitOps, recovered without major incident.
+
+5. **No backup, total loss**: Test cluster with no backups. Quorum lost, no recovery possible. Rebuilt cluster from scratch. Lesson reinforced.
+
+---
+
+## 136. Explain debugging service mesh sidecar injection failures
+
+Service mesh sidecars (Istio's Envoy, Linkerd's proxy) are injected into pods automatically. When injection fails, pods either run without the sidecar (losing mesh features) or fail to start.
+
+**Step 1: Identify the failure mode**
+
+There are two distinct failure modes:
+
+**Mode A: Pod runs without sidecar**
+
+The pod started, but it doesn't have the expected sidecar container. Missing mesh features (mTLS, routing, observability).
+
+```bash
+kubectl get pod <pod> -o jsonpath='{.spec.containers[*].name}'
+# Only your app container, no istio-proxy or linkerd-proxy
+```
+
+**Mode B: Pod fails to start due to injection issue**
+
+Sometimes injection partially happens but configuration is broken, pod stuck in init or running but unable to communicate.
+
+**Step 2: Verify injection is enabled**
+
+For Istio, injection requires a namespace label OR a pod annotation:
+
+```bash
+# Namespace label (auto-inject all pods in namespace):
+kubectl get ns <namespace> --show-labels
+# Look for: istio-injection=enabled
+
+# Or pod annotation:
+kubectl get pod <pod> -o jsonpath='{.metadata.annotations.sidecar\.istio\.io/inject}'
+# Should be "true" or absent (depending on policy)
+```
+
+For Linkerd:
+
+```bash
+kubectl get ns <namespace> --show-labels
+# Look for: linkerd.io/inject=enabled
+
+kubectl get pod <pod> -o jsonpath='{.metadata.annotations.linkerd\.io/inject}'
+```
+
+If neither namespace nor pod has the label/annotation, injection didn't happen by design.
+
+**Step 3: Check the mutating admission webhook**
+
+Sidecar injection happens via a MutatingAdmissionWebhook. If the webhook isn't working, injection fails silently.
+
+**Istio:**
+
+```bash
+kubectl get mutatingwebhookconfiguration | grep istio
+# istio-sidecar-injector
+
+kubectl describe mutatingwebhookconfiguration istio-sidecar-injector
+# Look at:
+# - rules (which resources trigger it)
+# - clientConfig (where webhook server is)
+# - failurePolicy (Fail vs Ignore)
+# - namespaceSelector
+
+kubectl get pods -n istio-system | grep istiod
+# Webhook is served by istiod
+kubectl logs -n istio-system <istiod-pod>
+```
+
+**Linkerd:**
+
+```bash
+kubectl get mutatingwebhookconfiguration | grep linkerd
+# linkerd-proxy-injector-webhook-config
+
+kubectl get pods -n linkerd | grep proxy-injector
+kubectl logs -n linkerd <proxy-injector-pod>
+```
+
+**Step 4: Common failure causes**
+
+**Cause A: Webhook server pod down**
+
+```bash
+kubectl get pods -n istio-system -l app=istiod
+# Not Ready or Running?
+```
+
+If the injector pod is down, the webhook fails. Behavior depends on `failurePolicy`:
+- `Fail`: pods that should be injected can't be created at all (blocks pod creation)
+- `Ignore`: pods are created without injection (silent failure)
+
+Both istiod and Linkerd default to `Fail` for injector. If you see ALL pod creations failing, the injector is down.
+
+**Cause B: Webhook timeout**
+
+The webhook has a default timeout (10s). If injector is slow:
+
+```
+failed calling webhook "sidecar-injector.istio.io": ... context deadline exceeded
+```
+
+Pod creation fails or proceeds without injection.
+
+Causes:
+- Injector pod CPU starved
+- Injector calling slow external service
+- Network issue between API server and injector
+
+Tune webhook timeout:
+
+```yaml
+webhooks:
+  - name: ...
+    timeoutSeconds: 30   # Default 10
+```
+
+**Cause C: NamespaceSelector mismatch**
+
+```bash
+kubectl get mutatingwebhookconfiguration istio-sidecar-injector -o yaml | grep -A 10 namespaceSelector
+```
+
+The webhook only triggers for namespaces matching the selector. If your namespace doesn't have the right label, injection is skipped.
+
+Common Istio config:
+
+```yaml
+namespaceSelector:
+  matchLabels:
+    istio-injection: enabled
+```
+
+Without this label on your namespace, pods aren't injected.
+
+**Cause D: Object selector**
+
+Some webhooks have objectSelector for finer control:
+
+```yaml
+objectSelector:
+  matchLabels:
+    sidecar-inject: enabled
+```
+
+Pods without the matching label aren't injected.
+
+**Cause E: Pod opted out**
+
+```bash
+kubectl get pod <pod> -o yaml | grep -A 3 annotations
+# Look for: sidecar.istio.io/inject: "false"
+```
+
+Explicit opt-out. Often inherited from a template or set by mistake.
+
+**Cause F: kube-system namespace excluded**
+
+Most service meshes exclude kube-system by default. If you put workloads in kube-system, they won't be injected. Use a separate namespace.
+
+**Cause G: API server can't reach webhook**
+
+The webhook service must be reachable from kube-apiserver:
+
+```bash
+# From a master node, test:
+curl -k https://<webhook-service>.<namespace>.svc:443/healthz
+```
+
+If unreachable:
+- NetworkPolicy blocking
+- Service has no endpoints (injector pod not running)
+- DNS issue
+
+**Cause H: CA bundle mismatch**
+
+The webhook config's `caBundle` must match the cert presented by the webhook service.
+
+```bash
+kubectl get mutatingwebhookconfiguration <name> -o yaml | grep caBundle
+# Compare with the actual server cert
+```
+
+If they don't match, API server can't verify the webhook, fails the call.
+
+For Istio, this is managed automatically. For custom setups, often broken after cert rotation.
+
+**Step 5: Verify the injected pod**
+
+Once injection works, verify the pod is correctly configured:
+
+```bash
+kubectl get pod <pod> -o yaml | grep -A 5 initContainers
+# Should have istio-init or linkerd-init
+
+kubectl get pod <pod> -o yaml | grep -A 5 containers
+# Should have istio-proxy or linkerd-proxy
+
+kubectl logs <pod> -c istio-proxy
+# Or:
+kubectl logs <pod> -c linkerd-proxy
+```
+
+**Step 6: Init container failures**
+
+The init container sets up iptables to redirect traffic to the proxy. Failures:
+
+```bash
+kubectl logs <pod> -c istio-init
+# Or:
+kubectl logs <pod> -c linkerd-init
+```
+
+Common init failures:
+
+**Requires NET_ADMIN capability:**
+
+```yaml
+# Pod's securityContext or container's securityContext:
+capabilities:
+  add: ["NET_ADMIN", "NET_RAW"]
+```
+
+If the pod runs with restrictive security context, init fails.
+
+**Conflicts with other iptables manipulation:**
+
+If your application also manipulates iptables (rare), conflicts can occur.
+
+**Step 7: Sidecar startup issues**
+
+```bash
+kubectl logs <pod> -c istio-proxy
+```
+
+Common issues:
+
+**Can't reach control plane:**
+
+```
+xDS connection failed: ...
+```
+
+The Envoy proxy can't reach istiod for configuration. Check NetworkPolicy, DNS, service.
+
+**Resource limits too low:**
+
+The proxy needs some memory. With aggressive limits, it OOMKills.
+
+**Step 8: Linkerd-specific debugging**
+
+```bash
+linkerd check
+# Comprehensive check of mesh installation
+
+linkerd inject <yaml> --manual
+# Inject a YAML manually to inspect what would be added
+```
+
+**Step 9: Istio-specific debugging**
+
+```bash
+istioctl analyze -n <namespace>
+# Analyzes namespace for misconfigurations
+
+istioctl proxy-status
+# Shows sync status of all sidecars with istiod
+
+istioctl proxy-config all <pod>.<namespace>
+# Dump full proxy config
+```
+
+**Production scenarios:**
+
+1. **Istio upgrade left old injector**: Old istio-sidecar-injector still served old config. Pods got injected with old proxy version, incompatible with new istiod. Fix: deleted old webhook config.
+
+2. **Pod in unprotected namespace**: Engineer created pod in default namespace, expected mTLS. Default ns didn't have istio-injection label. Pod ran without sidecar, traffic in cleartext.
+
+3. **CA cert rotated, injector still had old**: Manual cert rotation didn't update injector's CA bundle. Webhook calls failed verification. All pod creations rejected for 10 minutes. Fix: rotated CA bundle.
+
+4. **failurePolicy: Fail caused outage**: Injector pod OOMKilled during high pod churn. All pod creations failed (failurePolicy: Fail). Fix: increased injector resources, considered Ignore for resilience.
+
+5. **Pod's restrictive PodSecurityPolicy blocked NET_ADMIN**: PSP didn't allow NET_ADMIN. Init container failed. Pod couldn't start. Fix: PSP exception or moved to PodSecurity Restricted with proper securityContext.
+
+---
+
+## 137. NetworkPolicy blocks production traffic unexpectedly
+
+NetworkPolicies provide pod-level firewalling, but their semantics catch many people off guard. A well-intentioned policy can silently break production traffic.
+
+**Step 1: Confirm NetworkPolicy is the cause**
+
+Symptoms:
+- Connections suddenly failing between specific pods
+- DNS not resolving from some pods
+- External calls failing
+- Timeouts (not connection refused — silent drop)
+
+```bash
+kubectl get networkpolicy -A
+# What policies exist?
+
+kubectl describe networkpolicy <name> -n <namespace>
+```
+
+**Step 2: Understand NetworkPolicy semantics**
+
+Key principles people miss:
+
+**Principle 1: Default is "no policy = allow all"**
+
+If a pod has no NetworkPolicy selecting it, all traffic is allowed.
+
+**Principle 2: Once a policy selects a pod, all NOT explicitly allowed traffic is denied**
+
+This is the most common gotcha. A policy that says "allow ingress from app=frontend" doesn't *only* allow that; it implicitly **denies everything else** to that pod.
+
+**Principle 3: Policies are additive, not subtractive**
+
+You can't have a "deny" policy. Multiple policies on the same pod each allow some traffic; the union is allowed.
+
+**Principle 4: Ingress and Egress are independent**
+
+A policy can be:
+- `policyTypes: [Ingress]` (only filters incoming)
+- `policyTypes: [Egress]` (only filters outgoing)
+- `policyTypes: [Ingress, Egress]` (both)
+
+**Step 3: Test if traffic is being blocked**
+
+```bash
+# From a debug pod in the same namespace as the supposedly-blocked target:
+kubectl run -it --rm debug --image=nicolaka/netshoot --restart=Never -- bash
+
+# Try to connect:
+curl -v http://<target-pod-ip>:<port>
+nc -zv <target-pod-ip> <port>
+
+# Time out = likely blocked by NetworkPolicy (or other firewall)
+# Connection refused = target not listening (different problem)
+```
+
+**Step 4: Find which policy applies**
+
+```bash
+# All policies in the target's namespace:
+kubectl get networkpolicy -n <namespace>
+
+# For each, check if it selects the target pod:
+kubectl get networkpolicy <name> -n <namespace> -o yaml
+# Look at podSelector — does it match the target pod's labels?
+```
+
+**Common mistake**: assuming policies in OTHER namespaces don't affect you. They don't directly, but if your egress policy in namespace A allows traffic to namespace B, and namespace B has a policy denying ingress, traffic fails.
+
+**Step 5: Common misconfigurations**
+
+**Issue A: Default deny applied without exceptions**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+```
+
+This selects all pods and allows nothing. Without companion "allow" policies, the namespace is isolated.
+
+This is intentional (zero-trust starting point) but breaks if other allow policies aren't comprehensive.
+
+**Issue B: DNS not allowed**
+
+If you deny egress, you also block DNS by default:
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            name: production
+    ports:
+      - port: 8080
+```
+
+This allows egress only to namespace=production on port 8080. DNS (port 53) to kube-dns is blocked.
+
+Result: pod can't resolve any hostnames. Every external call fails with DNS lookup errors.
+
+Fix: explicitly allow DNS:
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+    ports:
+      - port: 53
+        protocol: UDP
+      - port: 53
+        protocol: TCP
+```
+
+**Issue C: Wrong selector logic (AND vs OR)**
+
+```yaml
+ingress:
+  - from:
+      - namespaceSelector:
+          matchLabels:
+            env: prod
+        podSelector:
+          matchLabels:
+            app: api
+```
+
+This requires BOTH namespace AND pod to match (AND). Pods from `env=prod` namespace with label `app=api` are allowed.
+
+```yaml
+ingress:
+  - from:
+      - namespaceSelector:
+          matchLabels:
+            env: prod
+      - podSelector:
+          matchLabels:
+            app: api
+```
+
+This is OR. Either source matches. The second selects pods from THIS namespace (the target's namespace) with `app=api`.
+
+The difference is a single `-` (list item vs. continuation). Subtle and frequently miswritten.
+
+**Issue D: IP-based rules with overlay networks**
+
+```yaml
+ingress:
+  - from:
+      - ipBlock:
+          cidr: 10.0.0.0/8
+```
+
+Pods get IPs from the pod CIDR, often 10.x.x.x. If you allow `10.0.0.0/8`, it might include unintended pods.
+
+Worse: with NAT'd egress (some CNI configurations), the source IP seen by the target is the node IP, not the pod IP. IP-based rules don't work as expected.
+
+**Issue E: External traffic blocked**
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector: {}
+```
+
+This allows egress to all pods in any namespace, but **not to anything outside the cluster**. Pods can't reach external APIs, the internet, or even other Kubernetes Service IPs in some configurations.
+
+Allow external:
+
+```yaml
+egress:
+  - to:
+      - ipBlock:
+          cidr: 0.0.0.0/0
+          except:
+            - 10.0.0.0/8     # Exclude pod/node IPs
+```
+
+**Issue F: NodePort traffic blocked**
+
+When external traffic hits a NodePort, kube-proxy DNATs to a pod. The source IP depends on `externalTrafficPolicy`:
+
+- `Cluster` (default): source NATed to node IP
+- `Local`: original source IP preserved
+
+If you have ingress rules based on source IP, `Cluster` policy makes all external traffic look like it's coming from node IPs (which might not be in your allowed CIDRs).
+
+**Step 6: Test policies in isolation**
+
+To find which policy is the culprit:
+
+```bash
+# Save existing policies:
+kubectl get networkpolicy -n <namespace> -o yaml > policies-backup.yaml
+
+# Delete them one at a time:
+kubectl delete networkpolicy <suspicious-policy> -n <namespace>
+
+# Test connectivity
+# If it works now, that was the culprit
+
+# Restore:
+kubectl apply -f policies-backup.yaml
+```
+
+**Step 7: Use CNI-specific tooling**
+
+Cilium has excellent NetworkPolicy debugging:
+
+```bash
+# Trace flow:
+hubble observe --pod <namespace>/<pod> --verdict DROPPED
+# Shows which policy denied which packet
+
+# See effective policies for a pod:
+cilium endpoint get <endpoint-id>
+```
+
+Calico:
+
+```bash
+calicoctl get networkpolicies -A
+# Plus Calico's own GlobalNetworkPolicies and HostEndpoints
+
+# Check what's blocking:
+# Enable flow logs in Felix configuration
+```
+
+**Step 8: Visualize policies**
+
+Tools like `nwpc` (NetworkPolicy compiler) or visual tools (Cilium Hubble UI, Otterize, networkpolicy-viewer) help see what's allowed and denied.
+
+**Step 9: Common production patterns**
+
+**Pattern 1: Per-namespace baseline**
+
+```yaml
+# Default deny-all in each namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Always allow DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+```
+
+**Pattern 2: Service-to-service explicit allow**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - port: 8080
+```
+
+**Pattern 3: Allow external HTTPS for outbound**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-https-egress
+spec:
+  podSelector:
+    matchLabels:
+      external-calls: enabled
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16   # Link-local
+              - 10.0.0.0/8       # Internal
+      ports:
+        - port: 443
+```
+
+**Production scenarios:**
+
+1. **DNS forgot when adding default-deny**: New team adopted zero-trust networking. Applied default-deny egress, forgot DNS allow rule. All pods immediately lost DNS, app errors cascaded.
+
+2. **Selector logic confusion**: Policy meant "from namespace=prod AND pod=api" but written with separate list items (OR). Traffic from random pods in other namespaces leaked through.
+
+3. **External API blocked silently**: Egress policy allowed only internal services. Pod's external API calls timed out. Took hours to discover because error logs said "connection timeout" not "blocked by policy".
+
+4. **Cilium identity collisions**: With many namespaces and selectors, Cilium ran out of identity slots. New pods got default identity, policies didn't apply correctly. Fix: increased identity limit.
+
+5. **Multiple policies, additive misunderstanding**: Team A's policy allowed traffic. Team B added a "restrict" policy, expecting it to override. NetworkPolicies are union (allow-only), so Team A's allow still worked. Surprise: traffic flowed where they thought they'd blocked it.
+
+---
+
+## 138. CSI driver stops provisioning volumes
+
+CSI (Container Storage Interface) drivers handle dynamic volume provisioning. When they stop working, PVCs stay Pending indefinitely.
+
+**Step 1: Confirm the symptom**
+
+```bash
+kubectl get pvc -A
+# Look for Pending PVCs older than a few minutes
+
+kubectl describe pvc <pvc-name>
+# Events section shows provisioning failures
+```
+
+Common event messages:
+
+```
+Warning  ProvisioningFailed  ... failed to provision volume: ...
+Normal   ExternalProvisioning  ... waiting for a volume to be created
+```
+
+**Step 2: Identify the CSI driver**
+
+```bash
+# Which CSI drivers are installed?
+kubectl get csidriver
+
+# Which StorageClass is being used?
+kubectl get pvc <pvc-name> -o jsonpath='{.spec.storageClassName}'
+
+# What's the StorageClass's provisioner?
+kubectl get storageclass <name> -o jsonpath='{.provisioner}'
+```
+
+**Step 3: Check CSI driver pods**
+
+CSI drivers typically have:
+- A **controller** Deployment (handles dynamic provisioning, attach/detach)
+- A **node** DaemonSet (handles mount/unmount on each node)
+
+```bash
+# For AWS EBS CSI:
+kubectl get pods -n kube-system -l app=ebs-csi-controller
+kubectl get pods -n kube-system -l app=ebs-csi-node
+
+# For Azure Disk CSI:
+kubectl get pods -n kube-system -l app=csi-azuredisk-controller
+kubectl get pods -n kube-system -l app=csi-azuredisk-node
+
+# For GCE PD CSI:
+kubectl get pods -n kube-system -l app=gcp-compute-persistent-disk-csi-driver
+```
+
+If any are not Running, the driver can't function.
+
+**Step 4: Check controller logs**
+
+The controller does the actual provisioning. Its logs show why provisioning fails:
+
+```bash
+kubectl logs -n kube-system <csi-controller-pod> -c csi-provisioner
+kubectl logs -n kube-system <csi-controller-pod> -c csi-attacher
+kubectl logs -n kube-system <csi-controller-pod> -c <provider-plugin>
+```
+
+The controller pod has multiple containers; each handles different operations:
+- `csi-provisioner`: dynamic provisioning
+- `csi-attacher`: attaching volumes to nodes
+- `csi-resizer`: resizing volumes
+- `csi-snapshotter`: snapshots
+- `<provider-plugin>`: the actual driver (e.g., `ebs-plugin`)
+
+**Step 5: Common failure causes**
+
+**Cause A: Cloud API authentication / permissions**
+
+CSI drivers call cloud APIs (CreateVolume, AttachVolume, etc.). Permissions might be:
+- IAM role not attached / wrong
+- Permissions reduced
+- IAM token expired
+
+For AWS EBS CSI:
+
+```bash
+kubectl logs -n kube-system <ebs-csi-controller-pod> -c ebs-plugin | grep -i "denied\|unauthorized"
+# Look for: AccessDenied, UnauthorizedOperation
+```
+
+Verify IAM:
+
+```bash
+# IRSA setup:
+kubectl get sa -n kube-system ebs-csi-controller-sa -o yaml | grep eks.amazonaws.com/role-arn
+
+# Test the role:
+aws sts get-caller-identity   # From a pod with that SA
+```
+
+**Cause B: Cloud quota exceeded**
+
+You're trying to create more volumes than your account allows:
+
+```
+Error creating volume: VolumeLimitExceeded
+You have exceeded the maximum number of volumes you can have in this account
+```
+
+Increase quotas via cloud console.
+
+**Cause C: Cloud API throttling**
+
+```
+Error creating volume: ThrottlingException: Rate exceeded
+```
+
+CSI driver hitting cloud API rate limits. Often during mass scaling events.
+
+Mitigation:
+- Backoff and retry (driver should do this; check version)
+- Reduce concurrent provisioning
+- Increase rate limits with cloud provider (sometimes possible)
+
+**Cause D: Wrong region / zone**
+
+The CSI driver tries to create a volume in zone us-east-1a, but the StorageClass or other constraints require us-east-1b.
+
+```bash
+kubectl get storageclass <name> -o yaml
+# Check parameters and allowedTopologies
+```
+
+Common cause: `volumeBindingMode: Immediate` (default) creates a volume in any zone, then the pod can't be scheduled in that zone due to other constraints.
+
+Fix: use `volumeBindingMode: WaitForFirstConsumer` so the volume is created in the right zone for the pod's actual placement.
+
+**Cause E: CSI driver crashed / restarting**
+
+```bash
+kubectl get pods -n kube-system | grep csi
+# CrashLoopBackOff?
+
+kubectl logs -n kube-system <csi-pod> --previous
+```
+
+Could be:
+- OOM (memory limit too low)
+- Bug in driver
+- Misconfiguration
+
+**Cause F: Storage backend unreachable**
+
+For network storage (NFS, iSCSI):
+
+```bash
+kubectl logs -n kube-system <csi-node-pod> | grep -i "connection\|timeout"
+```
+
+Storage server might be:
+- Down
+- Network-isolated from cluster
+- Auth changed
+
+**Cause G: CSI sidecar version mismatch**
+
+```bash
+kubectl get pods -n kube-system <csi-pod> -o jsonpath='{.spec.containers[*].image}'
+```
+
+CSI uses sidecars (provisioner, attacher, snapshotter) maintained separately. Version skew between sidecars and main driver can cause issues.
+
+Usually fixed by updating to matching versions, often via the driver's manifest.
+
+**Cause H: NodeStageVolume failures**
+
+The "node" part of the CSI driver runs on each node. If it can't mount:
+
+```bash
+kubectl logs -n kube-system <csi-node-pod-on-target-node>
+
+# Common errors:
+# Failed to find device path
+# Failed to format and mount: format failed
+# Failed to attach volume: ... timeout
+```
+
+Causes:
+- Volume not attached to node yet (race condition)
+- Device path doesn't appear (cloud SDK or driver issue)
+- Filesystem format errors
+
+**Step 6: Verify with manual provisioning**
+
+Bypass the StorageClass to see if the issue is provisioning or binding:
+
+```bash
+# Create a PVC explicitly:
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: <name>
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+Watch:
+
+```bash
+kubectl get pvc test-pvc -w
+kubectl describe pvc test-pvc
+```
+
+**Step 7: Manual cloud API verification**
+
+Test the cloud API directly:
+
+```bash
+# AWS:
+aws ec2 create-volume --size 5 --availability-zone us-east-1a --volume-type gp3
+
+# If this fails, it's a cloud-level issue, not CSI
+```
+
+This helps separate "CSI driver issue" from "cloud account issue."
+
+**Step 8: VolumeAttachment issues**
+
+After provisioning, the volume must attach to a node:
+
+```bash
+kubectl get volumeattachment | grep <pv-name>
+kubectl describe volumeattachment <name>
+# Events show attach failures
+```
+
+Attach issues:
+- Volume in different zone than pod's node
+- Cloud's max attachments per instance exceeded (e.g., AWS limits attachments to ~25-40 per instance)
+- Driver couldn't communicate with cloud
+
+**Step 9: Restart CSI driver**
+
+If logs suggest a transient issue:
+
+```bash
+kubectl delete pod -n kube-system <csi-controller-pod>
+# New pod starts, retries pending operations
+
+kubectl delete pod -n kube-system <csi-node-pod-on-affected-node>
+```
+
+Sometimes a restart clears stuck state.
+
+**Step 10: Driver upgrade**
+
+If a known bug affects your driver version:
+
+```bash
+# Check current version:
+kubectl get csidriver <name> -o yaml | grep image
+
+# Upgrade following driver's docs
+```
+
+Be cautious — CSI upgrades can have their own issues, test in lower environment first.
+
+**Production scenarios:**
+
+1. **IRSA token expired during long-running pod**: AWS EBS CSI controller's pod token wasn't refreshing properly. After 1 hour, lost permissions. New PVCs failed. Fix: ensured projected SA tokens with proper expiration.
+
+2. **EBS volumes per instance exhausted**: AWS instance had 39 EBS volumes attached, hit limit (40 max). New PVC-pod attempts failed. Fix: redistributed pods, smaller volume counts per node.
+
+3. **CSI sidecar version skew**: Upgraded the EBS plugin but left csi-provisioner at older version. New features didn't work. Fix: aligned all sidecar versions.
+
+4. **NFS server overwhelmed**: Mass pod restart triggered many simultaneous NFS mounts. NFS server CPU pegged, mounts timed out. Fix: rate-limited pod restarts, NFS server scaled.
+
+5. **Cloud account hit volume quota**: 5000 PVCs in cluster. AWS limited to 5000 EBS volumes per region. New PVCs couldn't be created. Fix: increased quota via support, consolidated workloads.
+
+---
+
+## 139. Kubernetes upgrade causes workload downtime
+
+Kubernetes upgrades should be zero-downtime if done correctly. When they cause downtime, the root cause is usually preventable.
+
+**Step 1: Understand the upgrade sequence**
+
+A proper Kubernetes upgrade:
+
+1. Upgrade control plane (API server, scheduler, controller-manager) — minor version at a time
+2. Upgrade etcd (carefully)
+3. Upgrade worker nodes one at a time (drain, upgrade, uncordon)
+4. Update DaemonSets and operators
+
+Each step should be non-disruptive if workloads are properly configured.
+
+**Step 2: Identify when/how downtime occurred**
+
+Categorize:
+
+**Downtime A: During control plane upgrade**
+
+Symptoms:
+- kubectl commands fail during upgrade
+- API throttling/errors
+- HPA stops scaling
+
+Cause: API server briefly unavailable. With HA control plane (3 masters), one at a time being upgraded, others handle. With non-HA, all is down.
+
+Worker nodes and running pods are not directly affected by control plane downtime. Apps keep serving traffic.
+
+**Downtime B: During worker node drain**
+
+Symptoms:
+- Service traffic drops
+- 502s from ingress
+- Some requests fail
+
+Cause: pods evicted from a node before they're up elsewhere, or evicted ungracefully.
+
+**Downtime C: After upgrade**
+
+Symptoms:
+- Pods fail after upgrade
+- New deprecated API errors
+- Webhooks break
+
+Cause: API deprecations, kubelet config changes, etc.
+
+**Step 3: Drain-related downtime**
+
+This is the most common cause.
+
+**Cause A: Insufficient replicas**
+
+```yaml
+spec:
+  replicas: 1
+```
+
+With 1 replica, draining a node = service down briefly. Solution: at least 2 replicas (3+ for production).
+
+**Cause B: No PodDisruptionBudget**
+
+Without PDB, drain can evict pods faster than they come back up elsewhere:
+
+1. Drain evicts pod-1 from node-A
+2. New pod-1 schedules on node-B but isn't Ready yet
+3. Drain evicts pod-2 from node-A
+4. Now both pods are Terminating/starting, no Ready replicas
+5. Service has no endpoints, traffic fails
+
+Solution:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: myapp-pdb
+spec:
+  minAvailable: 2     # Always keep at least 2 ready
+  selector:
+    matchLabels:
+      app: myapp
+```
+
+Now drain blocks until other pods become Ready before evicting more.
+
+**Cause C: No preStop / graceful shutdown**
+
+When evicted, the pod gets SIGTERM. If the app doesn't handle SIGTERM (or has no preStop hook for connection draining), in-flight requests fail.
+
+Fix:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 15"]   # Allow endpoint propagation
+terminationGracePeriodSeconds: 60
+```
+
+**Cause D: Readiness probe issues**
+
+If readiness probe is slow or unreliable, new pods don't become Ready in time. PDB doesn't allow next eviction. Drain blocks.
+
+Or: readiness probe is too lenient, marks pod Ready before it can really serve. Traffic hits not-actually-ready pods.
+
+**Step 4: API deprecation issues**
+
+Each Kubernetes version deprecates some APIs and removes others.
+
+Pre-upgrade check:
+
+```bash
+# Use pluto or kubent (kube-no-trouble) to find deprecated APIs:
+kubent
+
+# Output shows resources using deprecated APIs:
+# extensions/v1beta1/Ingress (deprecated in 1.14, removed in 1.22)
+```
+
+Common removals causing issues:
+- `extensions/v1beta1` Ingress (removed in 1.22)
+- `policy/v1beta1` PodDisruptionBudget (removed in 1.25)
+- `batch/v1beta1` CronJob (removed in 1.25)
+- `autoscaling/v2beta1` HPA (removed in 1.25)
+
+After upgrade, controllers using old APIs can't reconcile. Manifests using old APIs can't be applied.
+
+**Fix:**
+
+```bash
+# Update manifests to current APIs
+# e.g., extensions/v1beta1 Ingress → networking.k8s.io/v1
+```
+
+**Step 5: Container runtime / OS issues**
+
+**Issue: containerd config changed**
+
+In recent versions, containerd config changes can affect:
+- Cgroup driver (cgroupfs vs. systemd)
+- Default runtime
+- Registry configuration
+
+Mismatch causes pods to fail to start.
+
+```bash
+# After upgrade, check:
+journalctl -u kubelet | grep -i error
+journalctl -u containerd | grep -i error
+```
+
+**Issue: kernel version change**
+
+OS upgrade as part of node upgrade brings new kernel. Some apps depend on specific kernel features:
+- BPF programs
+- Kernel modules
+- Specific syscalls
+
+Test before mass-deploying.
+
+**Step 6: Webhook / operator compatibility**
+
+After cluster upgrade:
+
+**Webhooks may break:**
+
+Webhooks calling deprecated APIs fail. Or webhook server expects an older version of admission request.
+
+```bash
+kubectl get mutatingwebhookconfigurations
+kubectl get validatingwebhookconfigurations
+
+# Check each for compatibility with new K8s version
+```
+
+**Operators may break:**
+
+Operators (cert-manager, prometheus-operator, etc.) need to support the new K8s version. Pre-upgrade, ensure operators are compatible.
+
+Often the operator must be upgraded first, then K8s.
+
+**Step 7: Specific upgrade scenarios**
+
+**Scenario A: kubelet config drift**
+
+```bash
+# After upgrade, kubelet config may have changed
+cat /var/lib/kubelet/config.yaml
+
+# Some flags/options behave differently or are renamed
+```
+
+**Scenario B: CNI compatibility**
+
+CNI plugins must support the new K8s version. Some CNIs (Calico, Cilium) need their own upgrade procedure.
+
+```bash
+# Before K8s upgrade:
+calicoctl version
+# Or:
+cilium version
+
+# Verify supports target K8s version
+```
+
+**Scenario C: kube-proxy mode changes**
+
+Migration from iptables to IPVS or vice versa during upgrade can cause Service routing issues. Typically not done at the same time as version upgrade.
+
+**Step 8: Mitigation during upgrade**
+
+If you're in the middle of an upgrade with issues:
+
+```bash
+# Pause the upgrade:
+# - Don't continue draining nodes
+# - Hold off on next master upgrade
+
+# Investigate current state:
+kubectl get pods -A | grep -v Running
+kubectl get nodes
+kubectl get events --sort-by='.lastTimestamp' --all-namespaces
+
+# Decide:
+# - Roll forward (fix the issue, continue)
+# - Roll back (revert to previous version - hard with K8s)
+```
+
+K8s doesn't easily support downgrade. Sometimes you must roll forward and fix.
+
+**Step 9: Preventing future upgrade issues**
+
+**Best practices:**
+
+1. **Test in lower environments first**: dev → staging → production
+2. **Check deprecation warnings**: `kubent` before upgrade
+3. **Read changelog**: K8s release notes detail breaking changes
+4. **Upgrade one minor version at a time**: 1.24 → 1.25, not 1.24 → 1.27
+5. **Upgrade addons in coordination**: CNI, CSI, ingress, monitoring
+6. **Drain carefully**: respect PDBs, use --grace-period
+7. **Monitor during upgrade**: have dashboards open, alerting enabled
+8. **Have rollback plan**: even if K8s downgrade is hard, plan for restoring etcd snapshot
+
+**Step 10: Cloud-managed upgrades**
+
+For EKS, GKE, AKS, control plane upgrades are managed by the cloud:
+
+- You initiate; cloud handles control plane (HA, gradual)
+- You then upgrade node groups
+- Same issues with workload downtime apply
+
+Some clouds offer "blue-green node upgrades" where new node group is created, workloads migrated, old removed. Smoother but cost briefly doubled.
+
+**Production scenarios:**
+
+1. **PDB allowed no disruptions during drain**: Service had 5 replicas, PDB minAvailable=5. Couldn't drain any pod. Upgrade stuck. Fix: changed PDB to minAvailable=4.
+
+2. **Ingress v1beta1 to v1 migration**: 1.22 upgrade removed v1beta1 Ingress. All Ingress objects became invalid. New objects couldn't be created. Apps without existing endpoints lost ingress routing. Fix: migrated all Ingresses to v1 before upgrade.
+
+3. **cert-manager incompatibility**: cert-manager 1.0 didn't support K8s 1.22. Webhook failures blocked all pod creation. Fix: upgraded cert-manager first, then K8s.
+
+4. **Network policy CNI bug**: After upgrading Calico, certain NetworkPolicies stopped working correctly. Some traffic that should be allowed was dropped. Found via Hubble logs. Fix: Calico patch release.
+
+5. **DaemonSet held back**: Cluster autoscaler DaemonSet had nodeSelector requiring an old label. After upgrade, that label was removed. CA stopped working. Fix: updated DaemonSet's selector.
+
+6. **In-place node upgrade lost workloads**: Used in-place node OS upgrade (skipped drain). Pods didn't gracefully terminate. Some apps lost in-flight data. Fix: always drain, never in-place.
+
+---
+
+## 140. How do you debug API throttling?
+
+API throttling occurs when the API server rate-limits requests, returning 429 errors. This affects controllers, operators, kubectl, and any clients.
+
+**Step 1: Identify throttling**
+
+```bash
+# kubectl shows it directly:
+kubectl get pods
+# Throttling request took 1.234s, request: GET:...
+
+# Or:
+Error from server: the server has received too many requests
+```
+
+In application code, clients receive HTTP 429 (Too Many Requests) with retry-after headers.
+
+**Step 2: Identify what's getting throttled**
+
+```promql
+# API server's perspective:
+# Requests rejected:
+sum(rate(apiserver_request_total{code="429"}[5m])) by (verb, resource, subresource)
+
+# Per-user breakdown:
+sum(rate(apiserver_request_total{code="429"}[5m])) by (username, user_agent)
+```
+
+This tells you which clients are hitting limits.
+
+**Step 3: Understand throttling mechanisms**
+
+Kubernetes has two main throttling layers:
+
+**Layer 1: Client-side throttling (client-go)**
+
+Each client (controller, kubectl, etc.) has its own rate limiter. Default: 50 QPS burst, 100 QPS. Configured per client.
+
+Client-side throttling is *self-imposed*. The client decides not to make more requests, returns "throttled" to its caller.
+
+**Layer 2: Server-side throttling (APF - API Priority and Fairness)**
+
+The API server itself rate-limits incoming requests using APF. This is the server's defense against floods.
+
+APF organizes requests into "flow schemas" and applies priority levels. When a priority level is overloaded, requests are queued or rejected.
+
+**Step 4: Diagnose client-side throttling**
+
+```bash
+# In client logs (kubectl --v=4):
+kubectl get pods --v=4 2>&1 | grep -i throttling
+# I0510 ... Throttling request took 245ms, request: GET:...
+```
+
+Client-side throttling happens before the request leaves your machine. Possible fixes:
+
+**For controllers (your own or third-party):**
+
+Most controllers expose flags or config for QPS/burst:
+
+```yaml
+# Example for a generic controller:
+args:
+  - --kube-api-qps=100
+  - --kube-api-burst=200
+```
+
+For controller-runtime based operators:
+
+```go
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+  // ...
+})
+// Underlying client uses default qps/burst; can be configured via rest.Config:
+config := ctrl.GetConfigOrDie()
+config.QPS = 50
+config.Burst = 100
+```
+
+**For kubectl:**
+
+```bash
+# kubeconfig:
+# users:
+# - name: ...
+#   user:
+#     ...
+# Plus client-go config in kubectl is hardcoded but can be increased via PR
+```
+
+kubectl's defaults are usually fine; if you hit kubectl throttling, you're doing something unusual.
+
+**Step 5: Diagnose server-side throttling (APF)**
+
+```bash
+# Check APF metrics:
+kubectl get --raw /metrics | grep apiserver_flowcontrol
+
+# Specifically:
+# apiserver_flowcontrol_rejected_requests_total
+# apiserver_flowcontrol_dispatched_requests_total
+# apiserver_flowcontrol_current_inqueue_requests
+```
+
+Promtail/Prometheus queries:
+
+```promql
+# Rejected requests:
+sum(rate(apiserver_flowcontrol_rejected_requests_total[5m])) by (priority_level, flow_schema, reason)
+
+# Queue length:
+apiserver_flowcontrol_current_inqueue_requests
+```
+
+**FlowSchemas and PriorityLevelConfigurations:**
+
+```bash
+kubectl get flowschemas
+# Default schemas include:
+# system-leader-election     PriorityClass=leader-election
+# kube-controller-manager    PriorityClass=workload-high
+# kube-scheduler             PriorityClass=workload-high  
+# ...
+# global-default             PriorityClass=global-default
+
+kubectl get prioritylevelconfigurations
+# leader-election           AssuredConcurrencyShares=10
+# workload-high             AssuredConcurrencyShares=20
+# workload-low              AssuredConcurrencyShares=20
+# global-default            AssuredConcurrencyShares=20
+# system                    AssuredConcurrencyShares=30
+```
+
+Each PriorityLevel has a share of the API server's concurrency. Requests are categorized into FlowSchemas, which map to PriorityLevels.
+
+**Step 6: Identify the noisy client**
+
+```bash
+# Most active clients by user-agent:
+sum(rate(apiserver_request_total[5m])) by (user_agent) | topk(10)
+```
+
+Common offenders:
+
+**Offender A: Old kubectl in loop**
+
+A script doing `while true; do kubectl get pods; done` floods the API server.
+
+**Offender B: Misbehaving controller**
+
+A controller with a bug causing requeue storms. Each reconcile failure → immediate requeue → another reconcile → loop.
+
+```bash
+# Find controllers by user-agent:
+sum(rate(apiserver_request_total[5m])) by (user_agent) | sort_desc
+# Look for high-rate user-agents
+```
+
+Common bad patterns:
+- LIST every reconcile instead of using cache
+- Watch reconnection storm after blip
+- Webhook calls inside reconcile (multiplies API calls)
+
+**Offender C: Operators**
+
+Operators (cert-manager, prometheus-operator, third-party) sometimes have bugs causing high API usage.
+
+**Offender D: Metrics scrapers**
+
+Prometheus / Datadog scraping kubelet endpoints calls API server for service discovery. With many namespaces, this is heavy.
+
+**Step 7: Mitigation**
+
+**Action 1: Tune APF for your noisy client**
+
+If a legitimate client needs more capacity, give its FlowSchema a higher priority:
+
+```yaml
+apiVersion: flowcontrol.apiserver.k8s.io/v1beta3
+kind: PriorityLevelConfiguration
+metadata:
+  name: high-priority-controller
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 50
+    limitResponse:
+      type: Queue
+      queuing:
+        queues: 64
+        handSize: 6
+        queueLengthLimit: 50
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1beta3
+kind: FlowSchema
+metadata:
+  name: high-priority-controller
+spec:
+  matchingPrecedence: 1000
+  priorityLevelConfiguration:
+    name: high-priority-controller
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount:
+            name: my-controller
+            namespace: my-system
+      resourceRules:
+        - verbs: ["*"]
+          apiGroups: ["*"]
+          resources: ["*"]
+```
+
+**Action 2: Fix the noisy client**
+
+If the noise is from a bug, fix the controller:
+- Use informers, not polling
+- Avoid LIST in reconcile; use cached Get
+- Implement proper backoff on errors
+
+**Action 3: Block or rate-limit the client**
+
+If it's misbehaving and can't be fixed quickly:
+
+```bash
+# Reduce its FlowSchema priority or rate
+# Or revoke its RBAC temporarily
+```
+
+**Action 4: Scale API server**
+
+For genuinely high load:
+
+```bash
+# Increase API server replicas (in HA setup)
+# Increase API server resources
+```
+
+**Step 8: Audit log analysis**
+
+For detailed analysis:
+
+```bash
+# API server audit log:
+tail -f /var/log/kubernetes/audit.log | jq
+
+# Filter by user:
+cat audit.log | jq 'select(.user.username == "system:serviceaccount:my-system:my-sa")'
+```
+
+Tells you exactly what each client requested and when.
+
+**Step 9: Validate with cluster size**
+
+API server capacity scales with resources. Reasonable expectations:
+
+- Small cluster (< 100 nodes): 1k-5k requests/sec
+- Medium (100-500 nodes): 5k-15k
+- Large (500-5000 nodes): 15k-50k+
+
+If you're at the lower end of your range, throttling indicates room to scale API server resources.
+
+**Step 10: Long-term monitoring**
+
+```promql
+# Alert on rejected requests:
+sum(rate(apiserver_flowcontrol_rejected_requests_total[5m])) > 0
+
+# Alert on long queue times:
+histogram_quantile(0.99,
+  rate(apiserver_flowcontrol_request_wait_duration_seconds_bucket[5m])
+) > 1
+```
+
+**Production scenarios:**
+
+1. **Custom operator with reconcile loop bug**: Operator requeued every error immediately, looping at API rate. APF rejected requests. Symptom: that operator's other functions stopped working. Fix: added exponential backoff.
+
+2. **Mass scaling triggered API floods**: Cluster autoscaler added 100 nodes. kubelet on each registered, fetched its config, listed secrets. API server overwhelmed. Fix: throttled cluster autoscaler scale-up rate.
+
+3. **Metrics-server with too many namespaces**: 5000 namespaces. metrics-server's pod list operation timed out. Fix: increased metrics-server resources and scrape interval.
+
+4. **kubectl in CI/CD loop**: Build pipeline polled `kubectl get pod` every 100ms. Build agent's user got 90% of throttling. Fix: replaced with `kubectl wait`.
+
+5. **Audit log buffer full**: API server's audit log buffer filled because the audit webhook was slow. Backpressure throttled all requests. Symptom: API throttling without high request rate. Fix: faster audit webhook, larger audit buffer.
+
