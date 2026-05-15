@@ -58927,3 +58927,10535 @@ jobs:
       - name: Validate policies
         run: |
           conftest test --policy policies/ deployments/
+
+          ```
+
+Conftest tests manifests against policies before deployment.
+
+**Component 4: Continuous compliance**
+
+Regular scans:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: compliance-scan
+spec:
+  schedule: "0 6 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: scan
+              image: aquasec/trivy:latest
+              command:
+                - trivy
+                - k8s
+                - --compliance=cis
+                - cluster
+```
+
+**Workflow:**
+
+```
+Developer writes manifest
+       ↓
+Pre-commit hook: validate against policies
+       ↓
+Push to Git
+       ↓
+PR opened
+       ↓
+CI: run conftest, kubeconform
+       ↓
+PR review (humans)
+       ↓
+Merge
+       ↓
+GitOps deploys (ArgoCD/Flux)
+       ↓
+Admission webhook checks policies
+       ↓
+Resource created (or rejected)
+       ↓
+Continuous monitoring (Gatekeeper audit)
+```
+
+Multiple enforcement points.
+
+**Tools:**
+
+**Conftest:**
+
+Tests configurations against Rego policies:
+
+```bash
+# Test a deployment:
+conftest test deployment.yaml --policy policies/
+
+# Output:
+FAIL - deployment.yaml - Container must not run as privileged
+PASS - deployment.yaml - Resource limits specified
+```
+
+In CI:
+
+```yaml
+- name: Conftest
+  run: conftest test manifests/ --policy policies/
+```
+
+**Kubeconform:**
+
+Schema validation:
+
+```bash
+kubeconform -summary deployment.yaml
+```
+
+Catches malformed YAML, wrong API versions.
+
+**Kyverno CLI:**
+
+```bash
+kyverno apply policies/ --resource deployment.yaml
+```
+
+Tests Kyverno policies offline.
+
+**OPA in CI:**
+
+```bash
+opa eval --data policy.rego --input deployment.json "data.policy.allow"
+```
+
+**Tools for runtime enforcement:**
+
+- Gatekeeper
+- Kyverno
+- Falco (runtime detection)
+- Cilium NetworkPolicy
+
+**Policy categories:**
+
+**Security policies:**
+
+```yaml
+# No privileged:
+- name: no-privileged
+  rule: container.securityContext.privileged != true
+
+# Drop capabilities:
+- name: drop-all-caps
+  rule: contains(container.securityContext.capabilities.drop, "ALL")
+
+# Non-root:
+- name: non-root
+  rule: pod.spec.securityContext.runAsNonRoot == true
+```
+
+**Compliance policies:**
+
+```yaml
+# PCI requirement: encryption:
+- name: encrypted-storage
+  rule: storageClass.parameters.encrypted == "true"
+
+# SOC 2: audit logging:
+- name: audit-enabled
+  rule: cluster.config.audit_policy != null
+```
+
+**Operational policies:**
+
+```yaml
+# Resource limits:
+- name: resource-limits
+  rule: container.resources.limits != null
+
+# Required labels:
+- name: required-labels
+  rule: contains(metadata.labels, ["team", "cost-center"])
+```
+
+**Cost policies:**
+
+```yaml
+# Max resource requests:
+- name: max-cpu-request
+  rule: container.resources.requests.cpu <= "8"
+```
+
+**Networking policies:**
+
+```yaml
+# Require NetworkPolicy:
+- name: namespace-has-netpol
+  rule: count(networkpolicies_in_namespace) > 0
+```
+
+**Multi-layer enforcement:**
+
+**Layer 1: Pre-commit hook**
+
+```bash
+# .git/hooks/pre-commit:
+#!/bin/bash
+conftest test ./manifests --policy ./policies
+```
+
+Catches issues before commit.
+
+**Layer 2: CI/CD pipeline**
+
+```yaml
+jobs:
+  validate:
+    steps:
+      - conftest test
+      - kubeconform
+      - trivy config
+```
+
+Block PRs with violations.
+
+**Layer 3: Admission webhook**
+
+Gatekeeper or Kyverno blocks non-compliant at deployment.
+
+**Layer 4: Runtime**
+
+Falco detects violations at runtime. Continuous audit.
+
+**Layer 5: Periodic scan**
+
+```bash
+# Daily scan running cluster:
+trivy k8s --compliance=cis cluster
+gatekeeper audit
+```
+
+Detect drift, new policies.
+
+**GitOps + PaC:**
+
+```
+Git: source of truth for policies AND deployments
+
+policies/ → applied to cluster (Argo CD)
+deployments/ → must pass policies/
+
+Changes via PR with policy validation in CI
+```
+
+**Policy versioning:**
+
+Policies evolve:
+
+```
+policies/
+  ├── v1/
+  │   └── no-privileged.yaml
+  ├── v2/
+  │   └── enhanced-security.yaml
+```
+
+Apply selectively:
+
+```yaml
+# Production: strict policies (v2):
+metadata:
+  labels:
+    policy-version: v2
+
+# Development: lenient (v1):
+metadata:
+  labels:
+    policy-version: v1
+```
+
+**Exception handling:**
+
+Sometimes need exceptions:
+
+```yaml
+# Annotation-based exception:
+metadata:
+  annotations:
+    policy-exception/no-privileged: "Approved by security team in TICKET-123"
+```
+
+```yaml
+# Policy checks annotation:
+violation[{"msg": msg}] {
+  pod := input.review.object
+  pod.spec.containers[_].securityContext.privileged
+  not pod.metadata.annotations["policy-exception/no-privileged"]
+  msg := "Privileged not allowed"
+}
+```
+
+Documented, time-limited.
+
+**Reporting:**
+
+Compliance dashboards:
+
+```promql
+# Policy violations:
+gatekeeper_violations
+
+# Pass rate:
+gatekeeper_constraint_count{enforced="true"} 
+- gatekeeper_violations
+/ gatekeeper_constraint_count{enforced="true"}
+```
+
+**Documentation:**
+
+For each policy:
+- What it does
+- Why (rationale)
+- Examples (allowed/denied)
+- Exception process
+
+**Production scenarios:**
+
+1. **PaC migration**: From wiki documentation to OPA policies. Implemented in Gatekeeper. Continuous enforcement. Compliance audits much easier.
+
+2. **CI/CD integration**: Added conftest to CI. PRs failing policy blocked from merge. Developers got immediate feedback.
+
+3. **GitOps + policies**: ArgoCD deployed policies. Gatekeeper enforced. Single source of truth in Git. Audit trail complete.
+
+4. **Exception workflow**: Implemented exception annotation system. Exceptions tracked with tickets. Auto-expire after 90 days. Compliance officer happy.
+
+5. **Continuous compliance**: Daily kube-bench + trivy scans. Results in Prometheus. Dashboard tracks compliance over time. Catches policy drift immediately.
+
+# Kubernetes Monitoring, Logging & Observability (261-270)
+
+## 261. Explain Kubernetes observability architecture
+
+Observability lets you understand system behavior from external outputs. Kubernetes observability is multi-layered, capturing data from infrastructure to application.
+
+**The three pillars of observability:**
+
+**Pillar 1: Metrics**
+
+Numeric measurements over time:
+- Request rate
+- Error rate
+- Latency percentiles
+- Resource usage (CPU, memory)
+- Custom business metrics
+
+Characteristics:
+- Aggregated
+- Low overhead
+- Good for trends and alerting
+- Limited dimensionality
+
+**Pillar 2: Logs**
+
+Discrete events with context:
+- Application logs
+- System logs
+- Audit logs
+- Container logs
+
+Characteristics:
+- Detailed
+- High cardinality
+- Searchable
+- Higher storage cost
+
+**Pillar 3: Traces**
+
+Request flow across services:
+- Span trees
+- Timing breakdowns
+- Service dependencies
+- Error propagation
+
+Characteristics:
+- Detailed per-request
+- Shows distributed flow
+- Helps debug latency
+- Higher overhead
+
+**Layered architecture:**
+
+```
+┌─────────────────────────────────────────────┐
+│             Application Layer               │
+│   (Custom metrics, traces, app logs)        │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│            Container Layer                  │
+│  (Container metrics, container logs)        │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│           Kubernetes Layer                  │
+│  (Cluster metrics, K8s events, audit logs)  │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│          Infrastructure Layer               │
+│   (Node metrics, OS logs, hardware)         │
+└─────────────────────────────────────────────┘
+```
+
+Each layer needs observability.
+
+**Standard observability stack:**
+
+**Metrics:**
+- Prometheus (scraper and TSDB)
+- Grafana (visualization)
+- Alertmanager (alerts)
+- Thanos / Mimir (long-term, HA)
+
+**Logs:**
+- Fluent Bit / Fluentd / Vector (collection)
+- Loki / Elasticsearch (storage)
+- Grafana / Kibana (visualization)
+
+**Traces:**
+- OpenTelemetry (instrumentation)
+- Jaeger / Tempo / Zipkin (storage)
+- Grafana (visualization)
+
+**Cloud-managed:**
+- Datadog
+- New Relic
+- AWS CloudWatch
+- GCP Cloud Operations
+- Azure Monitor
+
+**Data flow:**
+
+**Metrics flow:**
+
+```
+Application exposes /metrics endpoint (Prometheus format)
+            ↓
+Prometheus scrapes (pulls)
+            ↓
+Stores in TSDB
+            ↓
+Grafana queries for dashboards
+Alertmanager evaluates for alerts
+```
+
+**Logs flow:**
+
+```
+Application writes to stdout/stderr
+            ↓
+Container runtime captures
+            ↓
+Files at /var/log/pods/*
+            ↓
+Fluent Bit (DaemonSet) reads
+            ↓
+Ships to Loki/Elasticsearch
+            ↓
+Grafana/Kibana for queries
+```
+
+**Traces flow:**
+
+```
+Application instrumented (OpenTelemetry SDK)
+            ↓
+Spans sent to OTel Collector
+            ↓
+Collector forwards to backend (Tempo)
+            ↓
+Grafana queries for visualization
+```
+
+**Components per layer:**
+
+**Application layer:**
+
+```yaml
+# Pod exposes metrics:
+spec:
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4317
+```
+
+App emits:
+- /metrics endpoint
+- Traces to OTel
+- Logs to stdout
+
+**Container/pod layer:**
+
+cAdvisor (built into kubelet) exposes:
+- container_cpu_usage_seconds_total
+- container_memory_working_set_bytes
+- container_network_*
+- container_fs_*
+
+Available via kubelet `/metrics/cadvisor`.
+
+**Kubernetes layer:**
+
+kube-state-metrics exposes Kubernetes object state:
+- kube_pod_status_phase
+- kube_deployment_status_replicas
+- kube_node_status_condition
+
+Different from cAdvisor (resource usage); kube-state-metrics is object state.
+
+**Node layer:**
+
+node-exporter runs on every node:
+- CPU, memory, disk
+- Network statistics
+- File system
+
+DaemonSet pattern.
+
+**Control plane:**
+
+API server, scheduler, controller-manager, etcd all expose `/metrics`:
+- apiserver_request_total
+- scheduler_pod_scheduling_duration_seconds
+- etcd_server_has_leader
+
+**Integration points:**
+
+**Service discovery:**
+
+Prometheus discovers targets:
+
+```yaml
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+```
+
+Pods with annotation auto-scraped.
+
+**Labels and metadata:**
+
+Every metric/log/trace has labels:
+- namespace
+- pod
+- container
+- service
+
+Enable correlation across signals.
+
+**Correlation:**
+
+```
+Alert fires (high error rate)
+        ↓
+Click → Dashboard (drill into metric)
+        ↓
+Click → Logs (see error messages)
+        ↓
+Click → Traces (find slow requests)
+```
+
+Unified observability platform connects signals.
+
+**Best practices:**
+
+**Practice 1: Instrument early**
+
+Add observability from start, not after issues.
+
+```yaml
+# Required for all production services:
+- /metrics endpoint
+- Structured logging
+- OpenTelemetry traces
+- Health endpoints (/healthz, /readyz)
+```
+
+**Practice 2: Standardize**
+
+Common metric names across services:
+- `http_requests_total`
+- `http_request_duration_seconds`
+- `errors_total`
+
+Easier dashboards, alerts.
+
+**Practice 3: High cardinality care**
+
+```promql
+# Bad: user_id as label
+http_requests_total{user_id="12345"}
+# Each user = new series, explodes cardinality
+
+# Good: aggregate, use traces for individual users
+http_requests_total{endpoint="/api/users"}
+```
+
+**Practice 4: Sampling**
+
+Traces: don't collect every request. Sample 1-10%.
+
+Logs: sample successful requests, log all errors.
+
+**Practice 5: SLOs over arbitrary alerts**
+
+Alert on user-impacting issues, not internal noise.
+
+**Practice 6: Run-Use-Build (Brendan Gregg)**
+
+USE for resources, RED for services.
+
+**Common architecture:**
+
+```
+Cluster components:
+├─ Prometheus (HA pair or Thanos)
+├─ Grafana
+├─ Alertmanager (HA)
+├─ Loki (or ES)
+├─ Tempo (or Jaeger)
+├─ OTel Collector
+├─ Fluent Bit (DaemonSet)
+└─ Exporters (node-exporter, kube-state-metrics)
+
+Optional:
+├─ Falco (security)
+├─ Pixie (auto-instrumentation)
+└─ Cilium Hubble (network)
+```
+
+**Cloud-managed alternative:**
+
+Instead of running stack yourself:
+
+```
+Datadog Agent (DaemonSet)
+    ↓
+All metrics/logs/traces → Datadog SaaS
+    ↓
+Datadog UI for everything
+```
+
+Trade-off: cost vs. operational burden.
+
+**Production scenarios:**
+
+1. **Standardized observability**: Platform team built reusable observability setup. All services use OpenTelemetry, structured JSON logs, Prometheus metrics. Consistent across cluster.
+
+2. **Three pillars correlation**: Alert fires from Prometheus. Linked to Loki logs (same timestamp/pod). Linked to Tempo trace (request ID). Full debugging context in minutes.
+
+3. **Cloud-managed for new team**: Small team without observability expertise. Used Datadog. No infrastructure to manage. Higher cost but faster results.
+
+4. **Self-hosted scaling**: Started with Datadog. Grew to billions of metrics, cost spiraled. Migrated to self-hosted Prometheus + Thanos. Cost dropped 80%, more operational effort.
+
+5. **OpenTelemetry consolidation**: Different services used different observability libraries. Migrated all to OpenTelemetry. Single instrumentation, multiple backends supported.
+
+---
+
+## 262. Difference between monitoring and observability
+
+These terms are often used interchangeably but represent different approaches to understanding system behavior.
+
+**Monitoring:**
+
+Watching predetermined metrics to detect known problems.
+
+**Characteristics:**
+- Known failure modes
+- Predetermined dashboards
+- Threshold-based alerts
+- "Is the system working?"
+
+**Examples:**
+- CPU > 80% = alert
+- Disk space < 10% = alert
+- HTTP 500 errors > X/sec = alert
+
+**Observability:**
+
+Ability to understand system behavior from external outputs, including for problems you didn't anticipate.
+
+**Characteristics:**
+- Unknown failure modes
+- Exploratory investigation
+- Rich data (metrics + logs + traces)
+- "Why is the system behaving this way?"
+
+**Examples:**
+- "Latency is high for 1% of users in eu-west, what's unique about them?"
+- "Errors started at 2pm, what changed?"
+- "This specific user's request failed, walk me through what happened"
+
+**The shift:**
+
+Old systems: monoliths, predictable failures, monitoring sufficed.
+
+Modern systems: microservices, distributed, novel failure modes. Need observability.
+
+**Comparison:**
+
+| Aspect | Monitoring | Observability |
+|--------|------------|---------------|
+| Scope | Known issues | Known + unknown |
+| Approach | Reactive (alerts) | Investigative (questions) |
+| Data | Predefined metrics | High-cardinality data |
+| Tools | Dashboards, alerts | Tracing, log search, correlation |
+| Question type | Binary (up/down) | Open-ended (why?) |
+
+**Example: latency increase**
+
+**Monitoring approach:**
+
+Dashboard shows P99 latency 500ms (alert threshold). Alert fires.
+
+You know: P99 is high.
+You don't know: which users? which endpoints? what changed?
+
+**Observability approach:**
+
+Same alert. But you can:
+1. Drill into metrics: which endpoint?
+2. Filter logs: what errors?
+3. Examine traces: where in request flow?
+4. Correlate: deploys/changes around that time?
+
+Within minutes: root cause.
+
+**The three pillars revisited:**
+
+**Metrics**: monitoring (mostly).
+**Logs**: observability (with right structure).
+**Traces**: observability.
+
+Together: comprehensive observability.
+
+**High cardinality:**
+
+Observability requires high-cardinality data:
+
+```
+# Low cardinality (good for monitoring):
+http_requests_total{endpoint="/api/users", status="200"}
+
+# High cardinality (good for observability):
+http_requests_total{
+  endpoint="/api/users",
+  status="200",
+  user_id="12345",
+  trace_id="abc-123",
+  region="us-east-1",
+  version="v1.2.3"
+}
+```
+
+But: high cardinality is expensive in metric systems.
+
+**Solution**: traces and logs for high cardinality, metrics for aggregates.
+
+**Observability principles:**
+
+**Principle 1: Instrument richly**
+
+Capture data you might need, not just what you think you'll need.
+
+**Principle 2: Correlate signals**
+
+Link metrics, logs, traces via shared IDs (trace_id, request_id).
+
+**Principle 3: Enable exploration**
+
+Tools support ad-hoc queries, not just predefined dashboards.
+
+**Principle 4: Capture intent**
+
+Why was this request made? What user context?
+
+**Modern observability tools:**
+
+Designed for exploration:
+
+- **Honeycomb**: high-cardinality events
+- **Datadog**: unified metrics + logs + APM
+- **Grafana stack**: Prometheus + Loki + Tempo
+- **New Relic**: similar
+- **Lightstep**: distributed tracing focus
+
+**Open standards:**
+
+**OpenTelemetry**: vendor-neutral instrumentation
+
+```python
+from opentelemetry import trace, metrics
+
+tracer = trace.get_tracer(__name__)
+meter = metrics.get_meter(__name__)
+
+# Instrument once, send to many backends
+```
+
+**Anti-patterns:**
+
+**Anti-pattern 1: Dashboard sprawl**
+
+100 dashboards, no one reads them all. Monitoring-style approach.
+
+Fix: focus on golden signals, support exploration.
+
+**Anti-pattern 2: Alert fatigue**
+
+Every metric has an alert. Most are noise.
+
+Fix: alert on user impact (SLOs), not internal noise.
+
+**Anti-pattern 3: Logging without structure**
+
+```
+# Bad:
+"User logged in"
+"Request took 5 seconds"
+
+# Good (structured):
+{"event": "login", "user_id": "123", "duration_ms": 5000}
+```
+
+Structured logs enable querying.
+
+**Anti-pattern 4: Metrics-only mindset**
+
+"We have monitoring, we don't need traces."
+
+Modern systems: need all three pillars.
+
+**Anti-pattern 5: Sampling everything**
+
+Sampling at metrics level loses ability to investigate specific issues.
+
+Better: aggregate metrics + detailed traces (sampled).
+
+**When monitoring is enough:**
+
+- Simple, well-understood systems
+- Few failure modes
+- Limited scale
+- Small team
+
+**When you need observability:**
+
+- Distributed systems
+- Microservices
+- Novel failure modes possible
+- Complex user behaviors
+- Modern scale
+
+Most production Kubernetes deployments need observability.
+
+**Production scenarios:**
+
+1. **Monitoring caught known, observability fixed unknown**: Monitoring alerted on high error rate. Observability (traces) showed errors specific to one customer ID, downstream service called only by that customer. Root cause in 10 minutes.
+
+2. **Dashboard alone insufficient**: P99 latency spiked. Dashboard showed it but not why. Added traces. Next time: traces immediately showed slow database queries from specific service.
+
+3. **Logs without structure failed**: Plain text logs. Investigating issue meant grep across many files. Migrated to JSON logs in Loki. Queries became fast and powerful.
+
+4. **OpenTelemetry adoption**: Each team had different observability. Standardized on OpenTelemetry. Consistent data across services. Easier debugging.
+
+5. **High cardinality moved to traces**: Tried adding user_id to metrics. Cardinality exploded. Moved user-level data to traces. Metrics stayed performant, debugging capability preserved.
+
+---
+
+## 263. Explain Prometheus architecture
+
+Prometheus is the de facto standard for Kubernetes metrics. Understanding its architecture helps deploy and operate it effectively.
+
+**Core Prometheus:**
+
+```
+┌────────────────────────────────────────────┐
+│              Prometheus Server             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │ Retrieval│→ │   TSDB   │← │  Query   │  │
+│  │ (Scraper)│  │ (Storage)│  │  Engine  │  │
+│  └──────────┘  └──────────┘  └──────────┘  │
+│       ↑              ↑             ↑       │
+│       │              │             │       │
+└───────┼──────────────┼─────────────┼───────┘
+        │              │             │
+   Service          Local           HTTP API
+   Discovery        Disk            (Grafana,
+        ↓                            etc.)
+   Targets
+   (Pods, etc.)
+```
+
+**Components:**
+
+**Component 1: Retrieval (scraper)**
+
+Pulls metrics from targets:
+
+```yaml
+# Prometheus config:
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+```
+
+Every 15s (default), Prometheus pulls `/metrics` from each target.
+
+**Pull model:**
+
+Prometheus pulls (rather than push):
+- Prometheus knows the target list
+- Targets just expose endpoint
+- Easier to determine target health
+- Pull from anywhere with network access
+
+**Component 2: Storage (TSDB)**
+
+Time-series database:
+- Optimized for time-series data
+- Local disk storage
+- 2-hour blocks
+- Compacted over time
+
+```
+/data/
+├── chunks_head/   # Current writes
+├── wal/           # Write-ahead log
+└── 01HX.../       # Compacted blocks
+```
+
+Storage requirements:
+- ~1-3 bytes per sample
+- Active series count drives memory
+- Retention drives disk
+
+For 1M series, 15s scrape, 15-day retention: ~30-50GB disk.
+
+**Component 3: Query engine**
+
+PromQL (Prometheus Query Language):
+
+```promql
+# Simple:
+http_requests_total
+
+# Rate:
+rate(http_requests_total[5m])
+
+# Aggregation:
+sum by (status) (rate(http_requests_total[5m]))
+
+# Comparison:
+rate(http_requests_total[5m]) > 100
+```
+
+Used by:
+- Grafana dashboards
+- Alertmanager rules
+- Direct API queries
+
+**Component 4: Service discovery**
+
+Automatically discovers targets:
+
+```yaml
+# Kubernetes SD:
+kubernetes_sd_configs:
+  - role: pod   # Or service, endpoints, node, ingress
+```
+
+Roles:
+- `node`: cluster nodes
+- `pod`: pods with metadata
+- `service`: services
+- `endpoints`: service endpoints
+- `ingress`: ingresses
+
+Pods auto-discovered. Add metric scraping by annotation:
+
+```yaml
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: /metrics
+```
+
+**Component 5: Alertmanager (separate)**
+
+```
+Prometheus → Alert evaluation → Sends to Alertmanager
+                                       ↓
+                                Receivers (Slack, PagerDuty)
+```
+
+Alerting rules in Prometheus:
+
+```yaml
+groups:
+  - name: example
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_errors[5m]) / rate(http_requests[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate"
+```
+
+Sends to Alertmanager which handles routing, deduplication, notifications.
+
+**Components beyond core:**
+
+**Exporters:**
+
+Translate other systems' metrics to Prometheus format:
+
+- **node-exporter**: OS/hardware metrics (DaemonSet)
+- **kube-state-metrics**: Kubernetes object state
+- **blackbox-exporter**: probing endpoints
+- **mysqld-exporter**: MySQL
+- **postgres-exporter**: PostgreSQL
+
+```yaml
+# DaemonSet for node-exporter:
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+spec:
+  template:
+    spec:
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter
+          ports:
+            - containerPort: 9100
+```
+
+**Pushgateway:**
+
+For ephemeral jobs (can't be scraped):
+
+```bash
+# Push metric:
+echo "my_metric 42" | curl --data-binary @- http://pushgateway:9091/metrics/job/my_job
+```
+
+Prometheus scrapes Pushgateway. Use sparingly (anti-pattern for long-lived workloads).
+
+**Prometheus Operator:**
+
+Kubernetes-native Prometheus management:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: prometheus
+spec:
+  serviceAccountName: prometheus
+  serviceMonitorSelector:
+    matchLabels:
+      team: frontend
+  resources:
+    requests:
+      memory: 2Gi
+```
+
+**ServiceMonitor**: declarative scrape configs:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: my-app
+  labels:
+    team: frontend
+spec:
+  selector:
+    matchLabels:
+      app: my-app
+  endpoints:
+    - port: metrics
+      interval: 15s
+```
+
+Apps deploy ServiceMonitor, Prometheus auto-scrapes.
+
+**PodMonitor**: similar for pods without Services.
+
+**PrometheusRule**: alert rules as CRDs:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: my-app-rules
+spec:
+  groups:
+    - name: my-app
+      rules:
+        - alert: HighLatency
+          expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 0.5
+```
+
+**Architecture options:**
+
+**Option 1: Single Prometheus**
+
+Simple. Works up to ~1M series, ~1000 nodes.
+
+**Option 2: HA Prometheus pair**
+
+Two identical Prometheus instances scrape same targets. Both store data independently.
+
+Grafana queries either. Survives one failure.
+
+**Option 3: Thanos**
+
+For long-term storage and global query:
+
+```
+Cluster Prometheuses (short retention)
+  → Thanos Sidecar uploads to S3
+  → Thanos Query reads from local + S3
+  → Grafana queries Thanos
+```
+
+**Option 4: Cortex / Mimir**
+
+Horizontally scalable, multi-tenant:
+
+```
+Distributor → Ingester → Storage
+   ↑              ↑          ↑
+   Push       Recent      S3/GCS
+```
+
+For very large scale.
+
+**Option 5: VictoriaMetrics**
+
+Alternative TSDB:
+- Prometheus-compatible
+- Higher performance for some workloads
+- Single binary or cluster mode
+
+**Scaling considerations:**
+
+**Cardinality:**
+
+Each unique label combination = new series.
+
+```promql
+# Number of series:
+prometheus_tsdb_head_series
+```
+
+Avoid high-cardinality labels:
+- user_id (unbounded)
+- request_id (unbounded)
+- timestamp (worst possible)
+
+**Memory:**
+
+Roughly 3KB per active series. 1M series = 3GB.
+
+Plus query memory, headers, etc.
+
+**Storage:**
+
+```
+samples/sec × bytes/sample × retention_seconds
+```
+
+For 1M series, 15s scrape, 15-day retention:
+- 67k samples/sec × 1.5 bytes × 1.3M seconds = ~130GB
+
+**Configuration:**
+
+```yaml
+global:
+  scrape_interval: 15s      # Default
+  evaluation_interval: 15s
+  external_labels:
+    cluster: prod
+    region: us-east-1
+
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    scrape_interval: 30s    # Override for some jobs
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+rule_files:
+  - /etc/prometheus/rules/*.yaml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+```
+
+**Common queries:**
+
+```promql
+# Request rate:
+sum(rate(http_requests_total[5m])) by (service)
+
+# Error rate:
+sum(rate(http_requests_total{status=~"5.."}[5m])) 
+/ sum(rate(http_requests_total[5m]))
+
+# P99 latency:
+histogram_quantile(0.99, 
+  sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+
+# CPU usage:
+sum(rate(container_cpu_usage_seconds_total[5m])) by (pod)
+
+# Memory usage:
+sum(container_memory_working_set_bytes) by (pod)
+```
+
+**Production scenarios:**
+
+1. **kube-prometheus-stack adoption**: Used kube-prometheus-stack Helm chart. Installs Prometheus Operator, Grafana, Alertmanager, exporters. Production-ready in hours.
+
+2. **High cardinality crashed Prometheus**: App added user_id as label. Series went from 1M to 50M. Prometheus OOMed. Removed label, used traces for user-level data.
+
+3. **Thanos for multi-cluster**: 5 clusters, each with Prometheus + Thanos Sidecar. Central Thanos Query for cross-cluster view. Long-term storage in S3.
+
+4. **VictoriaMetrics migration**: Outgrew Prometheus scalability. Migrated to VictoriaMetrics single-node. Same Prometheus client, much better performance.
+
+5. **ServiceMonitor self-service**: Teams added ServiceMonitor to their Helm charts. Prometheus auto-discovered. No central config changes needed.
+
+---
+
+## 264. How does Prometheus service discovery work?
+
+Service discovery automatically finds and tracks targets to scrape. Without it, Prometheus config would need manual updates for every new pod.
+
+**Why service discovery:**
+
+Without SD:
+```yaml
+# Manually list every target:
+scrape_configs:
+  - job_name: 'my-app'
+    static_configs:
+      - targets:
+          - 10.0.1.5:8080
+          - 10.0.1.6:8080
+          - 10.0.1.7:8080
+```
+
+Pods come and go constantly. Manual updates impossible.
+
+With SD:
+```yaml
+- job_name: 'kubernetes-pods'
+  kubernetes_sd_configs:
+    - role: pod
+  # Auto-discovers all pods
+```
+
+**Kubernetes service discovery roles:**
+
+**Role: node**
+
+Discovers cluster nodes:
+
+```yaml
+- job_name: 'kubernetes-nodes'
+  kubernetes_sd_configs:
+    - role: node
+```
+
+Used for: node-exporter, kubelet metrics.
+
+**Role: pod**
+
+Discovers all pods:
+
+```yaml
+- job_name: 'kubernetes-pods'
+  kubernetes_sd_configs:
+    - role: pod
+```
+
+Used for: application metrics on pod ports.
+
+**Role: service**
+
+Discovers Services:
+
+```yaml
+- job_name: 'kubernetes-services'
+  kubernetes_sd_configs:
+    - role: service
+```
+
+Less common; usually scrape pods directly.
+
+**Role: endpoints**
+
+Discovers Service endpoints (pods backing services):
+
+```yaml
+- job_name: 'kubernetes-endpoints'
+  kubernetes_sd_configs:
+    - role: endpoints
+```
+
+**Role: endpointslices**
+
+Modern alternative to endpoints (more scalable):
+
+```yaml
+- job_name: 'kubernetes-endpointslices'
+  kubernetes_sd_configs:
+    - role: endpointslice
+```
+
+**Role: ingress**
+
+Discovers Ingresses:
+
+```yaml
+- job_name: 'kubernetes-ingresses'
+  kubernetes_sd_configs:
+    - role: ingress
+```
+
+Used by blackbox-exporter for external probing.
+
+**How SD works:**
+
+```
+Prometheus → Kubernetes API → List all pods
+                ↓
+Receives metadata (labels, annotations, IPs)
+                ↓
+Relabel configs filter and transform
+                ↓
+Final target list to scrape
+```
+
+Prometheus uses kubernetes API to watch for changes. New pods auto-added; deleted pods removed.
+
+**Relabel configs:**
+
+Critical for filtering. SD returns ALL pods; relabel selects which to scrape.
+
+```yaml
+relabel_configs:
+  # Only scrape pods with annotation:
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+    action: keep
+    regex: true
+  
+  # Use annotation for port:
+  - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+    action: replace
+    target_label: __address__
+    regex: ([^:]+)(?::\d+)?;(\d+)
+    replacement: $1:$2
+  
+  # Use annotation for path:
+  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+    action: replace
+    target_label: __metrics_path__
+    regex: (.+)
+  
+  # Add namespace label:
+  - source_labels: [__meta_kubernetes_namespace]
+    target_label: namespace
+  
+  # Add pod name label:
+  - source_labels: [__meta_kubernetes_pod_name]
+    target_label: pod
+```
+
+**Annotation-based discovery:**
+
+Pods opt-in via annotations:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+```
+
+Prometheus discovers, but only scrapes pods with `prometheus.io/scrape: "true"`.
+
+**Available metadata:**
+
+Prometheus exposes many meta labels:
+
+```
+__meta_kubernetes_namespace
+__meta_kubernetes_pod_name
+__meta_kubernetes_pod_label_<labelname>
+__meta_kubernetes_pod_annotation_<annotationname>
+__meta_kubernetes_pod_node_name
+__meta_kubernetes_pod_ready
+__meta_kubernetes_pod_container_name
+__meta_kubernetes_pod_container_port_name
+__meta_kubernetes_pod_container_port_number
+```
+
+Use in relabel configs.
+
+**Common SD patterns:**
+
+**Pattern 1: Annotation-based pod discovery**
+
+```yaml
+- job_name: 'kubernetes-pods'
+  kubernetes_sd_configs:
+    - role: pod
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+      action: keep
+      regex: true
+```
+
+Pods opt-in. Works for any pod type.
+
+**Pattern 2: Label-based service discovery**
+
+```yaml
+- job_name: 'frontend-services'
+  kubernetes_sd_configs:
+    - role: pod
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_label_tier]
+      action: keep
+      regex: frontend
+```
+
+Only scrape pods with `tier: frontend` label.
+
+**Pattern 3: Multiple ports on a pod**
+
+```yaml
+relabel_configs:
+  - source_labels: [__meta_kubernetes_pod_container_port_name]
+    action: keep
+    regex: metrics
+```
+
+Only scrape ports named "metrics".
+
+**Pattern 4: Namespace-scoped discovery**
+
+```yaml
+- job_name: 'production-pods'
+  kubernetes_sd_configs:
+    - role: pod
+      namespaces:
+        names: ["production", "staging"]
+```
+
+Discover only specific namespaces.
+
+**ServiceMonitor (Prometheus Operator):**
+
+Higher-level abstraction:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: my-app
+  namespace: my-app
+spec:
+  selector:
+    matchLabels:
+      app: my-app
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+```
+
+Operator translates ServiceMonitor to Prometheus scrape config. Easier than raw configs.
+
+**PodMonitor:**
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: my-app
+spec:
+  selector:
+    matchLabels:
+      app: my-app
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 30s
+```
+
+For pods without Services.
+
+**Operator selector:**
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: main
+spec:
+  serviceMonitorSelector:
+    matchLabels:
+      release: prometheus
+```
+
+Only ServiceMonitors matching label scraped. Multi-tenancy possible.
+
+**Multi-cluster SD:**
+
+Federation:
+
+```yaml
+- job_name: 'federate'
+  honor_labels: true
+  metrics_path: '/federate'
+  params:
+    'match[]':
+      - '{__name__=~"job:.*"}'
+  static_configs:
+    - targets:
+        - 'cluster1-prometheus:9090'
+        - 'cluster2-prometheus:9090'
+```
+
+One Prometheus scrapes from others.
+
+**Or external_labels for multi-cluster:**
+
+```yaml
+global:
+  external_labels:
+    cluster: us-east-1
+    environment: prod
+```
+
+Distinguishes data from different clusters in centralized storage.
+
+**Cloud-specific SD:**
+
+**AWS EC2:**
+
+```yaml
+- job_name: 'ec2-instances'
+  ec2_sd_configs:
+    - region: us-east-1
+      port: 9100
+```
+
+**GCP:**
+
+```yaml
+- job_name: 'gce-instances'
+  gce_sd_configs:
+    - project: my-project
+      zone: us-central1-a
+      port: 9100
+```
+
+**Consul:**
+
+```yaml
+- job_name: 'consul-services'
+  consul_sd_configs:
+    - server: 'consul:8500'
+      services: ['my-service']
+```
+
+**Common issues:**
+
+**Issue 1: Target not appearing**
+
+Causes:
+- Label filter not matching
+- Annotation missing
+- Network policy blocking
+
+Debug:
+```bash
+# Check what Prometheus sees:
+curl http://prometheus:9090/api/v1/targets
+```
+
+**Issue 2: Wrong port scraped**
+
+Causes:
+- Port annotation incorrect
+- Multiple ports, wrong selected
+
+Fix relabel configs:
+
+```yaml
+- source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+  action: replace
+  target_label: __address__
+  regex: ([^:]+)(?::\d+)?;(\d+)
+  replacement: $1:$2
+```
+
+**Issue 3: Cardinality explosion**
+
+Too many labels added by relabeling.
+
+Fix: only add necessary labels:
+
+```yaml
+relabel_configs:
+  - source_labels: [__meta_kubernetes_namespace]
+    target_label: namespace
+  - source_labels: [__meta_kubernetes_pod_name]
+    target_label: pod
+  # Don't add every possible label
+```
+
+**Issue 4: Permission denied**
+
+Prometheus needs RBAC:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+```
+
+**Production scenarios:**
+
+1. **ServiceMonitor self-service**: Platform team set up Prometheus Operator. App teams add ServiceMonitor to their Helm charts. No central config changes for new apps.
+
+2. **Annotation approach**: Without Operator, used annotation-based discovery. Devs add `prometheus.io/scrape: "true"`. Works for any pod.
+
+3. **Cardinality from labels**: Initial relabel added every pod label as Prometheus label. Cardinality exploded. Pruned to namespace, pod, container only.
+
+4. **Multi-port pod**: Pod had metrics on port 9090, app on 8080. Initial config scraped 8080 (wrong). Used port name annotation to select correctly.
+
+5. **Multi-cluster federation**: 4 clusters. Per-cluster Prometheus. Central Prometheus federates aggregate metrics. Grafana queries central for global view.
+
+---
+
+## 265. Explain Alertmanager routing
+
+Alertmanager handles alerts from Prometheus: deduplicates, groups, routes to appropriate channels.
+
+**What Alertmanager does:**
+
+```
+Prometheus generates alerts
+        ↓
+Sends to Alertmanager
+        ↓
+Alertmanager:
+  - Deduplicates
+  - Groups related alerts
+  - Inhibits dependent alerts
+  - Silences during maintenance
+  - Routes to receivers
+        ↓
+Receivers (Slack, PagerDuty, email, webhooks)
+```
+
+**Why Alertmanager:**
+
+Without it:
+- Prometheus could send alerts directly
+- But: no grouping (alert storm)
+- No deduplication (same alert from HA pair)
+- No routing logic (all alerts to one place)
+- No silencing
+
+**Configuration:**
+
+```yaml
+# alertmanager.yaml:
+global:
+  resolve_timeout: 5m
+  slack_api_url: 'https://hooks.slack.com/...'
+
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'cluster']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - match:
+        severity: critical
+      receiver: pagerduty
+    - match:
+        team: frontend
+      receiver: frontend-slack
+
+receivers:
+  - name: default
+    slack_configs:
+      - channel: '#alerts'
+  - name: pagerduty
+    pagerduty_configs:
+      - service_key: <key>
+  - name: frontend-slack
+    slack_configs:
+      - channel: '#frontend-alerts'
+```
+
+**Routing tree:**
+
+Routes are hierarchical:
+
+```yaml
+route:
+  receiver: default
+  routes:
+    - match:
+        severity: critical
+      receiver: pagerduty
+      continue: false   # Stop here if matched
+    
+    - match:
+        team: frontend
+      receiver: frontend
+      routes:
+        - match:
+            environment: prod
+          receiver: frontend-prod
+    
+    - match:
+        team: backend
+      receiver: backend
+```
+
+First matching route used (unless `continue: true`).
+
+**Grouping:**
+
+Related alerts grouped into single notification:
+
+```yaml
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s       # Wait 30s for similar alerts
+  group_interval: 5m    # Then send updates every 5m
+```
+
+Example: 50 pods of same deployment fail.
+Without grouping: 50 separate alerts.
+With grouping: 1 alert "Deployment X: 50 pods failing".
+
+**Group wait:**
+
+How long to wait for related alerts:
+
+```yaml
+group_wait: 30s   # Wait 30s for more alerts in group
+```
+
+If 1 alert, then 3 more in 25s: all sent together at 30s mark.
+
+**Group interval:**
+
+Time between updates for same group:
+
+```yaml
+group_interval: 5m
+```
+
+After initial notification, wait 5 min before sending updates.
+
+**Repeat interval:**
+
+If alert still firing, repeat notification:
+
+```yaml
+repeat_interval: 4h   # Re-notify every 4 hours
+```
+
+Prevents missed alerts but also alert fatigue.
+
+**Inhibition:**
+
+Suppress some alerts when others fire:
+
+```yaml
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'cluster', 'service']
+```
+
+If critical alert fires, suppress warning for same service. Don't alert twice.
+
+Common use: cluster down → suppress per-service alerts.
+
+**Silences:**
+
+Temporarily mute alerts:
+
+```bash
+# CLI:
+amtool silence add severity=warning team=frontend --duration=2h
+
+# Or in UI:
+# Add silence matching certain labels
+```
+
+Use during maintenance, known issues.
+
+**Receivers:**
+
+**Slack:**
+
+```yaml
+- name: slack
+  slack_configs:
+    - api_url: https://hooks.slack.com/...
+      channel: '#alerts'
+      send_resolved: true
+      title: '{{ .CommonAnnotations.summary }}'
+      text: |
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Severity:* {{ .Labels.severity }}
+        {{ end }}
+```
+
+**PagerDuty:**
+
+```yaml
+- name: pagerduty
+  pagerduty_configs:
+    - service_key: <integration-key>
+      description: '{{ .CommonAnnotations.summary }}'
+      severity: '{{ .CommonLabels.severity }}'
+```
+
+**Email:**
+
+```yaml
+- name: email
+  email_configs:
+    - to: oncall@example.com
+      from: alertmanager@example.com
+      smarthost: smtp.example.com:587
+      auth_username: alertmanager
+      auth_password: secret
+```
+
+**Webhook (custom integrations):**
+
+```yaml
+- name: webhook
+  webhook_configs:
+    - url: https://my-system.example.com/alerts
+      send_resolved: true
+```
+
+**Multiple receivers:**
+
+```yaml
+- name: critical
+  slack_configs:
+    - channel: '#critical-alerts'
+  pagerduty_configs:
+    - service_key: <key>
+```
+
+Send to both Slack and PagerDuty.
+
+**Routing examples:**
+
+**By severity:**
+
+```yaml
+routes:
+  - match:
+      severity: critical
+    receiver: pagerduty
+  - match:
+      severity: warning
+    receiver: slack
+  - match:
+      severity: info
+    receiver: email
+```
+
+**By team:**
+
+```yaml
+routes:
+  - match:
+      team: frontend
+    receiver: frontend-slack
+  - match:
+      team: backend
+    receiver: backend-slack
+  - match:
+      team: data
+    receiver: data-slack
+```
+
+**By environment:**
+
+```yaml
+routes:
+  - match:
+      environment: prod
+    routes:
+      - match:
+          severity: critical
+        receiver: pagerduty-prod
+      - match:
+          severity: warning
+        receiver: slack-prod
+  - match:
+      environment: staging
+    receiver: slack-staging
+```
+
+**By time:**
+
+```yaml
+routes:
+  - match:
+      severity: critical
+    receiver: pagerduty
+    active_time_intervals:
+      - business-hours
+    mute_time_intervals:
+      - weekend
+
+time_intervals:
+  - name: business-hours
+    time_intervals:
+      - times:
+          - start_time: '09:00'
+            end_time: '17:00'
+        weekdays: ['monday:friday']
+        location: 'America/New_York'
+  - name: weekend
+    time_intervals:
+      - weekdays: ['saturday', 'sunday']
+```
+
+Different routing during business hours vs. off-hours.
+
+**Template customization:**
+
+```yaml
+templates:
+  - /etc/alertmanager/templates/*.tmpl
+```
+
+```yaml
+# templates/custom.tmpl:
+{{ define "slack.custom" }}
+:fire: *{{ .GroupLabels.alertname }}*
+{{ range .Alerts }}
+- {{ .Annotations.description }}
+{{ end }}
+{{ end }}
+```
+
+Use:
+
+```yaml
+receivers:
+  - name: slack
+    slack_configs:
+      - text: '{{ template "slack.custom" . }}'
+```
+
+**HA Alertmanager:**
+
+```yaml
+spec:
+  replicas: 3
+  containers:
+    - args:
+        - --cluster.peer=alertmanager-0:9094
+        - --cluster.peer=alertmanager-1:9094
+        - --cluster.peer=alertmanager-2:9094
+```
+
+3 instances:
+- Share state (deduplications, silences)
+- Tolerate failures
+- All receive alerts (HA Prometheus pair)
+- Coordinate to send notifications
+
+**Common pitfalls:**
+
+**Pitfall 1: Alert fatigue**
+
+Too many alerts, no one reads them.
+
+Fix: route only critical to PagerDuty, others to Slack.
+
+**Pitfall 2: Grouping too loose**
+
+Alerts grouped by alertname only. Different services lumped together.
+
+```yaml
+# Bad:
+group_by: ['alertname']
+
+# Good:
+group_by: ['alertname', 'cluster', 'service']
+```
+
+**Pitfall 3: Wrong repeat interval**
+
+Too short: spam.
+Too long: forgotten alerts.
+
+```yaml
+repeat_interval: 4h   # Typical
+```
+
+**Pitfall 4: No inhibition**
+
+When cluster is down, every service alerts. Inhibition silences child alerts.
+
+**Pitfall 5: Silences not tracked**
+
+Created silence for incident, forgot to remove. Alerts permanently silenced.
+
+Fix: limited duration, document.
+
+**Production scenarios:**
+
+1. **Team-based routing**: Each team had Slack channel. Alertmanager routed by team label. Each team saw their alerts.
+
+2. **PagerDuty for critical only**: Critical alerts to PagerDuty, warnings to Slack. Reduced page volume 80%. On-call quality of life improved.
+
+3. **Inhibition prevented alert storm**: When cluster master failed, hundreds of related alerts. Inhibition kept it to one: "cluster down". On-call wasn't overwhelmed.
+
+4. **HA Alertmanager**: 3 replicas, coordinated. During AlertManager pod restart, no missed alerts. HA worked.
+
+5. **Time-based routing**: Critical alerts paged during business hours. After hours: only severity=critical+impact=high. Reduced unnecessary night pages.
+
+---
+
+## 266. How do you design alerting strategies?
+
+Alerts wake people up. Bad alerting is worse than no alerting (alert fatigue). Good strategy means alerting on what matters.
+
+**Alerting philosophy:**
+
+**Bad: alert on causes**
+
+```
+- High CPU
+- High memory
+- Disk full
+```
+
+These might not affect users.
+
+**Good: alert on symptoms (user impact)**
+
+```
+- High error rate (users see errors)
+- High latency (users see slow)
+- Service down (users can't access)
+```
+
+User impact warrants paging.
+
+**Cause-based for context:**
+
+Low-severity alerts for engineering context:
+- "CPU high on node X" — might indicate issue developing
+
+**SLO-based alerting:**
+
+Define Service Level Objectives (SLOs):
+
+```
+SLO: 99.9% availability over 30 days
+```
+
+Error budget: 0.1% = ~43 minutes/month allowed downtime.
+
+Alert on:
+- Burning error budget too fast
+- Approaching budget exhaustion
+
+```yaml
+# Burn rate alerts:
+- alert: ErrorBudgetBurnRate14x
+  expr: |
+    (
+      rate(http_requests{status=~"5.."}[1h])
+      /
+      rate(http_requests[1h])
+    ) > 0.014
+  for: 5m
+  # 14x burn rate exhausts budget in 2 days
+```
+
+Higher burn rate = more urgent.
+
+**Multi-window alerts:**
+
+Catch both acute and chronic issues:
+
+```yaml
+# Acute (5m window):
+- alert: HighErrorRate5m
+  expr: rate(errors[5m]) / rate(requests[5m]) > 0.05
+  for: 5m
+
+# Chronic (1h window):
+- alert: HighErrorRate1h
+  expr: rate(errors[1h]) / rate(requests[1h]) > 0.01
+  for: 1h
+```
+
+Different windows catch different patterns.
+
+**Multi-severity:**
+
+```
+Critical (page on-call):
+- Service down
+- Error rate >50%
+- Massive latency spike
+
+Warning (Slack):
+- Errors elevated (>1%)
+- Latency P99 elevated
+- Approaching capacity
+
+Info (dashboard):
+- Resource trends
+- Long-term patterns
+```
+
+**Alerting principles:**
+
+**Principle 1: Actionable**
+
+Every alert: clear action.
+
+Bad: "Memory usage high" (so what?)
+Good: "Pod X likely to OOMKill in 10 min" (clear action)
+
+**Principle 2: Owned**
+
+Every alert has an owner who responds.
+
+Tag with team:
+```yaml
+labels:
+  team: backend
+```
+
+Routing sends to right people.
+
+**Principle 3: Documented**
+
+Alert has runbook:
+
+```yaml
+annotations:
+  summary: "Database connection pool exhausted"
+  description: "Service X has no DB connections available"
+  runbook_url: "https://wiki/runbooks/db-pool-exhausted"
+```
+
+Runbook explains:
+- What it means
+- How to investigate
+- How to fix
+- When to escalate
+
+**Principle 4: Tested**
+
+Test alert firing in non-prod. Ensure routing works.
+
+**Principle 5: Tuned**
+
+Review alerts regularly:
+- Which fire frequently? (tune or remove)
+- Which are noise? (remove)
+- Which incidents weren't caught? (add)
+
+**Alert severity definitions:**
+
+```yaml
+labels:
+  severity: critical   # Page immediately
+  severity: warning    # Slack, acknowledge in hours
+  severity: info       # Dashboard, no action needed
+```
+
+Stick to definitions consistently.
+
+**Alert categories:**
+
+**Category 1: Availability**
+
+User-facing functionality:
+
+```yaml
+- alert: ServiceDown
+  expr: up{job="my-service"} == 0
+  for: 2m
+
+- alert: HighErrorRate
+  expr: rate(http_errors[5m]) / rate(http_requests[5m]) > 0.05
+  for: 5m
+```
+
+**Category 2: Latency**
+
+```yaml
+- alert: HighLatency
+  expr: histogram_quantile(0.99, rate(http_duration_bucket[5m])) > 1
+  for: 10m
+```
+
+**Category 3: Saturation**
+
+Approaching capacity:
+
+```yaml
+- alert: HighCPU
+  expr: rate(container_cpu_usage_seconds_total[5m]) / on(pod) kube_pod_container_resource_limits{resource="cpu"} > 0.9
+  for: 15m
+```
+
+**Category 4: Errors (cause-based, lower severity)**
+
+```yaml
+- alert: TooManyOpenFiles
+  expr: process_open_fds / process_max_fds > 0.9
+  for: 10m
+  labels:
+    severity: warning
+```
+
+**Category 5: Business**
+
+```yaml
+- alert: NoOrdersInLast10Minutes
+  expr: rate(orders_total[10m]) == 0 and on() (hour() >= 9 and hour() <= 17)
+  for: 10m
+```
+
+**Standard alerts for K8s:**
+
+**Cluster level:**
+
+```yaml
+- alert: KubeAPIServerDown
+  expr: absent(up{job="apiserver"} == 1)
+  for: 5m
+
+- alert: KubeETCDDown
+  expr: up{job="kube-etcd"} == 0
+  for: 5m
+
+- alert: KubeNodeNotReady
+  expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+  for: 15m
+```
+
+**Workload level:**
+
+```yaml
+- alert: KubePodCrashLooping
+  expr: rate(kube_pod_container_status_restarts_total[10m]) > 0
+  for: 15m
+
+- alert: KubeDeploymentReplicasMismatch
+  expr: kube_deployment_status_replicas_available != kube_deployment_spec_replicas
+  for: 10m
+```
+
+**Resource level:**
+
+```yaml
+- alert: HighMemoryPressure
+  expr: kube_node_status_condition{condition="MemoryPressure",status="true"} == 1
+
+- alert: PVCFillingUp
+  expr: kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.85
+  for: 1h
+```
+
+**Workflow:**
+
+```
+1. Alert fires
+2. Routed to correct receiver
+3. On-call gets notification
+4. Acknowledges in PagerDuty
+5. Investigates using runbook
+6. Resolves
+7. Post-mortem if significant
+8. Improve runbook/alert
+```
+
+**Tuning alerts:**
+
+Track metrics:
+- Alerts per week
+- Acknowledgment time
+- False positive rate
+
+```promql
+# Alert frequency:
+sum by (alertname) (
+  increase(alertmanager_notifications_total{integration="pagerduty"}[7d])
+)
+```
+
+If alert fires too often: tune threshold, add `for` duration, or remove.
+
+**Anti-patterns:**
+
+**Anti-pattern 1: Alert on everything**
+
+"Just in case" alerts. Noise overwhelms signal.
+
+**Anti-pattern 2: Same severity for everything**
+
+Everything critical → nothing critical.
+
+**Anti-pattern 3: No runbook**
+
+Alert fires at 3am. On-call doesn't know what to do.
+
+**Anti-pattern 4: Static thresholds**
+
+CPU > 80% always. But normal varies by service.
+
+Better: anomaly detection, or relative thresholds.
+
+**Anti-pattern 5: No tuning**
+
+Set up once, never reviewed. Alerts decay in usefulness.
+
+**Best practices:**
+
+1. **Start minimal**: Few alerts. Add as needed.
+2. **SLO-based**: Tie to user impact.
+3. **Owner per alert**: Clear responsibility.
+4. **Runbooks**: For all alerts.
+5. **Regular review**: Monthly tuning.
+6. **Post-mortem driven**: Each incident reviews alerts.
+7. **Test routing**: Verify alerts go right place.
+8. **Track false positives**: Tune them down.
+
+**Production scenarios:**
+
+1. **Migrated to SLO-based**: Removed CPU/memory alerts. Added SLO burn rate alerts. Pages dropped 70%, real issues still caught.
+
+2. **Multi-window alerts**: Single 5m alert missed slow degradation. Added 1h alert. Now catches both spikes and gradual issues.
+
+3. **Runbook prevented escalation**: 3am alert, junior on-call. Runbook step-by-step led to fix in 15 minutes. Without runbook: would have escalated.
+
+4. **Tuned noisy alert**: Alert fired daily, always noise. Investigated, increased threshold + for duration. Now fires only on real issues.
+
+5. **Time-based routing**: Critical alerts page 24/7. Warnings only during business hours. Reduced unnecessary nights.
+
+---
+
+## 267. Explain SLI, SLO, and SLA
+
+These terms come from Site Reliability Engineering (SRE). They formalize how to think about service reliability.
+
+**SLI (Service Level Indicator):**
+
+A measurement. Quantifies a specific aspect of service quality.
+
+**Examples:**
+- Request success rate
+- P99 latency
+- Throughput
+- Availability
+
+**SLI formula:**
+
+```
+good events / total events
+```
+
+E.g., success rate:
+```
+successful_requests / total_requests
+```
+
+**SLO (Service Level Objective):**
+
+Target value for SLI. What's "good enough"?
+
+**Examples:**
+- 99.9% of requests succeed (over 30 days)
+- 99% of requests complete in <200ms
+- 99.95% availability
+
+**SLO defines:**
+- Target percentage
+- Time window
+- Acceptable error rate
+
+**SLA (Service Level Agreement):**
+
+Contractual commitment with consequences if not met.
+
+**Examples:**
+- 99.9% uptime, or service credit
+- 99.5% availability, or refund
+
+**Hierarchy:**
+
+```
+SLI: actual measurement
+  ↓
+SLO: target you aim for (internal)
+  ↓
+SLA: contractual promise (external, weaker than SLO)
+```
+
+Typical: SLA looser than SLO. Internal target stricter than contractual.
+
+**Error budget:**
+
+Derived from SLO:
+
+```
+SLO: 99.9% available
+Error budget: 0.1% of time can be unavailable
+```
+
+Over 30 days:
+```
+30 days × 24 hours × 60 min = 43,200 minutes
+0.1% = 43.2 minutes of allowed downtime
+```
+
+**Why error budgets matter:**
+
+**If we're under budget**: take more risk (deploy, change)
+**If we're over budget**: focus on reliability, slow down changes
+
+Balances innovation vs. reliability.
+
+**Designing SLIs:**
+
+**Good SLI characteristics:**
+
+- **Meaningful**: tied to user experience
+- **Measurable**: data available
+- **Bounded**: between 0 and 1
+- **Granular**: not just overall
+
+**Examples:**
+
+**Availability SLI:**
+
+```promql
+sum(rate(http_requests_total{status!~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+Fraction of non-5xx responses.
+
+**Latency SLI:**
+
+```promql
+sum(rate(http_request_duration_seconds_bucket{le="0.2"}[5m]))
+/
+sum(rate(http_request_duration_seconds_count[5m]))
+```
+
+Fraction of requests served <200ms.
+
+**Freshness SLI** (for data systems):
+
+```promql
+sum(rate(records_processed_within_threshold[5m]))
+/
+sum(rate(records_total[5m]))
+```
+
+Fraction of records processed within freshness target.
+
+**SLO time windows:**
+
+**Short window (1-7 days):**
+- Quickly detect issues
+- React to current burn
+
+**Long window (28-30 days):**
+- Industry standard
+- Smooths short-term variability
+- Matches reporting cycles
+
+Both: report on long, alert on short.
+
+**SLO percentages:**
+
+Common targets:
+- **99%**: 3.65 days/year downtime
+- **99.9%**: 8.76 hours/year
+- **99.95%**: 4.38 hours/year
+- **99.99%**: 52.6 minutes/year
+- **99.999%**: 5.26 minutes/year
+
+Higher = harder. Each "9" is 10x more reliable.
+
+Match to user impact:
+- Critical (payments): 99.99%+
+- Standard web: 99.9%
+- Internal tools: 99%
+
+**Choosing right SLO:**
+
+Consider:
+- Current performance (don't set unrealistic targets)
+- User expectations
+- Cost of higher reliability
+- Dependency reliability
+
+**Don't set 99.999% if you can only deliver 99.9%.** Causes constant alerts.
+
+**Error budget policies:**
+
+When budget healthy:
+- Deploy freely
+- Take on more changes
+- Experiment
+
+When budget exhausted:
+- Freeze non-critical changes
+- Focus on reliability
+- Pause feature work
+
+This is concrete decision-making framework.
+
+**SLO-based alerting:**
+
+Alert on error budget burn rate:
+
+```promql
+# 14x burn rate = budget exhausted in 2 days:
+(1 - sli) > 14 * (1 - slo)
+```
+
+For SLO 99.9% (0.1% errors allowed):
+- 14x burn = 1.4% errors
+- Alert at 1.4% errors over 1 hour
+
+**Burn rate examples:**
+
+```
+Burn rate 1x: budget lasts SLO window (30 days)
+Burn rate 2x: budget exhausted in 15 days
+Burn rate 10x: budget exhausted in 3 days
+Burn rate 60x: budget exhausted in 12 hours
+```
+
+Higher burn = more urgent.
+
+**Multi-burn-rate alerting:**
+
+```yaml
+# Fast burn (high severity):
+- alert: SLOBurnFast
+  expr: |
+    (
+      (1 - slo) > 14 * (1 - 0.999)
+    ) and (
+      (1 - slo_short) > 14 * (1 - 0.999)
+    )
+  for: 5m
+  labels:
+    severity: critical
+
+# Slow burn (lower severity):
+- alert: SLOBurnSlow
+  expr: |
+    (
+      (1 - slo) > 3 * (1 - 0.999)
+    ) and (
+      (1 - slo_short) > 3 * (1 - 0.999)
+    )
+  for: 1h
+  labels:
+    severity: warning
+```
+
+**SLO calculation tools:**
+
+**Pyrra:**
+
+```yaml
+apiVersion: pyrra.dev/v1alpha1
+kind: ServiceLevelObjective
+metadata:
+  name: my-app-availability
+spec:
+  target: "99.9"
+  window: 4w
+  indicator:
+    ratio:
+      errors:
+        metric: http_requests_total{status=~"5.."}
+      total:
+        metric: http_requests_total
+```
+
+Pyrra generates Prometheus rules, alerts.
+
+**Sloth:**
+
+Similar tool, declarative SLOs.
+
+**SLO dashboards:**
+
+Visualize:
+- Current SLI
+- SLO target line
+- Error budget remaining
+- Burn rate
+
+```promql
+# Error budget remaining:
+1 - (
+  (1 - rate(success[30d]))
+  /
+  (1 - 0.999)
+)
+```
+
+Negative = exceeded budget.
+
+**Practical SLO example:**
+
+**Service: Checkout API**
+
+**SLO 1: Availability**
+- SLI: % of requests returning non-5xx in <200ms
+- Target: 99.9% over 30 days
+- Error budget: ~43 min/month
+
+**SLO 2: Latency**
+- SLI: P99 latency
+- Target: <500ms over 7 days
+
+**Alerts:**
+- Critical: burn rate >14x for both fast (1h) and slow (5m) windows
+- Warning: burn rate >3x for fast (6h) and slow (30m) windows
+- Page when both conditions met (avoid false positives)
+
+**Production scenarios:**
+
+1. **SLO-based alerting migration**: Removed CPU/memory alerts (mostly noise). Implemented SLO-based for user-facing services. Page count dropped 70%, real issues still caught.
+
+2. **Error budget gated deploys**: If budget exhausted, deploys paused. Forced focus on reliability. Within 2 months, achieved consistent 99.9% SLO.
+
+3. **SLA discussions easier**: Customer wanted SLA. Used existing SLO data to negotiate realistic SLA (less strict than SLO).
+
+4. **Different SLOs per tier**: Tier 1 services: 99.99%. Tier 2: 99.9%. Tier 3: 99%. Cost-appropriate reliability.
+
+5. **Pyrra automated SLO management**: Defined SLOs in YAML, Pyrra generated all alerts. Easy to add new SLOs.
+
+---
+
+## 268. How do you define SLOs for microservices?
+
+Microservices SLOs require thoughtful design. Too strict = constant alerts. Too loose = users suffer. Per-service definition.
+
+**SLO design process:**
+
+**Step 1: Identify critical user journeys**
+
+What does the user actually care about?
+
+E-commerce:
+- Browse products
+- Add to cart
+- Checkout
+- Receive order confirmation
+
+Each is a journey. Each service plays a role.
+
+**Step 2: Map services to journeys**
+
+```
+Checkout journey:
+- API Gateway (entry)
+- Cart Service
+- Payment Service
+- Inventory Service
+- Order Service
+- Notification Service
+```
+
+Each service's SLO contributes to journey's reliability.
+
+**Step 3: Define SLIs per service**
+
+What measures success for this service?
+
+**API Gateway**: request success rate, latency
+**Cart Service**: cart operations success, latency
+**Payment Service**: payment success rate, payment latency
+**Database**: query success, query latency
+
+Service-specific SLIs.
+
+**Step 4: Set targets**
+
+**Considerations:**
+
+**Consideration 1: Dependency math**
+
+If service A depends on B, and both have 99.9%:
+```
+A availability = A's own (99.9%) × B's (99.9%) = 99.8%
+```
+
+A can't be more reliable than its dependencies.
+
+**Consideration 2: Aggregate to journey**
+
+```
+Journey = Gateway × Cart × Payment × Inventory × Order
+99.9% × 99.9% × 99.9% × 99.9% × 99.9% = 99.5%
+```
+
+5 services at 99.9% gives 99.5% end-to-end.
+
+For 99.9% journey reliability:
+- Need ~99.98% per service
+- Or fewer services
+- Or redundancy
+
+**Consideration 3: Tier services**
+
+Not all services need same SLO:
+
+**Tier 1**: critical path (payment, auth)
+- 99.99%+
+- Most monitoring, most resources
+
+**Tier 2**: important but graceful degradation possible
+- 99.9%
+- Standard monitoring
+
+**Tier 3**: nice-to-have, not critical
+- 99%
+- Less stringent
+
+**Step 5: Define multi-dimensional SLOs**
+
+Not just availability. Multiple aspects:
+
+```yaml
+service: payment-api
+slos:
+  - name: availability
+    sli: ratio of non-5xx responses
+    target: 99.9%
+    window: 30d
+  
+  - name: latency
+    sli: P95 latency
+    target: <300ms
+    window: 7d
+  
+  - name: payment-success
+    sli: successful payment / total payment attempts
+    target: 99.5%
+    window: 30d
+```
+
+Different aspects, different SLOs.
+
+**Step 6: Iterate**
+
+SLOs aren't set in stone:
+- Measure current performance
+- Set initial SLO slightly above current
+- Improve over time
+- Adjust as system changes
+
+**Example: e-commerce SLOs**
+
+**Tier 1 services:**
+
+```yaml
+# Payment service:
+availability: 99.99%
+latency_p95: 300ms
+
+# Auth service:
+availability: 99.99%
+latency_p95: 100ms
+
+# Order service:
+availability: 99.95%
+```
+
+**Tier 2 services:**
+
+```yaml
+# Cart service:
+availability: 99.9%
+latency_p95: 500ms
+
+# Inventory service:
+availability: 99.9%
+```
+
+**Tier 3 services:**
+
+```yaml
+# Recommendations:
+availability: 99%
+# If down, hide recommendations widget
+```
+
+**SLO documents:**
+
+Each service has SLO doc:
+
+```markdown
+# Payment Service SLO
+
+## Critical User Journey
+Customers complete payment for orders.
+
+## SLI Definition
+**Availability**: Ratio of payment requests returning success status.
+- Includes: HTTP 200-299
+- Excludes: HTTP 4xx (user errors)
+- Counts: HTTP 5xx as failures
+
+**Latency**: P95 of payment processing time.
+- Measured: from request receipt to response sent
+
+## SLO Targets
+- Availability: 99.99% over 30 days (4 min/month allowed downtime)
+- Latency: P95 < 300ms over 7 days
+
+## Error Budget Policy
+- Budget exhausted: freeze non-critical changes, focus reliability
+- Budget healthy: business as usual
+
+## Dependencies
+- Auth service (99.99%)
+- Database (99.99%)
+- Payment processor (99.9%)
+
+## Alerting
+- Burn rate 14x for 5m: page on-call
+- Burn rate 3x for 1h: Slack warning
+```
+
+**SLO governance:**
+
+**Service owners**: define and meet SLOs
+
+**Platform team**: provide tooling, frameworks
+
+**Leadership**: approve tier classifications
+
+Review quarterly: are SLOs realistic? Should we change tier?
+
+**Common challenges:**
+
+**Challenge 1: Defining SLI**
+
+What counts as success? Edge cases?
+
+Discussion needed. Document carefully.
+
+**Challenge 2: Data quality**
+
+SLI based on bad data = bad decisions.
+
+Verify metric collection accurate.
+
+**Challenge 3: Dependencies**
+
+Service A's SLO depends on B. B's SLO too low? A can't meet target.
+
+Cross-team alignment.
+
+**Challenge 4: Cost of high SLOs**
+
+99.999% costs much more than 99.9%. Diminishing returns.
+
+Match to actual user need.
+
+**Challenge 5: User errors vs system errors**
+
+```
+HTTP 400: user error (invalid input)
+HTTP 401: user error (not authenticated)
+HTTP 500: system error
+```
+
+Don't count user errors against availability SLO.
+
+**Tools:**
+
+**Prometheus rules:**
+
+```yaml
+groups:
+  - name: payment-slo
+    interval: 30s
+    rules:
+      - record: slo:availability:rate1h
+        expr: |
+          sum(rate(http_requests_total{job="payment", status=~"2.."}[1h]))
+          /
+          sum(rate(http_requests_total{job="payment"}[1h]))
+```
+
+Pre-compute SLI.
+
+**Sloth (declarative SLOs):**
+
+```yaml
+version: prometheus/v1
+service: payment-api
+slos:
+  - name: availability
+    objective: 99.9
+    sli:
+      events:
+        error_query: sum(rate(http_requests_total{status=~"5.."}[{{.window}}]))
+        total_query: sum(rate(http_requests_total[{{.window}}]))
+    alerting:
+      page:
+        burn_rate: 14
+```
+
+Generates rules, alerts.
+
+**Production scenarios:**
+
+1. **Tier-based SLO migration**: Defined 3 tiers. Tier 1 services (payments, auth) got 99.99%. Tier 2 (cart, profile) got 99.9%. Tier 3 (recommendations) got 99%. Right reliability for each.
+
+2. **Dependency analysis**: Service A SLO was 99.9%. Realized depends on B (99.9%) and C (99.9%). Math: max A could achieve was 99.7%. Adjusted A's SLO realistic.
+
+3. **SLOs drove improvement**: Set SLO 99.9% when achieving 99.5%. Forced focus on reliability. Within 3 months, achieving SLO consistently.
+
+4. **Excluded user errors**: Initial SLI included 4xx errors. Many were legitimate user errors. Excluded. SLO became more meaningful.
+
+5. **SLO-driven deploys**: When error budget low, deploys paused. Forced reliability focus. When budget healthy, faster shipping. Good balance.
+
+---
+
+## 269. Explain RED and USE methodologies
+
+These are frameworks for what to monitor. RED for services, USE for resources.
+
+**RED method (Tom Wilkie):**
+
+For request-driven services:
+
+**Rate**: requests per second
+**Errors**: error rate
+**Duration**: latency distribution
+
+**Three metrics per service.**
+
+**Rate:**
+
+```promql
+sum(rate(http_requests_total[5m]))
+```
+
+How busy is the service?
+
+**Errors:**
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+```
+
+Or error rate:
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+What proportion failing?
+
+**Duration:**
+
+```promql
+histogram_quantile(0.99,
+  sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+)
+```
+
+How long does it take?
+
+**Why RED:**
+
+- Simple: 3 metrics
+- User-facing: directly tied to user experience
+- Universal: applies to any request-driven service
+- Comparable: same metrics across services
+
+**Implementation:**
+
+```python
+# Instrument with Prometheus client:
+from prometheus_client import Counter, Histogram
+
+requests_total = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status']
+)
+
+request_duration = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration',
+    ['method', 'endpoint']
+)
+
+@app.route('/api/users')
+def get_users():
+    with request_duration.labels(method='GET', endpoint='/api/users').time():
+        # Handle request
+        ...
+    requests_total.labels(method='GET', endpoint='/api/users', status='200').inc()
+```
+
+**RED dashboard:**
+
+For each service:
+- Rate chart (requests/sec)
+- Errors chart (error rate or count)
+- Duration chart (P50, P95, P99 latencies)
+
+Quick health check.
+
+**RED limitations:**
+
+- Doesn't cover resource saturation
+- Doesn't help with background work (no requests)
+- Not great for asynchronous systems
+
+**USE method (Brendan Gregg):**
+
+For resources:
+
+**Utilization**: % of time resource busy
+**Saturation**: queue/waiting (resource overload)
+**Errors**: error count
+
+**Resources include:**
+- CPU
+- Memory
+- Disk
+- Network
+- Threads/processes
+
+**Per resource:**
+
+**Utilization:**
+
+```promql
+# CPU:
+rate(container_cpu_usage_seconds_total[5m])
+
+# Memory:
+container_memory_working_set_bytes / container_spec_memory_limit_bytes
+```
+
+How busy is the resource?
+
+**Saturation:**
+
+```promql
+# CPU: throttled time:
+rate(container_cpu_cfs_throttled_periods_total[5m])
+/
+rate(container_cpu_cfs_periods_total[5m])
+
+# Memory: page faults
+rate(container_memory_failcnt[5m])
+
+# Disk: I/O wait
+node_disk_io_time_seconds_total
+
+# Network: drops
+rate(node_network_receive_drop_total[5m])
+```
+
+Is resource queue building?
+
+**Errors:**
+
+```promql
+# Network errors:
+rate(node_network_receive_errs_total[5m])
+
+# Disk errors (from kernel logs):
+# Not directly in Prometheus, check dmesg
+```
+
+**Why USE:**
+
+- Identifies saturation (cause of slowness)
+- Resource-focused
+- Complements RED (services + resources)
+
+**RED + USE together:**
+
+**RED** at service level: am I serving users?
+**USE** at resource level: do I have capacity?
+
+Combined: complete picture.
+
+```
+User complaint: "Service slow"
+        ↓
+RED: see latency increased
+        ↓
+USE: see CPU at 95% utilization, throttling
+        ↓
+Root cause: resource saturation
+```
+
+**Per-service RED + USE:**
+
+```
+Service A:
+├─ Rate: 1000 req/sec
+├─ Errors: 0.5%
+├─ Duration P99: 200ms
+├─ CPU utilization: 60%
+├─ CPU saturation: 0% throttled
+├─ Memory utilization: 70%
+├─ Memory saturation: 0 OOM
+└─ Network: utilization OK, errors 0
+```
+
+Dashboard shows all.
+
+**Other methodologies:**
+
+**Four golden signals (Google SRE):**
+
+- **Latency**: time to serve requests
+- **Traffic**: request rate
+- **Errors**: failure rate
+- **Saturation**: how full
+
+Combines RED + USE concepts.
+
+**LETS (Tammy Bryant):**
+
+- **Latency**
+- **Errors**
+- **Traffic**
+- **Saturation**
+
+Similar concepts.
+
+**SRE workbook (Google):**
+
+Tier of importance:
+1. Symptoms (user-facing)
+2. Causes (resource constraints)
+3. Black-box vs white-box
+
+**Implementing RED:**
+
+**Service mesh:**
+
+Service mesh (Istio, Linkerd) automatically provides RED:
+
+```promql
+# Istio:
+sum(rate(istio_requests_total[5m])) by (destination_service)
+sum(rate(istio_requests_total{response_code=~"5.."}[5m])) by (destination_service)
+histogram_quantile(0.99, rate(istio_request_duration_milliseconds_bucket[5m]))
+```
+
+No instrumentation needed at app level.
+
+**API gateway:**
+
+NGINX, Envoy, etc. expose metrics:
+
+```promql
+nginx_ingress_controller_requests
+nginx_ingress_controller_request_duration_seconds
+```
+
+**App instrumentation:**
+
+Direct in code:
+
+```python
+# Prometheus Python client
+# OpenTelemetry
+# Vendor libraries (Datadog, New Relic)
+```
+
+**RED dashboard example:**
+
+```
+┌────────────────────────────────────────────┐
+│ Service: payment-api                       │
+├────────────────────────────────────────────┤
+│ Rate: 850 req/sec ▁▂▄█▆▅▃▂▁              │
+│ Errors: 0.3% ▁▁▁▁▂▁▁▁                    │
+│ P99 Latency: 180ms ▁▂▃▄▃▂▁                │
+│                                            │
+│ SLO Status: ✓ (99.95% available 30d)      │
+└────────────────────────────────────────────┘
+```
+
+Quick assessment.
+
+**USE dashboard example:**
+
+```
+┌────────────────────────────────────────────┐
+│ Pod: payment-api-7f8b9c                    │
+├────────────────────────────────────────────┤
+│ CPU: ▓▓▓▓▓▓░░░░ 60% (Throttle: 0%)        │
+│ Memory: ▓▓▓▓▓▓▓░░░ 70% (OOM: 0)          │
+│ Network: ▓▓░░░░░░░░ 20% (Errors: 0)       │
+│ Disk: ▓░░░░░░░░░ 10% (Errors: 0)          │
+└────────────────────────────────────────────┘
+```
+
+**When to use which:**
+
+**RED for:**
+- Service-level monitoring
+- User experience focus
+- SLO tracking
+- API services, web services
+
+**USE for:**
+- Resource capacity planning
+- Performance debugging
+- Infrastructure-focused
+
+**Both for:**
+- Complete service health
+- Root cause analysis
+- Capacity planning
+
+**Anti-patterns:**
+
+**Anti-pattern 1: Just one method**
+
+RED only: don't see capacity issues until users impacted.
+
+USE only: don't see service quality.
+
+Use both.
+
+**Anti-pattern 2: Too many metrics per service**
+
+50 metrics per service. No one reads. Focus.
+
+**Anti-pattern 3: No baselines**
+
+Metrics without context. "Is 200ms latency good?" depends.
+
+Establish baselines, set SLOs.
+
+**Anti-pattern 4: Average latencies**
+
+Averages hide tail latency:
+
+```
+Average: 100ms ← looks OK
+P99: 5s ← real problem affecting 1% users
+```
+
+Always look at percentiles.
+
+**Production scenarios:**
+
+1. **RED dashboards for all services**: Standardized: every service has RED dashboard. Same template, same metrics. Operators understand any service quickly.
+
+2. **USE for capacity planning**: Tracked USE over months. Identified CPU saturation 3 months before issues. Proactive scaling.
+
+3. **Service mesh provides RED**: Istio gave RED for free, no app instrumentation. Apps focus on business logic.
+
+4. **Combined dashboards**: Each service: RED on top half, USE on bottom half. Quick health + capacity view.
+
+5. **SLO based on RED**: SLOs defined from RED metrics. Error budget tracked. Drove reliability investment.
+
+---
+
+## 270. How do you monitor Kubernetes control plane?
+
+Control plane health is critical: if it fails, cluster operations break. Comprehensive monitoring is essential.
+
+**Control plane components:**
+
+- **API server**: gateway
+- **etcd**: state store
+- **Scheduler**: assigns pods
+- **Controller manager**: reconciliation
+- **Cloud controller manager**: cloud integration
+- **kubelet**: node agent (per node)
+- **kube-proxy**: networking (per node)
+
+Each needs monitoring.
+
+**API server monitoring:**
+
+**Metrics:**
+
+```promql
+# Request rate:
+sum(rate(apiserver_request_total[5m])) by (verb, resource, code)
+
+# Latency:
+histogram_quantile(0.99,
+  rate(apiserver_request_duration_seconds_bucket[5m])
+)
+
+# In-flight requests:
+apiserver_current_inflight_requests
+
+# Failures:
+sum(rate(apiserver_request_total{code=~"5.."}[5m]))
+
+# Throttled requests (APF):
+sum(rate(apiserver_flowcontrol_rejected_requests_total[5m]))
+
+# Webhook latency:
+histogram_quantile(0.99,
+  rate(apiserver_admission_webhook_admission_duration_seconds_bucket[5m])
+) by (name)
+```
+
+**Alerts:**
+
+```yaml
+- alert: APIServerDown
+  expr: absent(up{job="apiserver"} == 1)
+  for: 5m
+  labels:
+    severity: critical
+
+- alert: APIServerHighLatency
+  expr: histogram_quantile(0.99, rate(apiserver_request_duration_seconds_bucket{verb!="WATCH"}[5m])) > 1
+  for: 10m
+
+- alert: APIServerErrors
+  expr: sum(rate(apiserver_request_total{code=~"5.."}[5m])) > 10
+  for: 5m
+
+- alert: APIServerThrottling
+  expr: sum(rate(apiserver_flowcontrol_rejected_requests_total[5m])) > 0
+  for: 5m
+```
+
+**etcd monitoring:**
+
+Most critical. etcd issues affect everything.
+
+**Metrics:**
+
+```promql
+# Leader:
+etcd_server_has_leader
+
+# Leader changes:
+rate(etcd_server_leader_changes_seen_total[5m])
+
+# Disk fsync (critical):
+histogram_quantile(0.99,
+  rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])
+)
+
+# Backend commit:
+histogram_quantile(0.99,
+  rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])
+)
+
+# Database size:
+etcd_mvcc_db_total_size_in_bytes
+
+# Network peer latency:
+histogram_quantile(0.99,
+  rate(etcd_network_peer_round_trip_time_seconds_bucket[5m])
+)
+
+# Proposals failed:
+rate(etcd_server_proposals_failed_total[5m])
+```
+
+**Alerts:**
+
+```yaml
+- alert: EtcdDown
+  expr: up{job="kube-etcd"} == 0
+  for: 5m
+  labels:
+    severity: critical
+
+- alert: EtcdNoLeader
+  expr: etcd_server_has_leader == 0
+  for: 1m
+  labels:
+    severity: critical
+
+- alert: EtcdHighFsyncLatency
+  expr: histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) > 0.5
+  for: 10m
+
+- alert: EtcdDatabaseFull
+  expr: etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes > 0.8
+  for: 5m
+
+- alert: EtcdLeaderChanges
+  expr: rate(etcd_server_leader_changes_seen_total[5m]) > 0.1
+  for: 15m
+```
+
+**Scheduler monitoring:**
+
+**Metrics:**
+
+```promql
+# Up:
+up{job="kube-scheduler"}
+
+# Scheduling latency:
+histogram_quantile(0.99,
+  rate(scheduler_pod_scheduling_duration_seconds_bucket[5m])
+)
+
+# Scheduling attempts:
+sum(rate(scheduler_pod_scheduling_attempts_count[5m])) by (result)
+
+# Pending pods:
+sum(kube_pod_status_phase{phase="Pending"})
+
+# E2E scheduling latency:
+histogram_quantile(0.99,
+  rate(scheduler_e2e_scheduling_duration_seconds_bucket[5m])
+)
+```
+
+**Alerts:**
+
+```yaml
+- alert: SchedulerDown
+  expr: up{job="kube-scheduler"} == 0
+  for: 5m
+
+- alert: HighSchedulingLatency
+  expr: histogram_quantile(0.99, rate(scheduler_pod_scheduling_duration_seconds_bucket[5m])) > 5
+  for: 10m
+
+- alert: PodsPending
+  expr: sum(kube_pod_status_phase{phase="Pending"}) > 20
+  for: 30m
+```
+
+**Controller Manager monitoring:**
+
+```promql
+# Up:
+up{job="kube-controller-manager"}
+
+# Workqueue depth (per controller):
+workqueue_depth{job="kube-controller-manager"}
+
+# Workqueue latency:
+histogram_quantile(0.99,
+  rate(workqueue_queue_duration_seconds_bucket[5m])
+)
+```
+
+**Alerts:**
+
+```yaml
+- alert: ControllerManagerDown
+  expr: up{job="kube-controller-manager"} == 0
+  for: 5m
+
+- alert: WorkqueueBacklog
+  expr: workqueue_depth{job="kube-controller-manager"} > 100
+  for: 15m
+```
+
+**kubelet monitoring:**
+
+Per-node. Critical for pod scheduling and lifecycle.
+
+**Metrics:**
+
+```promql
+# Up:
+up{job="kubelet"}
+
+# PLEG latency:
+histogram_quantile(0.99,
+  rate(kubelet_pleg_relist_duration_seconds_bucket[5m])
+)
+
+# Pod start latency:
+histogram_quantile(0.99,
+  rate(kubelet_pod_start_duration_seconds_bucket[5m])
+)
+
+# Runtime operations:
+rate(kubelet_runtime_operations_errors_total[5m]) by (operation_type)
+```
+
+**Alerts:**
+
+```yaml
+- alert: KubeletDown
+  expr: up{job="kubelet"} == 0
+  for: 15m
+
+- alert: HighPLEG
+  expr: histogram_quantile(0.99, rate(kubelet_pleg_relist_duration_seconds_bucket[5m])) > 10
+  for: 5m
+```
+
+**Node monitoring:**
+
+Underlying VMs.
+
+```promql
+# Node ready:
+kube_node_status_condition{condition="Ready",status="true"}
+
+# Resource pressure:
+kube_node_status_condition{condition="MemoryPressure",status="true"}
+kube_node_status_condition{condition="DiskPressure",status="true"}
+kube_node_status_condition{condition="PIDPressure",status="true"}
+
+# CPU:
+sum(rate(node_cpu_seconds_total{mode!="idle"}[5m])) by (instance)
+
+# Memory:
+node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+
+# Disk:
+node_filesystem_avail_bytes / node_filesystem_size_bytes
+```
+
+**Workload monitoring:**
+
+```promql
+# Pod status:
+sum(kube_pod_status_phase) by (phase)
+
+# Restarts:
+rate(kube_pod_container_status_restarts_total[15m])
+
+# Replica mismatches:
+kube_deployment_status_replicas_available != kube_deployment_spec_replicas
+```
+
+**Cluster-level health:**
+
+```promql
+# Cluster overview:
+sum(kube_node_status_condition{condition="Ready",status="true"})
+sum(kube_pod_status_phase{phase="Running"})
+sum(kube_pod_status_phase{phase="Failed"})
+sum(kube_node_status_allocatable{resource="cpu"})
+```
+
+**Dashboards:**
+
+Standard dashboards:
+- API server
+- etcd
+- Scheduler
+- Controller manager
+- kubelet
+- Node overview
+- Cluster overview
+
+kube-prometheus-stack includes many.
+
+**Alert routing:**
+
+Control plane alerts:
+- Severity: critical (cluster-wide impact)
+- Route: ops-on-call (immediate response)
+- Page if active
+
+**Recovery procedures:**
+
+Runbooks for each component:
+
+**API server down:**
+1. Check `kubectl get nodes` from another master
+2. Check API server pod
+3. Restart API server static pod
+4. Check etcd connectivity
+
+**etcd issues:**
+1. Check etcd cluster health
+2. Look at leader changes
+3. Check disk performance
+4. Backup before action
+
+**Scheduler down:**
+1. Check pending pods (impact)
+2. Restart scheduler
+3. New pods deploy?
+
+**Cloud-managed clusters:**
+
+Many control plane components managed by cloud:
+- EKS, GKE, AKS handle control plane HA
+- You monitor what you can access
+- Cloud provider monitors what you can't
+
+EKS exposes via CloudWatch:
+- API server logs
+- Scheduler logs
+- Audit logs
+- Controller manager logs
+
+GKE/AKS similar.
+
+**Production scenarios:**
+
+1. **etcd fsync latency caught**: Alert fired on high fsync latency. Investigation: disk credits exhausted on gp2. Migrated to gp3. Latency normalized.
+
+2. **API server overload**: APF throttling alerts fired. Custom operator polling at high rate. Fixed operator, throttling stopped.
+
+3. **Leader changes investigated**: Alert on frequent etcd leader changes. Found: network issue between nodes causing transient failures. Fixed network.
+
+4. **Cloud-managed simplified**: Migrated from self-managed to GKE. No more managing control plane components. Focus on workloads.
+
+5. **Comprehensive dashboards**: Built standard dashboards using kube-prometheus-stack. New operators onboarded quickly with standard views.
+
+# Kubernetes Monitoring, Logging & Observability (271-290)
+
+## 271. Explain kube-state-metrics use cases
+
+kube-state-metrics (KSM) generates metrics about Kubernetes object state. Different from cAdvisor (resource usage); KSM is about desired vs actual state.
+
+**What KSM does:**
+
+Listens to Kubernetes API. Exposes metrics about objects:
+- Are pods running as expected?
+- Are deployments fully scaled?
+- Are nodes ready?
+- Are PVCs bound?
+
+**Architecture:**
+
+```
+KSM Pod
+  ↓ watches
+Kubernetes API
+  ↓ converts to metrics
+/metrics endpoint (Prometheus format)
+  ↓ scraped by
+Prometheus
+```
+
+**Key metrics:**
+
+**Pod state:**
+
+```promql
+# Pod phase:
+kube_pod_status_phase{phase="Running"}
+kube_pod_status_phase{phase="Pending"}
+kube_pod_status_phase{phase="Failed"}
+
+# Ready:
+kube_pod_status_ready{condition="true"}
+
+# Restarts:
+kube_pod_container_status_restarts_total
+
+# Container state:
+kube_pod_container_status_waiting_reason
+```
+
+**Deployment state:**
+
+```promql
+# Desired replicas:
+kube_deployment_spec_replicas
+
+# Available replicas:
+kube_deployment_status_replicas_available
+
+# Mismatch:
+kube_deployment_spec_replicas - kube_deployment_status_replicas_available
+```
+
+**Node state:**
+
+```promql
+# Ready:
+kube_node_status_condition{condition="Ready",status="true"}
+
+# Pressure conditions:
+kube_node_status_condition{condition="MemoryPressure"}
+kube_node_status_condition{condition="DiskPressure"}
+kube_node_status_condition{condition="PIDPressure"}
+
+# Allocatable:
+kube_node_status_allocatable{resource="cpu"}
+kube_node_status_allocatable{resource="memory"}
+```
+
+**PVC state:**
+
+```promql
+# Status:
+kube_persistentvolumeclaim_status_phase
+
+# Requested size:
+kube_persistentvolumeclaim_resource_requests_storage_bytes
+```
+
+**HPA state:**
+
+```promql
+# Current vs desired:
+kube_horizontalpodautoscaler_status_current_replicas
+kube_horizontalpodautoscaler_status_desired_replicas
+
+# Conditions:
+kube_horizontalpodautoscaler_status_condition
+```
+
+**Job state:**
+
+```promql
+# Status:
+kube_job_status_succeeded
+kube_job_status_failed
+kube_job_status_active
+
+# Completion time:
+kube_job_status_completion_time
+```
+
+**Common use cases:**
+
+**Use case 1: Detect failing deployments**
+
+```yaml
+- alert: DeploymentReplicasMismatch
+  expr: |
+    (
+      kube_deployment_spec_replicas
+      != 
+      kube_deployment_status_replicas_available
+    )
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} not fully available"
+```
+
+Detect deployments not fully scaled.
+
+**Use case 2: Detect crashlooping pods**
+
+```yaml
+- alert: PodCrashLooping
+  expr: |
+    rate(kube_pod_container_status_restarts_total[10m]) > 0
+  for: 10m
+  annotations:
+    description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} restarting"
+```
+
+**Use case 3: Pending pods**
+
+```yaml
+- alert: PendingPods
+  expr: |
+    sum by (namespace) (kube_pod_status_phase{phase="Pending"}) > 5
+  for: 30m
+```
+
+**Use case 4: Job failures**
+
+```yaml
+- alert: JobFailed
+  expr: |
+    kube_job_status_failed > 0
+  for: 1h
+```
+
+**Use case 5: PVC issues**
+
+```yaml
+- alert: PVCPending
+  expr: |
+    kube_persistentvolumeclaim_status_phase{phase="Pending"} == 1
+  for: 5m
+```
+
+**Use case 6: Node not ready**
+
+```yaml
+- alert: NodeNotReady
+  expr: |
+    kube_node_status_condition{condition="Ready",status="true"} == 0
+  for: 15m
+```
+
+**Use case 7: Capacity planning**
+
+```promql
+# Total cluster CPU:
+sum(kube_node_status_allocatable{resource="cpu"})
+
+# Used CPU (from requests):
+sum(kube_pod_container_resource_requests{resource="cpu"})
+
+# Utilization:
+sum(kube_pod_container_resource_requests{resource="cpu"}) 
+/
+sum(kube_node_status_allocatable{resource="cpu"})
+```
+
+Are we approaching cluster capacity?
+
+**Use case 8: Resource quota tracking**
+
+```promql
+# Usage vs limits:
+kube_resourcequota{type="used"} / kube_resourcequota{type="hard"}
+```
+
+Per-namespace resource consumption.
+
+**Use case 9: Object age**
+
+```promql
+# Old jobs (cleanup needed):
+time() - kube_job_status_start_time > 7 * 86400
+
+# Stuck pods:
+time() - kube_pod_start_time > 3600 
+and on(pod) kube_pod_status_phase{phase!="Running",phase!="Succeeded"}
+```
+
+**Use case 10: Label-based queries**
+
+KSM exposes object labels as metric labels:
+
+```promql
+# Pods by team:
+sum by (label_team) (kube_pod_labels)
+
+# Cost-center resource usage:
+sum by (label_cost_center) (
+  kube_pod_container_resource_requests{resource="cpu"}
+  * on(namespace, pod) group_left(label_cost_center)
+  kube_pod_labels
+)
+```
+
+**Combining KSM + cAdvisor:**
+
+KSM: state (desired, ready)
+cAdvisor: usage (actual CPU, memory)
+
+Together: complete picture.
+
+```promql
+# Pod requesting CPU vs using:
+kube_pod_container_resource_requests{resource="cpu"} 
+- on(pod, container)
+rate(container_cpu_usage_seconds_total[5m])
+```
+
+**Installation:**
+
+```yaml
+# Helm:
+helm install kube-state-metrics prometheus-community/kube-state-metrics
+
+# Or via kube-prometheus-stack (includes KSM)
+```
+
+**Configuration:**
+
+KSM auto-detects most resources. Optional configurations:
+
+```yaml
+# Specific namespaces only:
+- --namespaces=production,staging
+
+# Custom labels to expose:
+- --metric-labels-allowlist=*=team,cost-center
+
+# Custom annotations:
+- --metric-annotations-allowlist=*=ownership
+```
+
+**Cardinality considerations:**
+
+KSM produces many metrics. Tune:
+
+```yaml
+# Disable unneeded:
+- --resources=pods,deployments,nodes
+# Don't collect everything
+```
+
+**RBAC:**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-state-metrics
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "nodes", ...]
+    verbs: ["list", "watch"]
+```
+
+Read-only access to many resources.
+
+**Common dashboards:**
+
+Grafana dashboards using KSM:
+- Cluster overview
+- Deployment status
+- Pod health
+- Resource allocation
+- Capacity planning
+
+kube-prometheus-stack provides many out-of-the-box.
+
+**Production scenarios:**
+
+1. **Deployment monitoring**: KSM alert caught deployment stuck at 80% rollout for 30 min. Investigated, found bad config. Rolled back. Without KSM, would have noticed only when users complained.
+
+2. **Capacity planning**: KSM showed cluster at 85% CPU requested. Added nodes before users complained about pending pods. Proactive.
+
+3. **Cost allocation**: Used KSM labels (team, cost-center) joined with usage metrics. Per-team cost dashboards. Improved chargeback.
+
+4. **Failed job detection**: CronJob failures often missed. Alert on `kube_job_status_failed > 0`. Caught issues quickly.
+
+5. **Compliance reporting**: KSM showed all deployments running expected replicas. Evidence for SOC 2 availability controls.
+
+---
+
+## 272. How do you monitor etcd performance?
+
+etcd is the most performance-sensitive component. Slow etcd = slow cluster. Comprehensive monitoring essential.
+
+**Critical etcd metrics:**
+
+**Disk I/O metrics:**
+
+These are most important for etcd performance.
+
+```promql
+# WAL fsync (write-ahead log):
+histogram_quantile(0.99,
+  rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])
+)
+```
+
+Should be <10ms p99. Higher = slow disk = etcd performance problems.
+
+```promql
+# Backend commit (sync to disk):
+histogram_quantile(0.99,
+  rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])
+)
+```
+
+Should be <25ms p99.
+
+**Network metrics:**
+
+```promql
+# Peer round-trip time (between etcd nodes):
+histogram_quantile(0.99,
+  rate(etcd_network_peer_round_trip_time_seconds_bucket[5m])
+)
+```
+
+Should be <50ms p99. Higher = network issues between etcd members.
+
+**Cluster health:**
+
+```promql
+# Leader exists:
+etcd_server_has_leader
+
+# Leader changes:
+rate(etcd_server_leader_changes_seen_total[5m])
+```
+
+Frequent leader changes = instability.
+
+**Capacity:**
+
+```promql
+# Database size:
+etcd_mvcc_db_total_size_in_bytes
+
+# Quota:
+etcd_server_quota_backend_bytes
+
+# Utilization:
+etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes
+```
+
+Default quota: 2GB. Approaching 80% needs attention.
+
+**Performance counters:**
+
+```promql
+# Proposals (Raft):
+rate(etcd_server_proposals_committed_total[5m])
+rate(etcd_server_proposals_failed_total[5m])
+rate(etcd_server_proposals_pending[5m])
+
+# Watcher count:
+etcd_debugging_mvcc_watcher_total
+
+# Number of clients connected:
+etcd_server_client_count
+```
+
+**Slow operations:**
+
+```promql
+# Slow read indexes:
+rate(etcd_server_slow_read_indexes_total[5m])
+
+# Slow apply:
+rate(etcd_server_slow_apply_total[5m])
+```
+
+**Alert thresholds:**
+
+```yaml
+- alert: EtcdDown
+  expr: up{job="etcd"} == 0
+  for: 5m
+  labels:
+    severity: critical
+
+- alert: EtcdNoLeader
+  expr: etcd_server_has_leader == 0
+  for: 1m
+  labels:
+    severity: critical
+
+- alert: EtcdHighFsyncLatency
+  expr: |
+    histogram_quantile(0.99,
+      rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])
+    ) > 0.5
+  for: 10m
+  labels:
+    severity: warning
+
+- alert: EtcdHighCommitLatency
+  expr: |
+    histogram_quantile(0.99,
+      rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])
+    ) > 0.25
+  for: 10m
+
+- alert: EtcdLeaderChanges
+  expr: rate(etcd_server_leader_changes_seen_total[5m]) > 0.1
+  for: 15m
+
+- alert: EtcdDatabaseFull
+  expr: |
+    etcd_mvcc_db_total_size_in_bytes 
+    / etcd_server_quota_backend_bytes > 0.8
+  for: 10m
+  labels:
+    severity: critical
+
+- alert: EtcdProposalFailures
+  expr: rate(etcd_server_proposals_failed_total[5m]) > 0
+  for: 5m
+
+- alert: EtcdHighPeerLatency
+  expr: |
+    histogram_quantile(0.99,
+      rate(etcd_network_peer_round_trip_time_seconds_bucket[5m])
+    ) > 0.05
+  for: 10m
+```
+
+**Performance investigation workflow:**
+
+**Step 1: Check leader status**
+
+```bash
+# Are leadership changing?
+kubectl get --raw /metrics | grep etcd_server_has_leader
+kubectl get --raw /metrics | grep etcd_server_leader_changes_seen_total
+```
+
+Frequent changes indicate instability.
+
+**Step 2: Check disk performance**
+
+```bash
+# WAL fsync latency:
+kubectl get --raw /metrics | grep etcd_disk_wal_fsync_duration_seconds
+
+# If high, problem is disk
+```
+
+**Step 3: Check network**
+
+```bash
+# Peer RTT:
+kubectl get --raw /metrics | grep etcd_network_peer_round_trip
+```
+
+**Step 4: Check size**
+
+```bash
+# Database size approaching quota?
+kubectl get --raw /metrics | grep etcd_mvcc_db_total
+```
+
+**Common performance issues:**
+
+**Issue 1: Slow disk**
+
+Most common etcd problem. Solutions:
+
+- **Use SSDs**: required for production
+- **AWS**: gp3 with provisioned IOPS, or io1/io2
+- **GCP**: SSD persistent disks
+- **Local NVMe**: best performance
+- **Dedicated disk**: don't share with anything
+
+**Check disk:**
+
+```bash
+# Test disk latency on etcd node:
+fio --rw=write --ioengine=sync --fdatasync=1 \
+  --directory=/var/lib/etcd --size=22m --bs=2300 \
+  --name=mytest
+```
+
+Should show <10ms fsync latency.
+
+**Issue 2: Database too large**
+
+```bash
+# Check size:
+etcdctl --endpoints=https://localhost:2379 \
+  --cacert=/etc/etcd/ca.crt --cert=/etc/etcd/server.crt \
+  --key=/etc/etcd/server.key endpoint status
+```
+
+If close to 2GB quota:
+
+**Solution: Defragment**
+
+```bash
+# Per node, then move to next:
+etcdctl defrag --endpoints=$ENDPOINT
+```
+
+Reclaims space from deleted keys.
+
+**Solution: Compact**
+
+```bash
+# Compact to specific revision:
+etcdctl compact $(etcdctl endpoint status --write-out json | jq -r '.[0].Status.header.revision')
+```
+
+Automatic compaction (recommended):
+
+```yaml
+# etcd config:
+--auto-compaction-mode=periodic
+--auto-compaction-retention=1h
+```
+
+**Issue 3: Slow network**
+
+If peer RTT >50ms:
+- Check inter-node connectivity
+- Same AZ for etcd nodes (different AZs adds latency)
+- Network MTU
+- Network congestion
+
+**Issue 4: Excessive watchers**
+
+Many clients watching causes load:
+
+```promql
+etcd_debugging_mvcc_watcher_total
+```
+
+If thousands, investigate which clients have watches.
+
+**Issue 5: Heartbeat issues**
+
+```yaml
+# etcd config:
+--heartbeat-interval=100
+--election-timeout=1000
+```
+
+Default values usually fine. If issues:
+- heartbeat: 100ms
+- election: 1000ms (10x heartbeat)
+
+Too aggressive timeouts cause unnecessary leader changes.
+
+**Tuning etcd:**
+
+**Memory:**
+
+```yaml
+# Sufficient memory:
+resources:
+  requests:
+    memory: 4Gi   # For larger clusters
+  limits:
+    memory: 8Gi
+```
+
+**Quota:**
+
+```yaml
+# Increase if approaching 2GB:
+--quota-backend-bytes=8589934592   # 8GB
+```
+
+But: bigger DB = slower operations. Better to clean up unused data.
+
+**Compaction:**
+
+```yaml
+--auto-compaction-mode=periodic
+--auto-compaction-retention=1h
+```
+
+Without compaction, DB grows unbounded.
+
+**Logging:**
+
+```yaml
+# Production: minimal logging:
+--log-level=warn
+```
+
+Verbose logging affects performance.
+
+**Best practices:**
+
+1. **Dedicated disks**: SSDs/NVMe, not shared
+2. **Same AZ for nodes** (or carefully across AZs with good network)
+3. **3 or 5 nodes**: not more (more = slower consensus)
+4. **Monitoring**: comprehensive alerts
+5. **Regular backups**: automated
+6. **Defragmentation**: scheduled monthly
+7. **Sized appropriately**: memory for your cluster size
+
+**Dashboards:**
+
+Grafana dashboards for etcd:
+- Health overview
+- Performance metrics
+- Capacity utilization
+- Network latency between peers
+
+kube-prometheus-stack includes etcd dashboard.
+
+**Cloud-managed etcd:**
+
+EKS, GKE, AKS manage etcd. You monitor what's exposed:
+
+- EKS: limited etcd metrics
+- GKE: more detailed
+- AKS: similar to EKS
+
+You don't manage etcd directly but see health.
+
+**Production scenarios:**
+
+1. **Disk performance fix**: Alert on fsync latency >500ms. Investigation: gp2 EBS credits exhausted. Migrated to gp3. Latency normalized to 10ms.
+
+2. **Database approaching quota**: Alert on size 80%. Manual compaction + defrag + enabled auto-compaction. Size reduced to 30%.
+
+3. **Frequent leader changes**: Alert showed weekly leader changes. Investigation: network blips between AZs. Moved etcd to same AZ. Stability improved.
+
+4. **Excessive watchers**: 50k watchers detected. Custom operator polling-via-watch instead of using single watch with shared cache. Fixed operator, watchers dropped to 5k.
+
+5. **Performance testing**: Before production, ran fio on etcd disk. Identified slow disk before it caused issues. Switched to faster storage.
+
+---
+
+## 273. Explain distributed tracing in Kubernetes
+
+Distributed tracing tracks requests as they flow through multiple services. Essential for debugging microservices.
+
+**The problem traces solve:**
+
+```
+User request → API Gateway → Auth Service → Payment Service → Database
+                                    ↓
+                              Fraud Service
+                                    ↓
+                              Logging Service
+```
+
+Request fails. Where? Logs from 6 services scattered.
+
+Traces show the entire flow as a single tree.
+
+**Trace concepts:**
+
+**Trace**: complete journey of a request through the system.
+
+**Span**: single operation within a trace (one service call).
+
+**Spans form a tree:**
+
+```
+Trace (request ID: abc123)
+├── Span: API Gateway (50ms total)
+│   ├── Span: Auth Service (10ms)
+│   ├── Span: Payment Service (35ms)
+│   │   ├── Span: Database Query (5ms)
+│   │   └── Span: Fraud Service (25ms)
+│   └── Span: Notification (5ms)
+```
+
+Each span has:
+- Operation name
+- Start/end time
+- Tags (metadata)
+- Logs (events)
+- Parent span reference
+
+**Context propagation:**
+
+How do spans link across services?
+
+```
+Service A creates Span
+  ↓ adds trace ID + span ID to HTTP headers
+HTTP request to Service B
+  ↓ extracts trace ID + span ID
+Service B creates child Span
+  ↓
+And so on...
+```
+
+Headers (W3C Trace Context):
+- `traceparent`: identifies trace
+- `tracestate`: vendor-specific
+
+**Instrumentation:**
+
+Code generates spans:
+
+```python
+# OpenTelemetry Python:
+from opentelemetry import trace
+
+tracer = trace.get_tracer(__name__)
+
+@app.route('/api/users/<user_id>')
+def get_user(user_id):
+    with tracer.start_as_current_span("get_user") as span:
+        span.set_attribute("user.id", user_id)
+        
+        # Call other service
+        with tracer.start_as_current_span("db_query"):
+            user = db.get_user(user_id)
+        
+        return jsonify(user)
+```
+
+OpenTelemetry SDK automatically:
+- Generates trace IDs
+- Propagates context via headers
+- Sends spans to collector
+
+**Architecture in Kubernetes:**
+
+```
+App pods (instrumented with OpenTelemetry SDK)
+        ↓ OTLP protocol
+OpenTelemetry Collector (DaemonSet or Deployment)
+        ↓
+Trace backend (Tempo, Jaeger, etc.)
+        ↓
+Visualization (Grafana, Jaeger UI)
+```
+
+**OpenTelemetry Collector:**
+
+Receives, processes, exports traces:
+
+```yaml
+# config.yaml:
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  
+  attributes:
+    actions:
+      - key: cluster
+        value: prod
+        action: insert
+
+exporters:
+  otlp:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, attributes]
+      exporters: [otlp]
+```
+
+**Sampling:**
+
+Don't trace every request:
+
+```yaml
+processors:
+  probabilistic_sampler:
+    sampling_percentage: 10   # 10% of traces
+```
+
+Trade-off: coverage vs cost/performance.
+
+**Tail-based sampling:**
+
+Better: decide after seeing the trace.
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - name: errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: slow
+        type: latency
+        latency: {threshold_ms: 1000}
+      - name: probabilistic
+        type: probabilistic
+        probabilistic: {sampling_percentage: 1}
+```
+
+Always keep errors and slow requests. Sample others.
+
+**Service mesh tracing:**
+
+Istio, Linkerd auto-generate spans:
+
+```yaml
+# Istio enables tracing:
+spec:
+  meshConfig:
+    enableTracing: true
+    defaultProviders:
+      tracing:
+        - tempo
+```
+
+App doesn't need instrumentation for service-to-service spans. But still needs SDK for internal spans.
+
+**Common backends:**
+
+**Jaeger:**
+
+CNCF-graduated. Mature.
+
+```yaml
+# Jaeger all-in-one (dev):
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - port: 16686  # UI
+    - port: 14250  # gRPC
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+spec:
+  template:
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:latest
+```
+
+**Tempo (Grafana):**
+
+Object-storage based, scales well.
+
+```yaml
+# Tempo:
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tempo
+spec:
+  ...
+```
+
+Cheaper than Jaeger at scale (uses S3).
+
+**Zipkin:**
+
+Older, still popular.
+
+**Cloud-managed:**
+
+- Datadog APM
+- AWS X-Ray
+- GCP Cloud Trace
+- Azure Application Insights
+
+**Trace querying:**
+
+In Tempo/Jaeger UI:
+- Find by trace ID
+- Filter by service, operation
+- Filter by tags (user_id, error)
+- Filter by duration
+- Compare traces
+
+**Use cases:**
+
+**Use case 1: Find slow requests**
+
+Filter by duration >1s. See which spans took longest.
+
+**Use case 2: Find errors**
+
+Filter by error tag. Trace shows where error originated.
+
+**Use case 3: Service dependencies**
+
+Visualize call graph: A calls B, B calls C, etc.
+
+**Use case 4: Performance optimization**
+
+Identify N+1 queries, sequential calls that could be parallel.
+
+**Use case 5: User-specific debugging**
+
+User reports issue. Find their trace ID. See exact path.
+
+**Sampling strategies:**
+
+**Always-on (low traffic):**
+```yaml
+sampling_percentage: 100
+```
+
+**Probabilistic:**
+```yaml
+sampling_percentage: 1   # 1%
+```
+
+**Tail-based:**
+- Always sample errors
+- Always sample slow
+- Sample 1% normal
+
+**Rate-limited:**
+- Max 100 traces/sec
+- Prevents trace storms
+
+**Costs:**
+
+Tracing has cost:
+- Instrumentation overhead in apps (1-3%)
+- Storage (lots of data)
+- Network (sending to collector)
+
+Sample appropriately.
+
+**Best practices:**
+
+1. **Use OpenTelemetry**: open standard
+2. **Tail-based sampling**: keep important traces
+3. **Add useful attributes**: user_id, customer_id (for filtering)
+4. **Trace context in logs**: link logs to traces
+5. **Service mesh for service-to-service**: less app instrumentation needed
+6. **Don't trace synchronously**: async export to avoid blocking
+
+**Correlation with logs:**
+
+Include trace_id in logs:
+
+```json
+{
+  "timestamp": "2025-01-15T10:30:00Z",
+  "level": "ERROR",
+  "message": "Database query failed",
+  "trace_id": "abc123",
+  "span_id": "def456"
+}
+```
+
+In Grafana: click log → jump to trace.
+
+**Production scenarios:**
+
+1. **Traces identified bottleneck**: User complaints about slow page loads. Traces showed 80% of time in one DB query. Optimized query, latency dropped 5x.
+
+2. **N+1 query found**: Trace showed 100 sequential DB calls for one request. Refactored to batch query. Latency dropped from 2s to 50ms.
+
+3. **Tail sampling**: 100% sampling too expensive. Implemented tail sampling: all errors + slow + 1% normal. Cost dropped 95%, useful traces preserved.
+
+4. **Service mesh provided traces**: Istio auto-generated service-to-service traces. Apps only added attribute spans. Minimal instrumentation work.
+
+5. **Cross-service debugging**: Bug spanned 5 services. Trace showed exact flow, where error occurred. Without trace: would have taken hours.
+
+---
+
+## 274. How do you implement OpenTelemetry
+
+OpenTelemetry (OTel) is the vendor-neutral standard for observability. Implementing it provides flexibility and avoids vendor lock-in.
+
+**What OpenTelemetry provides:**
+
+- **APIs**: language-agnostic interfaces
+- **SDKs**: language-specific implementations
+- **Collector**: receives, processes, exports telemetry
+- **Protocol (OTLP)**: standard wire protocol
+- **Semantic conventions**: standard attribute names
+
+Covers metrics, logs, traces.
+
+**Architecture:**
+
+```
+Application
+  └─ OpenTelemetry SDK
+       ↓ OTLP
+OpenTelemetry Collector
+       ↓
+Backends (Tempo, Loki, Prometheus, Datadog, etc.)
+```
+
+**Step 1: Instrument applications**
+
+**Python:**
+
+```python
+# Install:
+# pip install opentelemetry-api opentelemetry-sdk opentelemetry-instrumentation-flask
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
+# Setup tracer:
+trace.set_tracer_provider(TracerProvider())
+tracer_provider = trace.get_tracer_provider()
+tracer_provider.add_span_processor(
+    BatchSpanProcessor(OTLPSpanExporter(endpoint="otel-collector:4317", insecure=True))
+)
+
+# Auto-instrument:
+FlaskInstrumentor().instrument()  # Auto-instruments Flask
+RequestsInstrumentor().instrument()  # Auto-instruments requests library
+
+# Manual spans:
+tracer = trace.get_tracer(__name__)
+
+@app.route('/api/users/<user_id>')
+def get_user(user_id):
+    with tracer.start_as_current_span("get_user_handler") as span:
+        span.set_attribute("user.id", user_id)
+        user = db.query(user_id)
+        return jsonify(user)
+```
+
+**Java:**
+
+```java
+// Maven dependencies:
+// io.opentelemetry:opentelemetry-api
+// io.opentelemetry:opentelemetry-sdk
+// io.opentelemetry.instrumentation:opentelemetry-instrumentation-api
+
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.Tracer;
+
+// Initialize:
+OpenTelemetry openTelemetry = ...;
+Tracer tracer = openTelemetry.getTracer("my-app");
+
+// Create spans:
+Span span = tracer.spanBuilder("operation-name").startSpan();
+try (Scope scope = span.makeCurrent()) {
+    span.setAttribute("user.id", userId);
+    // Do work
+} finally {
+    span.end();
+}
+```
+
+**Go:**
+
+```go
+import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+    "go.opentelemetry.io/otel/sdk/trace"
+)
+
+tp := trace.NewTracerProvider(
+    trace.WithBatcher(otlptracegrpc.NewClient(
+        otlptracegrpc.WithEndpoint("otel-collector:4317"),
+        otlptracegrpc.WithInsecure(),
+    )),
+)
+otel.SetTracerProvider(tp)
+
+tracer := otel.Tracer("my-app")
+ctx, span := tracer.Start(ctx, "operation-name")
+span.SetAttributes(attribute.String("user.id", userID))
+defer span.End()
+```
+
+**Node.js:**
+
+```javascript
+const { NodeTracerProvider } = require('@opentelemetry/sdk-trace-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-grpc');
+
+const provider = new NodeTracerProvider();
+provider.addSpanProcessor(new BatchSpanProcessor(new OTLPTraceExporter({
+  url: 'otel-collector:4317',
+})));
+provider.register();
+
+const tracer = trace.getTracer('my-app');
+const span = tracer.startSpan('operation-name');
+// Do work
+span.end();
+```
+
+**Auto-instrumentation:**
+
+Many languages support automatic instrumentation:
+
+```bash
+# Java agent (no code changes):
+java -javaagent:opentelemetry-javaagent.jar \
+  -Dotel.exporter.otlp.endpoint=http://otel-collector:4317 \
+  -jar my-app.jar
+
+# Python auto-instrumentation:
+opentelemetry-instrument \
+  --traces_exporter otlp \
+  --exporter_otlp_endpoint otel-collector:4317 \
+  python app.py
+```
+
+Instruments common libraries (HTTP, databases, frameworks) without code changes.
+
+**Step 2: Deploy OpenTelemetry Collector**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: 'apps'
+              kubernetes_sd_configs:
+                - role: pod
+    
+    processors:
+      batch:
+        timeout: 1s
+      memory_limiter:
+        limit_mib: 1500
+      attributes:
+        actions:
+          - key: cluster
+            value: prod
+            action: insert
+    
+    exporters:
+      otlp/tempo:
+        endpoint: tempo:4317
+        tls:
+          insecure: true
+      otlphttp/loki:
+        endpoint: http://loki:3100/otlp
+      prometheusremotewrite:
+        endpoint: http://prometheus:9090/api/v1/write
+    
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, attributes]
+          exporters: [otlp/tempo]
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [memory_limiter, batch]
+          exporters: [prometheusremotewrite]
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlphttp/loki]
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:latest
+          args:
+            - --config=/conf/config.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+          ports:
+            - containerPort: 4317  # OTLP gRPC
+            - containerPort: 4318  # OTLP HTTP
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+```
+
+**Deployment patterns:**
+
+**Pattern 1: Sidecar**
+
+OTel collector as sidecar in each pod. Local collection, then to central.
+
+**Pattern 2: DaemonSet**
+
+Collector on every node. Apps send to local node's collector.
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector-agent
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:latest
+```
+
+**Pattern 3: Deployment (centralized)**
+
+Central collector(s). All apps send here.
+
+Most flexible. Common pattern: agent (DaemonSet) → gateway (Deployment).
+
+**Step 3: Configure exporters**
+
+Send to your backends:
+
+```yaml
+exporters:
+  # Traces to Tempo:
+  otlp/tempo:
+    endpoint: tempo:4317
+  
+  # Logs to Loki:
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+  
+  # Metrics to Prometheus:
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+  
+  # Or to Datadog:
+  datadog:
+    api:
+      key: ${DD_API_KEY}
+  
+  # Or to multiple:
+  # Each pipeline can have multiple exporters
+```
+
+**Step 4: Add semantic conventions**
+
+Use standard attribute names:
+
+```python
+# Standard names:
+span.set_attribute("http.method", "GET")
+span.set_attribute("http.url", "/api/users")
+span.set_attribute("http.status_code", 200)
+span.set_attribute("user.id", user_id)
+span.set_attribute("service.name", "user-service")
+```
+
+OTel defines standard names (HTTP, database, RPC, etc.). Use them.
+
+**Step 5: Configure sampling**
+
+```yaml
+processors:
+  probabilistic_sampler:
+    sampling_percentage: 10
+  
+  # Or tail-based:
+  tail_sampling:
+    policies:
+      - name: errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: slow
+        type: latency
+        latency: {threshold_ms: 500}
+      - name: sample
+        type: probabilistic
+        probabilistic: {sampling_percentage: 1}
+```
+
+**Step 6: Correlate signals**
+
+Include trace context in logs:
+
+```python
+# In log formatting:
+import logging
+from opentelemetry import trace
+
+class TraceContextFilter(logging.Filter):
+    def filter(self, record):
+        span = trace.get_current_span()
+        if span.is_recording():
+            ctx = span.get_span_context()
+            record.trace_id = format(ctx.trace_id, '032x')
+            record.span_id = format(ctx.span_id, '016x')
+        return True
+```
+
+Now logs have trace_id, can link to traces.
+
+**Metrics with OpenTelemetry:**
+
+```python
+from opentelemetry import metrics
+
+meter = metrics.get_meter(__name__)
+
+request_counter = meter.create_counter(
+    "http.requests",
+    description="Total HTTP requests"
+)
+
+request_counter.add(1, {"method": "GET", "endpoint": "/api/users"})
+```
+
+Same SDK, metrics + traces + logs.
+
+**Common challenges:**
+
+**Challenge 1: Performance overhead**
+
+Instrumentation has cost. Mitigations:
+- Async export (batch processor)
+- Sampling
+- Limit attributes
+
+**Challenge 2: Cardinality**
+
+Don't add high-cardinality attributes (user_id) to metrics (use traces).
+
+**Challenge 3: Library compatibility**
+
+Some libraries don't auto-instrument well. Manual spans needed.
+
+**Challenge 4: Vendor specifics**
+
+Different backends support different features. OTel reduces but doesn't eliminate.
+
+**Migration approach:**
+
+If on vendor SDK (Datadog, New Relic):
+1. Add OpenTelemetry alongside
+2. Both running in parallel
+3. Verify data quality
+4. Remove vendor SDK
+5. Configure OTel to send to vendor
+
+**Operator pattern:**
+
+OpenTelemetry Operator simplifies:
+
+```yaml
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: collector
+spec:
+  mode: deployment
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+    ...
+```
+
+Operator manages collector deployments.
+
+**Auto-instrumentation injection:**
+
+```yaml
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: my-instrumentation
+spec:
+  exporter:
+    endpoint: http://otel-collector:4317
+  java:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest
+
+---
+# Pod annotation:
+metadata:
+  annotations:
+    instrumentation.opentelemetry.io/inject-java: "true"
+```
+
+Operator auto-injects instrumentation. No app changes.
+
+**Production scenarios:**
+
+1. **Replaced multiple SDKs**: Different services used Jaeger, Zipkin, Datadog SDKs. Migrated all to OpenTelemetry. Single instrumentation, multiple backend support.
+
+2. **Auto-instrumentation reduced effort**: Manual instrumentation for Java apps was time-consuming. Switched to OpenTelemetry agent. Comprehensive traces with zero code changes.
+
+3. **Vendor switch enabled**: Moved from Datadog APM to self-hosted Tempo+Grafana. Apps unchanged (used OpenTelemetry). Saved significant cost.
+
+4. **Correlation across signals**: Trace_id in logs let operators jump from log → trace. Investigation time dropped significantly.
+
+5. **Tail sampling adopted**: Initial probabilistic sampling missed errors. Switched to tail-based: always sample errors and slow. Better signal-to-noise.
+
+---
+
+## 275. Explain Jaeger architecture
+
+Jaeger is a popular distributed tracing system. Originally from Uber, now CNCF graduated.
+
+**Components:**
+
+```
+┌───────────────────────────────────────────┐
+│           Application                     │
+│   (with Jaeger SDK or OpenTelemetry)      │
+└──────────────────┬────────────────────────┘
+                   │ spans
+                   ↓
+┌──────────────────────────────────────────┐
+│          Jaeger Agent (DaemonSet)        │
+│   (Receives, batches, forwards)          │
+└──────────────────┬───────────────────────┘
+                   ↓
+┌──────────────────────────────────────────┐
+│        Jaeger Collector                  │
+│   (Validates, indexes, stores)           │
+└──────────────────┬───────────────────────┘
+                   ↓
+┌──────────────────────────────────────────┐
+│     Storage (Cassandra/Elasticsearch)    │
+└──────────────────┬───────────────────────┘
+                   ↓
+┌──────────────────────────────────────────┐
+│        Jaeger Query Service              │
+│   (Reads from storage)                   │
+└──────────────────┬───────────────────────┘
+                   ↓
+┌──────────────────────────────────────────┐
+│         Jaeger UI                        │
+│   (Web interface for visualization)      │
+└──────────────────────────────────────────┘
+```
+
+**Component details:**
+
+**Jaeger Agent:**
+
+- Runs as DaemonSet (one per node)
+- Apps send to localhost (UDP)
+- Batches and forwards to Collector
+- Decouples app from Collector availability
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: jaeger-agent
+spec:
+  template:
+    spec:
+      containers:
+        - name: jaeger-agent
+          image: jaegertracing/jaeger-agent:latest
+          args:
+            - --reporter.grpc.host-port=jaeger-collector:14250
+          ports:
+            - containerPort: 6831
+              protocol: UDP
+```
+
+**Jaeger Collector:**
+
+- Receives spans from Agents
+- Validates and processes
+- Stores in backend
+- Stateless, can scale horizontally
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger-collector
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: jaeger-collector
+          image: jaegertracing/jaeger-collector:latest
+          env:
+            - name: SPAN_STORAGE_TYPE
+              value: elasticsearch
+            - name: ES_SERVER_URLS
+              value: http://elasticsearch:9200
+          ports:
+            - containerPort: 14250
+            - containerPort: 14267
+```
+
+**Storage:**
+
+Options:
+- **Cassandra**: scalable, common
+- **Elasticsearch**: rich querying, common
+- **Kafka** + storage: buffering option
+- **In-memory**: dev only
+
+```yaml
+# Elasticsearch storage:
+env:
+  - name: SPAN_STORAGE_TYPE
+    value: elasticsearch
+  - name: ES_SERVER_URLS
+    value: http://elasticsearch:9200
+```
+
+**Query Service:**
+
+- Reads from storage
+- Provides API for UI
+- Backend for queries
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger-query
+spec:
+  template:
+    spec:
+      containers:
+        - name: jaeger-query
+          image: jaegertracing/jaeger-query:latest
+          env:
+            - name: SPAN_STORAGE_TYPE
+              value: elasticsearch
+            - name: ES_SERVER_URLS
+              value: http://elasticsearch:9200
+          ports:
+            - containerPort: 16686
+```
+
+**Jaeger UI:**
+
+Web interface to:
+- Search traces (by service, operation, tags)
+- View trace details
+- Compare traces
+- Service dependency graph
+- System architecture diagram
+
+**Deployment modes:**
+
+**Mode 1: All-in-One (dev)**
+
+Single binary, all components, in-memory storage:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+spec:
+  template:
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:latest
+          ports:
+            - containerPort: 16686  # UI
+            - containerPort: 14268  # HTTP collector
+            - containerPort: 14250  # gRPC collector
+```
+
+Good for testing, not production.
+
+**Mode 2: Production (separated components)**
+
+Each component as separate deployment:
+- Agent: DaemonSet
+- Collector: Deployment (HA)
+- Query: Deployment (HA)
+- Storage: Elasticsearch or Cassandra (HA)
+
+**Mode 3: Jaeger Operator**
+
+Operator manages Jaeger via CRDs:
+
+```yaml
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: my-jaeger
+spec:
+  strategy: production
+  storage:
+    type: elasticsearch
+    options:
+      es:
+        server-urls: http://elasticsearch:9200
+  ingress:
+    enabled: true
+```
+
+Operator handles deployments.
+
+**Sampling:**
+
+Jaeger supports multiple strategies:
+
+**Probabilistic (constant rate):**
+
+```json
+{
+  "type": "probabilistic",
+  "param": 0.1
+}
+```
+
+10% of traces.
+
+**Rate limiting:**
+
+```json
+{
+  "type": "ratelimiting",
+  "param": 100
+}
+```
+
+100 traces/sec maximum.
+
+**Remote configuration:**
+
+App fetches sampling config from Agent:
+
+```json
+{
+  "default_strategy": {
+    "type": "probabilistic",
+    "param": 0.01
+  },
+  "per_service_strategies": [
+    {
+      "service": "checkout",
+      "type": "probabilistic",
+      "param": 0.5
+    }
+  ]
+}
+```
+
+Different services, different rates.
+
+**Adaptive sampling:**
+
+Jaeger adjusts rates based on traffic. Per-operation.
+
+**Adaptive sampling (Collector):**
+
+```yaml
+SAMPLING_STRATEGIES_RECEIVER_TYPE: kafka
+ENABLE_ADAPTIVE_SAMPLING: true
+```
+
+Sampling rates adjust to keep target trace volume.
+
+**Trace querying:**
+
+UI lets you:
+
+**Find by service:**
+```
+service=payment-api
+```
+
+**Find by operation:**
+```
+service=payment-api
+operation=POST /api/charge
+```
+
+**Find by tags:**
+```
+tags={error: true}
+tags={user.id: 12345}
+```
+
+**Find by duration:**
+```
+min_duration=1s
+```
+
+**Time range:**
+```
+lookback=2h
+```
+
+**Trace visualization:**
+
+Shows:
+- Timeline of spans (gantt chart)
+- Service map
+- Logs within spans
+- Errors highlighted
+- Critical path
+
+Click a span to see:
+- Tags
+- Logs
+- Stack trace (if error)
+- Process info
+
+**Service dependency graph:**
+
+```
+API Gateway → Auth → DB
+            → Cart → DB
+            → Payment → Stripe (external)
+                     → Fraud → DB
+```
+
+Visualizes how services interact.
+
+**Integration with OpenTelemetry:**
+
+Jaeger supports OTLP natively:
+
+```yaml
+# Modern Jaeger receives OTLP:
+ports:
+  - containerPort: 4317  # OTLP gRPC
+  - containerPort: 4318  # OTLP HTTP
+```
+
+Apps using OpenTelemetry SDK can send directly to Jaeger.
+
+**Scaling Jaeger:**
+
+**Collector scaling:**
+
+```yaml
+spec:
+  replicas: 10   # Based on span volume
+```
+
+Stateless, scales horizontally.
+
+**Storage scaling:**
+
+Elasticsearch or Cassandra cluster sized for span volume:
+- 10M spans/day = ~5GB/day
+- Retention typically 7-30 days
+
+**Index management:**
+
+```yaml
+# Index per day:
+spec:
+  storage:
+    options:
+      es:
+        index-prefix: jaeger
+        max-doc-count: 20000000
+        max-span-age: 24h
+```
+
+Old indices deleted automatically.
+
+**Performance considerations:**
+
+**Span volume:**
+
+```
+Apps × Avg traces × spans/trace × sampling rate
+100 × 1M traces/day × 10 spans × 0.01 = 10M spans/day
+```
+
+Scale infrastructure accordingly.
+
+**Storage:**
+
+Spans are large (1-5KB each):
+- 10M spans/day × 2KB = 20GB/day
+- 30-day retention = 600GB
+
+**Search latency:**
+
+Elasticsearch must be sized for query patterns.
+
+**Production scenarios:**
+
+1. **Jaeger operator deployment**: Used Jaeger operator. Defined Jaeger CRD. Operator created collector, query, agent. Easy management.
+
+2. **Migration to Tempo**: Jaeger storage costs grew. Migrated to Grafana Tempo (S3-based). 90% storage cost reduction. Less rich querying but acceptable.
+
+3. **Service dependency graph**: Used Jaeger to understand microservice architecture. Identified unexpected dependencies. Refactored.
+
+4. **Critical path analysis**: Slow endpoint. Jaeger showed critical path: 80% in one DB query. Optimized query. Latency dropped 5x.
+
+5. **OpenTelemetry + Jaeger**: Apps used OpenTelemetry SDK, exported to Jaeger via OTLP. Standard instrumentation, popular backend.
+
+---
+
+## 276. How do you correlate logs, metrics, and traces?
+
+Correlation across observability signals is essential for fast debugging. Without correlation, you have three separate datasets.
+
+**The problem:**
+
+```
+Metrics: error rate spiked at 10:30
+Logs: many entries around 10:30, which are relevant?
+Traces: which traces show the issue?
+```
+
+Without correlation: manual matching by timestamp.
+
+With correlation: click metric anomaly → see logs → see traces.
+
+**Correlation IDs:**
+
+**Trace ID:**
+
+Most important correlation identifier:
+
+```
+trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+```
+
+Generated when request enters system. Propagated through all services.
+
+**Include in:**
+- Metrics (as exemplar, not label)
+- Logs (as field)
+- Traces (as primary key)
+
+**Logs with trace ID:**
+
+```json
+{
+  "timestamp": "2025-01-15T10:30:00Z",
+  "level": "ERROR",
+  "message": "Database query failed",
+  "service": "payment-api",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "error": "connection timeout"
+}
+```
+
+Structured logs critical.
+
+**Trace ID extraction:**
+
+```python
+# Python:
+import logging
+from opentelemetry import trace
+
+class TraceContextFilter(logging.Filter):
+    def filter(self, record):
+        span = trace.get_current_span()
+        if span.is_recording():
+            ctx = span.get_span_context()
+            record.trace_id = format(ctx.trace_id, '032x')
+            record.span_id = format(ctx.span_id, '016x')
+        return True
+
+logger = logging.getLogger()
+logger.addFilter(TraceContextFilter())
+
+# Now all logs include trace_id automatically
+```
+
+**Java:**
+
+```java
+// MDC (Mapped Diagnostic Context):
+SpanContext context = Span.current().getSpanContext();
+MDC.put("trace_id", context.getTraceId());
+MDC.put("span_id", context.getSpanId());
+
+// Log format includes %X{trace_id}
+logger.info("Processing request");
+```
+
+**Exemplars in Prometheus:**
+
+Link metrics to specific traces:
+
+```promql
+# Metric with exemplar:
+http_request_duration_seconds_bucket{le="0.5"} 1234 # exemplar: trace_id=abc123
+```
+
+Prometheus 2.26+ supports exemplars natively.
+
+Grafana shows exemplars on graphs. Click to jump to trace.
+
+**Configuring exemplars:**
+
+```python
+# Python (OpenTelemetry):
+from prometheus_client import Histogram
+
+request_duration = Histogram(
+    'http_request_duration_seconds',
+    'Request duration',
+    ['method', 'endpoint']
+)
+
+# When recording, exemplar is automatic with OpenTelemetry integration
+```
+
+**Service-level correlation:**
+
+Tag everything with consistent labels:
+
+```python
+# All signals from same service:
+service_name = "payment-api"
+service_version = "v1.2.3"
+cluster = "prod"
+environment = "production"
+```
+
+Metrics:
+```promql
+http_requests_total{service="payment-api", version="v1.2.3"}
+```
+
+Logs:
+```json
+{"service": "payment-api", "version": "v1.2.3", ...}
+```
+
+Traces (as span attributes):
+```python
+span.set_attribute("service.name", "payment-api")
+span.set_attribute("service.version", "v1.2.3")
+```
+
+**Time correlation:**
+
+Use synchronized timestamps:
+
+```
+metric at 2025-01-15T10:30:00.123Z
+log at   2025-01-15T10:30:00.125Z  (close in time)
+trace at 2025-01-15T10:30:00.120Z
+```
+
+Likely related.
+
+**Grafana correlation:**
+
+Grafana supports unified observability:
+
+```yaml
+# Datasource configuration:
+# Loki (logs)
+# Prometheus (metrics)
+# Tempo (traces)
+
+# Trace to logs:
+[derivedFields]
+name: TraceID
+matcherRegex: "trace_id=(\\w+)"
+url: "${__value.raw}"
+datasourceUid: tempo
+```
+
+In Grafana:
+- View metric → click exemplar → see trace
+- View trace → click "Logs for this span" → see logs
+- View log → click trace ID → see trace
+
+**Implementation:**
+
+**Step 1: Standardize instrumentation**
+
+OpenTelemetry for all services. Same SDK, same attribute names.
+
+**Step 2: Structured logging**
+
+All apps use JSON logging:
+
+```python
+import json
+import logging
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            'timestamp': self.formatTime(record),
+            'level': record.levelname,
+            'message': record.getMessage(),
+            'logger': record.name,
+        }
+        if hasattr(record, 'trace_id'):
+            log_data['trace_id'] = record.trace_id
+            log_data['span_id'] = record.span_id
+        return json.dumps(log_data)
+```
+
+**Step 3: Include trace context**
+
+Auto-inject trace_id into logs (as shown above).
+
+**Step 4: Configure exemplars**
+
+Prometheus + OpenTelemetry integration provides exemplars.
+
+**Step 5: Unified UI**
+
+Grafana with all three datasources. Cross-link configured.
+
+**Practical workflow:**
+
+**Workflow 1: Alert → investigate**
+
+```
+1. Alert: P99 latency spike for payment-api
+2. Open dashboard
+3. See latency metric with exemplars
+4. Click on exemplar from spike
+5. Jaeger/Tempo opens with that trace
+6. See request flow, where time spent
+7. Click "Logs" → see all logs from that request
+8. Identify root cause
+```
+
+**Workflow 2: User report → investigate**
+
+```
+1. User says: "I got error at 10:30 with order #12345"
+2. Search logs: order_id="12345"
+3. Find error log → extract trace_id
+4. Open trace → see full request
+5. Identify failing service
+6. Check that service's metrics
+```
+
+**Workflow 3: Capacity planning**
+
+```
+1. Service slow lately
+2. Metrics show increased latency over weeks
+3. Traces (slow ones) show DB queries getting slower
+4. DB metrics show growing dataset
+5. Root cause: data growth, need indexing
+```
+
+**Tools that support correlation:**
+
+**Grafana stack:**
+- Loki (logs) ↔ Tempo (traces) ↔ Prometheus (metrics)
+- Tight integration
+
+**Datadog:**
+- Unified APM, logs, metrics
+- Click-through between
+
+**New Relic:**
+- Similar unified platform
+
+**Elastic stack:**
+- Elasticsearch (logs) + APM (traces)
+- Correlation via APM agent
+
+**Honeycomb:**
+- Event-based, natural correlation
+
+**Cloud-native:**
+- AWS X-Ray + CloudWatch
+- GCP Cloud Trace + Cloud Logging + Cloud Monitoring
+
+**Anti-patterns:**
+
+**Anti-pattern 1: Inconsistent labels**
+
+Service called "payment" in metrics, "Payment Service" in logs, "payment-api" in traces. Can't correlate.
+
+Fix: standardize service names.
+
+**Anti-pattern 2: No trace context in logs**
+
+Logs without trace_id. Can't link to traces.
+
+Fix: structured logging with trace context.
+
+**Anti-pattern 3: Different time formats**
+
+Logs in PST, metrics in UTC. Confusing.
+
+Fix: UTC everywhere, ISO 8601.
+
+**Anti-pattern 4: Sampling without exemplars**
+
+Sample 1% of traces. Metrics show 100% requests. Can't find traces for most issues.
+
+Fix: tail-based sampling (always keep errors/slow) + exemplars.
+
+**Best practices:**
+
+1. **OpenTelemetry**: standardized instrumentation
+2. **Structured logging**: JSON with trace_id
+3. **Exemplars**: link metrics to traces
+4. **Consistent labels**: same across signals
+5. **Unified UI**: Grafana or similar
+6. **Trace context propagation**: across services
+7. **Sampling strategy**: tail-based for important traces
+
+**Production scenarios:**
+
+1. **3-pillar correlation in Grafana**: Loki + Tempo + Prometheus. Engineers debug by clicking through. Investigation time dropped from hours to minutes.
+
+2. **Exemplars caught regression**: Metric showed P99 latency spike. Click exemplar → trace → identified new query introduced in deploy. Rolled back.
+
+3. **User-specific debugging**: Customer reported issue. Logs filter by customer_id → trace_id → full trace. Found exact path.
+
+4. **OpenTelemetry standardization**: Different services used different SDKs. Standardized on OpenTelemetry. Consistent attributes across all signals.
+
+5. **Honeycomb's high-cardinality**: Used Honeycomb. High-cardinality fields (user_id, customer_id, version) as event attributes. Powerful exploration.
+
+---
+
+## 277. Explain centralized logging architecture
+
+Centralized logging aggregates logs from all services into a single system for storage, search, and analysis. Essential for distributed systems.
+
+**The problem:**
+
+Without centralized logging:
+- SSH into each pod/node to read logs
+- Logs lost when pods die
+- No cross-service correlation
+- Difficult retrospective analysis
+
+**Logging pipeline:**
+
+```
+Applications (stdout/stderr)
+        ↓
+Container runtime captures
+        ↓
+Log files on node (/var/log/pods/*)
+        ↓
+Log collector (Fluent Bit/Fluentd as DaemonSet)
+        ↓
+Log aggregator/buffer (optional)
+        ↓
+Log storage (Elasticsearch, Loki, etc.)
+        ↓
+Visualization (Kibana, Grafana)
+```
+
+**Component details:**
+
+**Source: applications**
+
+```python
+# App writes to stdout (best practice):
+import logging
+import sys
+
+logger = logging.getLogger()
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(handler)
+logger.info('{"event": "request", "method": "GET"}')
+```
+
+Kubernetes captures stdout/stderr.
+
+**Source: file logs**
+
+Some apps log to files. Mount and read:
+
+```yaml
+# Log collector reads file:
+volumeMounts:
+  - name: app-logs
+    mountPath: /var/log/app
+```
+
+**Collector: Fluent Bit**
+
+Lightweight, written in C:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+spec:
+  template:
+    spec:
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:latest
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: config
+              mountPath: /fluent-bit/etc
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+```
+
+**Fluent Bit config:**
+
+```ini
+[SERVICE]
+    Flush         1
+    Log_Level     info
+    Parsers_File  parsers.conf
+
+[INPUT]
+    Name              tail
+    Path              /var/log/containers/*.log
+    Parser            docker
+    Tag               kube.*
+    Refresh_Interval  5
+
+[FILTER]
+    Name                kubernetes
+    Match               kube.*
+    Merge_Log           On
+    Keep_Log            Off
+    K8S-Logging.Parser  On
+    K8S-Logging.Exclude On
+
+[OUTPUT]
+    Name            loki
+    Match           kube.*
+    Url             http://loki:3100/loki/api/v1/push
+    Labels          job=fluentbit
+    Label_Keys      $namespace,$pod,$container
+```
+
+**Collector: Fluentd**
+
+More flexible, more resource intensive:
+
+```ruby
+<source>
+  @type tail
+  path /var/log/containers/*.log
+  pos_file /var/log/fluentd-containers.log.pos
+  tag kubernetes.*
+  format json
+</source>
+
+<filter kubernetes.**>
+  @type kubernetes_metadata
+</filter>
+
+<match kubernetes.**>
+  @type elasticsearch
+  host elasticsearch
+  port 9200
+  logstash_format true
+</match>
+```
+
+**Collector: Vector**
+
+Modern alternative, Rust-based:
+
+```toml
+[sources.kubernetes_logs]
+type = "kubernetes_logs"
+
+[transforms.parse_json]
+type = "remap"
+inputs = ["kubernetes_logs"]
+source = '''
+  . = parse_json!(.message)
+'''
+
+[sinks.loki]
+type = "loki"
+inputs = ["parse_json"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+labels.namespace = "{{ kubernetes.pod_namespace }}"
+```
+
+**Storage options:**
+
+**Elasticsearch:**
+
+- Full-text search
+- Rich querying
+- Powerful aggregations
+- Heavy resource usage
+- Schema management
+
+```yaml
+# Elasticsearch cluster:
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: logs
+spec:
+  version: 8.10.0
+  nodeSets:
+    - name: default
+      count: 3
+      config:
+        node.store.allow_mmap: false
+```
+
+**Loki:**
+
+- Label-based indexing (like Prometheus)
+- Object storage (S3, GCS) for body
+- Cheap for retention
+- Less rich querying
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: loki
+spec:
+  template:
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:latest
+          args:
+            - -config.file=/etc/loki/config.yaml
+```
+
+**Splunk:**
+
+- Commercial, comprehensive
+- Powerful but expensive
+- Common in enterprise
+
+**Datadog Logs:**
+
+- Cloud-managed
+- Integrated with metrics, APM
+- Cost can be high at scale
+
+**ChaosSearch:**
+
+- S3-based, cheaper
+- Elasticsearch-compatible API
+
+**Cloud-managed:**
+
+- AWS CloudWatch Logs
+- GCP Cloud Logging
+- Azure Log Analytics
+
+**Architecture patterns:**
+
+**Pattern 1: Direct push (no buffer)**
+
+```
+App → Collector → Storage
+```
+
+Simple. Storage outages = log loss.
+
+**Pattern 2: With buffer**
+
+```
+App → Collector → Kafka/Buffer → Storage
+```
+
+Resilience to storage outages. Recommended for production.
+
+**Pattern 3: Sidecar**
+
+Each pod has logging sidecar:
+
+```yaml
+spec:
+  containers:
+    - name: app
+      image: my-app
+    - name: log-sidecar
+      image: fluent-bit
+```
+
+More resource use, but isolation.
+
+**Pattern 4: DaemonSet (most common)**
+
+One collector per node. Reads all pod logs.
+
+**Log retention:**
+
+Costs scale with retention:
+- 30 days: typical
+- 90 days: longer-term analysis
+- 1 year: compliance
+- Forever: not feasible at volume
+
+Tier storage:
+- Hot (recent): Elasticsearch, queryable
+- Cold (old): S3, less accessible
+
+**Log structure:**
+
+**Unstructured:**
+```
+2025-01-15 10:30:00 ERROR Database connection failed
+```
+
+Hard to query.
+
+**Structured (JSON):**
+```json
+{
+  "timestamp": "2025-01-15T10:30:00Z",
+  "level": "ERROR",
+  "message": "Database connection failed",
+  "service": "payment-api",
+  "trace_id": "abc123",
+  "error_code": "DB_TIMEOUT"
+}
+```
+
+Queryable, parseable.
+
+**Standard fields:**
+
+- timestamp
+- level (DEBUG, INFO, WARN, ERROR, FATAL)
+- service
+- message
+- trace_id, span_id
+- user_id (if applicable)
+- request_id
+
+**Performance considerations:**
+
+**Volume:**
+
+```
+1000 pods × 10 logs/sec × 100 bytes = 1 MB/sec
+Per day: ~85GB
+Per year: ~30TB
+```
+
+Scale infrastructure accordingly.
+
+**Cardinality:**
+
+For Loki (label-based):
+- Don't put high-cardinality (request_id) in labels
+- Use labels for stable categories (namespace, pod, level)
+- Put high-cardinality in log body
+
+**Indexing:**
+
+Elasticsearch indexes all fields by default. Costly.
+
+```json
+# Mapping to limit indexing:
+{
+  "mappings": {
+    "properties": {
+      "timestamp": {"type": "date"},
+      "level": {"type": "keyword"},
+      "message": {"type": "text"},
+      "trace_id": {"type": "keyword"}
+    }
+  }
+}
+```
+
+**Compression:**
+
+Logs are very compressible (text). 10:1 typical.
+
+**Access control:**
+
+```yaml
+# Per-team access:
+# Kibana spaces, Grafana orgs
+# RBAC on logs by tags/labels
+```
+
+Logs may contain sensitive data. Restrict access.
+
+**Production scenarios:**
+
+1. **Loki replaced Elasticsearch**: ES cluster cost $50k/month. Migrated to Loki + S3. Cost dropped to $5k/month. Some query loss but acceptable.
+
+2. **Structured logging adoption**: Migrated all services to JSON logs. Queries became powerful. Investigation time dropped.
+
+3. **Buffer prevented loss**: Loki outage for 30 minutes. Vector buffered to local disk. No log loss after recovery.
+
+4. **Tiered retention**: Hot 7 days in ES, cold 90 days in S3. Active queries fast, compliance queries slow but possible.
+
+5. **High cardinality lesson**: Put request_id in Loki labels. Loki struggled. Moved to log body. Performance recovered.
+
+---
+
+## 278. How do you scale Elasticsearch clusters?
+
+Elasticsearch is powerful but tricky to scale. Understanding architecture and scaling patterns is essential for production.
+
+**Elasticsearch components:**
+
+**Cluster**: collection of nodes
+
+**Nodes**: individual ES instances. Types:
+- **Master**: cluster state management (3 dedicated minimum)
+- **Data**: holds indices, handles queries
+- **Coordinating**: distributes queries (optional)
+- **Ingest**: preprocesses documents
+
+**Indices**: collections of documents
+
+**Shards**: indices split into shards
+- **Primary shards**: original data
+- **Replica shards**: copies
+
+**Index lifecycle:**
+
+```
+Index created
+  ↓ data ingested
+Hot phase (recent, queried)
+  ↓ time passes
+Warm phase (older, less queried)
+  ↓ time passes
+Cold phase (rarely queried)
+  ↓ time passes
+Delete phase (retention period over)
+```
+
+**Scaling strategies:**
+
+**Strategy 1: Vertical scaling**
+
+Bigger nodes:
+- More RAM (heap, query cache)
+- More CPU
+- Faster disks (SSD)
+
+Limits:
+- JVM heap max 32GB (compressed OOPs)
+- Disk size per node
+- Single node failures
+
+**Strategy 2: Horizontal scaling**
+
+More nodes:
+- Distribute shards
+- Parallelism
+- Survives failures
+
+Scaling tiers:
+- 3 nodes: basic HA
+- 5-7 nodes: medium
+- 10+ nodes: large
+- 100+ nodes: very large
+
+**Strategy 3: Sharding**
+
+Distribute index across multiple shards:
+
+```bash
+PUT /logs-2025-01-15
+{
+  "settings": {
+    "number_of_shards": 5,
+    "number_of_replicas": 1
+  }
+}
+```
+
+- 5 primary shards
+- 1 replica per primary (5 replicas)
+- Total: 10 shards distributed across nodes
+
+**Shard size:**
+
+- Too small (<1GB): overhead per shard
+- Too large (>50GB): slow recovery
+- Sweet spot: 10-50GB per shard
+
+**Calculating shards:**
+
+```
+Daily log volume: 100GB
+Retention: 30 days
+Total: 3TB
+
+If 30GB/shard target:
+3TB / 30GB = 100 shards
+
+If 1 replica:
+100 primaries + 100 replicas = 200 shards
+```
+
+**Strategy 4: Time-based indices**
+
+```
+logs-2025-01-15
+logs-2025-01-16
+logs-2025-01-17
+...
+```
+
+Benefits:
+- Old indices: read-only, can move to cold storage
+- Easier retention management (delete old indices)
+- Better shard management
+
+**Index aliases for queries:**
+
+```bash
+# Query alias spans current indices:
+GET /logs/_search
+```
+
+`logs` alias points to recent indices.
+
+**Strategy 5: Node tiers**
+
+**Hot tier:**
+- Recent data (1-7 days)
+- SSDs, more RAM
+- Heavy query load
+
+**Warm tier:**
+- Older (7-30 days)
+- Standard disks
+- Less query load
+
+**Cold tier:**
+- Old (30+ days)
+- Cheap storage (HDDs, S3-snapshot)
+- Rare queries
+
+```yaml
+# Node attributes:
+node.attr.data: hot   # Or warm, cold
+```
+
+```bash
+# Index settings to tier placement:
+PUT /logs-2025-01/_settings
+{
+  "index.routing.allocation.require.data": "warm"
+}
+```
+
+**Strategy 6: ILM (Index Lifecycle Management)**
+
+Automate transitions:
+
+```bash
+PUT _ilm/policy/logs_policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "1d",
+            "max_size": "50gb"
+          }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "allocate": {"require": {"data": "warm"}},
+          "forcemerge": {"max_num_segments": 1}
+        }
+      },
+      "cold": {
+        "min_age": "30d",
+        "actions": {
+          "allocate": {"require": {"data": "cold"}}
+        }
+      },
+      "delete": {
+        "min_age": "90d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+Index automatically progresses through phases.
+
+**Cluster sizing:**
+
+**Storage:**
+
+```
+Total data × (1 + replicas) × 1.5 overhead
+
+Example:
+1TB raw × 2 (1 replica) × 1.5 = 3TB total
+```
+
+**Memory:**
+
+Rule of thumb: 1:30 ratio (RAM:storage):
+
+```
+3TB storage → 100GB RAM total
+Per node (assuming 5 nodes): 20GB heap + 20GB OS = 40GB
+```
+
+**CPU:**
+
+Depends on query load:
+- Light: 4-8 cores per node
+- Medium: 16 cores per node
+- Heavy: 32+ cores
+
+**Common bottlenecks:**
+
+**Bottleneck 1: JVM heap pressure**
+
+```
+elasticsearch_jvm_memory_used_bytes / elasticsearch_jvm_memory_max_bytes
+```
+
+If >75% consistently, scale up or out.
+
+**Bottleneck 2: Disk I/O**
+
+```
+node_disk_io_time_seconds
+```
+
+If saturated, SSDs help. Or add nodes (parallelism).
+
+**Bottleneck 3: CPU**
+
+```
+process_cpu_seconds_total
+```
+
+If saturated, add nodes.
+
+**Bottleneck 4: Search latency**
+
+```
+elasticsearch_indices_search_query_time_seconds
+```
+
+If high, optimize queries, add replicas, or scale.
+
+**Bottleneck 5: Indexing latency**
+
+```
+elasticsearch_indices_indexing_index_time_seconds
+```
+
+If high:
+- Increase refresh_interval
+- Bulk indexing
+- More indexing nodes
+
+**Optimizations:**
+
+**Optimization 1: Refresh interval**
+
+```bash
+PUT /logs/_settings
+{
+  "index.refresh_interval": "30s"
+}
+```
+
+Default 1s = expensive. 30s improves indexing throughput dramatically.
+
+**Optimization 2: Bulk indexing**
+
+Don't index one document at a time:
+
+```bash
+# Bulk:
+POST /_bulk
+{"index": {"_index": "logs"}}
+{"timestamp": "...", "message": "..."}
+{"index": {"_index": "logs"}}
+{"timestamp": "...", "message": "..."}
+```
+
+Faster, less overhead.
+
+**Optimization 3: Force merge**
+
+For read-only indices:
+
+```bash
+POST /logs-2025-01-01/_forcemerge?max_num_segments=1
+```
+
+Compacts segments, improves query speed.
+
+**Optimization 4: Disable replicas during initial load**
+
+```bash
+PUT /new-index/_settings
+{
+  "index.number_of_replicas": 0
+}
+# Index data
+PUT /new-index/_settings
+{
+  "index.number_of_replicas": 1
+}
+```
+
+Initial indexing faster without replicas.
+
+**Optimization 5: Mapping optimization**
+
+```bash
+# Don't index everything as keyword:
+{
+  "mappings": {
+    "properties": {
+      "id": {"type": "keyword"},
+      "message": {"type": "text"},
+      "level": {"type": "keyword"},
+      "internal_data": {
+        "type": "object",
+        "enabled": false   // Don't index this
+      }
+    }
+  }
+}
+```
+
+Less indexing = faster, smaller.
+
+**HA Configuration:**
+
+```yaml
+# 3+ master nodes (avoid split-brain):
+node.roles: ["master"]
+discovery.seed_hosts: ["es-master-0", "es-master-1", "es-master-2"]
+cluster.initial_master_nodes: ["es-master-0", "es-master-1", "es-master-2"]
+
+# Data nodes:
+node.roles: ["data"]
+```
+
+**Backup/restore:**
+
+```bash
+# Snapshot:
+PUT /_snapshot/my-repo
+{
+  "type": "s3",
+  "settings": {
+    "bucket": "my-es-backups"
+  }
+}
+
+PUT /_snapshot/my-repo/snapshot-2025-01-15
+{
+  "indices": "logs-*"
+}
+```
+
+Regular snapshots for DR.
+
+**Monitoring:**
+
+Key metrics:
+- Cluster health (green/yellow/red)
+- Heap usage
+- CPU usage
+- Disk usage
+- Indexing/search latency
+- Pending tasks
+
+```promql
+elasticsearch_cluster_health_status{color="red"} == 1   # Alert
+elasticsearch_jvm_memory_used_bytes / elasticsearch_jvm_memory_max_bytes > 0.85
+```
+
+**Production scenarios:**
+
+1. **ILM saved cluster**: Cluster running out of disk. Implemented ILM with hot/warm/cold tiers. Old indices to cheap storage. Cluster operational again.
+
+2. **Sharding misconfigured**: 1000 tiny shards. Cluster overloaded with overhead. Re-sharded indices appropriately. Performance recovered.
+
+3. **Bulk indexing essential**: Logging pipeline used individual inserts. ES choked. Switched to bulk (100 docs per batch). Throughput 10x.
+
+4. **Tiered nodes for cost**: All nodes used SSDs. Moved old indices to HDD nodes. Hot tier unchanged performance, cold tier cheaper.
+
+5. **Force merge improved queries**: Search latency increased. Identified non-merged segments in read-only indices. Force merged. Query latency dropped 50%.
+
+---
+
+## 279. Explain Loki vs ELK stack
+
+Loki (Grafana) and ELK stack (Elastic) are two popular logging solutions with different design philosophies.
+
+**ELK stack (Elasticsearch + Logstash + Kibana):**
+
+**Elasticsearch:**
+- Full-text search engine
+- Indexes all fields
+- Powerful querying (full-text, aggregations)
+- Resource intensive
+
+**Logstash:**
+- Log processing pipeline
+- Transformations, enrichment
+- Heavy resource usage
+
+**Kibana:**
+- Visualization, dashboards
+- Powerful querying UI
+- Rich features
+
+Often: **EFK** (Elasticsearch + Fluentd + Kibana) instead.
+
+**Loki (Grafana):**
+
+**Loki**: log storage
+- Label-based indexing (like Prometheus)
+- Logs themselves not indexed
+- Stored compressed in object storage (S3, GCS)
+- Cheap
+
+**Promtail / Fluent Bit**: collectors
+
+**Grafana**: visualization (used for both metrics and logs)
+
+**Design philosophy:**
+
+**ELK:**
+- Index everything
+- Fast complex queries
+- Higher cost
+
+**Loki:**
+- Index labels only
+- Cheap storage
+- Less rich queries
+
+**Comparison:**
+
+| Aspect | ELK | Loki |
+|--------|-----|------|
+| Indexing | Full-text on all fields | Labels only |
+| Storage | Local disk (mostly) | Object storage |
+| Cost | High | Low |
+| Query power | Very high | Moderate |
+| Aggregations | Rich | Limited |
+| Operational complexity | High | Medium |
+| Maturity | Established | Newer but mature |
+| Best for | Complex analysis | Cost-effective logging |
+
+**Detailed comparison:**
+
+**Storage cost:**
+
+ELK on EBS:
+- 1TB of logs/day
+- 30-day retention
+- 30TB total + replicas = 60TB
+- EBS gp3: ~$5000/month
+
+Loki on S3:
+- Same 1TB/day, 30 days
+- 30TB compressed (~3TB after compression)
+- S3 Standard: ~$70/month
+
+10-100x cost difference.
+
+**Query performance:**
+
+ELK:
+```
+"Show me all error logs from payment service in last hour mentioning 'timeout'"
+```
+
+Fast: full-text indexed.
+
+Loki:
+```
+{service="payment", level="error"} |= "timeout"
+```
+
+Slower: filters by labels, then grep through logs.
+
+For large time ranges, ELK is significantly faster.
+
+**Query language:**
+
+**ELK (KQL/Lucene):**
+
+```
+service: "payment" AND level: "ERROR" AND message: "*timeout*"
+```
+
+Or aggregations:
+
+```json
+{
+  "aggs": {
+    "by_service": {
+      "terms": {"field": "service"},
+      "aggs": {
+        "errors": {
+          "filter": {"term": {"level": "ERROR"}}
+        }
+      }
+    }
+  }
+}
+```
+
+**Loki (LogQL):**
+
+```
+# Filter:
+{service="payment", level="error"} |= "timeout"
+
+# Aggregations (limited):
+sum by (service) (
+  count_over_time(
+    {level="error"}[5m]
+  )
+)
+```
+
+Less powerful but PromQL-like (familiar).
+
+**Operational complexity:**
+
+**ELK:**
+- Manage Elasticsearch cluster
+- Shard management
+- ILM policies
+- JVM tuning
+- Master node election
+- Many failure modes
+
+**Loki:**
+- Stateless components (mostly)
+- Object storage handles durability
+- Simpler scaling
+- Fewer failure modes
+
+**Multi-tenancy:**
+
+**ELK:**
+- Document-level security
+- Index-level separation
+- Spaces in Kibana
+
+**Loki:**
+- Built-in multi-tenancy (X-Scope-OrgID header)
+- Per-tenant data, queries
+
+**Integration:**
+
+**ELK:**
+- Beats family (Filebeat, Metricbeat, etc.)
+- Logstash for transformations
+- Elasticsearch API broadly supported
+
+**Loki:**
+- Promtail, Fluent Bit, Vector
+- Grafana integration native
+- Smaller ecosystem
+
+**Visualization:**
+
+**Kibana:**
+- Specifically built for ES
+- Rich dashboards
+- Discover (ad-hoc exploration)
+- ML features (Elastic Security, etc.)
+
+**Grafana (for Loki):**
+- Unified with metrics, traces
+- Cross-signal navigation
+- LogQL queries
+- Less rich than Kibana for log-specific
+
+**Hybrid approaches:**
+
+Some orgs use both:
+
+**Hot logs in Loki:**
+- Recent (7 days)
+- Cost-effective
+- Operational queries
+
+**Cold/important logs in ES:**
+- Audit, compliance
+- Complex analysis
+- Security logs
+
+**Choosing:**
+
+**Choose ELK when:**
+- Need rich querying, aggregations
+- Have ELK expertise
+- Budget for storage
+- Compliance requiring full-text search
+
+**Choose Loki when:**
+- Cost is concern
+- Already using Grafana/Prometheus
+- Operational queries primarily
+- Smaller scale
+
+**Migration:**
+
+ELK → Loki:
+
+1. Deploy Loki alongside ELK
+2. Configure Promtail/Fluent Bit to send to both
+3. Migrate dashboards to Grafana with Loki
+4. Verify Loki coverage
+5. Decommission ELK (or keep for compliance)
+
+**Production scenarios:**
+
+1. **Migration from ELK to Loki**: ELK cost $50k/month. Migrated to Loki. Cost dropped to $5k/month. Some query loss (less rich), but operationally sufficient.
+
+2. **Hybrid approach**: Loki for application logs (cheap retention). ELK for security/audit logs (rich queries needed). Best of both.
+
+3. **Kept ELK for compliance**: Migrated most logs to Loki. Compliance team needed Kibana for audit. Kept ELK for specific use cases.
+
+4. **Grafana unification**: Previously: Grafana for metrics, Kibana for logs. Migrated to Loki. Single UI for all observability.
+
+5. **Scale challenges in ELK**: ELK cluster constantly struggled. Sharding, ILM tuning, JVM tuning. Switched to Loki. Operational burden dropped dramatically.
+
+---
+
+## 280. How do you monitor container runtime metrics?
+
+Container runtime metrics show what's happening at the container level. cAdvisor exposes these in Kubernetes.
+
+**cAdvisor (Container Advisor):**
+
+Built into kubelet. Exposes container metrics via `/metrics/cadvisor`.
+
+**Common metrics:**
+
+**CPU:**
+
+```promql
+# CPU usage:
+rate(container_cpu_usage_seconds_total[5m])
+
+# By pod:
+sum by (pod) (rate(container_cpu_usage_seconds_total[5m]))
+
+# CFS throttling:
+rate(container_cpu_cfs_throttled_periods_total[5m])
+/
+rate(container_cpu_cfs_periods_total[5m])
+```
+
+**Memory:**
+
+```promql
+# Working set:
+container_memory_working_set_bytes
+
+# RSS:
+container_memory_rss
+
+# Cache:
+container_memory_cache
+
+# Failures:
+container_memory_failcnt
+
+# OOM kills:
+container_oom_events_total
+```
+
+**Network:**
+
+```promql
+# Bytes received:
+rate(container_network_receive_bytes_total[5m])
+
+# Bytes sent:
+rate(container_network_transmit_bytes_total[5m])
+
+# Packets:
+rate(container_network_receive_packets_total[5m])
+
+# Errors:
+rate(container_network_receive_errors_total[5m])
+
+# Drops:
+rate(container_network_receive_packets_dropped_total[5m])
+```
+
+**Filesystem:**
+
+```promql
+# Reads:
+rate(container_fs_reads_bytes_total[5m])
+
+# Writes:
+rate(container_fs_writes_bytes_total[5m])
+
+# Usage:
+container_fs_usage_bytes
+```
+
+**Tasks:**
+
+```promql
+# Number of processes:
+container_processes
+```
+
+**Useful aggregations:**
+
+**Top pods by CPU:**
+
+```promql
+topk(10, sum by (pod) (rate(container_cpu_usage_seconds_total[5m])))
+```
+
+**Memory utilization vs limit:**
+
+```promql
+container_memory_working_set_bytes
+/ on(pod, container)
+kube_pod_container_resource_limits{resource="memory"}
+```
+
+**CPU utilization vs request:**
+
+```promql
+sum by (pod) (rate(container_cpu_usage_seconds_total[5m]))
+/ on(pod) sum by (pod) (kube_pod_container_resource_requests{resource="cpu"})
+```
+
+**Throttling rate:**
+
+```promql
+sum by (pod) (rate(container_cpu_cfs_throttled_periods_total[5m]))
+/
+sum by (pod) (rate(container_cpu_cfs_periods_total[5m]))
+```
+
+If high (>10%), pod is CPU constrained.
+
+**Per-container metrics:**
+
+cAdvisor exposes per-container. Useful labels:
+- `pod`
+- `namespace`
+- `container`
+- `image`
+
+```promql
+# Memory by container:
+container_memory_working_set_bytes{container="my-app", container!=""}
+```
+
+`container!=""` excludes pod-level (no container) entries.
+
+**Pause container:**
+
+Every pod has a pause container. Filter out:
+
+```promql
+container_memory_working_set_bytes{container!="POD", container!=""}
+```
+
+**Memory metrics explained:**
+
+- **working_set**: actively used (kernel won't reclaim)
+- **rss**: resident set size
+- **cache**: page cache
+- **swap**: swap usage
+
+For OOM-relevant: use `working_set` (this is what kubelet checks).
+
+**Network errors:**
+
+```promql
+# Receive errors:
+rate(container_network_receive_errors_total[5m])
+
+# Transmit errors:
+rate(container_network_transmit_errors_total[5m])
+```
+
+Non-zero indicates network issues.
+
+**Disk pressure:**
+
+```promql
+# Filesystem usage:
+1 - (
+  container_fs_inodes_free / container_fs_inodes_total
+)
+```
+
+For container ephemeral storage.
+
+**Dashboards:**
+
+Standard Grafana dashboards:
+- Pod overview (RED + USE)
+- Cluster resource usage
+- Container details
+
+kube-prometheus-stack includes many.
+
+**Alerts:**
+
+```yaml
+- alert: PodHighCPU
+  expr: |
+    sum by (pod) (rate(container_cpu_usage_seconds_total[5m]))
+    / on(pod)
+    sum by (pod) (kube_pod_container_resource_limits{resource="cpu"})
+    > 0.9
+  for: 15m
+  annotations:
+    summary: "Pod {{ $labels.pod }} CPU near limit"
+
+- alert: PodHighMemory
+  expr: |
+    container_memory_working_set_bytes
+    / on(pod, container)
+    kube_pod_container_resource_limits{resource="memory"}
+    > 0.85
+  for: 15m
+
+- alert: PodOOMKilled
+  expr: |
+    rate(container_oom_events_total[5m]) > 0
+  annotations:
+    summary: "Pod {{ $labels.pod }} OOMKilled"
+
+- alert: PodHighThrottling
+  expr: |
+    sum by (pod) (rate(container_cpu_cfs_throttled_periods_total[5m]))
+    /
+    sum by (pod) (rate(container_cpu_cfs_periods_total[5m]))
+    > 0.25
+  for: 15m
+```
+
+**Performance considerations:**
+
+cAdvisor metrics can be voluminous:
+- Many containers
+- Many metrics per container
+- Rate of change
+
+Scrape interval typically 15-30s.
+
+Limit cardinality:
+
+```yaml
+# Drop unneeded metrics:
+metric_relabel_configs:
+  - source_labels: [__name__]
+    regex: 'container_(network_tcp_usage|tasks_state)_.*'
+    action: drop
+```
+
+**Container runtime metrics:**
+
+Beyond cAdvisor, runtime-specific:
+
+**containerd:**
+
+```promql
+# Container starts:
+containerd_container_actions_total{action="start"}
+
+# Runtime errors:
+containerd_container_actions_total{action!="success"}
+```
+
+**CRI-O:**
+
+Similar metrics, different names.
+
+**Image pull metrics:**
+
+```promql
+kubelet_runtime_operations_duration_seconds{operation_type="pull_image"}
+```
+
+How long images take to pull.
+
+**Production scenarios:**
+
+1. **Throttling detection**: Pod slowness but CPU not maxed. cAdvisor showed throttling 40%. CPU limit too low. Increased, performance restored.
+
+2. **OOM tracking**: container_oom_events_total alerted on regular OOMKills. Investigated specific pod, found memory leak. Fixed.
+
+3. **Capacity analysis**: cAdvisor data over 90 days. Showed which pods used least vs most. Right-sized requests/limits. Better cluster utilization.
+
+4. **Network issues**: container_network_receive_errors_total non-zero on specific node. NIC failing. Replaced node.
+
+5. **Dashboard standardization**: Built standard dashboard with cAdvisor metrics. Every workload has same view. Operators understand any pod quickly.
+
+---
+
+## 281. Explain black-box vs white-box monitoring
+
+These are complementary monitoring approaches. Both needed for comprehensive coverage.
+
+**White-box monitoring:**
+
+Internal view: metrics from within the system.
+
+**Examples:**
+- Application metrics (request count, errors)
+- Container metrics (CPU, memory)
+- Database queries
+- Custom business metrics
+
+**Sources:**
+- Prometheus scraping `/metrics`
+- Application instrumentation
+- Container runtime (cAdvisor)
+- Database internal metrics
+
+**Advantages:**
+- Detailed
+- Granular
+- Internal insights
+- Root cause analysis
+
+**Disadvantages:**
+- Requires instrumentation
+- Doesn't show user perspective
+- Only what you measure
+- Can miss external issues
+
+**Black-box monitoring:**
+
+External view: simulating user.
+
+**Examples:**
+- HTTP probes (is the endpoint up?)
+- TCP connection tests
+- DNS resolution checks
+- End-to-end synthetic transactions
+- Cloud region health checks
+
+**Advantages:**
+- User perspective
+- No instrumentation needed
+- Catches external issues
+- Validates entire stack
+
+**Disadvantages:**
+- Limited insight into causes
+- Less granular
+- Synthetic, not real users
+- Slower to detect issues
+
+**The blackbox-exporter:**
+
+Prometheus's component for black-box monitoring:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blackbox-exporter
+spec:
+  template:
+    spec:
+      containers:
+        - name: blackbox-exporter
+          image: prom/blackbox-exporter:latest
+          args:
+            - --config.file=/config/blackbox.yml
+```
+
+**Configuration:**
+
+```yaml
+# blackbox.yml:
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200, 201, 204]
+      fail_if_ssl: false
+      fail_if_not_ssl: true
+      preferred_ip_protocol: "ip4"
+  
+  http_post:
+    prober: http
+    timeout: 5s
+    http:
+      method: POST
+      body: '{"test": true}'
+      headers:
+        Content-Type: application/json
+  
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+  
+  dns_lookup:
+    prober: dns
+    dns:
+      query_name: example.com
+      query_type: A
+  
+  icmp_ping:
+    prober: icmp
+```
+
+**Prometheus configuration:**
+
+```yaml
+scrape_configs:
+  - job_name: 'blackbox-http'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - https://api.example.com/health
+          - https://www.example.com
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+```
+
+**Metrics:**
+
+```promql
+# Up:
+probe_success{instance="https://api.example.com"}
+
+# Latency:
+probe_duration_seconds
+
+# HTTP status:
+probe_http_status_code
+
+# SSL cert expiration:
+probe_ssl_earliest_cert_expiry - time()
+
+# DNS resolution time:
+probe_dns_lookup_time_seconds
+```
+
+**Alerts:**
+
+```yaml
+- alert: ServiceDown
+  expr: probe_success{job="blackbox-http"} == 0
+  for: 5m
+  labels:
+    severity: critical
+
+- alert: SSLCertExpiring
+  expr: probe_ssl_earliest_cert_expiry - time() < 7 * 86400
+  for: 1h
+  labels:
+    severity: warning
+
+- alert: HighLatency
+  expr: probe_duration_seconds > 2
+  for: 10m
+```
+
+**Black-box use cases:**
+
+**Use case 1: External service health**
+
+Are public APIs up?
+
+```yaml
+targets:
+  - https://api.example.com/health
+  - https://www.example.com
+```
+
+**Use case 2: SSL certificate monitoring**
+
+Catch expiring certs:
+
+```promql
+probe_ssl_earliest_cert_expiry - time() < 7 * 86400
+```
+
+**Use case 3: DNS health**
+
+```yaml
+modules:
+  dns_lookup:
+    prober: dns
+    dns:
+      query_name: example.com
+```
+
+**Use case 4: Cross-region health**
+
+Run blackbox-exporter in multiple regions, probe same services:
+
+```
+us-east-1 blackbox → api.example.com
+us-west-2 blackbox → api.example.com
+eu-west-1 blackbox → api.example.com
+```
+
+Regional issues detected.
+
+**Use case 5: End-to-end transactions**
+
+More complex than simple HTTP:
+
+```python
+# Synthetic transaction:
+def synthetic_checkout():
+    # 1. Login
+    response = requests.post("/login", ...)
+    
+    # 2. Add to cart
+    response = requests.post("/cart", ...)
+    
+    # 3. Checkout
+    response = requests.post("/checkout", ...)
+    
+    # Measure total time
+    # Verify success
+```
+
+Run periodically as a job.
+
+**Combining black-box and white-box:**
+
+**Scenario: API returns 500 errors**
+
+White-box detects:
+- Error rate metric spike
+- Specific service's error count
+- Database errors
+
+Black-box detects:
+- API endpoint failing
+- From user perspective
+
+Both: complete picture.
+
+**Scenario: Slow region**
+
+Black-box from another region shows slow response.
+White-box shows nothing wrong internally.
+
+Issue: network path. White-box alone would miss.
+
+**Scenario: SSL cert expires**
+
+White-box doesn't typically check SSL.
+Black-box monitors `probe_ssl_earliest_cert_expiry`.
+
+Black-box catches.
+
+**Synthetic monitoring (advanced black-box):**
+
+More than simple probes:
+
+**Tools:**
+- Catchpoint
+- Datadog Synthetics
+- New Relic Synthetics
+- Pingdom
+- Custom scripts
+
+**Capabilities:**
+- Full browser automation (Selenium-like)
+- Multi-step transactions
+- Geographic distribution
+- API workflows
+
+```javascript
+// Datadog Synthetic example:
+let test = {
+  steps: [
+    {
+      name: "Navigate to homepage",
+      type: "goToUrl",
+      params: { url: "https://example.com" }
+    },
+    {
+      name: "Click login",
+      type: "click",
+      params: { element: "#login-button" }
+    },
+    {
+      name: "Submit credentials",
+      type: "fill",
+      params: { 
+        element: "input[name=email]",
+        value: "test@example.com" 
+      }
+    }
+  ]
+};
+```
+
+**Distribution:**
+
+Run from multiple locations:
+- Major cloud regions
+- ISP networks (last-mile testing)
+- End-user locations
+
+Geographic perspective.
+
+**RUM (Real User Monitoring):**
+
+Different from black-box (synthetic). RUM captures real user data:
+
+```javascript
+// Browser SDK:
+import { datadogRum } from '@datadog/browser-rum';
+
+datadogRum.init({
+  applicationId: '...',
+  clientToken: '...',
+  service: 'my-app'
+});
+```
+
+Captures:
+- Page load times
+- User interactions
+- Errors
+- API call latencies
+
+Real user perspective, not synthetic.
+
+**Combined strategy:**
+
+```
+White-box (Prometheus, instrumentation): 
+  - Detailed internal metrics
+  - SLI for SLOs
+  - Root cause analysis
+
+Black-box (blackbox-exporter):
+  - External service health
+  - SSL monitoring
+  - Cross-region checks
+
+Synthetic (Catchpoint, Datadog):
+  - End-to-end transactions
+  - Geographic distribution
+  - User journey validation
+
+RUM:
+  - Real user experience
+  - Browser/device specifics
+  - Frontend performance
+```
+
+All four for comprehensive observability.
+
+**Production scenarios:**
+
+1. **Black-box caught SSL expiry**: Cert renewal automation failed silently. Black-box probe detected cert expiring in 6 days. Manual renewal, automation fixed.
+
+2. **Cross-region monitoring**: Black-box from EU detected slow US-East API. White-box showed nothing wrong. Issue: transatlantic link. Used CDN.
+
+3. **Synthetic transaction caught**: Login flow broken by new deploy. Synthetic transaction failed within minutes. Rolled back before user reports.
+
+4. **DNS resolution alert**: Black-box DNS check failed. CoreDNS issue in cluster. Fixed before applications affected.
+
+5. **RUM identified slow region**: Internal metrics fine. RUM showed users in Asia experiencing slow load. Added Asian CDN edge. Improved.
+
+---
+
+## 282. How do you reduce alert fatigue?
+
+Alert fatigue happens when too many alerts overwhelm responders. Important alerts get missed. Critical issue for on-call sustainability.
+
+**Symptoms of alert fatigue:**
+
+- Hundreds of alerts per day
+- Most are noise
+- Responders ignore alerts
+- "Cry wolf" effect
+- Burnout
+
+**Strategies:**
+
+**Strategy 1: Reduce alert count**
+
+Audit existing alerts:
+- Which fire often? (noise?)
+- Which never fire? (useless?)
+- Which alert on causes vs symptoms?
+
+Remove or tune.
+
+**Strategy 2: Symptom-based alerting**
+
+Alert on user impact, not causes:
+
+```yaml
+# Bad: many cause-based alerts:
+- HighCPU
+- HighMemory
+- HighDiskIO
+- LowDiskSpace
+
+# Good: symptom-based:
+- HighErrorRate
+- HighLatency
+- ServiceDown
+```
+
+One symptom alert > many cause alerts.
+
+**Strategy 3: SLO-based alerting**
+
+Alert on error budget burn rate, not arbitrary thresholds.
+
+```yaml
+- alert: ErrorBudgetBurnFast
+  expr: |
+    (
+      (
+        sum(rate(http_requests_total{status=~"5.."}[1h]))
+        /
+        sum(rate(http_requests_total[1h]))
+      ) > (14 * 0.001)   # 14x normal rate for 99.9% SLO
+    )
+  for: 5m
+  labels:
+    severity: critical
+```
+
+Only alert when budget burning. Otherwise: no-op.
+
+**Strategy 4: Multi-window alerts**
+
+Reduce false positives:
+
+```yaml
+# Both windows must trigger:
+- alert: HighErrorRateFast
+  expr: |
+    (
+      rate(http_errors[5m]) / rate(http_requests[5m]) > 0.05
+    ) 
+    AND
+    (
+      rate(http_errors[1h]) / rate(http_requests[1h]) > 0.01
+    )
+```
+
+Brief spike alone won't trigger.
+
+**Strategy 5: Proper `for` duration**
+
+```yaml
+# Too sensitive:
+expr: high_latency > threshold
+for: 1m
+
+# Better:
+expr: high_latency > threshold
+for: 10m
+```
+
+Avoid alerting on brief spikes.
+
+**Strategy 6: Inhibition**
+
+Suppress dependent alerts:
+
+```yaml
+# Alertmanager inhibition:
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+      component: 'cluster'
+    target_match:
+      severity: 'warning'
+    equal: ['cluster']
+```
+
+Cluster down → don't alert on every service in it.
+
+**Strategy 7: Severity-based routing**
+
+```yaml
+routes:
+  - match:
+      severity: critical
+    receiver: pagerduty   # Wake up
+  - match:
+      severity: warning
+    receiver: slack       # Inform
+  - match:
+      severity: info
+    receiver: email       # Note for later
+```
+
+Not everything pages.
+
+**Strategy 8: Grouping**
+
+```yaml
+group_by: ['alertname', 'service']
+group_wait: 30s
+group_interval: 5m
+```
+
+50 pods failing in 1 deployment = 1 grouped alert, not 50.
+
+**Strategy 9: Alertmanager silences**
+
+During known issues or maintenance:
+
+```bash
+# Silence for 4 hours:
+amtool silence add service=my-app --duration=4h
+```
+
+**Strategy 10: Regular review**
+
+Monthly:
+- Which alerts fired? How many false?
+- Which alerts didn't fire but should have?
+- Which were unactionable?
+
+Tune accordingly.
+
+**Strategy 11: Runbooks**
+
+Every alert has runbook:
+
+```yaml
+annotations:
+  summary: "High error rate"
+  runbook_url: "https://wiki/runbooks/high-error-rate"
+```
+
+Helps responders act quickly. Without runbook, alert might be ignored.
+
+**Strategy 12: Alert testing**
+
+Periodically test:
+- Does alert fire when expected?
+- Does routing work?
+- Is response time appropriate?
+
+Catch broken alerts.
+
+**Strategy 13: Acknowledgment tracking**
+
+How long to acknowledge alerts?
+- <2 min: probably good
+- 1 hour: too long, alert not effective
+
+Measure and improve.
+
+**Strategy 14: Eliminate flapping alerts**
+
+```yaml
+# Flapping alert:
+expr: cpu > 80
+for: 5m
+# Goes above and below 80 repeatedly
+```
+
+Fix: increase threshold, add hysteresis:
+
+```yaml
+- alert: HighCPU
+  expr: cpu > 85
+  for: 15m
+# Won't flap on 80-85 fluctuation
+```
+
+**Strategy 15: Aggregation**
+
+Don't alert per pod:
+
+```yaml
+# Per pod (noisy):
+expr: high_latency_per_pod
+
+# Per service (cleaner):
+expr: avg by (service) (high_latency_per_pod)
+```
+
+Aggregate to useful level.
+
+**Anti-patterns to avoid:**
+
+**Anti-pattern 1: Alert on everything**
+
+"Just in case." Noise drowns signal.
+
+**Anti-pattern 2: No severity differentiation**
+
+Everything critical = nothing critical.
+
+**Anti-pattern 3: No tuning**
+
+Setup once, never reviewed.
+
+**Anti-pattern 4: Alert without action**
+
+"FYI" alerts. If not actionable, don't alert.
+
+**Anti-pattern 5: Long-lived silences**
+
+Created silence for incident, forgot to remove.
+
+**Metrics on alerts:**
+
+```promql
+# Alert frequency:
+sum by (alertname) (
+  changes(ALERTS{alertstate="firing"}[7d])
+)
+
+# Most frequent:
+topk(10, sum by (alertname) (
+  increase(alertmanager_notifications_total[7d])
+))
+```
+
+Track which alerts dominate. Tune those.
+
+**Alert quality scoring:**
+
+Rate alerts:
+- **Actionable**: clear response needed
+- **Owned**: someone responds
+- **Documented**: runbook exists
+- **Tested**: known to work
+- **Tuned**: appropriate thresholds
+
+5/5 = good alert. Lower = improve or remove.
+
+**Cultural changes:**
+
+**Post-mortems for missed alerts:**
+
+If incident happened without alert: why? What alert would have caught it?
+
+**Post-mortems for noise:**
+
+If 100 alerts during incident: which were valuable? Remove noise.
+
+**Alert ownership:**
+
+Every alert has owner. They respond. They tune.
+
+No alert without owner.
+
+**Production scenarios:**
+
+1. **SLO migration cut alerts 80%**: Removed CPU/memory/disk alerts. Implemented SLO burn rate alerts. Page volume 70% lower, real issues still caught.
+
+2. **Inhibition during outage**: AWS us-east-1 outage. Hundreds of alerts. Inhibition suppressed dependent. On-call saw 5 root alerts, not 500.
+
+3. **Multi-window prevented false page**: Single window alerted on every brief spike. Added 1h window requirement. False positives down 90%.
+
+4. **Runbooks improved response**: 3am alerts were ignored. Created runbooks for top 10. On-call could act immediately, even if unfamiliar.
+
+5. **Monthly alert review**: Implemented "alert health" review monthly. Removed/tuned noisy alerts each month. Alert quality improved continuously.
+
+---
+
+## 283. Explain incident response workflows
+
+Incident response is how teams handle service disruptions. Structured workflows minimize impact and ensure learning.
+
+**Incident lifecycle:**
+
+```
+Detection → Triage → Response → Resolution → Post-mortem
+```
+
+**Phase 1: Detection**
+
+How incidents are detected:
+- **Alerts**: monitoring fires
+- **Customer reports**: support tickets
+- **Internal reports**: team members
+- **External**: status pages, social media
+
+**Time to detect (TTD):** how long until aware.
+
+Goal: minimize via good monitoring.
+
+**Phase 2: Triage**
+
+When alert fires:
+
+```
+1. Acknowledge alert
+2. Assess severity
+3. Determine if real (not false positive)
+4. Assess scope (who's affected?)
+5. Decide on response
+```
+
+**Severity levels:**
+
+- **SEV-1**: critical, customer-facing, all hands
+- **SEV-2**: significant, urgent response
+- **SEV-3**: moderate, working hours response
+- **SEV-4**: minor, scheduled fix
+
+**Phase 3: Response**
+
+**Incident commander (IC):**
+
+For SEV-1/2: dedicated coordinator.
+- Drives the response
+- Makes decisions
+- Communicates externally
+
+**Subject matter experts (SMEs):**
+
+Engineers fixing the issue.
+
+**Communications lead:**
+
+Updates stakeholders, status page.
+
+**Workflow:**
+
+```
+1. IC declares incident
+2. Open incident channel (Slack)
+3. Page relevant SMEs
+4. Update status page
+5. Investigate (SMEs)
+6. Try mitigations
+7. Communicate status
+8. Resolution
+```
+
+**Mitigation hierarchy:**
+
+1. **Stop the bleeding**: minimize ongoing impact
+2. **Root cause fix**: address underlying issue
+
+Often: rollback first (stop bleeding), then debug.
+
+**Time to mitigate (TTM):** time to stop user impact.
+**Time to resolve (TTR):** time to fully fixed.
+
+**Phase 4: Resolution**
+
+When fully resolved:
+- Verify no ongoing impact
+- Monitor for recurrence
+- Update status page
+- Schedule post-mortem
+- Close incident
+
+**Phase 5: Post-mortem**
+
+Blameless review:
+- What happened?
+- Timeline
+- What went well?
+- What didn't?
+- Action items
+
+**Postmortem template:**
+
+```markdown
+# Postmortem: [Incident Title]
+
+## Summary
+Brief description.
+
+## Impact
+- Duration:
+- Users affected:
+- Revenue impact:
+- Severity:
+
+## Timeline
+- 10:00: First alert
+- 10:05: On-call acknowledged
+- 10:10: Identified issue
+- 10:15: Mitigation deployed
+- 10:30: Verified resolved
+
+## Root Cause
+Detailed technical explanation.
+
+## What Went Well
+- 
+- 
+
+## What Didn't Go Well
+- 
+- 
+
+## Action Items
+| Action | Owner | Due | Status |
+|--------|-------|-----|--------|
+| Add alert | Alice | Jan 20 | Open |
+| Improve runbook | Bob | Jan 25 | Open |
+```
+
+**Tools:**
+
+**Incident management:**
+- PagerDuty
+- Opsgenie
+- VictorOps
+- Incident.io
+
+Features:
+- Alert routing
+- Escalation
+- On-call schedules
+- Incident timeline
+- Post-mortems
+
+**Communication:**
+- Slack (incident channel)
+- Statuspage (external)
+- Email/SMS for customers
+
+**Documentation:**
+- Runbooks
+- Incident wiki
+- Post-mortem archive
+
+**Communication patterns:**
+
+**Internal updates:**
+
+```
+Every 15-30 minutes during active incident:
+"Status update: Still investigating. SMEs looking at [thing]. ETA on next update: 15 min."
+```
+
+**External updates (status page):**
+
+```
+Initial: "We're investigating reports of [issue]."
+Update: "We've identified the issue and are working on a fix."
+Resolved: "The issue has been resolved. Post-mortem to follow."
+```
+
+**Customer communication:**
+
+For significant outages:
+- Email affected customers
+- Update support team
+- Provide credits if SLA breach
+
+**Roles in detail:**
+
+**Incident Commander:**
+
+```
+Responsibilities:
+- Make decisions
+- Coordinate teams
+- Communicate
+- NOT debugging (delegates to SMEs)
+
+Authority: highest during incident
+```
+
+**SMEs:**
+
+```
+Responsibilities:
+- Investigate
+- Apply fixes
+- Verify mitigations
+- Report findings to IC
+```
+
+**Scribe:**
+
+```
+Responsibilities:
+- Document timeline
+- Note actions taken
+- Capture decisions
+```
+
+For complex incidents.
+
+**Communications Lead:**
+
+```
+Responsibilities:
+- Update status page
+- Internal updates
+- Customer-facing communications
+- Liaison with support
+```
+
+**On-call rotation:**
+
+```
+Schedule: weekly rotations
+Primary on-call: first responder
+Secondary: backup
+Escalation: SMEs by domain
+Management: for SEV-1 awareness
+```
+
+**Escalation:**
+
+```
+Tier 1: Primary on-call (5 min)
+Tier 2: Secondary on-call (15 min)
+Tier 3: SMEs (15 min)
+Tier 4: Management (30 min)
+```
+
+If not acknowledged in time window, escalates.
+
+**Runbooks:**
+
+For common incidents:
+
+```markdown
+# Runbook: Database High Connections
+
+## Symptoms
+- Alert: db_connections_used > 0.9
+- App: "connection pool exhausted"
+
+## Investigation
+1. Check `kubectl get pods -n database`
+2. View metrics: dashboard X
+
+## Mitigations
+1. Increase connection pool: `kubectl scale ...`
+2. Identify queries: `kubectl exec ... pg_stat_activity`
+3. Kill long-running queries
+
+## Recovery
+1. Verify connections decreasing
+2. Verify error rate normalizing
+3. Document RCA
+
+## Escalation
+If not resolved in 30 min, escalate to DBA team.
+```
+
+**Wargames / chaos engineering:**
+
+Practice incident response:
+- Simulated outages
+- Tabletop exercises
+- Game days (full simulations)
+
+Improves team readiness.
+
+**Metrics:**
+
+Track:
+- MTTD: Mean Time to Detect
+- MTTA: Mean Time to Acknowledge
+- MTTR: Mean Time to Resolve
+- MTBF: Mean Time Between Failures
+
+Improve over time.
+
+**Postmortem culture:**
+
+**Blameless:**
+- Focus on systems, not individuals
+- "What conditions led to mistake?" not "Who screwed up?"
+- Psychological safety to share honestly
+
+**Actionable:**
+- Concrete action items
+- Owners and deadlines
+- Tracked to completion
+
+**Shared:**
+- Whole team learns
+- Pattern recognition across incidents
+
+**Production scenarios:**
+
+1. **Incident structured response**: SEV-1 outage. Following workflow: IC assigned, SMEs paged, channel opened, status page updated. Resolved in 35 min. Without structure: would have taken longer.
+
+2. **Wargame revealed gaps**: Monthly chaos days. Simulated DB failure. Team realized runbook outdated. Updated, improved.
+
+3. **Action items tracked**: Post-mortem action items in Jira. Followed up monthly. Completion rate >90%. Real improvements implemented.
+
+4. **Blameless culture mattered**: Engineer made mistake during deploy. Blameless post-mortem focused on tooling allowing it. Added safeguard. Engineer stayed engaged.
+
+5. **MTTR improvements**: Tracked MTTR over 12 months. Identified slow detection. Improved monitoring. MTTR dropped from 60 min to 15 min.
+
+---
+
+## 284. How do you monitor service mesh traffic?
+
+Service meshes (Istio, Linkerd) provide rich observability automatically. Understanding what to monitor maximizes value.
+
+**Service mesh observability:**
+
+Mesh adds sidecars (Envoy, etc.) to each pod. Sidecars intercept traffic, generate telemetry.
+
+**Automatic metrics:**
+
+For every service-to-service call:
+
+- Request rate
+- Error rate
+- Latency
+- Bytes transferred
+
+No application instrumentation needed.
+
+**Istio metrics:**
+
+```promql
+# Request rate:
+sum(rate(istio_requests_total[5m])) by (destination_service)
+
+# Error rate:
+sum(rate(istio_requests_total{response_code=~"5.."}[5m])) by (destination_service)
+/
+sum(rate(istio_requests_total[5m])) by (destination_service)
+
+# Latency P99:
+histogram_quantile(0.99,
+  sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le, destination_service)
+)
+
+# By source-destination pair:
+sum by (source_app, destination_app) (rate(istio_requests_total[5m]))
+```
+
+**RED metrics built-in:**
+
+- **Rate**: `istio_requests_total`
+- **Errors**: `istio_requests_total{response_code=~"5.."}`
+- **Duration**: `istio_request_duration_milliseconds`
+
+**Linkerd metrics:**
+
+```promql
+# Success rate:
+sum(rate(response_total{classification="success"}[5m]))
+/
+sum(rate(response_total[5m]))
+
+# Latency:
+histogram_quantile(0.99, sum(rate(response_latency_ms_bucket[5m])) by (le))
+```
+
+**Mesh dashboards:**
+
+Pre-built dashboards:
+
+**Istio:**
+- Mesh dashboard (cluster overview)
+- Service dashboard (per-service)
+- Workload dashboard (per-deployment)
+- Performance dashboard
+
+**Linkerd:**
+- Multi-Resource view
+- Service-level
+- Pod-level
+
+Access via Grafana.
+
+**Service dependency map:**
+
+Visualize call graph:
+
+```
+Frontend → API Gateway
+API Gateway → Auth Service
+API Gateway → User Service
+User Service → Database
+```
+
+Auto-generated from mesh telemetry.
+
+**Mesh traffic patterns:**
+
+**Pattern 1: Top dependencies**
+
+```promql
+topk(10, sum by (destination_app) (rate(istio_requests_total[5m])))
+```
+
+Which services are most called?
+
+**Pattern 2: Cross-namespace traffic**
+
+```promql
+sum by (source_workload_namespace, destination_workload_namespace) (
+  rate(istio_requests_total[5m])
+)
+```
+
+Identify unexpected cross-namespace calls.
+
+**Pattern 3: Error sources**
+
+```promql
+sum by (source_app, destination_app) (
+  rate(istio_requests_total{response_code=~"5.."}[5m])
+)
+```
+
+Which connections have errors?
+
+**Mesh-specific concerns:**
+
+**mTLS verification:**
+
+```promql
+# Requests using mTLS:
+sum(rate(istio_requests_total{security_policy="mutual_tls"}[5m]))
+/
+sum(rate(istio_requests_total[5m]))
+```
+
+Should be ~100% in strict mode.
+
+**Authorization policy denials:**
+
+```promql
+sum(rate(istio_requests_total{response_flags="UAEX"}[5m]))
+```
+
+Requests denied by AuthorizationPolicy.
+
+**Circuit breaker tripping:**
+
+```promql
+# Istio:
+envoy_cluster_circuit_breakers_default_cx_open
+```
+
+When circuit breakers open, capacity constraints.
+
+**Traffic shifting:**
+
+For canary deployments:
+
+```promql
+# Traffic split by version:
+sum by (destination_version) (rate(istio_requests_total{destination_app="my-app"}[5m]))
+```
+
+Verify expected ratios.
+
+**Retries and timeouts:**
+
+```promql
+# Retries:
+sum(rate(istio_request_duration_milliseconds_count{retry="true"}[5m]))
+
+# Timeouts:
+sum(rate(istio_requests_total{response_flags=~".*UT.*"}[5m]))
+```
+
+**Tracing in mesh:**
+
+Mesh auto-generates traces:
+
+```yaml
+# Istio:
+spec:
+  meshConfig:
+    enableTracing: true
+    defaultProviders:
+      tracing:
+        - zipkin
+```
+
+Sidecar adds trace headers, sends to backend.
+
+**Sampling:**
+
+```yaml
+# Istio sampling:
+spec:
+  meshConfig:
+    extensionProviders:
+      - name: zipkin
+        zipkin:
+          service: zipkin.istio-system.svc.cluster.local
+          port: 9411
+    defaultConfig:
+      tracing:
+        sampling: 1.0   # 100%
+```
+
+Or per-namespace.
+
+**Access logs:**
+
+Sidecars can log every request:
+
+```yaml
+# Istio access logs:
+spec:
+  meshConfig:
+    accessLogFile: /dev/stdout
+    accessLogFormat: |
+      [%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%" %RESPONSE_CODE%
+```
+
+Rich data but volume can be high.
+
+**SLOs from mesh metrics:**
+
+```yaml
+# Service availability SLI:
+sli: |
+  sum(rate(istio_requests_total{response_code!~"5.."}[5m]))
+  /
+  sum(rate(istio_requests_total[5m]))
+
+# Latency SLI:
+sli: |
+  histogram_quantile(0.99,
+    sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le)
+  )
+```
+
+Mesh provides foundation for service SLOs.
+
+**Per-route monitoring:**
+
+Track per-endpoint:
+
+```promql
+sum by (request_protocol, request_path) (
+  rate(istio_requests_total[5m])
+)
+```
+
+Per-path metrics for granularity.
+
+**Mesh overhead monitoring:**
+
+Mesh adds resources:
+
+```promql
+# Sidecar CPU:
+sum(rate(container_cpu_usage_seconds_total{container="istio-proxy"}[5m])) by (pod)
+
+# Sidecar memory:
+sum(container_memory_working_set_bytes{container="istio-proxy"}) by (pod)
+```
+
+Monitor sidecar resource usage.
+
+**Common alerts:**
+
+```yaml
+- alert: ServiceHighErrorRate
+  expr: |
+    sum(rate(istio_requests_total{response_code=~"5..", destination_service=~".*"}[5m])) by (destination_service)
+    / 
+    sum(rate(istio_requests_total{destination_service=~".*"}[5m])) by (destination_service)
+    > 0.05
+  for: 10m
+
+- alert: mTLSDisabled
+  expr: |
+    sum(rate(istio_requests_total{security_policy!="mutual_tls"}[5m]))
+    /
+    sum(rate(istio_requests_total[5m]))
+    > 0.01
+  for: 10m
+
+- alert: HighLatency
+  expr: |
+    histogram_quantile(0.99, 
+      sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le, destination_service)
+    ) > 1000
+  for: 10m
+```
+
+**Kiali (Istio observability UI):**
+
+Service mesh-specific UI:
+- Service graph
+- Traffic flow
+- Configuration validation
+- Inspection of resources
+
+```yaml
+# Install Kiali:
+istioctl install --set values.kiali.enabled=true
+```
+
+**Linkerd CLI:**
+
+```bash
+# Top traffic:
+linkerd viz top deploy/my-app
+
+# Stats:
+linkerd viz stat deploy
+
+# Service profile:
+linkerd viz routes deploy/my-app
+```
+
+**Best practices:**
+
+1. **Use built-in dashboards**: Istio/Linkerd provide good defaults
+2. **Service-level SLOs**: leverage mesh metrics
+3. **Watch sidecar overhead**: ensure not impacting workload
+4. **Verify mTLS coverage**: should be 100% in strict mode
+5. **Trace strategically**: 100% sampling expensive at scale
+6. **Access logs sparingly**: volume can overwhelm
+
+**Production scenarios:**
+
+1. **Mesh provided RED for free**: Apps had minimal instrumentation. Mesh provided complete RED metrics. Standardized dashboards across all services.
+
+2. **Service graph revealed surprises**: Kiali showed unexpected service calls. Service A called Service B which app team didn't know about. Investigated.
+
+3. **mTLS verification**: Migration to STRICT mode. Watched mtls coverage metric. Caught service that wasn't yet meshed. Fixed.
+
+4. **Sidecar overhead**: Some sidecars used more memory than apps. Tuned Envoy buffer sizes. Reduced memory 50%.
+
+5. **Mesh-based SLOs**: Built SLOs from mesh metrics. Same SLI across all services. Consistent reliability tracking.
+
+---
+
+## 285. Explain eBPF-based observability
+
+eBPF (extended Berkeley Packet Filter) allows running programs in the kernel. Modern observability tools use eBPF for low-overhead, deep visibility.
+
+**What eBPF does:**
+
+```
+User program writes eBPF code
+        ↓
+Loaded into kernel
+        ↓
+Runs at specific hooks (syscalls, network, etc.)
+        ↓
+Sends data to user space
+```
+
+Safe (verified), fast (in-kernel), powerful.
+
+**Why eBPF for observability:**
+
+**Traditional approaches:**
+- Sidecar containers
+- App instrumentation
+- /proc parsing
+
+Each has overhead, requires changes.
+
+**eBPF approach:**
+- Runs in kernel
+- Zero application changes
+- Very low overhead
+- Deep visibility
+
+**Capabilities:**
+
+eBPF can observe:
+- All syscalls
+- Network traffic (any protocol)
+- File system operations
+- Process events
+- Function calls
+- Performance counters
+
+**Tools using eBPF:**
+
+**Cilium:**
+
+CNI plugin with eBPF-based networking:
+- Network policies (eBPF datapath)
+- Service mesh (Cilium Service Mesh)
+- Visibility (Hubble)
+
+**Hubble:**
+
+Cilium's observability:
+
+```bash
+# Recent flows:
+hubble observe
+
+# Filter by pod:
+hubble observe --pod my-app
+
+# Verdict (allowed/denied):
+hubble observe --verdict DROPPED
+```
+
+Network observability without sidecars.
+
+**Pixie:**
+
+Auto-instrumentation via eBPF:
+
+```yaml
+# Install:
+px deploy
+```
+
+Provides:
+- Auto-generated dashboards
+- HTTP request analysis (no instrumentation)
+- DB query inspection
+- Service maps
+
+**Tetragon:**
+
+Cilium's runtime security:
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+spec:
+  kprobes:
+    - call: "sys_openat"
+      args:
+        - index: 1
+          type: "string"
+      selectors:
+        - matchArgs:
+            - operator: "Equal"
+              values:
+                - "/etc/shadow"
+```
+
+Detect (or block) suspicious actions.
+
+**Inspektor Gadget:**
+
+Collection of eBPF tools:
+
+```bash
+# Trace open syscalls:
+kubectl gadget trace open
+
+# Top processes by network:
+kubectl gadget top tcp
+```
+
+**Parca:**
+
+eBPF-based continuous profiling:
+
+```yaml
+# Install:
+helm install parca parca/parca
+```
+
+Profiles all processes. CPU usage breakdown.
+
+**Coroot:**
+
+Auto-instrumentation, SLO tracking via eBPF.
+
+**Falco:**
+
+Runtime security. Uses eBPF or kmod:
+
+```yaml
+- rule: Suspicious file access
+  condition: open_read and fd.name=/etc/shadow
+  output: Suspicious file read
+```
+
+**Benefits over traditional:**
+
+**Benefit 1: No code changes**
+
+Application unchanged. eBPF watches from kernel.
+
+**Benefit 2: Universal**
+
+Works for any language, any framework. No SDK needed.
+
+**Benefit 3: Low overhead**
+
+Typically <1% CPU. Better than sidecars.
+
+**Benefit 4: Deep visibility**
+
+Sees kernel events. Beyond what app exposes.
+
+**Benefit 5: Real-time**
+
+Kernel events immediately. No lag.
+
+**Use cases:**
+
+**Use case 1: Network observability**
+
+Without service mesh:
+
+```bash
+# Hubble:
+hubble observe --pod my-app --to-pod database
+# Shows all network flows between these pods
+```
+
+**Use case 2: HTTP analysis**
+
+Pixie:
+
+```python
+# Auto-generated:
+df = px.DataFrame(table='http_events')
+df.req_path  # HTTP path
+df.req_method  # GET, POST, etc.
+df.resp_status  # Status code
+```
+
+No app changes, see all HTTP traffic.
+
+**Use case 3: Database query analysis**
+
+```python
+# Pixie:
+df = px.DataFrame(table='mysql_events')
+df.req_body  # SQL queries
+df.latency_ns
+```
+
+See queries without instrumenting app or DB.
+
+**Use case 4: Profiling**
+
+Parca continuous profiling:
+
+```
+Stack trace at each sample point
+Aggregate over time
+Show hot code paths
+```
+
+Find performance bottlenecks.
+
+**Use case 5: Security**
+
+Tetragon/Falco watch syscalls. Detect attacks.
+
+```yaml
+- rule: Unusual file modification
+  condition: open_write and fd.name startswith /etc
+  output: Suspicious write
+```
+
+**Use case 6: Performance debugging**
+
+```bash
+# kubectl-trace:
+kubectl trace run node -e 'tracepoint:syscalls:sys_enter_open { printf("%s\n", str(args->filename)); }'
+```
+
+See file opens on a node.
+
+**Setup requirements:**
+
+eBPF requires:
+- Linux kernel 4.4+ (basic)
+- Kernel 5.x recommended (modern features)
+- CAP_BPF or CAP_SYS_ADMIN
+
+Containerized eBPF:
+
+```yaml
+spec:
+  hostPID: true
+  hostNetwork: true
+  containers:
+    - securityContext:
+        privileged: true   # Or specific capabilities
+```
+
+**Performance:**
+
+```
+Traditional sidecar: ~50-200MB memory per pod, 2-5% CPU
+eBPF agent: ~50MB per node (DaemonSet), <1% CPU
+```
+
+Significant savings at scale.
+
+**Comparison: eBPF vs service mesh:**
+
+| Aspect | eBPF | Service mesh |
+|--------|------|--------------|
+| Network observability | Yes | Yes |
+| Layer 7 (HTTP, gRPC) | Yes | Yes |
+| Encryption (mTLS) | Some (Cilium) | Yes |
+| Authorization | Some (Cilium) | Yes |
+| Per-pod overhead | Low | Higher (sidecar) |
+| App changes | None | None |
+| Maturity | Newer | Established |
+
+**Often complementary:**
+- Service mesh for traffic management
+- eBPF for low-level observability
+
+**Limitations:**
+
+**Limitation 1: Kernel dependency**
+
+Different kernels, different features. Compatibility matters.
+
+**Limitation 2: Complex programming**
+
+Writing eBPF requires kernel knowledge. Tools abstract but lower levels difficult.
+
+**Limitation 3: Privileged operation**
+
+eBPF programs typically need elevated privileges.
+
+**Limitation 4: Encrypted traffic**
+
+eBPF sees encrypted traffic but can't decrypt. Service mesh might inject TLS.
+
+**Limitation 5: Ecosystem**
+
+Newer ecosystem. Tools maturing.
+
+**Production scenarios:**
+
+1. **Replaced sidecars with Cilium**: Service mesh sidecars used significant resources. Migrated to Cilium Service Mesh (eBPF-based). 50% resource reduction.
+
+2. **Pixie for auto-instrumentation**: Adopting OpenTelemetry SDKs across many languages was slow. Pixie provided automatic HTTP/DB visibility. Quick wins.
+
+3. **Tetragon for security**: Replaced traditional IDS with Tetragon. eBPF-based detection. Real-time response (can kill processes). Better security.
+
+4. **Parca profiling caught issue**: Continuous profiling showed unexpected CPU in a library. Investigation found inefficient code. Fixed, performance improved.
+
+5. **Hubble for network debugging**: Without sidecars, debug network issues was hard. Hubble showed all flows. Quick identification of NetworkPolicy issues.
+
+---
+
+## 286. How do you troubleshoot memory leaks?
+
+Memory leaks cause pods to grow unbounded, eventually OOMKilled. Diagnosing requires multiple tools and techniques.
+
+**Detecting memory leaks:**
+
+**Symptom 1: Steadily increasing memory**
+
+```promql
+container_memory_working_set_bytes{pod="my-app"}
+```
+
+Memory grows over hours/days without dropping.
+
+**Symptom 2: OOMKilled pods**
+
+```bash
+kubectl get pods
+# Status: OOMKilled
+
+kubectl describe pod my-app
+# Last State: Terminated, Reason: OOMKilled
+```
+
+**Symptom 3: High working set, doesn't drop**
+
+```promql
+# Memory used (excluding cache):
+container_memory_working_set_bytes
+```
+
+Normal apps fluctuate. Leaks only grow.
+
+**Initial investigation:**
+
+**Step 1: Confirm it's a leak**
+
+```promql
+# Plot memory over time:
+container_memory_working_set_bytes{pod="my-app"}
+```
+
+If gradually increasing over hours/days: likely leak.
+If just high: maybe needs more memory.
+
+**Step 2: Check if all instances affected**
+
+```promql
+container_memory_working_set_bytes{deployment="my-app"}
+```
+
+All instances same pattern? Code issue. Just one? Maybe local issue.
+
+**Step 3: Correlate with traffic**
+
+```promql
+sum(rate(http_requests_total{service="my-app"}[5m]))
+```
+
+Memory grows with traffic = handling each request leaks. Memory grows without traffic = idle leak.
+
+**Language-specific tools:**
+
+**Java:**
+
+**Heap dump:**
+
+```bash
+# Trigger heap dump:
+kubectl exec -it my-app -- jcmd 1 GC.heap_dump /tmp/heap.hprof
+
+# Copy out:
+kubectl cp my-app:/tmp/heap.hprof ./heap.hprof
+
+# Analyze with Eclipse MAT or VisualVM
+```
+
+**Continuous monitoring:**
+
+```bash
+# JMX metrics:
+java -javaagent:jmx_prometheus_javaagent.jar=8080:config.yaml ...
+```
+
+Then:
+
+```promql
+jvm_memory_used_bytes{area="heap"}
+jvm_gc_collection_seconds_count
+```
+
+**Causes in Java:**
+- Caches without size limits
+- Listeners not removed
+- ThreadLocals not cleaned
+- Class loader leaks (common in app servers)
+- Large objects not collected
+
+**Python:**
+
+```python
+# tracemalloc:
+import tracemalloc
+
+tracemalloc.start()
+
+# ... your code ...
+
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics('lineno')
+
+for stat in top_stats[:10]:
+    print(stat)
+```
+
+**memory_profiler:**
+
+```python
+from memory_profiler import profile
+
+@profile
+def my_func():
+    # ...
+```
+
+Annotates lines with memory usage.
+
+**Causes in Python:**
+- Global lists/dicts growing unbounded
+- Circular references with __del__
+- C extensions not releasing memory
+- Generators not closed
+
+**Node.js:**
+
+**Heap snapshot:**
+
+```javascript
+const v8 = require('v8');
+v8.writeHeapSnapshot('/tmp/heap.heapsnapshot');
+```
+
+Analyze in Chrome DevTools.
+
+**Causes:**
+- Closures capturing references
+- Event listeners not removed
+- Caches growing
+- Native modules
+
+**Go:**
+
+```bash
+# pprof endpoint in app:
+import _ "net/http/pprof"
+
+# Get heap profile:
+go tool pprof http://my-app:8080/debug/pprof/heap
+```
+
+Interactive analysis.
+
+**Causes:**
+- Goroutine leaks (not exiting)
+- Channels not closed
+- Caches growing
+- Pointer references holding objects
+
+**Generic approaches:**
+
+**Approach 1: Memory growth over time**
+
+```promql
+# Rate of memory growth:
+rate(container_memory_working_set_bytes[1h])
+```
+
+Should be near 0 long-term. Sustained positive = leak.
+
+**Approach 2: Restart and observe**
+
+```bash
+kubectl rollout restart deployment/my-app
+```
+
+Memory drops to baseline. If grows again at same rate: confirmed leak.
+
+**Approach 3: Compare versions**
+
+Memory pattern changed after deploy?
+
+```promql
+# Compare current vs previous:
+avg_over_time(container_memory_working_set_bytes{pod="my-app"}[1h])
+```
+
+Recent change introduced leak?
+
+**Approach 4: Workload correlation**
+
+Memory tracks specific operation?
+- Big batch jobs
+- Specific endpoints
+- Particular customers
+
+Isolate to that operation.
+
+**Common leak patterns:**
+
+**Pattern 1: Caches without TTL**
+
+```python
+# Bad:
+cache = {}
+def get_user(id):
+    if id not in cache:
+        cache[id] = db.get_user(id)
+    return cache[id]
+# Grows forever
+```
+
+Fix: TTL or LRU cache.
+
+**Pattern 2: Event listener leak**
+
+```javascript
+// Bad:
+function handleClick() { ... }
+window.addEventListener('click', handleClick);
+// Never removed
+```
+
+Fix: removeEventListener when done.
+
+**Pattern 3: Connection pool leak**
+
+```python
+# Bad:
+def query():
+    conn = pool.get_connection()
+    result = conn.execute(...)
+    return result
+# Forgot conn.close()
+```
+
+Fix: context manager / try-finally.
+
+**Pattern 4: Goroutine leak (Go)**
+
+```go
+// Bad:
+func process() {
+    ch := make(chan int)
+    go worker(ch)
+    // No close(ch), worker hangs
+}
+```
+
+Fix: close channels, use context.
+
+**Mitigation while debugging:**
+
+**Mitigation 1: Increase memory limit**
+
+```yaml
+resources:
+  limits:
+    memory: 2Gi   # Was 1Gi
+```
+
+Buys time but doesn't fix.
+
+**Mitigation 2: Automatic restart**
+
+```yaml
+spec:
+  containers:
+    - livenessProbe:
+        httpGet:
+          path: /healthz
+        periodSeconds: 30
+```
+
+Memory limit hit → OOMKilled → restart. Workaround.
+
+**Mitigation 3: Scheduled restart**
+
+```yaml
+# CronJob to rollout restart:
+spec:
+  schedule: "0 4 * * *"   # Daily 4 AM
+```
+
+Restart before OOM. Mask but doesn't fix.
+
+**Long-term: actually fix the leak.**
+
+**Tools beyond app-level:**
+
+**Memory profiling tools:**
+
+- **jemalloc**: tracks memory allocations
+- **Valgrind**: detailed leak detection (slow)
+- **AddressSanitizer**: compile-time
+
+For containerized apps:
+
+```bash
+# Run with profiler:
+kubectl exec -it my-app -- /usr/bin/profiler my-app-binary
+```
+
+**Distributed tracing:**
+
+Memory allocated during specific request:
+
+```python
+# OpenTelemetry:
+with tracer.start_as_current_span("operation") as span:
+    span.set_attribute("memory_before", get_memory())
+    do_work()
+    span.set_attribute("memory_after", get_memory())
+```
+
+**Production scenarios:**
+
+1. **Cache without TTL**: Java app slowly grew memory. Heap dump showed massive HashMap. Cache without size limit. Added LRU with max size. Leak fixed.
+
+2. **Goroutine leak in Go**: Memory growth + goroutine count growing. pprof showed goroutines waiting on channels. Found code path leaking goroutines. Fixed with context cancellation.
+
+3. **Event listener accumulation**: Node.js app grew memory over hours. Heap snapshot showed many event listeners. Forgotten in component lifecycle. Added cleanup.
+
+4. **Database connection leak**: Python app's memory grew slowly. Connection pool exhausted, queries failed. Found code path not releasing connections. Added with-statement.
+
+5. **Workaround vs fix**: New service had slow leak. Implemented daily restart as workaround. Engineers fixed leak in v2. Removed restart.
+
+---
+
+## 287. Explain synthetic monitoring
+
+Synthetic monitoring uses simulated transactions to verify systems work end-to-end. Different from black-box (simple HTTP checks); synthetic is more complete.
+
+**What it does:**
+
+```
+Run scheduled tests
+        ↓
+Simulate user actions (login, purchase, etc.)
+        ↓
+Measure success and timing
+        ↓
+Alert on failures or slowness
+```
+
+**Difference from real user monitoring:**
+
+**Synthetic**: simulated transactions
+- Predictable
+- Run on schedule
+- Catch issues before users
+
+**RUM (Real User Monitoring)**: actual users
+- Reactive
+- Geographic real-world data
+- See actual user impact
+
+Both useful. Synthetic for proactive; RUM for actual.
+
+**Types of synthetic monitoring:**
+
+**Type 1: Simple HTTP check**
+
+```yaml
+# Black-box exporter:
+modules:
+  http_check:
+    prober: http
+    http:
+      method: GET
+      valid_status_codes: [200]
+
+targets:
+  - https://api.example.com/health
+```
+
+Basic but valuable.
+
+**Type 2: API workflow**
+
+Multi-step API test:
+
+```python
+def test_workflow():
+    # 1. Login
+    resp = requests.post('/login', json={'user': 'test', 'pass': 'x'})
+    assert resp.status_code == 200
+    token = resp.json()['token']
+    
+    # 2. Get user data
+    resp = requests.get('/me', headers={'Auth': token})
+    assert resp.status_code == 200
+    
+    # 3. Make purchase
+    resp = requests.post('/purchase', json={'item': 1}, headers={'Auth': token})
+    assert resp.status_code == 200
+    
+    # 4. Logout
+    resp = requests.post('/logout', headers={'Auth': token})
+    
+    return True
+```
+
+Tests entire workflow.
+
+**Type 3: Browser-based**
+
+Full browser automation:
+
+```javascript
+// Selenium/Playwright:
+async function syntheticTest() {
+    const browser = await chromium.launch();
+    const page = await browser.newPage();
+    
+    await page.goto('https://example.com');
+    await page.click('#login-button');
+    await page.fill('input[name=email]', 'test@example.com');
+    await page.fill('input[name=password]', 'password');
+    await page.click('button[type=submit]');
+    
+    // Verify logged in
+    await page.waitForSelector('.dashboard');
+    
+    await browser.close();
+}
+```
+
+Tests JavaScript, rendering, interactions.
+
+**Type 4: Geographic checks**
+
+Run synthetic from multiple regions:
+
+```
+Test from:
+- us-east-1
+- us-west-2
+- eu-west-1
+- ap-northeast-1
+```
+
+Identifies regional issues, CDN problems.
+
+**Tools:**
+
+**Open source:**
+
+**Prometheus + blackbox-exporter:**
+Simple HTTP/TCP checks.
+
+**Synthetic monitoring with custom scripts:**
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: synthetic-check
+spec:
+  schedule: "*/5 * * * *"   # Every 5 min
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: check
+              image: my-synthetic-image
+              command:
+                - python
+                - synthetic.py
+```
+
+Custom Python/JS tests.
+
+**Commercial:**
+
+- **Datadog Synthetics**
+- **New Relic Synthetics**
+- **Catchpoint**
+- **Pingdom**
+- **Uptrends**
+- **AWS CloudWatch Synthetics**
+- **GCP Cloud Monitoring synthetics**
+
+**Datadog example:**
+
+```yaml
+# Synthetic test config:
+locations:
+  - aws:us-east-1
+  - aws:eu-west-1
+  - aws:ap-northeast-1
+
+config:
+  steps:
+    - type: navigate
+      url: https://example.com
+    - type: click
+      element: '#login'
+    - type: fill
+      element: 'input[name=email]'
+      value: 'test@example.com'
+    - type: assert
+      element: '.dashboard'
+      condition: visible
+
+frequency: 300   # Every 5 min
+
+alerts:
+  - on_failure
+  - on_high_latency:
+      threshold: 3000   # 3 seconds
+```
+
+**Synthetic test design:**
+
+**Test 1: Health check**
+
+Simple "service alive":
+
+```bash
+GET /health
+Expect: 200 OK
+```
+
+**Test 2: Critical user journey**
+
+Most important user flow:
+
+```
+For e-commerce:
+1. Browse product
+2. Add to cart
+3. Checkout
+4. Payment
+
+Each step verified.
+```
+
+**Test 3: API contract**
+
+```python
+def test_api():
+    resp = requests.get('/api/products/1')
+    data = resp.json()
+    
+    assert 'id' in data
+    assert 'name' in data
+    assert 'price' in data
+    assert isinstance(data['price'], float)
+```
+
+Verify API contracts.
+
+**Test 4: Performance check**
+
+```python
+def test_performance():
+    start = time.time()
+    resp = requests.get('/api/heavy-endpoint')
+    duration = time.time() - start
+    
+    assert resp.status_code == 200
+    assert duration < 2.0   # SLA: <2s
+```
+
+**Frequency considerations:**
+
+```
+Health checks: every 1-5 min
+API workflows: every 5-15 min
+Browser tests: every 15-60 min
+End-to-end: every hour
+```
+
+More complex tests = less frequent (more expensive).
+
+**Metrics:**
+
+Synthetic tests produce metrics:
+
+```promql
+# Success rate:
+sum(rate(synthetic_test_success_total[1h]))
+/
+sum(rate(synthetic_test_total[1h]))
+
+# Latency:
+histogram_quantile(0.99,
+  rate(synthetic_test_duration_seconds_bucket[1h])
+)
+
+# Per-region:
+sum by (region) (rate(synthetic_test_total{status="success"}[1h]))
+```
+
+**Alerting:**
+
+```yaml
+- alert: SyntheticTestFailing
+  expr: synthetic_test_success_total == 0
+  for: 5m
+  labels:
+    severity: critical
+
+- alert: SyntheticTestSlow
+  expr: synthetic_test_duration_seconds > 5
+  for: 15m
+```
+
+**Use cases:**
+
+**Use case 1: Pre-production validation**
+
+Run synthetic tests against staging before promotion to prod.
+
+**Use case 2: Continuous validation**
+
+After every deploy, verify still works.
+
+**Use case 3: Geographic monitoring**
+
+Catch regional CDN, DNS issues.
+
+**Use case 4: SLA verification**
+
+Document compliance with customer SLAs.
+
+**Use case 5: External service health**
+
+Monitor third-party APIs you depend on.
+
+**Best practices:**
+
+**Practice 1: Test in production**
+
+Tests against production (with care):
+- Read-only mostly
+- Avoid creating real orders
+- Use test accounts
+
+**Practice 2: Cover critical paths**
+
+Don't test everything. Focus on critical user journeys.
+
+**Practice 3: Test what matters to users**
+
+Not internal APIs only. Test what user sees.
+
+**Practice 4: Multiple locations**
+
+Geographic distribution catches CDN/DNS issues.
+
+**Practice 5: Verify, don't just check**
+
+```python
+# Bad:
+resp = requests.get('/login')
+assert resp.status_code == 200
+
+# Better:
+resp = requests.get('/login')
+assert resp.status_code == 200
+assert 'login' in resp.text.lower()   # Verify content
+```
+
+Status 200 might still be wrong page.
+
+**Practice 6: Document tests**
+
+What does each test verify? Why important?
+
+**Practice 7: Maintain tests**
+
+UI changes break browser tests. Keep updated.
+
+**Production scenarios:**
+
+1. **Synthetic caught deploy break**: After deploy, login synthetic failed. Caught within 5 min. Rolled back before significant user impact.
+
+2. **Geographic issue revealed**: Synthetic from EU showed slow response. Internal metrics fine. Issue: CDN edge in EU degraded. Switched edge.
+
+3. **SLA reporting**: Customer required 99.9% availability proof. Synthetic test ran every minute. Provided uptime evidence.
+
+4. **Third-party monitoring**: Payment processor sometimes had issues. Synthetic test caught quickly. Communicated to customers before they noticed.
+
+5. **Browser test caught regression**: API tests passed. Browser test failed (UI change broke functionality). Caught before users.
+
+---
+
+## 288. How do you monitor autoscaling efficiency?
+
+Autoscaling adjusts capacity automatically. Monitoring ensures it's working efficiently—not over-scaling (waste) or under-scaling (impact).
+
+**Autoscaling types:**
+
+**HPA (Horizontal Pod Autoscaler):**
+- Adjusts pod count
+- Based on CPU, memory, custom metrics
+
+**VPA (Vertical Pod Autoscaler):**
+- Adjusts pod resources (CPU, memory)
+- Based on observed usage
+
+**Cluster Autoscaler / Karpenter:**
+- Adjusts node count
+- Based on pending pods
+
+**Metrics to monitor:**
+
+**HPA metrics:**
+
+```promql
+# Current vs desired:
+kube_horizontalpodautoscaler_status_current_replicas
+kube_horizontalpodautoscaler_status_desired_replicas
+
+# Mismatch:
+kube_horizontalpodautoscaler_status_desired_replicas
+- kube_horizontalpodautoscaler_status_current_replicas
+
+# Min/max:
+kube_horizontalpodautoscaler_spec_min_replicas
+kube_horizontalpodautoscaler_spec_max_replicas
+
+# HPA conditions:
+kube_horizontalpodautoscaler_status_condition
+```
+
+**Workload metrics:**
+
+```promql
+# Pods running:
+kube_deployment_status_replicas{deployment="my-app"}
+
+# Resource usage:
+sum(rate(container_cpu_usage_seconds_total[5m]))
+
+# Resource requests:
+sum(kube_pod_container_resource_requests{resource="cpu"})
+
+# Utilization:
+sum(rate(container_cpu_usage_seconds_total[5m]))
+/
+sum(kube_pod_container_resource_requests{resource="cpu"})
+```
+
+**Scaling efficiency:**
+
+**Metric 1: Right-sized**
+
+```promql
+# CPU utilization vs requests:
+sum by (deployment) (rate(container_cpu_usage_seconds_total[5m]))
+/
+sum by (deployment) (kube_pod_container_resource_requests{resource="cpu"})
+```
+
+Should be ~70% (HPA target). Higher = under-scaled. Lower = over-scaled.
+
+**Metric 2: Scaling responsiveness**
+
+```promql
+# Time from threshold breach to scale:
+# Custom calculated metric
+```
+
+Should scale within minutes of need.
+
+**Metric 3: Stability (no flapping)**
+
+```promql
+# Scaling events per hour:
+changes(kube_deployment_status_replicas[1h])
+```
+
+Frequent changes = flapping. Tune stabilization windows.
+
+**Metric 4: At limits**
+
+```promql
+# Hitting max:
+kube_horizontalpodautoscaler_status_current_replicas
+== 
+kube_horizontalpodautoscaler_spec_max_replicas
+```
+
+If frequently at max, increase max. If never near max, decrease (cost).
+
+**Metric 5: Pending pods**
+
+```promql
+sum(kube_pod_status_phase{phase="Pending"})
+```
+
+Pods pending = cluster can't scale up fast enough.
+
+**Cluster autoscaling:**
+
+```promql
+# Nodes count:
+sum(kube_node_info)
+
+# Allocatable resources:
+sum(kube_node_status_allocatable{resource="cpu"})
+
+# Pending pods (reason: no nodes):
+sum(kube_pod_status_phase{phase="Pending"})
+
+# Recent node additions:
+changes(kube_node_info[1h])
+```
+
+**Karpenter metrics:**
+
+```promql
+# Provisioned nodes:
+karpenter_nodes_created_count
+
+# Deprovisioned:
+karpenter_nodes_terminated_count
+
+# Pending pods:
+karpenter_pods_pending_count
+
+# Provisioning duration:
+karpenter_provisioner_scheduling_duration_seconds
+```
+
+**Dashboards:**
+
+Per autoscaler:
+- Current/desired/max replicas over time
+- Metric values vs threshold
+- Scaling events
+- Cost impact
+
+**Common issues:**
+
+**Issue 1: Slow scale-up**
+
+Symptom: high latency during traffic spikes.
+
+```promql
+# Scaling events lag traffic:
+rate(http_requests_total[5m])  # Traffic spike at T
+kube_deployment_status_replicas  # Scale up at T+5min
+```
+
+Causes:
+- Stabilization window too long
+- Slow pod startup
+- Cluster needs to scale nodes first
+
+**Fix:**
+
+```yaml
+behavior:
+  scaleUp:
+    stabilizationWindowSeconds: 0   # Immediate
+    policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+```
+
+Plus pod startup optimization.
+
+**Issue 2: Flapping**
+
+Symptom: scales up, then down, then up.
+
+```yaml
+behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 300   # Wait 5 min before scaling down
+  scaleUp:
+    stabilizationWindowSeconds: 0
+```
+
+Asymmetric: scale up fast, down slow.
+
+**Issue 3: Pod startup time**
+
+If pod takes 2 min to start, HPA can't react fast enough.
+
+Optimize:
+- Smaller images
+- Faster initialization
+- Pre-pull images
+- Smaller resource requests
+
+**Issue 4: At max replicas**
+
+Hitting max means can't scale further. Either:
+- Increase max
+- Optimize app (handle more per pod)
+- Add cluster nodes
+
+**Issue 5: Resource fragmentation**
+
+Pods need 2 cores. Nodes have 0.5 cores free each. Can't schedule despite total available.
+
+Use:
+- Larger nodes
+- Smaller pods
+- Cluster autoscaler that consolidates
+
+**Cost efficiency:**
+
+```promql
+# Cost per request:
+(node_cost + pod_cost) / sum(rate(http_requests_total[1h]))
+
+# Cost vs traffic:
+# Should scale proportionally
+```
+
+If cost grows faster than traffic = inefficient scaling.
+
+**Alerts:**
+
+```yaml
+- alert: HPAAtMax
+  expr: |
+    kube_horizontalpodautoscaler_status_current_replicas
+    == kube_horizontalpodautoscaler_spec_max_replicas
+  for: 30m
+  annotations:
+    summary: "HPA at max replicas - may need increase"
+
+- alert: PodsCantSchedule
+  expr: kube_pod_status_phase{phase="Pending"} > 5
+  for: 15m
+
+- alert: ScalingFlapping
+  expr: |
+    changes(kube_deployment_status_replicas[1h]) > 10
+  for: 1h
+  annotations:
+    summary: "Deployment scaling frequently"
+
+- alert: NodeUtilizationLow
+  expr: |
+    sum(rate(container_cpu_usage_seconds_total[1h]))
+    /
+    sum(kube_node_status_allocatable{resource="cpu"})
+    < 0.3
+  for: 1d
+  annotations:
+    summary: "Cluster underutilized - consider scaling down"
+```
+
+**Tuning autoscalers:**
+
+**HPA tuning:**
+
+```yaml
+spec:
+  minReplicas: 2
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70   # Target 70%
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+```
+
+Scale up fast (100% per minute). Scale down slow (10% per minute).
+
+**Custom metrics for HPA:**
+
+```yaml
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "100"
+```
+
+Scale based on actual workload (RPS) not just CPU.
+
+**Production scenarios:**
+
+1. **Slow scale-up issue**: Traffic spike, errors. HPA scaled but pods took 3 min to start. Optimized pod startup. Pre-pulled images. Reduced to 30s. Scale-up effective.
+
+2. **Flapping fixed**: Deployment scaled up/down 20 times/hour. Added stabilization windows. Asymmetric (fast up, slow down). Flapping stopped.
+
+3. **At max consistently**: Hit max replicas during peak. Increased max from 50 to 100. Discovered single-pod throughput ceiling. Optimized app for higher throughput per pod.
+
+4. **Karpenter consolidation**: Cluster underutilized. Karpenter automatically consolidated. Removed half the nodes. Saved 30% on costs.
+
+5. **Custom metric scaling**: CPU-based HPA didn't catch traffic spikes (CPU lags). Added requests/sec custom metric. HPA scaled before CPU climbed. Better latency.
+
+---
+
+## 289. Explain cost observability in Kubernetes
+
+Kubernetes costs can spiral without observation. Cost observability shows where money goes, enables optimization.
+
+**Why cost observability:**
+
+- Identify expensive workloads
+- Detect waste
+- Allocate costs to teams (chargeback)
+- Optimize before bills explode
+- Cloud bill surprise prevention
+
+**What contributes to costs:**
+
+**Compute:**
+- Node count and types
+- Spot vs on-demand
+- Regional pricing
+
+**Storage:**
+- PVs (provisioned size, type)
+- Snapshots
+- Object storage
+
+**Network:**
+- Egress (especially cross-region)
+- Load balancers
+- NAT gateway
+
+**Other:**
+- Container registries
+- Logging
+- Monitoring infrastructure
+- Cloud-managed services (RDS, etc.)
+
+**Tools for cost observability:**
+
+**Kubecost:**
+
+Most popular open-source tool:
+
+```yaml
+# Install:
+helm install kubecost kubecost/cost-analyzer
+```
+
+Provides:
+- Cost by namespace
+- Cost by deployment
+- Cost by label (team, environment)
+- Idle resources
+- Recommendations
+
+**OpenCost:**
+
+CNCF project. Foundation that Kubecost is built on.
+
+```yaml
+helm install opencost opencost/opencost
+```
+
+**Cloud-native:**
+
+**AWS:**
+- Cost Explorer
+- Cost and Usage Report
+- AWS Cost Anomaly Detection
+
+**GCP:**
+- Billing Dashboard
+- BigQuery billing export
+
+**Azure:**
+- Cost Management
+
+**Per-cluster, not per-pod by default.**
+
+**Implementation approach:**
+
+**Step 1: Tag/label everything**
+
+```yaml
+metadata:
+  labels:
+    team: frontend
+    cost-center: engineering
+    environment: production
+    application: my-app
+```
+
+Used for cost allocation.
+
+**Step 2: Deploy cost monitoring**
+
+```yaml
+# Kubecost via Helm:
+helm install kubecost kubecost/cost-analyzer \
+  --set kubecostToken="YOUR_TOKEN" \
+  --set persistentVolume.enabled=true
+```
+
+**Step 3: Configure cloud integration**
+
+For accurate costs, integrate with cloud:
+
+```yaml
+# Kubecost AWS integration:
+kubecostProductConfigs:
+  athenaProjectID: "..."
+  athenaBucketName: "..."
+  awsServiceKeyName: "..."
+  awsServiceKeyPassword: "..."
+```
+
+Pulls real billing data.
+
+**Step 4: Dashboards**
+
+Default and custom:
+- Cost by namespace
+- Cost trends
+- Idle resources
+- Top expensive workloads
+- Team allocation
+
+**Key metrics:**
+
+**Cost per namespace:**
+
+```
+namespace: production
+  cost/day: $500
+  pods: 50
+  cost/pod/day: $10
+```
+
+**Cost per deployment:**
+
+```
+deployment: my-app
+  cost/day: $50
+  replicas: 5
+  cost/replica/day: $10
+```
+
+**Resource efficiency:**
+
+```
+deployment: my-app
+  requested: 4 CPU, 8GB
+  used: 1.5 CPU, 4GB
+  efficiency: 37% CPU, 50% memory
+  cost: $50/day
+  potential savings: $30/day if right-sized
+```
+
+**Idle resources:**
+
+```
+PVCs unused: 5
+Total: 500GB
+Cost: $50/month
+```
+
+**Forecasting:**
+
+```
+Current run rate: $5000/month
+Projected next month: $5500 (+10%)
+Trend: increasing
+```
+
+**Cost allocation models:**
+
+**Model 1: Direct (per namespace)**
+
+Each namespace = one team.
+Cost simply summed.
+
+**Model 2: Label-based**
+
+Multiple labels (team, cost-center, project).
+Costs split by labels.
+
+**Model 3: Time-weighted**
+
+Pods running half the day get 50% of their hourly cost.
+
+**Model 4: Allocation ratios**
+
+Shared resources (databases) split by usage:
+
+```
+Database used 60% by team A, 40% by team B
+$1000/month database cost:
+  Team A: $600
+  Team B: $400
+```
+
+**Common findings:**
+
+**Finding 1: Over-provisioned**
+
+```
+Requests: 4 CPU
+Usage: 0.5 CPU
+Waste: 87.5% (3.5 CPU paid for, unused)
+```
+
+**Fix**: right-size requests. Use VPA recommendations.
+
+**Finding 2: Idle resources**
+
+PVCs detached from any pod:
+
+```bash
+kubectl get pvc -A
+# Look for "released" status
+```
+
+Costs accumulate.
+
+**Finding 3: Forgotten environments**
+
+Staging cluster left running over weekends.
+
+```
+Weekend cost: ~$1000
+With scheduled shutdown: $0
+```
+
+**Finding 4: Expensive storage tier**
+
+Logs on premium SSD instead of HDD.
+
+**Finding 5: Cross-AZ traffic**
+
+Pods talking across AZs. Hidden network cost.
+
+**Cost optimization:**
+
+**Optimization 1: Right-sizing**
+
+VPA recommendations:
+
+```bash
+kubectl get vpa -A
+```
+
+Apply recommendations, save.
+
+**Optimization 2: Spot instances**
+
+For non-critical:
+
+```yaml
+nodeSelector:
+  node.kubernetes.io/instance-type: spot
+tolerations:
+  - key: spot
+    effect: NoSchedule
+```
+
+50-90% cost reduction for compatible workloads.
+
+**Optimization 3: Cluster autoscaler**
+
+Scale down during off-peak:
+
+```yaml
+# Cluster autoscaler:
+spec:
+  template:
+    spec:
+      containers:
+        - args:
+            - --scale-down-utilization-threshold=0.5
+            - --scale-down-unneeded-time=10m
+```
+
+**Optimization 4: Scheduled scaling**
+
+```yaml
+# KEDA cron scaler:
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+spec:
+  triggers:
+    - type: cron
+      metadata:
+        timezone: "America/New_York"
+        start: "0 9 * * 1-5"     # 9am weekdays
+        end: "0 18 * * 1-5"      # 6pm weekdays
+        desiredReplicas: "10"
+    - type: cron
+      metadata:
+        start: "0 18 * * 1-5"
+        end: "0 9 * * 1-5"
+        desiredReplicas: "2"
+```
+
+**Optimization 5: Resource consolidation**
+
+Karpenter or bin-packing scheduler:
+
+```yaml
+# Karpenter:
+spec:
+  consolidation:
+    enabled: true
+```
+
+Repacks workloads to fewer nodes.
+
+**Chargeback / showback:**
+
+**Chargeback**: actually bill teams
+**Showback**: show costs but don't bill
+
+Both drive accountability.
+
+```
+Email weekly:
+"Team Frontend used $5000 last week.
+- Compute: $3000
+- Storage: $1500
+- Network: $500
+Top deployments: ..."
+```
+
+**Production scenarios:**
+
+1. **Kubecost revealed waste**: First week of Kubecost showed 60% of resources idle. Right-sized requests. Saved $20k/month.
+
+2. **Per-team chargeback**: Implemented per-label cost allocation. Each team got monthly bill. Teams optimized their own usage. Total cost dropped 30%.
+
+3. **Idle PVCs**: 200GB of PVCs orphaned. Found via Kubecost. Cleaned up. Saved $200/month.
+
+4. **Spot migration**: Migrated batch jobs to spot instances. Compatible workloads. 70% cost reduction for those workloads.
+
+5. **Scheduled scale-down**: Dev/staging cluster scaled to minimum on weekends. Weekend cost from $5000 to $200. $4800/month savings.
+
+---
+
+## 290. How do you build executive dashboards?
+
+Executive dashboards present operational health to non-technical leadership. Different goals, different design than engineering dashboards.
+
+**Audience needs:**
+
+Executives want:
+- High-level health
+- Business impact
+- Trends over time
+- Cost/efficiency
+- Compliance status
+
+Not interested in:
+- Detailed technical metrics
+- Pod-level data
+- Granular logs
+
+**Dashboard principles:**
+
+**Principle 1: Business-relevant metrics**
+
+Translate technical to business:
+
+```
+Technical: P99 latency 350ms
+Business: 99% of customers wait <0.5s
+
+Technical: 99.95% availability
+Business: 4 minutes unavailability/month
+
+Technical: 10k req/sec
+Business: 100M transactions/day
+```
+
+**Principle 2: Trends over snapshots**
+
+```
+Bad: current value 95%
+Good: 30-day trend showing 92% → 95%
+```
+
+Direction matters.
+
+**Principle 3: Color coding**
+
+Red/yellow/green for quick comprehension:
+
+- Green: healthy
+- Yellow: attention
+- Red: action needed
+
+**Principle 4: Comparison context**
+
+```
+This month: $5000
+Last month: $4500
+YoY: $48k → $60k (+25%)
+Industry avg: $55k
+```
+
+Context for evaluation.
+
+**Principle 5: Drill-down available**
+
+Top-level summary, with ability to dig deeper.
+
+**Common executive metrics:**
+
+**Metric 1: Service availability**
+
+```
+Overall availability: 99.95%
+- Critical services: 99.99%
+- Standard services: 99.95%
+- Internal services: 99.9%
+
+SLO compliance: ✓
+Error budget remaining: 80%
+```
+
+**Metric 2: Incidents**
+
+```
+This month: 3 incidents
+- 1 SEV-1 (resolved 25 min)
+- 2 SEV-3
+
+Trend: down from 5 last month
+
+MTTR: 28 min (target: <30 min) ✓
+```
+
+**Metric 3: Performance**
+
+```
+P99 latency: 250ms
+- Target: <300ms ✓
+- 30-day trend: stable
+
+Customer experience score: 4.5/5
+```
+
+**Metric 4: Cost**
+
+```
+Monthly cost: $50,000
+- Compute: 60%
+- Storage: 25%
+- Network: 15%
+
+YoY: +10%
+Cost per transaction: $0.05 (down from $0.08)
+```
+
+**Metric 5: Security**
+
+```
+Critical vulnerabilities: 0 ✓
+High vulnerabilities: 5 (down from 12)
+Compliance: SOC 2 ✓, PCI ✓, GDPR ✓
+
+Last security incident: 6 months ago
+```
+
+**Metric 6: Capacity**
+
+```
+Cluster utilization: 65%
+Growth runway: 6 months at current trend
+Auto-scaling efficiency: 92%
+```
+
+**Layout examples:**
+
+**Top row: status overview**
+
+```
+┌──────────┬──────────┬──────────┬──────────┐
+│ Avail.   │ Perf.    │ Cost     │ Security │
+│ 99.95% ✓ │ 250ms ✓  │ $50k ↑   │ Good ✓   │
+└──────────┴──────────┴──────────┴──────────┘
+```
+
+Single-page overview.
+
+**Second row: trends**
+
+```
+Availability over time (chart)
+Performance trends (chart)
+Cost trends (chart)
+```
+
+**Third row: incidents/issues**
+
+```
+Recent incidents
+Top concerns
+Action items
+```
+
+**Tools:**
+
+**Grafana:**
+
+Standard dashboarding. Many examples for executive views.
+
+```yaml
+# Use stat panels for KPIs:
+- type: stat
+  title: "Availability"
+  targets:
+    - expr: avg_over_time(sli_availability[30d]) * 100
+  options:
+    colorMode: background
+    thresholds:
+      - { value: 99.9, color: green }
+      - { value: 99, color: yellow }
+      - { value: 0, color: red }
+```
+
+**Datadog:**
+
+Built-in executive overview templates.
+
+**Tableau, Power BI:**
+
+For deeper business analytics. Pull from monitoring systems.
+
+**Custom dashboards:**
+
+Sometimes simpler to build custom:
+
+```html
+<!-- Simple HTML dashboard -->
+<div class="kpi healthy">
+  Availability: 99.95%
+</div>
+```
+
+Single-page, focused.
+
+**Common executive concerns:**
+
+**Concern 1: Are we meeting SLAs?**
+
+Show SLA compliance per service.
+Highlight breaches.
+
+**Concern 2: How are we trending?**
+
+Year-over-year comparisons.
+30-day trends.
+
+**Concern 3: Cost efficiency?**
+
+Cost per transaction.
+Year-over-year cost.
+
+**Concern 4: Security posture?**
+
+Vulnerability counts.
+Compliance status.
+Recent incidents.
+
+**Concern 5: Capacity planning?**
+
+Growth runway.
+Auto-scaling efficiency.
+
+**Dashboard maintenance:**
+
+**Update regularly:**
+
+KPIs evolve. Review quarterly:
+- Are these still right metrics?
+- New concerns?
+- Targets still appropriate?
+
+**Test before sharing:**
+
+Verify data accuracy. Wrong metrics worse than no metrics.
+
+**Get feedback:**
+
+Ask executives:
+- Useful?
+- Missing anything?
+- Too much?
+
+Iterate.
+
+**Examples in practice:**
+
+**Executive dashboard for SaaS:**
+
+```
+┌─────────────────────────────────────────────┐
+│ Customer Experience                         │
+├─────────────────────────────────────────────┤
+│ Availability: 99.97% (Target: 99.9%) ✓     │
+│ Page load: 1.2s (Target: <2s) ✓            │
+│ API latency: 180ms (Target: <300ms) ✓      │
+│ Customer NPS: +52                          │
+├─────────────────────────────────────────────┤
+│ Operational Health                          │
+├─────────────────────────────────────────────┤
+│ Incidents this month: 2                    │
+│ MTTR: 22 min (Target: <30 min) ✓           │
+│ Deployments: 145 (success: 99.3%)          │
+│ Last security incident: 8 months ago       │
+├─────────────────────────────────────────────┤
+│ Financial Health                            │
+├─────────────────────────────────────────────┤
+│ Monthly cost: $52,000                      │
+│ Cost per customer: $4.50 (down from $5.20) │
+│ Forecast next quarter: $58,000             │
+├─────────────────────────────────────────────┤
+│ Trends                                      │
+├─────────────────────────────────────────────┤
+│ [30-day availability chart]                 │
+│ [30-day cost chart]                         │
+│ [30-day latency chart]                      │
+└─────────────────────────────────────────────┘
+```
+
+**Anti-patterns:**
+
+**Anti-pattern 1: Too much information**
+
+50 charts, executives won't read.
+
+**Anti-pattern 2: Engineering metrics**
+
+CPU utilization, pod counts. Not business-relevant.
+
+**Anti-pattern 3: No context**
+
+"99.5% availability" - is that good? Compared to what?
+
+**Anti-pattern 4: Static targets**
+
+Targets that don't update as needs change.
+
+**Anti-pattern 5: Manual updates**
+
+Dashboards updated manually become stale.
+
+**Production scenarios:**
+
+1. **SLO-based executive view**: Built exec dashboard around SLOs. Single page: availability, performance, error budget. CEO loved it. Quarterly business reviews used it.
+
+2. **Cost dashboard drove behavior**: Per-team cost dashboard visible to all. Teams started optimizing voluntarily. Total cost dropped 20%.
+
+3. **Compliance status**: Executives needed compliance status. Built dashboard showing SOC 2, PCI, HIPAA compliance state. Auditor liked too.
+
+4. **Incident metrics**: Tracked MTTR over 12 months. Showed continuous improvement. Board reported on regularly.
+
+5. **Customer-impact translation**: Engineering metrics meant nothing to executives. Translated to "% customers affected" and dollar impact. Resonated immediately.
+
