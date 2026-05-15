@@ -51784,3 +51784,7146 @@ Tekton Chains automatically signs and provides provenance.
 
 5. **Pipeline secret leak**: Developer accidentally logged secret in plain text. Caught by log monitoring. Rotated. Implemented secret masking, log scanning for leakage. Prevention better than detection.
 
+# Kubernetes Security & Compliance (241-260)
+
+## 241. Explain Kubernetes audit logging
+
+Audit logs record every action against the Kubernetes API server. They're essential for security investigation, compliance, and operational forensics.
+
+**What audit logs capture:**
+
+Every API request:
+- Who made it (user, service account)
+- What action (verb: get, create, update, delete)
+- What resource (pod, secret, deployment)
+- Source (IP, user agent)
+- Result (allowed, denied)
+- Response
+
+**Audit policy configuration:**
+
+```yaml
+# audit-policy.yaml:
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - "RequestReceived"
+rules:
+  # Don't log routine reads
+  - level: None
+    users: ["system:kube-proxy"]
+    verbs: ["watch"]
+    resources:
+      - group: ""
+        resources: ["endpoints", "services"]
+  
+  # Don't log node status updates
+  - level: None
+    users: ["kubelet"]
+    verbs: ["get"]
+    resources:
+      - group: ""
+        resources: ["nodes"]
+  
+  # Log secret access at metadata level (don't include data)
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+  
+  # Log authentication failures
+  - level: Metadata
+    omitStages: ["RequestReceived"]
+    namespaces: ["kube-system"]
+  
+  # Detailed logging for sensitive operations
+  - level: RequestResponse
+    verbs: ["create", "update", "patch", "delete"]
+    resources:
+      - group: ""
+        resources: ["pods", "secrets", "configmaps"]
+  
+  # Default: log everything else at Metadata level
+  - level: Metadata
+```
+
+**Log levels:**
+
+- **None**: don't log
+- **Metadata**: who, what, when (no request/response body)
+- **Request**: metadata + request body
+- **RequestResponse**: metadata + request body + response body
+
+Higher levels = more storage but more forensics value.
+
+**Stages:**
+
+- **RequestReceived**: when API server received
+- **ResponseStarted**: when response started
+- **ResponseComplete**: when response done
+- **Panic**: server panic
+
+Typically: omit RequestReceived (duplicate), log others.
+
+**Enabling audit logging:**
+
+```yaml
+# kube-apiserver args:
+- --audit-policy-file=/etc/kubernetes/audit-policy.yaml
+- --audit-log-path=/var/log/audit.log
+- --audit-log-maxage=30        # Days to retain
+- --audit-log-maxbackup=10     # Number of files
+- --audit-log-maxsize=100      # MB per file
+```
+
+**Log destinations:**
+
+**Local file:**
+
+```yaml
+- --audit-log-path=/var/log/audit.log
+```
+
+Simple but limited (rotation, capacity).
+
+**Webhook:**
+
+```yaml
+- --audit-webhook-config-file=/etc/kubernetes/audit-webhook.yaml
+```
+
+Send to external system:
+- Elasticsearch
+- Splunk
+- Datadog
+- Custom SIEM
+
+```yaml
+# audit-webhook.yaml:
+apiVersion: v1
+kind: Config
+clusters:
+  - name: webhook
+    cluster:
+      server: https://audit-webhook.example.com/audit
+users:
+  - name: webhook
+    user:
+      token: <token>
+contexts:
+  - name: webhook
+    context:
+      cluster: webhook
+      user: webhook
+current-context: webhook
+```
+
+**Audit log entry example:**
+
+```json
+{
+  "kind": "Event",
+  "apiVersion": "audit.k8s.io/v1",
+  "level": "RequestResponse",
+  "auditID": "abc-123",
+  "stage": "ResponseComplete",
+  "requestURI": "/api/v1/namespaces/production/secrets/db-creds",
+  "verb": "get",
+  "user": {
+    "username": "alice@example.com",
+    "groups": ["developers"]
+  },
+  "sourceIPs": ["10.0.1.5"],
+  "userAgent": "kubectl/v1.28.0",
+  "objectRef": {
+    "resource": "secrets",
+    "namespace": "production",
+    "name": "db-creds",
+    "apiVersion": "v1"
+  },
+  "responseStatus": {
+    "code": 200
+  },
+  "responseObject": {
+    // The actual secret data (if Level: RequestResponse)
+  },
+  "requestReceivedTimestamp": "2025-01-15T10:30:00Z",
+  "stageTimestamp": "2025-01-15T10:30:00.123Z"
+}
+```
+
+**Audit policy best practices:**
+
+**Practice 1: Don't log everything**
+
+```yaml
+# Bad: log all reads:
+- level: RequestResponse
+  verbs: ["*"]
+```
+
+Generates massive logs. Performance impact.
+
+**Practice 2: High level for sensitive operations**
+
+```yaml
+# Secrets, RBAC changes: full logging
+- level: RequestResponse
+  resources:
+    - group: ""
+      resources: ["secrets"]
+    - group: "rbac.authorization.k8s.io"
+      resources: ["*"]
+```
+
+**Practice 3: Metadata for normal operations**
+
+```yaml
+- level: Metadata
+  resources:
+    - group: ""
+      resources: ["pods", "services", "configmaps"]
+```
+
+Who/what/when, not full payload.
+
+**Practice 4: Skip routine traffic**
+
+```yaml
+- level: None
+  users: ["system:kube-proxy", "system:kube-scheduler"]
+  verbs: ["watch"]
+```
+
+Don't log control plane chatter.
+
+**Practice 5: Skip read-only health checks**
+
+```yaml
+- level: None
+  nonResourceURLs:
+    - "/healthz*"
+    - "/livez*"
+    - "/readyz*"
+```
+
+**Common audit use cases:**
+
+**Use case 1: Investigate breach**
+
+```bash
+# Who accessed this secret?
+grep "name\":\"db-creds\"" /var/log/audit.log | jq '.user.username'
+
+# When did the breach start?
+grep "verb\":\"create\".*\"resource\":\"pods" /var/log/audit.log | jq '.requestReceivedTimestamp'
+```
+
+**Use case 2: Compliance audit**
+
+"Show all secret access in the last 90 days":
+
+```bash
+# Query log aggregator:
+audit_log{resource="secrets", verb="get"} | last 90 days
+```
+
+**Use case 3: Detect anomalies**
+
+```bash
+# Suspicious patterns:
+# - Service account making calls from external IP
+# - Massive resource enumeration
+# - Off-hours admin activity
+```
+
+**Use case 4: Track changes**
+
+```bash
+# Who modified this deployment?
+grep "deployments/my-app" /var/log/audit.log | grep "update\|patch"
+```
+
+**Audit log forwarding:**
+
+Don't keep logs locally only:
+
+```yaml
+# Fluentd config to ship audit logs:
+<source>
+  @type tail
+  path /var/log/audit.log
+  pos_file /var/log/audit.pos
+  tag k8s.audit
+  <parse>
+    @type json
+  </parse>
+</source>
+
+<match k8s.audit>
+  @type elasticsearch
+  host elasticsearch.example.com
+  index_name kubernetes-audit
+</match>
+```
+
+Ship to:
+- Elasticsearch / Loki
+- Splunk
+- Datadog
+- Custom SIEM
+
+**Cloud-managed clusters:**
+
+EKS, GKE, AKS expose audit logs to cloud services:
+
+**EKS:**
+
+```bash
+# Enable in cluster config:
+aws eks update-cluster-config --name my-cluster \
+  --logging '{"clusterLogging":[{"types":["audit"],"enabled":true}]}'
+
+# Logs go to CloudWatch Logs
+```
+
+**GKE:**
+
+Logs to Cloud Logging automatically (when configured).
+
+**AKS:**
+
+Logs to Azure Monitor.
+
+**Audit log analysis:**
+
+**Tools:**
+- Splunk
+- Elastic Stack
+- Datadog
+- Grafana Loki
+- Custom dashboards
+
+**Sample queries:**
+
+```sql
+-- Most active users:
+SELECT user, count(*) FROM audit_logs
+GROUP BY user ORDER BY 2 DESC LIMIT 10
+
+-- Failed authentications:
+SELECT * FROM audit_logs
+WHERE responseStatus.code = 401
+
+-- Privilege escalations:
+SELECT * FROM audit_logs
+WHERE objectRef.resource = 'clusterrolebindings'
+AND verb IN ('create', 'update')
+
+-- Secret access from unusual IPs:
+SELECT * FROM audit_logs
+WHERE objectRef.resource = 'secrets'
+AND sourceIPs NOT IN (known_ips)
+```
+
+**Alerting on audit events:**
+
+```yaml
+# Falco-style alerts on audit logs:
+- rule: Cluster role binding to cluster-admin
+  condition: kactivity.objectref.resource = "clusterrolebindings" 
+             and kactivity.requestobject.roleRef.name = "cluster-admin"
+  output: Privileged role binding (user=%kactivity.user)
+  priority: WARNING
+```
+
+**Retention:**
+
+- **Operational**: 30-90 days for debugging
+- **Security**: 1 year for incident investigation
+- **Compliance**: typically 1-7 years (varies by regulation)
+
+**Storage considerations:**
+
+Audit logs can be massive:
+- Active cluster: GB/day
+- Compress for storage
+- Archive to cheap storage (S3 Glacier)
+- Index hot data for quick queries
+
+**Production scenarios:**
+
+1. **Breach investigation**: User reported compromised account. Audit logs showed exact API calls made with stolen credentials over 3-week window. Knew exactly what was accessed.
+
+2. **Compliance audit passed**: SOC 2 auditor needed evidence of access controls. Audit logs showed every secret access, who/when. Demonstrated control effectiveness.
+
+3. **Insider threat detected**: Engineer about to leave kept accessing systems they didn't need. Audit log anomaly detection flagged unusual pattern. Investigated before damage.
+
+4. **Misconfiguration tracked**: Production outage from RBAC change. Audit logs showed exactly who made the change and when. Quick rollback, root cause identified.
+
+5. **Privilege escalation prevented**: Falco-on-audit rule alerted when service account attempted to create ClusterRoleBinding. Investigation found compromised CI. Stopped before impact.
+
+---
+
+## 242. How do you detect privilege escalation?
+
+Privilege escalation is when an attacker gains higher privileges than originally granted. In Kubernetes, this can lead to cluster compromise. Detection is essential because prevention isn't always possible.
+
+**Types of privilege escalation:**
+
+**Type 1: RBAC escalation**
+
+Gaining cluster-admin or broader permissions:
+- Creating ClusterRoleBindings
+- Modifying existing roles to add permissions
+- Exploiting permission gaps
+
+**Type 2: Pod-level escalation**
+
+Within a pod:
+- setuid binaries
+- sudo (if installed)
+- Container escape to host
+- Kernel exploits
+
+**Type 3: Token theft**
+
+Stealing service account tokens or kubeconfigs to act as more privileged identity.
+
+**Type 4: Workload identity abuse**
+
+Using cloud workload identity to escalate cloud privileges.
+
+**Detection strategies:**
+
+**Strategy 1: Audit log analysis**
+
+```yaml
+# Audit policy for privilege operations:
+- level: RequestResponse
+  verbs: ["create", "update", "patch"]
+  resources:
+    - group: "rbac.authorization.k8s.io"
+      resources: ["*"]
+```
+
+Then alert:
+
+```sql
+-- New cluster-admin bindings:
+SELECT * FROM audit_logs
+WHERE objectRef.resource = 'clusterrolebindings'
+AND verb IN ('create', 'update')
+AND requestObject.roleRef.name = 'cluster-admin'
+```
+
+**Strategy 2: Falco rules**
+
+Detect at runtime:
+
+```yaml
+- rule: Cluster role binding created
+  desc: A cluster role binding was created
+  condition: >
+    kactivity and ka.target.resource=clusterrolebindings
+    and (ka.verb=create or ka.verb=update)
+  output: >
+    Cluster role binding created/updated 
+    (user=%ka.user.name verb=%ka.verb role=%ka.req.binding.role)
+  priority: WARNING
+
+- rule: Service account token mounted in unexpected pod
+  desc: Pod mounts SA token but shouldn't need it
+  condition: >
+    spawned_process and container 
+    and proc.cmdline contains "/var/run/secrets/kubernetes.io"
+  output: SA token accessed in pod
+  priority: NOTICE
+```
+
+**Strategy 3: Behavior baselines**
+
+What's normal for each workload? Anomalies = suspicious:
+
+- Pod usually does X. Suddenly does Y. Flag.
+- User typically accesses these namespaces. Accessing new ones. Flag.
+
+Tools: Tetragon, Cilium, commercial APMs.
+
+**Strategy 4: Pod escape detection**
+
+```yaml
+- rule: Container escape attempt
+  condition: >
+    container and proc.name in (mount, umount, modprobe)
+    and not container.privileged
+  output: Possible escape attempt
+  priority: CRITICAL
+
+- rule: Sensitive host directory accessed
+  condition: >
+    container and open_read 
+    and (fd.name startswith /proc/1 
+         or fd.name startswith /host)
+  output: Host filesystem access from container
+  priority: ERROR
+```
+
+**Strategy 5: Capability detection**
+
+Detect when capabilities used unexpectedly:
+
+```yaml
+- rule: SYS_ADMIN capability usage
+  condition: >
+    container and proc_capability_set contains CAP_SYS_ADMIN
+    and not container.privileged
+  output: Pod using SYS_ADMIN
+  priority: WARNING
+```
+
+**Specific privilege escalation patterns:**
+
+**Pattern 1: Create ClusterRoleBinding to cluster-admin**
+
+The classic. Attacker creates:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pwned
+subjects:
+  - kind: ServiceAccount
+    name: my-sa
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+```
+
+Now `my-sa` has cluster-admin.
+
+**Detect:**
+
+```yaml
+# Falco:
+- rule: Cluster admin binding created
+  condition: >
+    kactivity and ka.target.resource=clusterrolebindings 
+    and ka.req.binding.role=cluster-admin
+  output: cluster-admin granted to %ka.req.binding.subjects
+  priority: CRITICAL
+```
+
+**Pattern 2: Escalate via existing permissions**
+
+If you have `roles.rbac.authorization.k8s.io/create`, you can create a role with `roles.rbac.authorization.k8s.io/escalate` and grant yourself more.
+
+Kubernetes has built-in prevention: the `escalate` verb. You can't create a role with permissions you don't have unless you have escalate.
+
+**Detect attempts:**
+
+```yaml
+- rule: Escalate verb usage
+  condition: >
+    kactivity and ka.verb=escalate
+  output: User using escalate verb
+  priority: WARNING
+```
+
+**Pattern 3: Pod escape via privileged**
+
+```yaml
+# Malicious pod:
+spec:
+  containers:
+    - securityContext:
+        privileged: true
+      volumeMounts:
+        - mountPath: /host
+          name: host
+  volumes:
+    - name: host
+      hostPath:
+        path: /
+```
+
+Mount host filesystem, edit `/etc/passwd`, etc.
+
+**Detect:**
+
+PSS prevents this entirely. But if it does happen:
+
+```yaml
+- rule: Privileged pod created
+  condition: >
+    kactivity and ka.target.resource=pods
+    and ka.verb=create
+    and ka.req.pod.containers contains privileged=true
+  output: Privileged pod %ka.target.name created
+  priority: WARNING
+```
+
+**Pattern 4: Service account token theft**
+
+Attacker compromises pod, steals SA token. Uses from elsewhere.
+
+**Detect:**
+
+```yaml
+# Token used from unexpected source IP:
+- rule: SA token from external IP
+  condition: >
+    kactivity 
+    and ka.user.name startswith "system:serviceaccount"
+    and ka.sourceips not in (cluster_ips)
+  output: SA token used externally
+  priority: CRITICAL
+```
+
+**Pattern 5: Sudo or setuid abuse**
+
+```yaml
+- rule: Sudo usage in container
+  condition: >
+    spawned_process and container 
+    and proc.name=sudo
+  output: Sudo in container
+  priority: WARNING
+
+- rule: Setuid binary executed
+  condition: >
+    spawned_process and container
+    and proc.is_setuid=true
+  output: Setuid binary
+  priority: NOTICE
+```
+
+**Pattern 6: Privileged container exec**
+
+```yaml
+- rule: Exec into privileged pod
+  condition: >
+    kactivity and ka.target.resource=pods/exec
+    and ka.target.subresource=exec
+    and pod.privileged=true
+  output: Exec into privileged pod
+  priority: WARNING
+```
+
+**Tools for detection:**
+
+**Falco:**
+
+Best for syscall-level detection. Rules above are Falco syntax.
+
+**Tetragon:**
+
+eBPF-based, can enforce (not just detect):
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-escalation
+spec:
+  kprobes:
+    - call: "sys_setuid"
+      selectors:
+        - matchActions:
+            - action: Sigkill
+```
+
+Kill processes attempting setuid.
+
+**KubeArmor:**
+
+LSM-based runtime security:
+
+```yaml
+apiVersion: security.kubearmor.com/v1
+kind: KubeArmorPolicy
+spec:
+  process:
+    matchPaths:
+      - path: /usr/bin/sudo
+        action: Block
+```
+
+**Commercial:**
+- Sysdig Secure
+- Aqua Security
+- Prisma Cloud
+- Datadog Security
+
+Comprehensive detection across layers.
+
+**Prevention complements detection:**
+
+Detection works best with prevention:
+- PSS prevents privileged containers
+- NetworkPolicies limit lateral movement
+- Minimal RBAC reduces escalation paths
+- Image security prevents malicious images
+
+**Investigation workflow:**
+
+When privilege escalation detected:
+
+1. **Isolate**: cordon node, network-isolate pod
+2. **Snapshot**: capture state for forensics
+3. **Identify**: who/what triggered alert
+4. **Investigate**: how was it possible
+5. **Contain**: revoke compromised credentials
+6. **Remediate**: fix root cause
+7. **Document**: post-mortem, prevention
+
+**Production scenarios:**
+
+1. **Falco caught CRB creation**: CI service account had broader permissions than intended. CI was compromised via malicious PR. Tried to create cluster-admin binding. Falco alerted within seconds. Revoked CI access, investigated.
+
+2. **Detected token theft**: Service account token used from IP outside cluster. Audit alert fired. Token revoked. Found compromised developer laptop with kubectl access.
+
+3. **Privileged pod from new namespace**: Falco detected privileged pod in production. Should never happen. Investigated - misconfigured PSS in new namespace. Fixed, no actual compromise.
+
+4. **Sudo usage in container**: Image had sudo installed for legitimate reasons. Falco flagged execution. Investigation: legitimate admin debugging. Whitelisted but documented.
+
+5. **Cloud privilege escalation**: Pod with IRSA escalated to cloud admin via overly permissive IAM. Cloud Trail logs detected. Reduced IAM permissions, retrained team.
+
+---
+
+## 243. Explain Falco architecture
+
+Falco is the CNCF-graduated runtime security tool for cloud-native environments. Understanding its architecture helps deploy and use it effectively.
+
+**Falco overview:**
+
+Falco detects unexpected behavior by:
+1. Capturing kernel events
+2. Filtering through rules
+3. Alerting on matches
+
+Think: SIEM for syscalls.
+
+**Architecture components:**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Falco Process                        │
+│  ┌───────────┐  ┌──────────┐  ┌──────────────────────┐  │
+│  │  Driver   │→ │  Engine  │→ │  Outputs             │  │
+│  │ (events)  │  │ (rules)  │  │ (alerts)             │  │
+│  └───────────┘  └──────────┘  └──────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+       ↑
+       │ Kernel events
+       ↓
+┌─────────────────┐
+│     Kernel      │
+└─────────────────┘
+```
+
+**Component 1: Driver (event capture)**
+
+Three driver options:
+
+**eBPF (preferred):**
+
+```yaml
+# Falco config:
+driver:
+  kind: ebpf
+```
+
+Modern, in-kernel, performant. Recommended for new deployments.
+
+**Kernel module:**
+
+```yaml
+driver:
+  kind: kmod
+```
+
+Legacy. Compiled for specific kernel. More invasive.
+
+**Modern eBPF (best):**
+
+```yaml
+driver:
+  kind: modern-ebpf
+```
+
+CO-RE (Compile Once, Run Everywhere) eBPF. Works across kernel versions.
+
+**Component 2: Engine**
+
+The rules engine processes events:
+
+```yaml
+- rule: Write below etc
+  desc: A file below /etc was written
+  condition: >
+    open_write and 
+    fd.name startswith /etc
+  output: Write below /etc (file=%fd.name)
+  priority: ERROR
+```
+
+Components:
+- **Condition**: when to trigger
+- **Output**: what to report
+- **Priority**: severity
+- **Macros**: reusable fragments
+- **Lists**: reusable values
+
+**Falco macros:**
+
+Pre-defined conditions:
+
+```yaml
+- macro: container
+  condition: container.id != host
+
+- macro: spawned_process
+  condition: evt.type = execve and evt.dir = 
+
+- macro: open_write
+  condition: (evt.type=open or evt.type=openat) and evt.is_open_write=true
+```
+
+Reuse in rules:
+
+```yaml
+- rule: Suspicious process in container
+  condition: spawned_process and container and proc.name=netcat
+```
+
+**Falco lists:**
+
+```yaml
+- list: shell_binaries
+  items: [bash, sh, ksh, csh, fish]
+
+- list: known_safe_users
+  items: ["root", "admin"]
+```
+
+**Component 3: Outputs**
+
+Where alerts go:
+
+```yaml
+# Falco config:
+stdout_output:
+  enabled: true
+
+file_output:
+  enabled: true
+  filename: /var/log/falco.log
+
+syslog_output:
+  enabled: true
+
+http_output:
+  enabled: true
+  url: https://my-webhook.example.com/
+
+grpc_output:
+  enabled: true
+```
+
+Common pattern: Falco → Falcosidekick → many destinations.
+
+**Falcosidekick:**
+
+Companion tool that fans out alerts:
+
+```yaml
+# Falcosidekick config:
+slack:
+  webhookurl: https://hooks.slack.com/...
+pagerduty:
+  routingkey: ...
+opsgenie:
+  apikey: ...
+elasticsearch:
+  hostport: http://es:9200
+loki:
+  hostport: http://loki:3100
+prometheus:
+  enabled: true
+```
+
+One Falco event → multiple destinations: Slack alert, PagerDuty for critical, Elasticsearch for storage, Prometheus metrics.
+
+**Deployment:**
+
+Falco runs as DaemonSet:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: falco
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: falco
+          image: falcosecurity/falco:latest
+          securityContext:
+            privileged: true   # Needs kernel access
+          volumeMounts:
+            - mountPath: /host/var/run/docker.sock
+              name: docker-socket
+            - mountPath: /host/proc
+              name: proc-fs
+              readOnly: true
+            - mountPath: /host/dev
+              name: dev-fs
+      volumes:
+        - name: docker-socket
+          hostPath:
+            path: /var/run/docker.sock
+        - name: proc-fs
+          hostPath:
+            path: /proc
+        - name: dev-fs
+          hostPath:
+            path: /dev
+```
+
+Privileged + hostPID + host mounts needed for syscall capture.
+
+**Rule structure:**
+
+```yaml
+- rule: Rule name
+  desc: What this detects
+  condition: |
+    when this is true (condition)
+  output: |
+    Format the alert message
+  priority: WARNING
+  tags: [container, mitre_execution]
+  source: syscall
+```
+
+**Conditions can include:**
+
+```yaml
+condition: >
+  spawned_process                          # Macro
+  and container                            # Macro
+  and proc.name=bash                       # Field comparison
+  and not user.name in (known_safe_users)  # List membership
+  and (fd.name startswith /tmp 
+       or fd.name startswith /var/tmp)     # Multiple paths
+```
+
+**Output formatting:**
+
+```yaml
+output: >
+  Suspicious process spawned
+  (user=%user.name user_loginuid=%user.loginuid
+  command=%proc.cmdline pid=%proc.pid
+  container_id=%container.id container_name=%container.name
+  image=%container.image.repository:%container.image.tag)
+```
+
+Variables get replaced with actual values.
+
+**Built-in rule sets:**
+
+Falco ships with rules for:
+- General Linux security
+- Container security
+- Kubernetes (audit logs)
+- Cloud-specific
+- Application-specific (database access)
+
+**Custom rules:**
+
+```yaml
+# In Helm values:
+falco:
+  customRules:
+    rules-my-org.yaml: |-
+      - rule: Custom rule
+        condition: ...
+```
+
+Or via ConfigMap.
+
+**K8s audit integration:**
+
+Falco can analyze Kubernetes audit logs:
+
+```yaml
+# Falco config:
+plugins:
+  - name: k8saudit
+    library_path: libk8saudit.so
+    init_config:
+      ""
+    open_params: "http://:9765/k8s-audit"
+```
+
+Then rules on audit events:
+
+```yaml
+- rule: K8s: Service account created
+  condition: kevt and serviceaccount and kcreate
+  output: Service account created
+  priority: INFO
+  source: k8s_audit
+```
+
+**Falco vs alternatives:**
+
+| Aspect | Falco | Tetragon | Sysdig Secure |
+|--------|-------|----------|---------------|
+| License | Open source | Open source | Commercial |
+| Drivers | eBPF, kmod | eBPF | eBPF |
+| Enforcement | No (detect only) | Yes | Yes |
+| K8s audit | Yes | Yes | Yes |
+| Compliance reports | Limited | Limited | Yes |
+| Community | Largest | Growing | N/A |
+
+**Performance considerations:**
+
+Falco overhead:
+- CPU: 1-5% per node
+- Memory: 100-500 MB per node
+
+Tuning:
+- Disable noisy rules
+- Optimize conditions
+- Use eBPF (faster than kmod)
+
+**Common rules:**
+
+**Container security:**
+
+```yaml
+- rule: Run shell in container
+  condition: container and shell_procs and proc.tty != 0
+  output: Shell in container
+
+- rule: Suspicious network tool
+  condition: spawned_process and container and proc.name in (nc, ncat, netcat)
+  output: Network tool in container
+
+- rule: Write below binary directory
+  condition: open_write and fd.name startswith /usr/bin
+  output: Modification of binaries
+```
+
+**Kubernetes:**
+
+```yaml
+- rule: K8s: Privileged container created
+  condition: kevt and pod and kcreate and ka.req.pod.containers.privileged
+  output: Privileged container created
+
+- rule: K8s: Cluster role binding created
+  condition: kevt and clusterrolebinding and kcreate
+  output: ClusterRoleBinding created
+```
+
+**Cloud:**
+
+```yaml
+- rule: AWS console login from unusual location
+  condition: ct.name="ConsoleLogin" and not ct.src_ip in (allowed_ips)
+  output: Unusual AWS login
+  source: aws_cloudtrail
+```
+
+**Tuning Falco:**
+
+**Issue: too many false positives**
+
+Initial rules generate noise. Tune:
+
+```yaml
+# Allowlist known-good behaviors:
+- rule: Read sensitive file
+  condition: >
+    open_read and fd.name in (sensitive_files)
+    and not proc.name in (allowed_readers)
+```
+
+**Issue: missed events**
+
+Some events not captured:
+- Container runtime-specific events
+- Application-level events
+
+Add custom rules or use different sensors.
+
+**Issue: log volume**
+
+```yaml
+# Filter at output level:
+http_output:
+  enabled: true
+  url: https://...
+  # Only send WARNING+:
+  min_priority: WARNING
+```
+
+**Integration patterns:**
+
+**Pattern 1: Falco → Falcosidekick → Slack**
+
+Quick alerts to chat.
+
+**Pattern 2: Falco → SIEM**
+
+Long-term storage, correlation with other logs.
+
+**Pattern 3: Falco → Automation**
+
+Auto-respond:
+- Kill suspicious pods
+- Isolate via NetworkPolicy
+- Snapshot for forensics
+
+```python
+# Falcosidekick → webhook → response function:
+def handle_alert(alert):
+    if alert['priority'] == 'CRITICAL':
+        if 'crypto miner' in alert['output']:
+            kubectl.delete_pod(alert['pod'])
+```
+
+**Production scenarios:**
+
+1. **Crypto miner caught**: Falco rule for unusual outbound to known mining pools. Within minutes, detected pod connecting to pool. Auto-killed via webhook. Investigation found compromised CI.
+
+2. **Falco tuning**: Default rules fired 5000 events/day mostly noise. Spent week tuning, allowlisting legitimate. Now ~50 events/day, mostly real.
+
+3. **Multi-cluster Falco**: Standardized Falco across 20 clusters. All alerts to central Falcosidekick → SIEM. Unified detection.
+
+4. **K8s audit + Falco**: Combined Falco syscall + audit log analysis. Detection across kernel events AND API calls. Better coverage.
+
+5. **Compliance via Falco**: PCI audit required runtime monitoring. Falco provided. Generated reports of file integrity, process monitoring. Compliance achieved.
+
+---
+
+## 244. How do you secure ingress traffic?
+
+Ingress is the entry point for external traffic. Securing it protects the entire cluster from external threats.
+
+**Ingress security layers:**
+
+```
+Internet
+  ↓
+Cloud LB (DDoS protection)
+  ↓
+WAF (application-level filtering)
+  ↓
+Ingress controller (TLS, routing)
+  ↓
+Service mesh (mTLS internally)
+  ↓
+Application
+```
+
+Multiple layers of defense.
+
+**Layer 1: Cloud load balancer**
+
+Cloud LBs provide:
+- DDoS protection (AWS Shield, Cloudflare)
+- Geographic filtering
+- TLS termination (optional)
+- Basic rate limiting
+
+**Layer 2: WAF (Web Application Firewall)**
+
+Protects against:
+- SQL injection
+- XSS
+- CSRF
+- Bot traffic
+- Known exploit patterns
+
+```yaml
+# AWS WAF rules:
+- ManagedRuleGroupConfig:
+    AWSManagedRulesCommonRuleSet
+- ManagedRuleGroupConfig:
+    AWSManagedRulesKnownBadInputsRuleSet
+```
+
+Block before reaching cluster.
+
+**Layer 3: TLS termination**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  tls:
+    - hosts:
+        - api.example.com
+      secretName: api-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app
+                port:
+                  number: 80
+```
+
+Force HTTPS:
+- HTTP → HTTPS redirect
+- HSTS headers
+- TLS 1.2+ only
+
+**TLS configuration:**
+
+```yaml
+# NGINX Ingress ConfigMap:
+data:
+  ssl-protocols: "TLSv1.2 TLSv1.3"
+  ssl-ciphers: "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:..."
+  ssl-prefer-server-ciphers: "true"
+  hsts: "true"
+  hsts-max-age: "31536000"
+  hsts-include-subdomains: "true"
+```
+
+Modern, secure TLS.
+
+**Cert management:**
+
+```yaml
+# Cert-manager for automatic certs:
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    email: admin@example.com
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+```
+
+Annotate Ingress:
+
+```yaml
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+```
+
+Cert-manager handles issuance and renewal automatically.
+
+**Layer 4: Rate limiting**
+
+```yaml
+# NGINX rate limit:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+    nginx.ingress.kubernetes.io/limit-rpm: "100"
+```
+
+Prevents:
+- Brute force
+- DDoS at app layer
+- Abuse
+
+**Layer 5: Authentication**
+
+**Basic auth:**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "Authentication Required"
+```
+
+**OAuth/OIDC:**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "https://oauth2-proxy.example.com/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://oauth2-proxy.example.com/oauth2/start"
+```
+
+Integration with OAuth2 Proxy:
+
+```yaml
+# oauth2-proxy:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+spec:
+  template:
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:latest
+          args:
+            - --provider=oidc
+            - --oidc-issuer-url=https://accounts.example.com
+            - --client-id=...
+            - --redirect-url=https://app.example.com/oauth2/callback
+```
+
+User authenticates via SSO before reaching app.
+
+**mTLS for clients:**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    nginx.ingress.kubernetes.io/auth-tls-secret: "default/ca-secret"
+    nginx.ingress.kubernetes.io/auth-tls-verify-depth: "1"
+```
+
+Clients need valid certificate. Strong authentication.
+
+**Layer 6: IP allowlisting**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16"
+```
+
+Only specific IPs allowed.
+
+**Layer 7: ModSecurity / WAF rules**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/enable-owasp-modsecurity-crs: "true"
+```
+
+OWASP Core Rule Set: protects against OWASP Top 10.
+
+**Layer 8: CORS**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://trusted.example.com"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST"
+```
+
+Restrict cross-origin requests.
+
+**Layer 9: Security headers**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-XSS-Protection: 1; mode=block";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+      more_set_headers "Content-Security-Policy: default-src 'self'";
+      more_set_headers "Permissions-Policy: geolocation=(), microphone=()";
+```
+
+Headers protect clients:
+- HSTS: enforce HTTPS
+- CSP: control resource loading
+- X-Frame-Options: prevent clickjacking
+
+**Service mesh for internal:**
+
+After ingress, internal communication via mesh:
+
+```yaml
+# Istio:
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+mTLS between services automatically.
+
+**Specific threat protections:**
+
+**Protection: DDoS**
+
+- Cloud LB DDoS protection (AWS Shield, Cloudflare)
+- Rate limiting at ingress
+- Connection limits
+- Geographic blocking if applicable
+
+**Protection: Brute force**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "5"   # 5 req/sec per IP
+```
+
+**Protection: SQL injection**
+
+WAF rules block patterns:
+- `' OR 1=1`
+- `UNION SELECT`
+- `'; DROP TABLE`
+
+**Protection: Bot traffic**
+
+```yaml
+# Cloudflare bot management
+# Or rate limit + JavaScript challenge
+```
+
+**Protection: Path traversal**
+
+WAF blocks `../` patterns.
+
+**Protection: Sensitive endpoint exposure**
+
+```yaml
+# Restrict admin endpoints:
+- path: /admin
+  backend: my-admin-app
+  # With IP whitelist or auth
+```
+
+**Patterns:**
+
+**Pattern 1: Standard public API**
+
+```yaml
+spec:
+  tls:
+    - hosts: [api.example.com]
+      secretName: api-tls
+  rules:
+    - host: api.example.com
+      # Force HTTPS, rate limiting, basic security headers
+```
+
+**Pattern 2: Authenticated admin**
+
+```yaml
+# OAuth required:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "https://oauth2-proxy.example.com/oauth2/auth"
+```
+
+**Pattern 3: API with mTLS**
+
+```yaml
+# Client certs required:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+```
+
+**Pattern 4: Public + WAF**
+
+```yaml
+# WAF in front of ingress:
+# Cloudflare → AWS WAF → Ingress
+```
+
+**Monitoring:**
+
+```promql
+# Suspicious traffic patterns:
+sum(rate(nginx_ingress_controller_requests{status=~"4.."}[5m])) by (host)
+
+# Errors per host:
+sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m])) by (host)
+
+# Request rate:
+sum(rate(nginx_ingress_controller_requests[1m])) by (host)
+```
+
+Alert on:
+- 401/403 spikes (auth attacks)
+- 5xx errors
+- DDoS patterns
+
+**Production scenarios:**
+
+1. **Cloudflare + WAF + Ingress**: Three layers. Cloudflare for DDoS. WAF for app attacks. Ingress for routing. Defense in depth.
+
+2. **OAuth for internal tools**: Admin dashboards, Grafana, etc. Required corporate SSO via OAuth2 Proxy. No password fatigue, easy access management.
+
+3. **mTLS for B2B API**: B2B partners authenticated via client certs. No API keys. Strong authentication, audit trail.
+
+4. **Rate limit blocked attack**: Brute force attempt on login endpoint. Rate limit per IP kicked in. Attacker blocked after 100 attempts. Logs alerted security.
+
+5. **HSTS prevented downgrade**: Old browser tried to connect HTTP. HSTS forced HTTPS. Attacker couldn't downgrade attack. TLS configuration matters.
+
+---
+
+## 245. Explain mTLS in Kubernetes
+
+Mutual TLS (mTLS) provides mutual authentication and encryption between services. Both client and server verify each other's identity, unlike standard TLS where only the server is verified.
+
+**TLS vs mTLS:**
+
+**Standard TLS:**
+```
+Client → connects → Server
+Server presents cert → Client verifies
+[Encrypted communication]
+```
+
+Client identity not verified.
+
+**mTLS:**
+```
+Client → connects → Server
+Server presents cert → Client verifies
+Client presents cert → Server verifies
+[Encrypted communication]
+```
+
+Both parties authenticated.
+
+**Why mTLS matters:**
+
+In Kubernetes:
+- Pod-to-pod communication is unauthenticated by default
+- Anyone in cluster can call any service
+- mTLS ensures only verified workloads communicate
+
+Provides:
+- **Authentication**: cryptographic identity verification
+- **Encryption**: data protected in transit
+- **Integrity**: tampering detected
+- **Authorization basis**: who can call what
+
+**Implementing mTLS:**
+
+**Approach 1: Service mesh (most common)**
+
+**Istio:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+```
+
+Cluster-wide strict mTLS. All in-mesh traffic encrypted.
+
+Modes:
+- **STRICT**: only mTLS
+- **PERMISSIVE**: both mTLS and plain (transition)
+- **DISABLE**: no mTLS
+
+**Linkerd:**
+
+```yaml
+# Linkerd: mTLS by default, no configuration needed
+# All meshed services automatically use mTLS
+```
+
+**Cilium:**
+
+```yaml
+# Cilium with mutual TLS:
+spec:
+  ingress:
+    - mutualTLS:
+        secret:
+          name: ca-cert
+```
+
+**Approach 2: Application-level**
+
+Apps implement mTLS themselves:
+
+```python
+# Python example:
+context = ssl.create_default_context(
+    cafile='/etc/ssl/ca.crt'
+)
+context.load_cert_chain(
+    certfile='/etc/ssl/client.crt',
+    keyfile='/etc/ssl/client.key'
+)
+
+connection = http.client.HTTPSConnection(
+    'service.example.com',
+    context=context
+)
+```
+
+Complex; service mesh simpler.
+
+**Approach 3: Ingress mTLS**
+
+External mTLS at ingress:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    nginx.ingress.kubernetes.io/auth-tls-secret: "default/ca-secret"
+```
+
+External clients use mTLS. Internal traffic separate.
+
+**How service mesh mTLS works:**
+
+```
+Service A pod                 Service B pod
+┌─────────────┐               ┌─────────────┐
+│   App A     │ → (plain) →   │   Sidecar   │
+│             │               │   (Envoy)   │
+│   Sidecar   │ ← encrypted ← │   App B     │
+│   (Envoy)   │               │             │
+└─────────────┘               └─────────────┘
+```
+
+1. App A makes plain HTTP call to B
+2. Sidecar intercepts, adds mTLS to call
+3. Connects to B's sidecar
+4. mTLS handshake: both verify
+5. Encrypted communication
+6. B's sidecar decrypts, forwards plain to App B
+
+Apps unchanged, mesh handles mTLS.
+
+**Certificate management:**
+
+**Istio CA:**
+
+Istio includes Citadel (now part of istiod):
+
+```
+istiod (CA) → issues certs → workload identities
+```
+
+Each pod gets:
+- Workload certificate
+- Identity: `cluster.local/ns/production/sa/my-app`
+- Short-lived (24h default)
+- Auto-rotated
+
+**Linkerd identity:**
+
+Similar: linkerd-identity issues certs.
+
+**External CA integration:**
+
+```yaml
+# Istio with external CA:
+spec:
+  values:
+    pilot:
+      env:
+        CA_PROVIDER: external
+```
+
+Use enterprise PKI, HashiCorp Vault, etc.
+
+**SPIFFE/SPIRE:**
+
+Standard for workload identity:
+
+```
+SPIRE Server (CA)
+       ↓
+SPIRE Agents (per node) → issue certs to workloads
+```
+
+Identities in SPIFFE format:
+`spiffe://example.com/ns/production/sa/my-app`
+
+Service meshes adopting SPIFFE for portability.
+
+**Authorization with mTLS:**
+
+mTLS provides identity. Use for authorization:
+
+```yaml
+# Istio AuthorizationPolicy:
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: backend-policy
+spec:
+  selector:
+    matchLabels:
+      app: backend
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/frontend"]
+```
+
+Only `frontend` SA can call `backend`. Identity verified via mTLS cert.
+
+**Operations:**
+
+**Verification:**
+
+```bash
+# Istio: check mTLS status
+istioctl x describe pod my-app-xyz
+# Shows: TLS settings, identity
+
+# Check actual traffic encryption:
+istioctl proxy-config secret my-app-xyz
+```
+
+**Troubleshooting:**
+
+Common issues:
+
+**Issue 1: PERMISSIVE leftover from migration**
+
+Mode left as PERMISSIVE allows both mTLS and plain. Reduces security.
+
+```yaml
+# Verify STRICT:
+kubectl get peerauthentication -A
+```
+
+**Issue 2: Workload outside mesh**
+
+Pod doesn't have sidecar (forgot label):
+
+```yaml
+metadata:
+  labels:
+    istio-injection: enabled
+```
+
+Without sidecar, no mTLS.
+
+**Issue 3: External traffic**
+
+External (non-mesh) clients can't do mTLS without configuration. Use:
+- Ingress for external
+- Mesh for internal
+- Mesh expansion for VMs
+
+**Performance impact:**
+
+mTLS adds overhead:
+- Latency: 1-3ms per call
+- CPU: 2-5% per sidecar
+- Memory: 50-200MB per sidecar
+
+Usually acceptable for security benefits.
+
+**mTLS without service mesh:**
+
+Possible but harder:
+
+**Manual certificates:**
+
+```yaml
+# Mount certs in pod:
+volumes:
+  - name: certs
+    secret:
+      secretName: my-app-certs
+```
+
+App reads certs, configures TLS.
+
+**Tools:**
+- cert-manager for issuance
+- SPIRE for SPIFFE identities
+
+But: complex. Service mesh removes this complexity.
+
+**Use cases for mTLS:**
+
+**Use case 1: Zero trust**
+
+Don't trust based on network location. Verify every connection cryptographically.
+
+**Use case 2: Compliance**
+
+Many regulations require encryption in transit. mTLS provides authenticated encryption.
+
+**Use case 3: Multi-tenant**
+
+Multiple workloads on shared infrastructure. mTLS prevents cross-tenant traffic without proper auth.
+
+**Use case 4: B2B APIs**
+
+Partner authentication via certificates. Strong auth without API key management.
+
+**Use case 5: Internal service auth**
+
+Replace internal API tokens with mTLS identities.
+
+**mTLS + JWT:**
+
+Combine for defense in depth:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: jwt-auth
+spec:
+  selector:
+    matchLabels:
+      app: api
+  jwtRules:
+    - issuer: "https://accounts.example.com"
+      jwksUri: "https://accounts.example.com/.well-known/jwks.json"
+```
+
+mTLS verifies workload, JWT verifies user. Both required.
+
+**Production scenarios:**
+
+1. **Istio strict mTLS migrated everything**: Started with PERMISSIVE. Audited which services were mTLS-capable. Gradually moved to STRICT. All internal traffic encrypted.
+
+2. **mTLS replaced API keys**: Internal service-to-service used API keys. Rotation was painful. Migrated to Istio mTLS. No more API keys for internal calls.
+
+3. **mTLS for compliance**: HIPAA required encryption in transit. mTLS automatic for all in-mesh traffic. Compliance achieved.
+
+4. **B2B partners with client certs**: Partners authenticated via mTLS at ingress. Strong cryptographic auth. Per-partner certs revocable.
+
+5. **Performance acceptable**: Initially worried about mTLS overhead. Measured 1-2ms added latency, ~3% CPU. Well within budget for security benefit.
+
+---
+
+## 246. How do you rotate certificates automatically?
+
+Certificate rotation prevents expired certs from breaking applications. Manual rotation is error-prone; automation is essential.
+
+**Why rotation:**
+
+Certificates expire. Without renewal:
+- Services stop accepting/making connections
+- Outages
+- Manual remediation under pressure
+
+**Types of certificates in Kubernetes:**
+
+**Type 1: Cluster certificates**
+
+- API server certs
+- etcd certs
+- Kubelet client certs
+- Service account signing keys
+
+**Type 2: Application certificates**
+
+- TLS for ingress
+- Service mesh workload certs
+- mTLS for inter-service
+- Application-specific (database, etc.)
+
+Each rotates differently.
+
+**Cluster certificate rotation:**
+
+**Kubeadm clusters:**
+
+```bash
+# Check expiry:
+kubeadm certs check-expiration
+
+# Output:
+# CERTIFICATE                EXPIRES
+# admin.conf                 Mar 15, 2025
+# apiserver                  Mar 15, 2025
+# apiserver-kubelet-client   Mar 15, 2025
+# etcd-server                Mar 15, 2025
+# etcd-peer                  Mar 15, 2025
+
+# Renew all:
+kubeadm certs renew all
+
+# Renew specific:
+kubeadm certs renew apiserver
+```
+
+Restart control plane components after renewal.
+
+**Automatic rotation in kubeadm:**
+
+```bash
+# Upgrade renews all certs:
+kubeadm upgrade apply v1.28.x
+```
+
+Annual upgrade = automatic rotation.
+
+**Kubelet certificate rotation:**
+
+```yaml
+# kubelet config:
+rotateCertificates: true
+serverTLSBootstrap: true
+```
+
+Kubelet automatically renews its certificates. Standard in modern Kubernetes.
+
+**Managed clusters (EKS, GKE, AKS):**
+
+Cloud provider rotates control plane certs:
+- EKS: automatic, transparent
+- GKE: automatic
+- AKS: with regular upgrades
+
+You don't manage these.
+
+**Service account signing keys:**
+
+```bash
+# kube-apiserver flag:
+--service-account-signing-key-file=/etc/kubernetes/pki/sa.key
+```
+
+Rotation more complex:
+1. Generate new key
+2. Configure API server with both keys (validating both)
+3. Wait for all SA tokens to be reissued
+4. Remove old key
+
+Usually done during cluster upgrades.
+
+**Application certificate rotation:**
+
+**Approach 1: cert-manager**
+
+The standard tool for K8s certificates.
+
+```yaml
+# Install:
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+```
+
+**Let's Encrypt:**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    email: admin@example.com
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+```
+
+**Request certificate:**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: api-tls
+  namespace: production
+spec:
+  secretName: api-tls
+  duration: 2160h     # 90 days
+  renewBefore: 720h   # Renew 30 days before expiry
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: api.example.com
+  dnsNames:
+    - api.example.com
+```
+
+cert-manager:
+1. Requests cert from Let's Encrypt
+2. Validates ownership (HTTP-01 challenge)
+3. Stores in Secret `api-tls`
+4. Monitors expiry
+5. Renews automatically
+
+**Or via Ingress annotation:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    - hosts: [api.example.com]
+      secretName: api-tls
+```
+
+cert-manager auto-creates Certificate resource.
+
+**HashiCorp Vault as CA:**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: vault-issuer
+spec:
+  vault:
+    server: https://vault.example.com
+    path: pki/sign/my-role
+    auth:
+      kubernetes:
+        role: cert-manager
+        mountPath: /v1/auth/kubernetes
+```
+
+Internal PKI via Vault.
+
+**Self-signed:**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: self-signed
+spec:
+  selfSigned: {}
+```
+
+For internal use, dev environments.
+
+**CA hierarchy:**
+
+```yaml
+# Root CA:
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-root-ca
+spec:
+  isCA: true
+  commonName: my-root-ca
+  secretName: root-ca-secret
+  duration: 87600h   # 10 years
+  issuerRef:
+    name: self-signed
+    kind: ClusterIssuer
+
+---
+# Intermediate issuer:
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: my-ca-issuer
+spec:
+  ca:
+    secretName: root-ca-secret
+```
+
+Then certs issued by `my-ca-issuer`.
+
+**Service mesh rotation:**
+
+**Istio:**
+
+```yaml
+# Default 24-hour workload certs:
+spec:
+  values:
+    pilot:
+      env:
+        DEFAULT_WORKLOAD_CERT_TTL: "24h"
+```
+
+istiod rotates workload certs automatically. Sidecars renew before expiry.
+
+**Linkerd:**
+
+Similar: linkerd-identity rotates automatically.
+
+**Root CA rotation (service mesh):**
+
+More complex. Long-lived (1-10 years). Rotation procedure:
+
+```bash
+# Istio root CA rotation:
+1. Generate new root + intermediate
+2. Combine old + new root in trust bundle
+3. Issue new intermediate
+4. Wait for propagation
+5. Remove old root
+```
+
+Documented procedure. Don't ad-hoc.
+
+**Application-specific rotation:**
+
+**Database certificates:**
+
+```yaml
+# cert-manager Certificate for DB:
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: postgres-tls
+spec:
+  secretName: postgres-tls
+  issuerRef:
+    name: my-ca-issuer
+  commonName: postgres.production.svc.cluster.local
+  duration: 2160h
+  renewBefore: 720h
+```
+
+Pods mount the cert. App restarts pick up new.
+
+**Reloader:**
+
+```yaml
+# Reloader: restart pods on Secret change:
+metadata:
+  annotations:
+    reloader.stakater.com/auto: "true"
+```
+
+When cert rotates, deployment restarts. Picks up new cert.
+
+**Or: hot reload**
+
+Apps that watch cert files and reload without restart:
+- NGINX: SIGHUP reloads
+- HAProxy: similar
+- Custom: file watcher
+
+**Pre-renewal:**
+
+```yaml
+spec:
+  renewBefore: 720h   # 30 days
+```
+
+Renew well before expiry. Buffer for issues.
+
+**Monitoring expiry:**
+
+```promql
+# Days until cert expires:
+(certmanager_certificate_expiration_timestamp_seconds - time()) / 86400
+```
+
+Alert at thresholds:
+- 30 days: warning
+- 7 days: critical
+- 1 day: page
+
+**Certificate alerts:**
+
+```yaml
+- alert: CertExpiringSoon
+  expr: (certmanager_certificate_expiration_timestamp_seconds - time()) / 86400 < 30
+  for: 1h
+  labels:
+    severity: warning
+
+- alert: CertExpired
+  expr: certmanager_certificate_expiration_timestamp_seconds - time() < 0
+  labels:
+    severity: critical
+```
+
+**External monitoring:**
+
+Don't trust only internal monitoring:
+
+```bash
+# External script:
+echo | openssl s_client -connect api.example.com:443 2>/dev/null | \
+  openssl x509 -noout -dates
+```
+
+External cron monitors external view of certs.
+
+**Common issues:**
+
+**Issue 1: Cert-manager fails to renew**
+
+Causes:
+- ACME challenge fails (DNS, HTTP)
+- Rate limits (Let's Encrypt)
+- Webhook issues
+
+```bash
+# Check:
+kubectl describe certificate api-tls
+kubectl logs -n cert-manager deployment/cert-manager
+```
+
+**Issue 2: App doesn't reload new cert**
+
+App caches certs in memory. Renewal happens but app keeps old.
+
+Fix: Reloader to restart, or app hot-reload.
+
+**Issue 3: Service mesh root CA expires**
+
+Catastrophic if not handled. All workload certs invalid.
+
+Fix: monitor root expiry, plan rotation well in advance.
+
+**Issue 4: Cluster cert expiry without renewal**
+
+```
+The certificate has expired or is not yet valid
+```
+
+Cluster components stop working. Emergency.
+
+Fix:
+```bash
+kubeadm certs renew all
+# Restart control plane
+```
+
+**Best practices:**
+
+1. **Automation**: cert-manager for all app certs
+2. **Monitoring**: alerts well before expiry
+3. **External verification**: not just internal
+4. **Renewal buffer**: renew weeks before expiry
+5. **Documentation**: procedure for each cert type
+6. **Test rotation**: in lower environments
+7. **Backup CAs**: encrypted backups of CA keys
+
+**Production scenarios:**
+
+1. **cert-manager + Let's Encrypt**: All public certs automated. Renewal happens 30 days before expiry. No manual intervention for years.
+
+2. **Cluster cert expiry incident**: Self-managed cluster, certs about to expire. Kubeadm cert renewal fixed. Now: annual cluster upgrade includes cert renewal.
+
+3. **Vault for internal PKI**: Internal services used Vault-issued certs via cert-manager. 30-day certs, auto-renewed. Strong, automated PKI.
+
+4. **Service mesh transparent rotation**: Istio rotated workload certs every 24h. Apps unaware. Renewal happened automatically.
+
+5. **External monitoring caught issue**: Internal cert-manager said cert renewed. External monitor showed old cert still served. Issue: NGINX didn't reload. Reloader fixed.
+
+---
+
+## 247. Explain compliance requirements in Kubernetes
+
+Compliance frameworks define security and operational requirements. Kubernetes deployments often need to meet multiple compliance standards.
+
+**Common compliance frameworks:**
+
+**SOC 2:**
+
+Service Organization Control 2. Focuses on:
+- Security
+- Availability
+- Processing integrity
+- Confidentiality
+- Privacy
+
+Common for SaaS. Auditor reviews controls annually.
+
+**PCI-DSS:**
+
+Payment Card Industry Data Security Standard. Required for handling credit card data.
+
+12 requirements covering:
+- Network security
+- Access control
+- Encryption
+- Monitoring
+
+**HIPAA:**
+
+Healthcare information protection. For US healthcare data.
+
+Requirements:
+- Access controls
+- Audit logs
+- Encryption
+- Breach notification
+
+**GDPR:**
+
+EU data protection. Applies if EU users' data processed.
+
+Requirements:
+- Data minimization
+- Right to deletion
+- Consent management
+- Breach notification
+
+**ISO 27001:**
+
+International security management standard. Comprehensive ISMS framework.
+
+**FedRAMP:**
+
+US federal cloud security. Tiered (Low, Moderate, High).
+
+**CIS Kubernetes Benchmark:**
+
+CIS (Center for Internet Security) Kubernetes Benchmark. Best practices for Kubernetes hardening. Often referenced by other compliance frameworks.
+
+**NIST 800-53:**
+
+US government security controls. Used as basis for many compliance programs.
+
+**Common control areas:**
+
+**Area 1: Access control**
+
+Requirements:
+- Least privilege
+- Multi-factor authentication
+- Regular access reviews
+- Audit of access
+
+Kubernetes implementation:
+- RBAC with minimal permissions
+- OIDC with corporate SSO + MFA
+- Regular RBAC audits
+- Audit logging
+
+**Area 2: Encryption**
+
+Requirements:
+- Encryption at rest
+- Encryption in transit
+- Key management
+
+Kubernetes implementation:
+- etcd encryption at rest
+- TLS for all API traffic
+- mTLS for service-to-service
+- KMS for key management
+
+**Area 3: Audit logging**
+
+Requirements:
+- Log all access
+- Tamper-resistant storage
+- Retention period
+- Regular review
+
+Kubernetes implementation:
+- Audit policy
+- Logs to immutable storage (S3 with object lock)
+- Compliance-appropriate retention
+- SIEM integration for review
+
+**Area 4: Network security**
+
+Requirements:
+- Network segmentation
+- Firewall rules
+- Intrusion detection
+
+Kubernetes implementation:
+- NetworkPolicies for segmentation
+- Service mesh for mTLS
+- WAF at ingress
+- Runtime detection (Falco)
+
+**Area 5: Vulnerability management**
+
+Requirements:
+- Regular scanning
+- Patch management
+- Risk assessment
+
+Kubernetes implementation:
+- Image scanning in CI
+- Continuous scanning of running images
+- Regular cluster upgrades
+- Vulnerability tracking
+
+**Area 6: Incident response**
+
+Requirements:
+- Incident response plan
+- Forensics capability
+- Notification procedures
+
+Kubernetes implementation:
+- Runbooks for common incidents
+- Audit logs for forensics
+- Pod snapshots
+- Alert routing to on-call
+
+**Area 7: Data protection**
+
+Requirements:
+- Data classification
+- Data handling procedures
+- Retention/deletion
+
+Kubernetes implementation:
+- Secrets in external store (Vault, AWS SM)
+- Encryption for sensitive PVs
+- Data retention policies
+- Secure deletion procedures
+
+**Compliance-as-code:**
+
+Many controls can be enforced via policy:
+
+```yaml
+# OPA Gatekeeper or Kyverno:
+# - Require resource limits (PCI 8.x)
+# - Block privileged containers (PCI 2.2)
+# - Require image scanning (PCI 6.x)
+# - Require labels for ownership (SOC 2)
+```
+
+**CIS Benchmark example controls:**
+
+**Control 1.2.1**: API server should use --anonymous-auth=false
+
+```bash
+# Check:
+ps aux | grep kube-apiserver | grep anonymous-auth
+
+# Should show: --anonymous-auth=false
+```
+
+**Control 1.2.5**: API server should set --token-auth-file= (not used)
+
+**Control 1.3.1**: Use --terminated-pod-gc-threshold
+
+**Control 5.x.x**: Pod Security Standards enforcement
+
+**Tools:**
+
+**kube-bench:**
+
+Checks cluster against CIS Benchmark:
+
+```bash
+# Run:
+kube-bench run --targets node,master
+
+# Output:
+[INFO] 1.1 Master Node Configuration Files
+[PASS] 1.1.1 Ensure that the API server pod specification file permissions are set to 644
+[FAIL] 1.1.2 Ensure that the API server pod specification file ownership is set to root:root
+...
+```
+
+Identifies non-compliant configurations.
+
+**Trivy:**
+
+Comprehensive scanning:
+- Container images
+- Kubernetes configurations
+- Compliance frameworks
+
+```bash
+# Check compliance:
+trivy k8s --compliance=nsa cluster
+```
+
+NSA, CIS, PCI built-in checks.
+
+**Kubescape:**
+
+```bash
+kubescape scan framework nsa
+```
+
+Multiple frameworks supported.
+
+**Polaris:**
+
+Audits configurations for best practices.
+
+**Compliance reporting:**
+
+Auditors want evidence:
+
+**Evidence type 1: Configuration**
+
+```bash
+# Snapshot of current configs:
+kubectl get networkpolicies -A -o yaml > network-policies.yaml
+kubectl get podsecuritypolicy -A -o yaml > psp.yaml
+```
+
+**Evidence type 2: Logs**
+
+Audit logs showing controls in action.
+
+**Evidence type 3: Reports**
+
+```bash
+# Scan reports:
+trivy k8s --compliance=pci-dss --report=summary cluster > pci-report.txt
+```
+
+**Evidence type 4: Procedures**
+
+Runbooks, documented processes.
+
+**Continuous compliance:**
+
+Don't audit once a year:
+
+```yaml
+# CronJob for continuous checking:
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: compliance-check
+spec:
+  schedule: "0 6 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: scan
+              image: aquasec/kube-bench:latest
+              command:
+                - kube-bench
+                - run
+                - --targets=node,master
+                - --json
+              # Output to compliance system
+```
+
+Daily scans, track over time.
+
+**Compliance dashboards:**
+
+```promql
+# Compliance metrics:
+compliance_check_passed{control="1.2.1"} 1
+compliance_check_passed{control="1.2.5"} 0   # Failing
+
+# Percentage compliant:
+sum(compliance_check_passed) / count(compliance_check_passed) * 100
+```
+
+Visualize compliance posture over time.
+
+**Cross-framework mapping:**
+
+Different frameworks have similar requirements:
+
+```
+"Encryption in transit" appears in:
+- PCI-DSS 4.1
+- HIPAA Security Rule
+- SOC 2 Common Criteria CC6.1
+- GDPR Article 32
+```
+
+Implement once (mTLS), satisfy multiple frameworks.
+
+**Audit preparation:**
+
+Before audit:
+
+1. **Self-assessment**: kube-bench, Trivy
+2. **Fix findings**: address before auditor finds
+3. **Gather evidence**: configs, logs, reports
+4. **Train team**: what auditor will ask
+5. **Documentation**: keep current
+
+**During audit:**
+
+- Provide evidence promptly
+- Explain rationale for exceptions
+- Show continuous improvement
+
+**Common audit findings:**
+
+**Finding 1: Excessive RBAC permissions**
+
+Many cluster-admins, broad ClusterRoleBindings.
+
+Fix: minimize, document.
+
+**Finding 2: Unencrypted etcd**
+
+Default Kubernetes has unencrypted etcd.
+
+Fix: encryption at rest configuration.
+
+**Finding 3: Insufficient logging**
+
+No audit logs or short retention.
+
+Fix: enable audit logging, retain per requirement.
+
+**Finding 4: Vulnerable images**
+
+Running images with known CVEs.
+
+Fix: image scanning, patching process.
+
+**Finding 5: Missing network policies**
+
+Default-allow networking.
+
+Fix: NetworkPolicies, default-deny.
+
+**Production scenarios:**
+
+1. **SOC 2 audit passed**: First-time SOC 2 audit. Spent 6 months preparing: audit logs, RBAC tightening, NetworkPolicies, encryption, runbooks. Auditor found 2 minor issues. Passed.
+
+2. **PCI-DSS for payments**: Payment service required PCI compliance. Isolated payment namespace, network policies, encryption, logging. Quarterly scans. Annual external audit.
+
+3. **HIPAA for healthcare data**: HIPAA-compliant cluster: encryption at rest, mTLS, audit logging, access controls. BAA with cloud provider. Documented procedures.
+
+4. **GDPR data deletion**: User requested data deletion under GDPR. Procedure: identify all storage with user data, delete from each. Audit log of deletion.
+
+5. **Continuous compliance via CronJob**: Daily kube-bench scans. Results in Prometheus. Dashboard tracks compliance over time. Catches drift immediately.
+
+---
+
+## 248. How do you implement PCI-DSS controls?
+
+PCI-DSS (Payment Card Industry Data Security Standard) protects cardholder data. Kubernetes deployments handling payment data must meet specific requirements.
+
+**PCI-DSS scope:**
+
+Applies to:
+- Systems storing, processing, or transmitting cardholder data (CDE - Cardholder Data Environment)
+- Systems connected to those
+
+Reduce scope by isolating CDE.
+
+**The 12 requirements:**
+
+1. Install and maintain firewall configuration
+2. Don't use vendor-supplied defaults
+3. Protect stored cardholder data
+4. Encrypt transmission of cardholder data
+5. Protect against malware
+6. Develop and maintain secure systems
+7. Restrict access by business need-to-know
+8. Identify and authenticate access
+9. Restrict physical access
+10. Track and monitor all access
+11. Regularly test security
+12. Maintain information security policy
+
+**Implementing in Kubernetes:**
+
+**Requirement 1: Firewall configuration**
+
+NetworkPolicies as firewall:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cde-default-deny
+  namespace: payments
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+Default-deny in CDE namespace. Explicit allows for required traffic.
+
+```yaml
+# Allow only specific traffic:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-api-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-api
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - port: 8443
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: payment-db
+      ports:
+        - port: 5432
+```
+
+**Requirement 2: Don't use defaults**
+
+- Change default Kubernetes configs
+- Disable anonymous access:
+
+```yaml
+# kube-apiserver:
+- --anonymous-auth=false
+```
+
+- Strong passwords/keys
+- No default service accounts with permissions
+
+**Requirement 3: Protect stored cardholder data**
+
+PCI prefers not storing card data. If you must:
+
+**Encryption at rest:**
+
+```yaml
+# etcd encryption:
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - kms:
+          name: cloud-kms
+          endpoint: ...
+```
+
+**PV encryption:**
+
+```yaml
+# StorageClass with encryption:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: encrypted-ssd
+parameters:
+  type: gp3
+  encrypted: "true"
+  kmsKeyId: arn:aws:kms:...
+```
+
+All PVs encrypted with KMS keys.
+
+**Tokenization:**
+
+Don't store PAN (Primary Account Number) at all:
+
+```python
+# Use payment processor's tokens:
+token = stripe.create_token(card_data)
+db.save_token(token)
+# Never store actual card number
+```
+
+**Requirement 4: Encrypt transmission**
+
+mTLS for all communication:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: payments
+spec:
+  mtls:
+    mode: STRICT
+```
+
+External: TLS at ingress with strong ciphers:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-protocols: "TLSv1.2 TLSv1.3"
+    nginx.ingress.kubernetes.io/ssl-ciphers: "ECDHE+AES256:..."
+```
+
+**Requirement 5: Protect against malware**
+
+Image scanning:
+
+```yaml
+# CI pipeline:
+- trivy image --severity HIGH,CRITICAL --exit-code 1 my-app:v1
+```
+
+Runtime detection:
+- Falco for anomaly detection
+- Block unknown executables
+
+**Requirement 6: Secure development**
+
+- Code reviews
+- Security testing
+- Patch management
+- Change management
+
+Kubernetes:
+- Regular upgrades
+- Vulnerability scanning
+- GitOps with PR reviews
+
+**Requirement 7: Restrict access**
+
+Strict RBAC:
+
+```yaml
+# Payment team only:
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: payments
+  name: payment-team
+subjects:
+  - kind: Group
+    name: payment-engineers
+roleRef:
+  kind: Role
+  name: payment-admin
+```
+
+No cross-team access to CDE.
+
+**Requirement 8: Authenticate access**
+
+- OIDC with MFA required
+- Strong passwords
+- Unique IDs (no shared accounts)
+- Account lockout
+
+```yaml
+# kube-apiserver OIDC:
+- --oidc-issuer-url=https://accounts.example.com
+- --oidc-client-id=kubernetes
+```
+
+OIDC provider enforces MFA.
+
+**Requirement 9: Physical access**
+
+Cloud providers handle. Document their controls (SOC 2, ISO 27001 reports).
+
+**Requirement 10: Track and monitor**
+
+Comprehensive audit logging:
+
+```yaml
+# Audit policy for CDE:
+- level: RequestResponse
+  namespaces: ["payments"]
+  resources:
+    - group: ""
+      resources: ["*"]
+```
+
+Everything in CDE logged.
+
+Log retention: 1 year minimum per PCI.
+
+```yaml
+# CronJob to archive old logs:
+0 0 * * * aws s3 sync /var/log/audit/ s3://compliance-logs/audit/
+```
+
+S3 Object Lock for immutability.
+
+**Requirement 11: Test security**
+
+- Quarterly vulnerability scans
+- Annual penetration testing
+- IDS/IPS
+
+Kubernetes:
+- Continuous image scanning
+- Runtime threat detection (Falco)
+- Regular pen tests of cluster
+
+**Requirement 12: Security policy**
+
+Documented policies:
+- Acceptable use
+- Incident response
+- Access management
+- Change management
+
+Reviewed annually, signed by leadership.
+
+**Network segmentation:**
+
+Reduce PCI scope:
+
+```
+Cluster
+  ├─ Namespace: cde (PCI scope)
+  │    ├─ payment-api
+  │    ├─ payment-db
+  │    └─ Strict NetworkPolicies
+  ├─ Namespace: non-cde
+  │    └─ Other apps (not in scope)
+```
+
+CDE pods can only talk to other CDE pods or specific external endpoints.
+
+**Cluster-level segmentation:**
+
+Some orgs use separate cluster for CDE:
+
+```
+PCI cluster (in scope)
+Non-PCI cluster (out of scope)
+```
+
+Smaller blast radius, easier to audit.
+
+**Audit logging for PCI:**
+
+Specific requirements:
+- All access to cardholder data
+- All admin actions
+- All access failures
+- Modifications to authentication
+- Audit log access itself
+
+```yaml
+# Strict audit policy:
+- level: RequestResponse
+  verbs: ["create", "update", "patch", "delete"]
+  resources:
+    - group: ""
+      resources: ["secrets", "configmaps"]
+  namespaces: ["payments"]
+
+- level: Metadata
+  verbs: ["get", "list"]
+  resources:
+    - group: ""
+      resources: ["secrets"]
+  namespaces: ["payments"]
+```
+
+**Vulnerability scanning:**
+
+Quarterly external ASV scans:
+- AWS Inspector
+- Qualys
+- Tenable
+
+Internal continuous:
+- Trivy
+- Snyk
+
+**Pen testing:**
+
+Annual:
+- External pen test (network perimeter)
+- Internal pen test (assume breach scenarios)
+- Application pen test
+
+For Kubernetes:
+- Cluster pen test
+- Common attack scenarios
+- Container escape attempts
+
+**Common PCI findings:**
+
+**Finding 1: Excessive scope**
+
+Everything is "potentially in scope".
+
+Fix: clear network segmentation, only specific namespaces in CDE.
+
+**Finding 2: Insufficient logging**
+
+Logs missing or short retention.
+
+Fix: comprehensive audit policy, long retention.
+
+**Finding 3: Unencrypted data**
+
+Cardholder data stored unencrypted somewhere.
+
+Fix: encryption everywhere, or tokenization.
+
+**Finding 4: Weak access controls**
+
+Shared accounts, no MFA, excessive permissions.
+
+Fix: OIDC + MFA, per-user accounts, minimal RBAC.
+
+**Finding 5: Untested controls**
+
+Controls documented but never tested.
+
+Fix: regular testing, evidence of remediation.
+
+**Production approach:**
+
+**Step 1: Define CDE scope**
+
+What systems handle card data? Minimize:
+- Don't store PAN if possible
+- Tokenize early
+- Isolate processing
+
+**Step 2: Implement controls**
+
+For each of 12 requirements:
+- Map to Kubernetes control
+- Implement
+- Document
+
+**Step 3: Test**
+
+Self-assess with kube-bench, Trivy.
+
+**Step 4: External audit**
+
+QSA (Qualified Security Assessor) audits annually.
+
+**Step 5: Continuous compliance**
+
+- Monitor controls
+- Continuous scanning
+- Regular reviews
+
+**Production scenarios:**
+
+1. **Tokenization eliminated PCI scope**: Service stored partial card data. Refactored to use Stripe tokens. Card data never touched our systems. PCI scope: significantly reduced.
+
+2. **Network isolation for CDE**: Created dedicated namespace, strict NetworkPolicies. CDE only talked to CDE. Reduced scope from "everything" to "this namespace".
+
+3. **Audit log retention**: Initial 30-day retention. PCI required 1 year. Implemented archive to S3 with object lock. Compliance met, queries possible.
+
+4. **MFA via OIDC**: Replaced kubeconfig with OIDC + corporate MFA. Per-user accounts, MFA-required. PCI Requirement 8 satisfied.
+
+5. **External pen test findings**: Pen test found exposed admin endpoint. Fixed: ingress requires auth. Re-tested, passed. Important to remediate, not just identify.
+
+---
+
+## 249. Explain SOC2 considerations for Kubernetes
+
+SOC 2 (Service Organization Control 2) is widely required for SaaS companies. The audit verifies controls over a 6-12 month period.
+
+**SOC 2 trust service criteria:**
+
+**Security**: protection against unauthorized access (always included)
+**Availability**: system operational and usable
+**Processing integrity**: complete, valid, accurate processing
+**Confidentiality**: information designated confidential is protected
+**Privacy**: personal information handled per privacy policy
+
+Most companies do Security + Availability. Privacy and Confidentiality for sensitive data.
+
+**SOC 2 types:**
+
+**Type I**: point-in-time assessment. Controls designed appropriately.
+
+**Type II**: assessment over period (typically 12 months). Controls operating effectively.
+
+Type II is the goal for ongoing trust.
+
+**Common SOC 2 controls and Kubernetes implementation:**
+
+**CC6.1 - Logical access controls:**
+
+Restrict access to authorized users.
+
+Kubernetes:
+- OIDC for user authentication
+- RBAC for authorization
+- MFA required
+- Regular access reviews
+
+```yaml
+# OIDC config:
+- --oidc-issuer-url=https://corp-sso.example.com
+- --oidc-client-id=kubernetes
+- --oidc-username-claim=email
+```
+
+Evidence: authentication logs, RBAC manifests, access review records.
+
+**CC6.2 - User access management:**
+
+Onboarding, offboarding, modification.
+
+Kubernetes:
+- SSO integration (departures auto-remove access)
+- RBAC tied to groups
+- Documented procedures
+
+Evidence: account lifecycle records.
+
+**CC6.3 - Logical access modifications:**
+
+Changes to access reviewed and approved.
+
+Kubernetes:
+- GitOps for RBAC (PR review for changes)
+- Audit logs of RBAC changes
+
+Evidence: PRs showing review, audit logs.
+
+**CC6.6 - Boundary protection:**
+
+Restrict network access.
+
+Kubernetes:
+- NetworkPolicies
+- Ingress with WAF
+- Service mesh mTLS
+
+Evidence: NetworkPolicy manifests, firewall rules.
+
+**CC6.7 - Restricting access to information assets:**
+
+Need-to-know basis.
+
+Kubernetes:
+- Namespace isolation
+- Per-team RBAC
+- Secrets access controls
+
+**CC6.8 - System operation logs:**
+
+Track activity.
+
+Kubernetes:
+- Audit logging enabled
+- Logs shipped to immutable storage
+- Retention per policy
+
+```yaml
+# Audit logging:
+--audit-policy-file=/etc/kubernetes/audit-policy.yaml
+--audit-log-path=/var/log/audit.log
+--audit-log-maxage=365   # 1 year retention
+```
+
+Evidence: sample audit logs, retention policy.
+
+**CC7.1 - System monitoring:**
+
+Continuous monitoring for incidents.
+
+Kubernetes:
+- Prometheus monitoring
+- Falco runtime security
+- Alert routing to on-call
+
+**CC7.2 - Anomalies analyzed:**
+
+Investigate anomalies promptly.
+
+Process:
+- Falco alerts → SIEM → on-call
+- Documented incident response
+
+**CC7.3 - Incident response:**
+
+Documented incident response process.
+
+Components:
+- Runbooks
+- Communication plan
+- Post-mortems
+- Tracking system
+
+**CC7.4 - Incidents communicated:**
+
+Stakeholder notification.
+
+Process documented and tested.
+
+**CC8.1 - Change management:**
+
+Authorized changes only.
+
+Kubernetes:
+- GitOps (all changes via PR)
+- Required reviewers
+- Audit trail
+
+```yaml
+# Branch protection:
+- Required reviews: 1+
+- Required status checks
+- No direct commits
+```
+
+**A1.1, A1.2 - Availability planning:**
+
+Capacity and availability.
+
+Kubernetes:
+- HPA, VPA, Cluster Autoscaler
+- Multi-AZ deployments
+- DR strategy
+
+**A1.3 - Backups:**
+
+Regular backups, tested restoration.
+
+Kubernetes:
+- etcd backups (Velero)
+- PV snapshots
+- DR testing
+
+Evidence: backup schedules, test results.
+
+**Other criteria similar mappings.**
+
+**SOC 2 audit preparation:**
+
+**Month 1-3: Gap analysis**
+
+Compare current state to SOC 2 requirements:
+- What controls exist?
+- What's missing?
+- What's documented?
+
+**Month 4-9: Implementation**
+
+Fill gaps:
+- Implement missing controls
+- Document procedures
+- Train team
+
+**Month 10-12: Evidence collection**
+
+For Type II, collect evidence over the audit period:
+- Logs
+- Reports
+- Procedure execution records
+- Meeting minutes
+
+**Audit:**
+
+External auditor reviews:
+- Documentation
+- Evidence
+- Interviews team
+- Tests controls
+
+**SOC 2 evidence types:**
+
+**Evidence type 1: Configuration**
+
+```bash
+# Snapshot:
+kubectl get networkpolicies -A -o yaml
+kubectl get clusterrolebindings -o yaml
+kubectl get crd
+```
+
+**Evidence type 2: Logs**
+
+Audit log samples showing controls in action:
+- User authentication
+- RBAC enforcement
+- Failed access attempts
+
+**Evidence type 3: Reports**
+
+```bash
+# Compliance scans:
+kube-bench run --json > kube-bench-report.json
+trivy k8s --report=summary cluster
+```
+
+**Evidence type 4: Process records**
+
+- PR approvals
+- Incident records
+- Change tickets
+- Access review documentation
+
+**Evidence type 5: Personnel records**
+
+- Training records
+- Background checks
+- Confidentiality agreements
+
+**Continuous compliance approach:**
+
+Don't audit-prepare in panic:
+
+```yaml
+# Daily compliance scan:
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: compliance-scan
+spec:
+  schedule: "0 6 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: scan
+              image: aquasec/trivy:latest
+              command:
+                - trivy
+                - k8s
+                - --compliance=cis
+                - --report=summary
+                - cluster
+```
+
+Daily checks, fixes immediately.
+
+**Common SOC 2 challenges:**
+
+**Challenge 1: Evidence collection**
+
+Auditor needs evidence over the period, not just current. Plan early.
+
+**Challenge 2: Personnel changes**
+
+People leave, new ones join. Documentation must stay current.
+
+**Challenge 3: Vendor controls**
+
+Cloud providers have their own SOC 2. Use their reports for some controls (physical security, etc.).
+
+**Challenge 4: Scope creep**
+
+Auditors may want to expand scope. Define scope clearly.
+
+**Challenge 5: Exceptions**
+
+Some controls don't apply or are different. Document compensating controls.
+
+**Specific Kubernetes controls for SOC 2:**
+
+**Control: All deployments via PR**
+
+```yaml
+# Enforce in branch protection
+# Audit: PR history
+# Evidence: random samples of PRs
+```
+
+**Control: All access via OIDC**
+
+```yaml
+# No static kubeconfig for users
+# All auth through corporate IdP
+# Audit: API server logs
+```
+
+**Control: Production access requires approval**
+
+```yaml
+# Use environments with required reviewers:
+environment:
+  name: production
+  reviewers:
+    - sre-team
+```
+
+**Control: Vulnerabilities tracked**
+
+```yaml
+# Trivy in CI, blocking critical
+# Continuous scanning
+# Tracking system for remediation
+```
+
+**Control: Backups tested**
+
+```yaml
+# Quarterly DR drill
+# Velero restore to test cluster
+# Documented test results
+```
+
+**Tools that help:**
+
+**Drata, Vanta, Secureframe**: SOC 2 automation platforms. Connect to systems, collect evidence, generate reports.
+
+Integration with Kubernetes:
+- API access
+- Auto-collect configurations
+- Continuous compliance monitoring
+
+**Production scenarios:**
+
+1. **First SOC 2 Type II**: 12-month process. Initial scan found many gaps. Implemented controls, documented procedures, trained team. Type II audit found 2 minor issues. Passed.
+
+2. **GitOps for change management**: All Kubernetes changes via Git PRs. Audit trail clear. SOC 2 change management control satisfied.
+
+3. **Vanta for evidence collection**: Manual evidence collection took weeks. Vanta automated 80%. Annual audit much smoother.
+
+4. **DR drill for SOC 2**: Annual SOC 2 required DR testing. Quarterly drills documented. Reduce, recovered, validated. Compliance met.
+
+5. **Vendor SOC 2 reports**: AWS, GCP, Datadog SOC 2 reports used as evidence for shared controls. Saved doing them ourselves.
+
+---
+
+## 250. How do you implement GDPR controls?
+
+GDPR (General Data Protection Regulation) protects EU residents' personal data. Applies to any organization processing EU data, regardless of where the org is located.
+
+**Key GDPR principles:**
+
+1. **Lawfulness, fairness, transparency**
+2. **Purpose limitation**: collect for specific purposes
+3. **Data minimization**: only what's needed
+4. **Accuracy**: keep data current
+5. **Storage limitation**: don't keep forever
+6. **Integrity and confidentiality**: secure
+7. **Accountability**: demonstrate compliance
+
+**GDPR rights:**
+
+- Right to access
+- Right to rectification
+- Right to erasure ("right to be forgotten")
+- Right to restrict processing
+- Right to data portability
+- Right to object
+- Rights related to automated decision-making
+
+**Implementing in Kubernetes:**
+
+**Implementation 1: Data inventory**
+
+Know where personal data lives:
+
+```
+Application: customer-portal
+Data: name, email, address, payment info
+Storage: postgres-prod cluster, S3 bucket customer-uploads
+```
+
+Maintain mapping.
+
+**Implementation 2: Data minimization**
+
+Don't collect more than needed:
+
+```yaml
+# Database schema review:
+# Remove fields not strictly necessary
+# Anonymize where possible
+```
+
+**Implementation 3: Encryption**
+
+**At rest:**
+
+```yaml
+# Encrypted PVs:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: encrypted
+parameters:
+  encrypted: "true"
+```
+
+**Database encryption:**
+
+```sql
+-- PostgreSQL transparent data encryption
+-- Or column-level for sensitive fields:
+CREATE TABLE users (
+  id SERIAL,
+  email TEXT,
+  ssn BYTEA   -- Encrypted with pgcrypto
+);
+```
+
+**In transit:**
+
+```yaml
+# mTLS via service mesh:
+spec:
+  mtls:
+    mode: STRICT
+```
+
+**Implementation 4: Access controls**
+
+Restrict who can access personal data:
+
+```yaml
+# RBAC for personal data:
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: customer-data-access
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["customer-db-creds"]
+    verbs: ["get"]
+```
+
+Audit access:
+
+```yaml
+# Audit policy:
+- level: RequestResponse
+  resources:
+    - group: ""
+      resources: ["secrets"]
+      resourceNames: ["customer-data"]
+```
+
+**Implementation 5: Right to erasure**
+
+When user requests deletion:
+
+```python
+# Procedure:
+def delete_user_data(user_id):
+    # 1. Delete from primary database
+    db.execute("DELETE FROM users WHERE id = ?", user_id)
+    
+    # 2. Delete from analytics
+    analytics_db.execute("DELETE FROM events WHERE user_id = ?", user_id)
+    
+    # 3. Delete from object storage
+    s3.delete_objects(bucket="user-uploads", prefix=f"users/{user_id}/")
+    
+    # 4. Mark in audit log
+    audit_log.record("user_deletion", user_id)
+    
+    # 5. Update backups (next backup will not have user)
+    # Note: existing backups may still have data
+    
+    # 6. Confirm to user
+    return True
+```
+
+Document procedure. Test it.
+
+**Implementation 6: Right to access**
+
+Export user's data:
+
+```python
+def export_user_data(user_id):
+    data = {
+        'profile': db.query_user(user_id),
+        'activity': activity_log.query(user_id),
+        'uploads': s3.list_objects(prefix=f"users/{user_id}/"),
+    }
+    return json.dumps(data)
+```
+
+Provide to user in standard format.
+
+**Implementation 7: Data portability**
+
+User can take data to another service:
+
+```python
+def export_portable_data(user_id):
+    # Common format (JSON, CSV)
+    return generate_portable_export(user_id)
+```
+
+**Implementation 8: Consent management**
+
+Track and honor consent:
+
+```yaml
+# Consent stored explicitly:
+# Use case-specific consent
+```
+
+**Implementation 9: Audit logging**
+
+GDPR requires demonstrating compliance:
+
+```yaml
+# Comprehensive audit for personal data:
+- level: RequestResponse
+  resources:
+    - group: ""
+      resources: ["secrets", "configmaps"]
+      resourceNames: ["customer-*"]
+```
+
+**Implementation 10: Breach notification**
+
+GDPR requires notification within 72 hours.
+
+Process:
+1. Detection (monitoring, alerts)
+2. Assessment (scope, impact)
+3. Containment
+4. Notification (DPA + affected users)
+5. Post-incident review
+
+**Geographic considerations:**
+
+GDPR applies to EU data. May require:
+- EU data residency (data in EU)
+- EU-specific cluster
+- Or proper data transfer mechanisms
+
+**Data transfer:**
+
+EU to non-EU transfer requires:
+- Adequacy decision (some countries deemed adequate)
+- Standard Contractual Clauses (SCCs)
+- Binding Corporate Rules (BCRs)
+
+Document transfer mechanisms.
+
+**Data Processing Agreements (DPAs):**
+
+With vendors:
+- Cloud provider DPA
+- SaaS vendor DPAs
+- Document data flows
+
+**Sub-processors:**
+
+Track and disclose:
+
+```
+Primary processor: us
+Sub-processors:
+- AWS (infrastructure)
+- Stripe (payments)
+- SendGrid (email)
+- Datadog (monitoring)
+```
+
+User-accessible list.
+
+**Pseudonymization:**
+
+Reduce identifiability:
+
+```python
+# Use tokens instead of real IDs:
+def pseudonymize_user(user_id):
+    token = hash(user_id + secret)
+    db.update("UPDATE events SET user_token = ? WHERE user_id = ?", token, user_id)
+    return token
+
+# Now events can be analyzed without real IDs
+# Real ID kept separately, accessible only when needed
+```
+
+**Anonymization:**
+
+Remove identification entirely:
+
+```python
+# For analytics on aggregate data:
+def anonymize():
+    # Remove PII
+    # Aggregate to k-anonymous level
+    # Cannot re-identify
+```
+
+**Data retention:**
+
+Don't keep forever:
+
+```yaml
+# Retention policies:
+- User profiles: until account deletion
+- Logs: 90 days
+- Backups: 30 days
+- Analytics: 13 months (for year-over-year)
+```
+
+Automated deletion:
+
+```yaml
+# Database job:
+CREATE EVENT delete_old_data
+ON SCHEDULE EVERY 1 DAY
+DO
+  DELETE FROM events WHERE created_at < NOW() - INTERVAL 90 DAY;
+```
+
+**Privacy by design:**
+
+GDPR requires privacy by default:
+- Pseudonymize by default
+- Encrypt by default
+- Minimize collection
+- Default privacy settings
+
+**Tools:**
+
+**Data discovery:**
+- Looking for personal data across systems
+- Tools: BigID, OneTrust
+
+**Consent management:**
+- Cookie consent platforms
+- API for consent tracking
+
+**Privacy compliance platforms:**
+- OneTrust
+- TrustArc
+- Privitar
+
+**Production scenarios:**
+
+1. **Right to erasure implementation**: User requested deletion. Documented procedure: delete from prod DB, analytics, object storage, audit logs. 30-day backup retention meant fully erased after that. Confirmed to user.
+
+2. **EU data residency**: EU customer required data in EU. Created EU cluster (eu-west-1). Replicated relevant services. EU traffic stays in EU.
+
+3. **Sub-processor disclosure**: GDPR Article 28 requires sub-processor list. Maintained public list. Updates trigger 30-day notice to customers.
+
+4. **Encryption at rest for compliance**: All PVs encrypted with KMS. etcd encryption. Database column-level for SSNs. Encryption everywhere.
+
+5. **Breach response drill**: Simulated breach, ran response process. Detected → assessed → contained → notified within 24 hours. Validated 72-hour timeline.
+
+---
+
+## 251. Explain encryption in transit and at rest
+
+Encryption protects data from unauthorized access. Two categories: data moving through networks (in transit) and data stored (at rest).
+
+**Encryption in transit:**
+
+Data being transmitted between components.
+
+**Sources of in-transit traffic:**
+
+- User → ingress (HTTPS)
+- Ingress → pod (HTTP or HTTPS)
+- Pod → pod (mTLS or plain)
+- Pod → database (TLS)
+- Pod → external API (HTTPS)
+- API server → etcd (TLS)
+- kubelet → API server (TLS)
+
+**Default TLS in Kubernetes:**
+
+Control plane communications use TLS:
+- API server ↔ etcd: TLS
+- API server ↔ kubelet: TLS
+- kubectl ↔ API server: TLS
+
+Configured during cluster installation.
+
+**Pod-to-pod encryption:**
+
+Default: NOT encrypted. Anyone in cluster can sniff traffic.
+
+**Adding encryption:**
+
+**Option 1: Service mesh (recommended)**
+
+```yaml
+# Istio PeerAuthentication:
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+Automatic mTLS for all pod-to-pod traffic.
+
+**Option 2: Application TLS**
+
+App opens TLS connection to peer. Requires cert management in app.
+
+**Option 3: WireGuard via CNI**
+
+```yaml
+# Cilium WireGuard:
+spec:
+  encryption:
+    enabled: true
+    type: wireguard
+```
+
+CNI encrypts all pod-to-pod traffic at network layer.
+
+**Option 4: IPSec via CNI**
+
+```yaml
+# Calico IPSec:
+spec:
+  encryption:
+    type: ipsec
+```
+
+**External traffic:**
+
+**Ingress TLS:**
+
+```yaml
+spec:
+  tls:
+    - hosts: [api.example.com]
+      secretName: api-tls
+```
+
+Mandatory for production.
+
+**Egress TLS:**
+
+Apps connect to external services via TLS:
+
+```python
+import requests
+response = requests.get(
+    'https://api.external.com',
+    verify=True   # Verify cert
+)
+```
+
+**Configuration considerations:**
+
+**TLS version:**
+
+```yaml
+# Modern only:
+ssl-protocols: "TLSv1.2 TLSv1.3"
+```
+
+TLS 1.0, 1.1 deprecated. TLS 1.3 preferred.
+
+**Cipher suites:**
+
+```yaml
+ssl-ciphers: "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:..."
+```
+
+Strong, modern ciphers only.
+
+**Certificate management:**
+
+cert-manager for automation:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tls-cert
+spec:
+  secretName: tls-cert
+  issuerRef:
+    name: letsencrypt-prod
+```
+
+Automatic renewal.
+
+**Encryption at rest:**
+
+Data stored on disks.
+
+**Storage layers:**
+
+- etcd (cluster state)
+- Persistent volumes (application data)
+- Container images
+- Backups
+- Logs
+
+**etcd encryption:**
+
+By default: NOT encrypted. Secrets in etcd are base64-encoded only.
+
+**Enable encryption:**
+
+```yaml
+# EncryptionConfiguration:
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: <32-byte-base64>
+      - identity: {}   # Fallback for reading old unencrypted
+```
+
+```yaml
+# kube-apiserver:
+- --encryption-provider-config=/etc/kubernetes/encryption.yaml
+```
+
+**KMS provider (better):**
+
+```yaml
+providers:
+  - kms:
+      name: aws-kms
+      endpoint: unix:///var/run/kmsplugin/socket.sock
+      timeout: 3s
+      cachesize: 100
+```
+
+Encryption keys in cloud KMS. Never leave KMS. Auditable.
+
+**Encrypt existing secrets:**
+
+After enabling encryption, existing secrets remain unencrypted until re-saved:
+
+```bash
+# Re-create all secrets to encrypt:
+kubectl get secrets --all-namespaces -o json | kubectl replace -f -
+```
+
+**Persistent volume encryption:**
+
+**Cloud-managed:**
+
+```yaml
+# AWS EBS:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: encrypted-ebs
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  kmsKeyId: arn:aws:kms:us-east-1:...:key/...
+
+---
+
+# GCP PD:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: encrypted-pd
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  disk-encryption-kms-key: projects/my-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key
+
+---
+
+# Azure:
+parameters:
+  diskEncryptionSetID: /subscriptions/.../diskEncryptionSets/my-des
+```
+
+**Self-managed:**
+
+For non-cloud:
+- LUKS encryption on disks
+- File system encryption
+
+**Application-level encryption:**
+
+Encrypt sensitive fields in database:
+
+```sql
+-- PostgreSQL with pgcrypto:
+CREATE EXTENSION pgcrypto;
+
+INSERT INTO users (email, ssn_encrypted)
+VALUES ('user@example.com', pgp_sym_encrypt('123-45-6789', 'encryption_key'));
+
+SELECT email, pgp_sym_decrypt(ssn_encrypted, 'encryption_key') AS ssn FROM users;
+```
+
+Keys managed separately (KMS, Vault).
+
+**Image encryption:**
+
+OCI image encryption supported:
+
+```bash
+# Encrypt image:
+skopeo copy --encryption-key jwe:./public.pem docker://my-image oci:./encrypted-image
+
+# Decryption keys to pull
+```
+
+Less common; mostly for highly sensitive deployments.
+
+**Backup encryption:**
+
+```bash
+# Velero with encrypted storage:
+velero backup create my-backup \
+  --storage-location encrypted-s3-bucket
+```
+
+S3 bucket with SSE-KMS for encryption.
+
+**Log encryption:**
+
+Logs in transit and at rest:
+
+```yaml
+# Fluentd to TLS-protected endpoint:
+<match>
+  @type elasticsearch
+  scheme https
+  ssl_verify true
+</match>
+```
+
+Plus encryption at rest at log storage.
+
+**Key management:**
+
+Where do encryption keys live?
+
+**Cloud KMS:**
+- AWS KMS
+- GCP KMS
+- Azure Key Vault
+
+Keys never leave service. API to encrypt/decrypt.
+
+**HSM (Hardware Security Module):**
+- CloudHSM
+- Dedicated hardware
+- FIPS 140-2 Level 3
+
+For highest security.
+
+**Vault:**
+- HashiCorp Vault
+- Transit secrets engine
+- Encryption as a service
+
+**Self-managed:**
+- Keys in K8s Secrets (encrypt etcd!)
+- Keys in files (with restricted permissions)
+
+Less secure; cloud KMS preferred.
+
+**Key rotation:**
+
+Encryption keys should rotate:
+
+```yaml
+# Multiple keys in EncryptionConfiguration:
+providers:
+  - aescbc:
+      keys:
+        - name: key2   # Active key
+          secret: <new-key>
+        - name: key1   # Old key (decrypt only)
+          secret: <old-key>
+```
+
+Re-save data to encrypt with new key.
+
+**Performance impact:**
+
+Encryption has overhead:
+- TLS: 1-5ms per connection setup, minimal ongoing
+- mTLS: similar
+- Disk encryption: 5-15% CPU
+- App-level: varies
+
+Usually acceptable for security.
+
+**Compliance requirements:**
+
+- PCI-DSS: encryption required for cardholder data
+- HIPAA: encryption required for PHI
+- GDPR: encryption strongly recommended
+- SOC 2: encryption part of security controls
+
+**Verification:**
+
+```bash
+# Check etcd encryption:
+kubectl get secret -A -o yaml | head
+# Should NOT show plain base64 readable secret data
+
+# Check pod TLS:
+kubectl exec -it test-pod -- curl -v https://api/
+
+# Check storage encryption:
+aws ec2 describe-volumes --query 'Volumes[*].[VolumeId,Encrypted]'
+```
+
+**Production scenarios:**
+
+1. **Encryption everywhere**: New cluster: etcd encryption at rest with KMS, mTLS for all in-cluster, TLS for external. PV encryption with KMS keys. Backup encryption. Comprehensive.
+
+2. **Compliance-driven**: HIPAA required encryption everywhere. Implemented: etcd KMS, PV encryption, mTLS via Istio, TLS at ingress. Compliance officer satisfied.
+
+3. **Old cluster retrofit**: Existing cluster without encryption. Enabled etcd encryption (re-saved all secrets), encrypted new PVs, added Istio for mTLS. Gradual migration.
+
+4. **KMS for key management**: Used AWS KMS for etcd, EBS, S3 encryption. Single source for keys. Audit all key usage. Better than managing keys in files.
+
+5. **Key rotation drill**: Tested rotating etcd encryption key. Added new key, re-saved secrets, removed old. No downtime. Validated procedure.
+
+---
+
+## 252. How do you secure etcd?
+
+etcd is the most critical component to secure. It contains all cluster state including secrets. Compromise = total cluster compromise.
+
+**Why etcd security matters:**
+
+etcd stores:
+- All Kubernetes resources
+- Secrets (encryption keys, API tokens, passwords)
+- RBAC configurations
+- Cluster certificates
+
+Anyone with etcd access has full cluster access, often bypassing all other controls.
+
+**Security layers:**
+
+**Layer 1: Network access**
+
+Restrict who can reach etcd:
+
+```yaml
+# etcd args:
+--listen-client-urls=https://127.0.0.1:2379,https://10.0.0.1:2379
+--listen-peer-urls=https://10.0.0.1:2380
+```
+
+Listen on specific interfaces:
+- Localhost for stacked etcd (API server local)
+- Specific IPs for cluster peers
+- Never 0.0.0.0 (all interfaces)
+
+**Network policies:**
+
+```yaml
+# Restrict etcd network access:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: etcd-isolation
+  namespace: kube-system
+spec:
+  podSelector:
+    matchLabels:
+      component: etcd
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              component: kube-apiserver
+      ports:
+        - port: 2379
+```
+
+Only API server reaches etcd.
+
+**Firewall:**
+
+```bash
+# At node level:
+iptables -A INPUT -p tcp --dport 2379 -s <api-server-ip> -j ACCEPT
+iptables -A INPUT -p tcp --dport 2379 -j DROP
+```
+
+Block external access.
+
+**Layer 2: TLS for client communication**
+
+etcd ↔ API server must use TLS:
+
+```yaml
+# etcd args:
+--client-cert-auth=true
+--trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+--cert-file=/etc/kubernetes/pki/etcd/server.crt
+--key-file=/etc/kubernetes/pki/etcd/server.key
+```
+
+API server connects with cert:
+
+```yaml
+# kube-apiserver args:
+--etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt
+--etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt
+--etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key
+```
+
+Both sides authenticate.
+
+**Layer 3: TLS for peer communication**
+
+etcd nodes communicate with each other:
+
+```yaml
+# etcd args:
+--peer-client-cert-auth=true
+--peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+--peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt
+--peer-key-file=/etc/kubernetes/pki/etcd/peer.key
+```
+
+Peer-to-peer encrypted and authenticated.
+
+**Layer 4: Encryption at rest**
+
+etcd data on disk:
+
+**Option 1: etcd encryption at filesystem**
+
+Disk-level encryption (LUKS, cloud disk encryption).
+
+**Option 2: K8s encryption configuration**
+
+Encrypts secrets within etcd:
+
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - kms:
+          name: cloud-kms
+```
+
+Even with etcd file access, secrets can't be read without KMS.
+
+**Layer 5: Authentication**
+
+etcd v3 has built-in auth:
+
+```bash
+# Enable auth:
+etcdctl auth enable
+
+# Create user:
+etcdctl user add my-user
+
+# Create role:
+etcdctl role add my-role
+etcdctl role grant-permission my-role read /myprefix/
+```
+
+Less commonly used since Kubernetes API server is the only client.
+
+**Layer 6: Access control**
+
+Who can access etcd nodes:
+
+- SSH access restricted
+- No direct etcd client access
+- Audit logging of access
+
+**Layer 7: Backup security**
+
+Backups contain everything:
+
+```bash
+# Backup:
+etcdctl snapshot save /backup/etcd-snap.db
+```
+
+Backups must be:
+- Encrypted (S3 with SSE-KMS)
+- Access-controlled
+- Stored off-cluster
+- Tested for restorability
+
+**Layer 8: Monitoring and audit**
+
+Audit etcd access:
+- Operating system audit logs
+- etcd's own audit
+- Anomaly detection
+
+**Specific configurations:**
+
+**Stacked etcd (default kubeadm):**
+
+```
+Master node:
+  ├─ API server
+  ├─ etcd
+  └─ Other control plane
+```
+
+Pros: simpler
+Cons: shared failure domain
+
+**External etcd:**
+
+```
+Master nodes: API server, etc.
+etcd nodes: dedicated, separate
+```
+
+Pros: isolation, scaling
+Cons: more infrastructure
+
+For high security: external etcd, dedicated hardware.
+
+**Hardening checklist:**
+
+1. **TLS for client communication**: Done via kubeadm
+2. **TLS for peer communication**: Done via kubeadm
+3. **Encryption at rest** for secrets: Manual configuration
+4. **Network isolation**: Firewall/NetworkPolicy
+5. **Restrict node access**: SSH controls
+6. **Backups encrypted**: S3 SSE-KMS
+7. **Audit logging**: OS-level
+8. **Monitoring**: Prometheus, alerts
+
+**Cloud-managed clusters:**
+
+EKS, GKE, AKS: cloud provider manages etcd:
+- Encryption usually automatic
+- Backups handled
+- Access through K8s API only
+
+Not user-accessible. Security largely outsourced.
+
+**Audit events on etcd:**
+
+```yaml
+# kube-apiserver audit policy:
+- level: RequestResponse
+  resources:
+    - group: ""
+      resources: ["secrets"]
+```
+
+Audit secret access (which goes to etcd).
+
+**OS-level monitoring:**
+
+```bash
+# auditd rules:
+-w /var/lib/etcd -p rwa -k etcd_access
+-w /etc/kubernetes/pki/etcd -p r -k etcd_cert_access
+```
+
+Tracks filesystem access to etcd data and certs.
+
+**Common attacks:**
+
+**Attack 1: Direct etcd access**
+
+If etcd listens on accessible IP, attacker uses etcdctl directly:
+
+```bash
+etcdctl --endpoints=https://victim:2379 get / --prefix --keys-only
+```
+
+Gets all keys including secrets.
+
+Prevention: localhost-only listen, TLS, certs.
+
+**Attack 2: Backup theft**
+
+Backup file stolen from S3, etc.
+
+Prevention: encryption, access controls, encrypted backups.
+
+**Attack 3: Master node compromise**
+
+If attacker gets root on master, can access etcd files.
+
+Prevention: hardened nodes, encryption at rest, monitoring.
+
+**Attack 4: API server compromise**
+
+Compromised API server can extract everything from etcd legitimately.
+
+Prevention: API server hardening, audit logging.
+
+**Common mistakes:**
+
+**Mistake 1: etcd listening on 0.0.0.0**
+
+```yaml
+# Bad:
+--listen-client-urls=https://0.0.0.0:2379
+```
+
+Anyone can attempt connection. Even with TLS, this is risky.
+
+Fix: specific IPs only.
+
+**Mistake 2: No encryption at rest**
+
+Default Kubernetes: etcd plaintext.
+
+Backup contains all secrets readable.
+
+Fix: encryption configuration.
+
+**Mistake 3: Shared CA for client/peer/server**
+
+Use separate CAs for different cert types. Compromise of one CA limited.
+
+**Mistake 4: No backups**
+
+If etcd corrupts, no recovery.
+
+Fix: regular backups, tested restore.
+
+**Mistake 5: Backups on same disk**
+
+If disk fails, backup also lost.
+
+Fix: backups to S3 or separate storage.
+
+**Production scenarios:**
+
+1. **Encryption at rest discovered missing**: Audit found etcd unencrypted. Enabled KMS encryption. Re-saved all secrets to encrypt. Now compliance with encryption requirement.
+
+2. **External etcd for scale**: 5000-node cluster moved to external etcd. Dedicated hardware, isolated network. Performance and security improved.
+
+3. **Backup tested in DR**: Quarterly DR drill: restored etcd backup to fresh cluster. Validated procedure. Found issue (cert mismatch). Fixed.
+
+4. **etcd compromise prevented**: Pen test attempted etcd access from worker node. Network policy blocked. TLS required certs. Defense layers worked.
+
+5. **Cloud KMS for keys**: Migrated etcd encryption keys to AWS KMS. Keys never on disk. Auditable, rotatable. Better security posture.
+
+---
+
+## 253. Explain Kubernetes API hardening
+
+The API server is the front door to your cluster. Hardening it reduces attack surface significantly.
+
+**API server security checklist:**
+
+**Check 1: Disable anonymous auth**
+
+```yaml
+# kube-apiserver:
+--anonymous-auth=false
+```
+
+Default in modern versions but verify.
+
+**Check 2: Disable insecure port**
+
+```yaml
+# Should NOT have:
+--insecure-port=8080
+--insecure-bind-address=0.0.0.0
+```
+
+Removed in K8s 1.20+. Old clusters might have.
+
+**Check 3: Strong authentication**
+
+OIDC for users:
+
+```yaml
+--oidc-issuer-url=https://accounts.example.com
+--oidc-client-id=kubernetes
+--oidc-username-claim=email
+--oidc-groups-claim=groups
+```
+
+ServiceAccount tokens for workloads.
+
+**Check 4: TLS for all communication**
+
+```yaml
+--tls-cert-file=/etc/kubernetes/pki/apiserver.crt
+--tls-private-key-file=/etc/kubernetes/pki/apiserver.key
+--tls-min-version=VersionTLS12
+--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,...
+```
+
+Strong TLS only.
+
+**Check 5: Client cert authentication**
+
+```yaml
+--client-ca-file=/etc/kubernetes/pki/ca.crt
+```
+
+For admin access via client certs.
+
+**Check 6: Authorization mode**
+
+```yaml
+--authorization-mode=Node,RBAC
+```
+
+Use RBAC. Node authorizer for kubelet.
+
+NOT:
+- `--authorization-mode=AlwaysAllow` (no security)
+- `--authorization-mode=ABAC` (deprecated, complex)
+
+**Check 7: Admission controllers**
+
+```yaml
+--enable-admission-plugins=NodeRestriction,PodSecurity,...
+```
+
+Critical:
+- NodeRestriction: limits kubelet actions
+- PodSecurity: PSS enforcement
+- ResourceQuota: prevent quota bypass
+- ServiceAccount: SA management
+
+**Check 8: Audit logging**
+
+```yaml
+--audit-policy-file=/etc/kubernetes/audit-policy.yaml
+--audit-log-path=/var/log/audit.log
+--audit-log-maxage=30
+--audit-log-maxbackup=10
+--audit-log-maxsize=100
+```
+
+Comprehensive logging.
+
+**Check 9: Request limits**
+
+```yaml
+--max-requests-inflight=400
+--max-mutating-requests-inflight=200
+```
+
+Prevent overload.
+
+**Check 10: API Priority and Fairness**
+
+Enabled by default in modern versions. Configures request prioritization.
+
+**Check 11: Encryption configuration**
+
+```yaml
+--encryption-provider-config=/etc/kubernetes/encryption.yaml
+```
+
+Encrypt secrets in etcd.
+
+**Check 12: Service account signing**
+
+```yaml
+--service-account-signing-key-file=/etc/kubernetes/pki/sa.key
+--service-account-key-file=/etc/kubernetes/pki/sa.pub
+--service-account-issuer=https://kubernetes.default.svc.cluster.local
+```
+
+For bound service account tokens.
+
+**Check 13: Bound service account tokens**
+
+```yaml
+--service-account-issuer=...
+--api-audiences=...
+```
+
+Modern, secure tokens.
+
+**Check 14: Disable profiling**
+
+```yaml
+--profiling=false
+```
+
+Removes debug endpoints in production.
+
+**Check 15: Etcd security**
+
+```yaml
+--etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt
+--etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt
+--etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key
+```
+
+TLS to etcd.
+
+**Network exposure:**
+
+**Public API server:**
+
+If API server is internet-facing:
+
+```yaml
+# Restrict by CIDR:
+--service-cluster-ip-range=10.0.0.0/12
+```
+
+Cloud LB with allowlist:
+- Office IPs
+- VPN IPs
+- Approved sources
+
+**Private API server (best):**
+
+API server only reachable from private network:
+- VPN required for access
+- Bastion hosts
+- No public endpoint
+
+EKS:
+
+```bash
+aws eks update-cluster-config --name my-cluster \
+  --resources-vpc-config endpointPublicAccess=false,endpointPrivateAccess=true
+```
+
+GKE:
+
+```bash
+gcloud container clusters create my-cluster \
+  --enable-private-nodes \
+  --enable-private-endpoint \
+  --master-ipv4-cidr=172.16.0.0/28
+```
+
+**Rate limiting:**
+
+API Priority and Fairness:
+
+```yaml
+apiVersion: flowcontrol.apiserver.k8s.io/v1beta3
+kind: PriorityLevelConfiguration
+metadata:
+  name: workload-low
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 10
+    limitResponse:
+      type: Queue
+
+---
+
+apiVersion: flowcontrol.apiserver.k8s.io/v1beta3
+kind: FlowSchema
+metadata:
+  name: catch-all
+spec:
+  priorityLevelConfiguration:
+    name: workload-low
+  rules:
+    - subjects:
+        - kind: User
+          user:
+            name: "*"
+      resourceRules:
+        - resources: ["*"]
+          verbs: ["*"]
+```
+
+Limits resource usage per priority.
+
+**Admission webhook security:**
+
+Custom admission webhooks add security:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: my-policy
+webhooks:
+  - name: policy.example.com
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+```
+
+Tools:
+- OPA Gatekeeper
+- Kyverno
+- Custom webhooks
+
+**RBAC for API access:**
+
+Restrict by role:
+
+```yaml
+# Limited RBAC:
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "create", "update"]
+```
+
+No cluster-admin for normal users.
+
+**Audit policy:**
+
+```yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["pods"]
+```
+
+**Monitoring API server:**
+
+```promql
+# Request rate:
+sum(rate(apiserver_request_total[5m])) by (verb, resource)
+
+# Latency:
+histogram_quantile(0.99, rate(apiserver_request_duration_seconds_bucket[5m]))
+
+# Failed authentications:
+sum(rate(apiserver_request_total{code=~"401|403"}[5m])) by (user_agent)
+```
+
+**Alerts:**
+
+```yaml
+- alert: APIServerHighErrorRate
+  expr: sum(rate(apiserver_request_total{code=~"5.."}[5m])) > 10
+  
+- alert: AuthenticationFailures
+  expr: sum(rate(apiserver_request_total{code="401"}[5m])) > 5
+```
+
+**Common attack scenarios:**
+
+**Attack 1: API server scanning**
+
+Attacker scans for exposed Kubernetes API servers (port 6443).
+
+Defense: private endpoint, firewall rules.
+
+**Attack 2: Token theft**
+
+SA token leaked from compromised pod.
+
+Defense: short-lived projected tokens, audit access.
+
+**Attack 3: Privilege escalation**
+
+Exploit RBAC misconfiguration.
+
+Defense: minimal RBAC, audit for changes.
+
+**Attack 4: API DOS**
+
+Flood API server with requests.
+
+Defense: rate limiting, APF, resource quotas.
+
+**CIS Benchmark for API server:**
+
+Run kube-bench:
+
+```bash
+kube-bench run --check 1.2
+# Tests API server configurations
+```
+
+Many checks for API server hardening.
+
+**Production scenarios:**
+
+1. **Public to private migration**: API server was public. Migrated to private. VPN required. Reduced attack surface massively.
+
+2. **Audit policy comprehensive**: Initial minimal audit. After incident, expanded to RequestResponse for sensitive operations. Better forensics.
+
+3. **APF prevented overload**: Custom controller bug caused request flood. APF rate-limited it. Critical traffic unaffected.
+
+4. **Admission webhook security**: OPA Gatekeeper added. Enforces image policy, RBAC, network. Defense in depth.
+
+5. **OIDC + MFA replaced kubeconfig**: Old: static kubeconfig files. New: OIDC with corporate SSO + MFA. Departures auto-remove access.
+
+---
+
+## 254. How do you restrict container capabilities?
+
+Linux capabilities divide root privileges into smaller units. Restricting them limits what containers can do even if they run as root.
+
+**Linux capabilities overview:**
+
+Traditional UNIX: root has all powers.
+
+Capabilities: split into discrete privileges:
+- CAP_NET_ADMIN: network configuration
+- CAP_SYS_ADMIN: many system admin operations
+- CAP_NET_RAW: raw packet access
+- CAP_SETUID: change UID
+- CAP_CHOWN: change file ownership
+- CAP_DAC_OVERRIDE: bypass file permissions
+
+About 40 capabilities total.
+
+**Default capabilities in containers:**
+
+Docker/containerd default capabilities:
+- AUDIT_WRITE
+- CHOWN
+- DAC_OVERRIDE
+- FOWNER
+- FSETID
+- KILL
+- MKNOD
+- NET_BIND_SERVICE (bind to <1024)
+- NET_RAW
+- SETFCAP
+- SETGID
+- SETPCAP
+- SETUID
+- SYS_CHROOT
+
+That's quite a few. Many unnecessary for most workloads.
+
+**Restricting capabilities:**
+
+**Drop all, add specific:**
+
+```yaml
+spec:
+  containers:
+    - name: app
+      securityContext:
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_BIND_SERVICE"]   # Only this
+```
+
+Best practice: drop everything, add only what's needed.
+
+**Common patterns:**
+
+**Web server binding to port 80/443:**
+
+```yaml
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_BIND_SERVICE"]
+```
+
+Without CAP_NET_BIND_SERVICE, non-root user can't bind to ports < 1024.
+
+**File ownership operations:**
+
+```yaml
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+    add: ["CHOWN", "FOWNER"]
+```
+
+Rarely needed in containers.
+
+**Network admin (CNI plugins, etc.):**
+
+```yaml
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_ADMIN", "NET_RAW"]
+```
+
+For network-related system pods.
+
+**Most common: drop all**
+
+```yaml
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+```
+
+For workloads that don't need any special privileges (most apps).
+
+**Capabilities to be especially careful with:**
+
+**CAP_SYS_ADMIN**: very powerful, near-root:
+- Mount filesystems
+- Many syscalls
+- Often path to container escape
+
+**CAP_NET_ADMIN**: network configuration:
+- Modify routes
+- Raw sockets
+- Configure interfaces
+
+**CAP_SYS_PTRACE**: debug processes:
+- Read other processes' memory
+- Used in some exploits
+
+**CAP_DAC_READ_SEARCH**: bypass file permissions for reading
+
+**Pod Security Standards alignment:**
+
+Baseline profile:
+- Drops NET_RAW from defaults
+- Restricts which can be added
+
+Restricted profile:
+- Drops ALL capabilities
+- Only NET_BIND_SERVICE addable
+
+```yaml
+# Restricted-compliant:
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_BIND_SERVICE"]   # Optional, only allowed addition
+```
+
+**Detecting required capabilities:**
+
+How to know what an app needs?
+
+**Method 1: Start with drop ALL, add as needed**
+
+```yaml
+# First try:
+capabilities:
+  drop: ["ALL"]
+```
+
+If app fails:
+- Check logs
+- Identify operation failing
+- Add specific capability
+- Test again
+
+**Method 2: Use strace**
+
+```bash
+# In container with all caps:
+strace -e trace=mount,bind,setuid my-app
+
+# See what syscalls are used
+# Map to required capabilities
+```
+
+**Method 3: Use seccomp-bpf audit mode**
+
+```yaml
+securityContext:
+  seccompProfile:
+    type: Localhost
+    localhostProfile: audit.json
+```
+
+Logs syscalls. Analyze, build profile.
+
+**Method 4: AppArmor logs**
+
+Run in complain mode, see what's accessed.
+
+**Capability inheritance:**
+
+In containers, capabilities propagate:
+- Parent → child processes
+- Drops are permanent (can't add back)
+
+So drop early in pod startup.
+
+**runtime/default seccomp:**
+
+Beyond capabilities, seccomp filters syscalls:
+
+```yaml
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+```
+
+`RuntimeDefault`: Docker/containerd's default seccomp profile. Blocks dangerous syscalls.
+
+**Allowing privilege escalation:**
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+```
+
+Prevents:
+- setuid binaries gaining root
+- File capabilities elevating privileges
+- Common escape paths
+
+Set to `false` in Restricted PSS.
+
+**Pod Security Standards enforcement:**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+Restricted profile automatically enforces:
+- Drop ALL capabilities
+- No privilege escalation
+
+**Custom capability sets:**
+
+For specific workloads:
+
+**Web server (needs port < 1024):**
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_BIND_SERVICE"]
+  readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault
+```
+
+**Database (sometimes needs IPC_LOCK):**
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  capabilities:
+    drop: ["ALL"]
+    add: ["IPC_LOCK"]   # For mlock to prevent swap
+```
+
+**System tool (network operations):**
+
+```yaml
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_ADMIN", "NET_RAW"]
+```
+
+**Avoid privileged:**
+
+```yaml
+# Don't:
+securityContext:
+  privileged: true
+```
+
+Privileged = all capabilities + more (mount, dev access). Essentially host root.
+
+Only for truly privileged system components (CNI agents). Pod Security Standards block privileged in Baseline+.
+
+**Checking what's actually used:**
+
+```bash
+# Inside container:
+cat /proc/self/status | grep Cap
+
+# CapPrm: permitted
+# CapEff: effective (currently active)
+# CapBnd: bounding set (max possible)
+```
+
+Compare to desired set.
+
+**Common mistakes:**
+
+**Mistake 1: Privileged for simple cases**
+
+```yaml
+# Bad:
+privileged: true   # Because app needs to bind port 80
+
+# Good:
+capabilities:
+  add: ["NET_BIND_SERVICE"]
+```
+
+Privileged is overkill.
+
+**Mistake 2: Not dropping ALL first**
+
+```yaml
+# Implicit: default caps still present:
+capabilities:
+  add: ["NET_BIND_SERVICE"]
+```
+
+Should be:
+
+```yaml
+capabilities:
+  drop: ["ALL"]
+  add: ["NET_BIND_SERVICE"]
+```
+
+**Mistake 3: Forgetting drop for read-only root**
+
+App tries to write to root filesystem. Capabilities don't help. Need:
+
+```yaml
+readOnlyRootFilesystem: true
+volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+```
+
+**Mistake 4: Inconsistent across containers**
+
+Each container in pod can have different capabilities. Ensure consistency where needed.
+
+**Production scenarios:**
+
+1. **All apps moved to drop ALL**: Migrated all production apps. Most worked immediately. Some needed NET_BIND_SERVICE (apps binding port 80). Removed default capabilities cluster-wide.
+
+2. **Privileged removed**: Found 5 apps with privileged: true for various reasons. Investigated each: 3 didn't actually need it, 2 needed specific capabilities. Replaced.
+
+3. **CIS benchmark compliance**: Audit required dropping NET_RAW (default). Updated all manifests to drop ALL. Compliance achieved.
+
+4. **PSS Restricted enforced**: New namespaces enforce Restricted PSS. Capabilities must be dropped ALL. Templates updated for new apps.
+
+5. **Container escape prevented**: Pod compromised but had no capabilities. Couldn't mount host filesystem or escape. Damage limited to pod.
+
+---
+
+## 255. Explain seccomp and AppArmor usage
+
+Seccomp and AppArmor are Linux security mechanisms that restrict what processes can do beyond standard permissions. Both add defense-in-depth for containers.
+
+**Seccomp (Secure Computing):**
+
+Filters system calls. Process can only make allowed syscalls.
+
+**How it works:**
+
+```
+Process makes syscall (e.g., openat)
+   ↓
+Kernel checks seccomp filter
+   ↓
+Allowed: proceed
+Denied: errno or kill process
+```
+
+Limits attack surface: even if process compromised, can't make dangerous syscalls.
+
+**Seccomp profiles:**
+
+JSON describing allowed syscalls:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "architectures": ["SCMP_ARCH_X86_64"],
+  "syscalls": [
+    {
+      "names": [
+        "accept",
+        "accept4",
+        "access",
+        "open",
+        "openat",
+        "read",
+        "write",
+        "close"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
+```
+
+- `defaultAction`: what to do for non-listed syscalls (ERRNO = return error)
+- `syscalls`: list of allowed syscalls
+
+**Applying seccomp:**
+
+**Method 1: RuntimeDefault (recommended)**
+
+```yaml
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+```
+
+Uses container runtime's default profile (containerd, Docker). Blocks ~50 dangerous syscalls. Good baseline.
+
+**Method 2: Localhost (custom)**
+
+```yaml
+spec:
+  securityContext:
+    seccompProfile:
+      type: Localhost
+      localhostProfile: my-app.json
+```
+
+Custom profile stored on node at `/var/lib/kubelet/seccomp/my-app.json`.
+
+**Method 3: Unconfined (no restrictions)**
+
+```yaml
+seccompProfile:
+  type: Unconfined
+```
+
+No restrictions. Avoid in production.
+
+**Building custom profiles:**
+
+**Automatic profile generation:**
+
+```bash
+# Run app, record syscalls:
+strace -f -c my-app
+# Or:
+docker run --security-opt seccomp=audit.json my-app
+
+# Generate profile from observed syscalls
+```
+
+**Tools:**
+- **OCI SECCOMP BPF Hook**: generates profiles automatically
+- **Security Profiles Operator**: K8s operator for profile management
+
+**Security Profiles Operator:**
+
+```yaml
+apiVersion: security-profiles-operator.x-k8s.io/v1beta1
+kind: ProfileRecording
+metadata:
+  name: recording
+spec:
+  kind: SeccompProfile
+  podSelector:
+    matchLabels:
+      app: my-app
+```
+
+Records syscalls used by app, generates profile.
+
+**Common seccomp profiles:**
+
+**Default (containerd/Docker):**
+
+Blocks dangerous syscalls:
+- mount, umount
+- ptrace
+- reboot
+- kexec_load
+- create_module, delete_module
+
+Good for most apps.
+
+**Restricted (stricter):**
+
+Allows only specific syscalls needed by app. Smaller surface.
+
+**AppArmor:**
+
+Linux Security Module. Restricts what files, capabilities, etc. a program can access.
+
+**AppArmor profile:**
+
+```
+profile my-app flags=(attach_disconnected) {
+  # Capabilities allowed:
+  capability net_bind_service,
+  
+  # File access:
+  /var/log/** w,
+  /tmp/** rw,
+  /etc/passwd r,
+  
+  # Deny dangerous:
+  deny /etc/shadow r,
+  deny /** w,   # Read-only root
+}
+```
+
+**Applying to pod:**
+
+```yaml
+metadata:
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/<container-name>: localhost/my-app
+spec:
+  containers:
+    - name: my-app
+```
+
+Profile must be loaded on node:
+
+```bash
+apparmor_parser -r /etc/apparmor.d/my-app
+```
+
+**Comparison:**
+
+| Aspect | Seccomp | AppArmor |
+|--------|---------|----------|
+| Filters | Syscalls | Files, capabilities, network |
+| Granularity | Per-syscall | Per-resource |
+| Configuration | JSON | Profile language |
+| Linux support | Universal | Some distros (Ubuntu, SUSE) |
+| Maturity | Higher | Older |
+
+**SELinux:**
+
+Similar to AppArmor but different model. Common in RedHat distros.
+
+```yaml
+spec:
+  securityContext:
+    seLinuxOptions:
+      level: "s0:c123,c456"
+```
+
+Type enforcement. Complex to configure but powerful.
+
+**When to use what:**
+
+**Seccomp:**
+- Always (RuntimeDefault minimum)
+- Custom profiles for high-security apps
+- Universal support
+
+**AppArmor:**
+- Ubuntu-based clusters
+- File system restrictions needed
+- Capability restrictions beyond seccomp
+
+**SELinux:**
+- RedHat-based clusters (RHEL, CentOS, Fedora)
+- Government/military environments
+- Compliance requirements
+
+**Production usage:**
+
+**Standard production setup:**
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+```
+
+Combines:
+- Non-root
+- RuntimeDefault seccomp
+- No privilege escalation
+- Read-only root
+- All capabilities dropped
+
+**High-security setup:**
+
+```yaml
+metadata:
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/app: localhost/my-app-strict
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: Localhost
+      localhostProfile: my-app-strict.json
+  containers:
+    - name: app
+      securityContext:
+        capabilities:
+          drop: ["ALL"]
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+```
+
+Custom seccomp + AppArmor + minimal capabilities.
+
+**Building custom profiles - workflow:**
+
+**Step 1: Run in audit mode**
+
+Seccomp:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_LOG"
+}
+```
+
+Logs syscalls but doesn't block.
+
+AppArmor:
+
+```bash
+aa-complain my-app
+```
+
+Logs violations but doesn't enforce.
+
+**Step 2: Run typical workload**
+
+Let app do everything it normally does.
+
+**Step 3: Analyze logs**
+
+```bash
+# Seccomp:
+journalctl | grep audit | grep "comm=my-app"
+
+# AppArmor:
+journalctl | grep apparmor
+```
+
+**Step 4: Build profile**
+
+Based on observed activity:
+- Seccomp: list of syscalls used
+- AppArmor: list of files/capabilities accessed
+
+**Step 5: Test in enforce mode**
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO"
+}
+```
+
+Or:
+
+```bash
+aa-enforce my-app
+```
+
+**Step 6: Monitor**
+
+Watch for blocked operations. Iterate if needed.
+
+**Common challenges:**
+
+**Challenge 1: Custom syscalls miss something**
+
+App fails after enforcement. Logs show blocked syscall.
+
+Fix: add to allowlist, redeploy.
+
+**Challenge 2: Different OS versions**
+
+Profile works on Ubuntu, fails on Alpine. Different syscalls.
+
+Fix: profile per OS, or use broader profile.
+
+**Challenge 3: App updates**
+
+New version uses new syscalls. Old profile breaks.
+
+Fix: regenerate profiles on app updates.
+
+**Challenge 4: Performance**
+
+Filtering has overhead:
+- Seccomp: minimal (<1%)
+- AppArmor: 1-3%
+- SELinux: similar to AppArmor
+
+Usually negligible.
+
+**Falco for monitoring:**
+
+```yaml
+- rule: Unexpected syscall
+  condition: spawned_process and not proc.syscall in (allowed_syscalls)
+  output: Unexpected syscall
+```
+
+Detect violations of expected behavior.
+
+**Production scenarios:**
+
+1. **RuntimeDefault everywhere**: Enforced RuntimeDefault seccomp via PSS. Some apps initially failed (unusual syscalls). Investigated, most updated. Few exceptions documented.
+
+2. **Custom seccomp for database**: Used SPO to generate profile for PostgreSQL. Allowed only syscalls actually used. Tighter than RuntimeDefault. No performance impact.
+
+3. **AppArmor for sensitive workloads**: Payment processing pods used AppArmor profile. Restricted file access to specific paths. Defense in depth.
+
+4. **Detection of profile bypass**: Falco rule for unexpected syscalls. Pod tried mount syscall (blocked by seccomp). Alert triggered. Investigation found compromised image.
+
+5. **AppArmor on Ubuntu nodes**: Used AppArmor extensively on Ubuntu nodes. SELinux on RHEL nodes. Different profiles for different OS. Comprehensive coverage.
+
+---
+
+## 256. How do you prevent container breakout?
+
+Container breakout (escape) is when an attacker compromises a container and gains access to the host. Multiple layers of defense prevent this.
+
+**How container breakout happens:**
+
+**Vector 1: Privileged containers**
+
+```yaml
+# Allows escape:
+securityContext:
+  privileged: true
+```
+
+Privileged container has:
+- All capabilities
+- Access to host devices
+- Can mount host filesystem
+
+Almost certain breakout path if compromised.
+
+**Vector 2: Container runtime vulnerabilities**
+
+CVEs in runc, containerd, Docker:
+- CVE-2019-5736 (runc): writing to /proc/self/exe to escape
+- CVE-2022-0185 (kernel): filesystem mount bug
+- Other periodic vulnerabilities
+
+**Vector 3: Kernel vulnerabilities**
+
+Container shares kernel with host. Kernel vulnerability = potential escape:
+- Dirty COW
+- Dirty Pipe
+- Various LPE exploits
+
+**Vector 4: Misconfiguration**
+
+```yaml
+# HostPath access:
+volumes:
+  - name: host
+    hostPath:
+      path: /
+
+# Mounts entire host filesystem
+```
+
+**Vector 5: Linux capabilities**
+
+```yaml
+capabilities:
+  add: ["SYS_ADMIN"]
+```
+
+CAP_SYS_ADMIN allows many escape techniques.
+
+**Vector 6: Shared namespaces**
+
+```yaml
+hostPID: true
+hostNetwork: true
+hostIPC: true
+```
+
+Share host's namespaces, easier to interact with host.
+
+**Prevention layers:**
+
+**Layer 1: Pod Security Standards**
+
+```yaml
+metadata:
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+Restricted profile blocks:
+- privileged
+- hostNetwork/PID/IPC
+- hostPath
+- Most dangerous capabilities
+
+Primary defense.
+
+**Layer 2: Drop capabilities**
+
+```yaml
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+```
+
+Even if compromised, attacker lacks capabilities for escape.
+
+**Layer 3: Read-only root filesystem**
+
+```yaml
+securityContext:
+  readOnlyRootFilesystem: true
+```
+
+Can't modify container binaries. Attacker can't install tools, modify binaries.
+
+```yaml
+# Writable specific paths:
+volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+  - name: cache
+    mountPath: /var/cache
+volumes:
+  - name: tmp
+    emptyDir: {}
+  - name: cache
+    emptyDir: {}
+```
+
+**Layer 4: Non-root user**
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+```
+
+Even with capabilities, non-root limited.
+
+**Layer 5: No privilege escalation**
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+```
+
+Prevents setuid binaries gaining root. Common escape vector closed.
+
+**Layer 6: Seccomp**
+
+```yaml
+securityContext:
+  seccompProfile:
+    type: RuntimeDefault
+```
+
+Blocks dangerous syscalls used in escapes.
+
+**Layer 7: AppArmor/SELinux**
+
+```yaml
+annotations:
+  container.apparmor.security.beta.kubernetes.io/app: runtime/default
+```
+
+LSM additional restrictions.
+
+**Layer 8: Sandboxed runtimes**
+
+For high-risk workloads, use sandboxed runtime:
+
+**gVisor:**
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+
+---
+
+spec:
+  runtimeClassName: gvisor
+```
+
+User-space kernel implementation. Container doesn't share host kernel directly.
+
+**Kata Containers:**
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata
+handler: kata
+```
+
+Lightweight VMs per container. Hardware isolation.
+
+**Firecracker:**
+
+AWS's microVM, used by Fargate. Strong isolation.
+
+**Layer 9: Up-to-date kernel and runtime**
+
+```bash
+# Keep current:
+- Kubernetes version
+- Container runtime
+- Kernel
+- Base images
+```
+
+Patches close known escape vectors.
+
+**Layer 10: Restricted volumes**
+
+```yaml
+# Don't allow:
+volumes:
+  - hostPath:
+      path: /
+```
+
+Only:
+- configMap, secret
+- emptyDir
+- persistentVolumeClaim
+- downwardAPI
+
+Restricted PSS enforces.
+
+**Layer 11: Pod security context**
+
+```yaml
+spec:
+  securityContext:
+    fsGroup: 1000          # Pod's group for shared volumes
+    runAsUser: 1000        # Non-root
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+    sysctls: []            # No dangerous sysctls
+```
+
+**Layer 12: Network isolation**
+
+If escape happens, contain:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-pod
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: dependency
+```
+
+Compromised pod can't reach other services.
+
+**Defense in depth example:**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-pod
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/app: runtime/default
+spec:
+  runtimeClassName: gvisor
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: my-app:v1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        limits:
+          memory: 512Mi
+          cpu: 500m
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
+```
+
+Multiple layers:
+- gVisor (sandboxed runtime)
+- Non-root
+- No capabilities
+- Read-only root
+- AppArmor
+- Seccomp
+- No privilege escalation
+
+**Runtime detection:**
+
+If escape attempted, detect:
+
+```yaml
+# Falco rules:
+- rule: Container escape attempt
+  condition: >
+    spawned_process and container 
+    and proc.name in (mount, umount, modprobe)
+  output: Escape attempt detected
+  priority: CRITICAL
+
+- rule: Privileged process started
+  condition: spawned_process and container 
+             and proc.tty != 0 
+             and shell_procs
+  output: Shell with TTY in container
+  priority: WARNING
+```
+
+**Tetragon for enforcement:**
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+spec:
+  kprobes:
+    - call: "sys_setuid"
+      selectors:
+        - matchActions:
+            - action: Sigkill
+```
+
+Kill process attempting privilege escalation.
+
+**What happens during escape:**
+
+Typical chain:
+1. App vulnerability (RCE, command injection)
+2. Attacker gains shell in container
+3. Tries privilege escalation (sudo, setuid)
+4. Tries container escape (kernel exploit, mount)
+5. Gains host access
+6. Moves laterally to other pods
+
+Each step is a defense opportunity.
+
+**Common breakout techniques:**
+
+**Technique 1: hostPath mount**
+
+```yaml
+# If allowed:
+volumes:
+  - hostPath:
+      path: /
+```
+
+Read /etc/shadow, ssh keys, etc.
+
+**Defense**: PSS Restricted blocks hostPath.
+
+**Technique 2: Docker socket access**
+
+```yaml
+volumes:
+  - hostPath:
+      path: /var/run/docker.sock
+```
+
+Pod can create new containers as root.
+
+**Defense**: never mount docker.sock; PSS blocks.
+
+**Technique 3: Privileged + kernel module**
+
+```yaml
+privileged: true
+```
+
+Load malicious kernel module. Total compromise.
+
+**Defense**: PSS blocks privileged.
+
+**Technique 4: ptrace abuse**
+
+```yaml
+capabilities:
+  add: ["SYS_PTRACE"]
+```
+
+Trace host processes if shared PID namespace.
+
+**Defense**: don't add CAP_SYS_PTRACE; don't use hostPID.
+
+**Technique 5: /proc/sys exposure**
+
+If /proc writable, modify kernel parameters.
+
+**Defense**: read-only root, no privileged.
+
+**Production scenarios:**
+
+1. **Container escape prevented by PSS**: Pod compromised via SQL injection. Attacker tried mount /, blocked by readonly + capabilities. Tried privileged container creation, blocked by PSS. Damage contained to pod.
+
+2. **gVisor for untrusted code**: Customer-submitted code runs in cluster. Used gVisor runtime. Even compromised code couldn't escape sandbox.
+
+3. **Kernel update saved**: New kernel vuln (Dirty Pipe) announced. Updated nodes within hours. Patched before exploited.
+
+4. **Falco detected escape attempt**: Attacker compromised pod, tried mount() syscall. Falco rule fired. Pod isolated and investigated immediately.
+
+5. **Defense in depth proved value**: Multiple layers: PSS, capabilities, seccomp, AppArmor. Each provided defense. Attacker would need to bypass all simultaneously.
+
+---
+
+## 257. Explain multi-tenant cluster security
+
+Multi-tenant clusters host workloads from different teams or customers. Security must isolate tenants from each other while sharing infrastructure.
+
+**Multi-tenancy models:**
+
+**Soft multi-tenancy:**
+
+Same organization, different teams.
+- Trust between tenants
+- Mistakes more likely than malice
+- Namespace + RBAC isolation
+
+**Hard multi-tenancy:**
+
+Different organizations or untrusted code.
+- No trust between tenants
+- Malice possible
+- Stronger isolation needed (vCluster, separate clusters)
+
+**Threats:**
+
+- Cross-tenant data access
+- Resource exhaustion (DoS)
+- Privilege escalation between tenants
+- Network access between tenants
+- Information leakage
+
+**Security controls:**
+
+**Control 1: Namespace isolation**
+
+Each tenant in own namespace:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+  labels:
+    tenant: a
+```
+
+Logical separation. Not enforcement by itself.
+
+**Control 2: RBAC isolation**
+
+Per-tenant RBAC:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: tenant-a
+  name: tenant-admin
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: tenant-a
+  name: tenant-a-admin
+subjects:
+  - kind: Group
+    name: tenant-a-team
+roleRef:
+  kind: Role
+  name: tenant-admin
+```
+
+Tenant a has full access to namespace a, no access to other namespaces.
+
+**No ClusterRoles for tenants:**
+
+Tenants shouldn't have cluster-wide permissions. Use Role + RoleBinding, not Cluster.
+
+**Control 3: ResourceQuota**
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-a-quota
+  namespace: tenant-a
+spec:
+  hard:
+    requests.cpu: "100"
+    requests.memory: "200Gi"
+    limits.cpu: "200"
+    limits.memory: "400Gi"
+    pods: "500"
+    persistentvolumeclaims: "50"
+    services.loadbalancers: "5"
+```
+
+Limit resource consumption. Prevents one tenant exhausting cluster.
+
+**Control 4: LimitRange**
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: tenant-a
+spec:
+  limits:
+    - default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: 4
+        memory: 8Gi
+      type: Container
+```
+
+Per-pod limits.
+
+**Control 5: NetworkPolicies**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: same-tenant-only
+  namespace: tenant-a
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tenant: a
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              tenant: a
+    # Plus DNS:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+```
+
+Tenant a traffic only within tenant a (and DNS).
+
+**Control 6: Pod Security**
+
+Per-namespace PSS:
+
+```yaml
+metadata:
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+Tenants can't create privileged pods.
+
+**Control 7: Storage isolation**
+
+```yaml
+# Per-tenant storage class:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: tenant-a-storage
+provisioner: ebs.csi.aws.com
+parameters:
+  encrypted: "true"
+  kmsKeyId: arn:aws:kms:.../tenant-a-key
+```
+
+Per-tenant encryption keys.
+
+**Control 8: Admission control**
+
+OPA Gatekeeper or Kyverno enforces:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: tenant-isolation
+spec:
+  rules:
+    - name: check-namespace-label
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Pods must run in tenant namespace"
+        deny:
+          conditions:
+            any:
+              - key: "{{request.namespace}}"
+                operator: NotEquals
+                value: "{{request.object.metadata.labels.tenant}}-namespace"
+```
+
+Enforce tenant rules cluster-wide.
+
+**Control 9: Node isolation**
+
+For stronger separation:
+
+```yaml
+# Tenant-specific nodes:
+nodeSelector:
+  tenant: a
+
+tolerations:
+  - key: tenant
+    operator: Equal
+    value: a
+    effect: NoSchedule
+```
+
+Tenant a pods on tenant a nodes. Strong physical isolation.
+
+**Control 10: Audit per tenant**
+
+```yaml
+# Audit policy:
+- level: RequestResponse
+  namespaces: ["tenant-a", "tenant-b"]
+```
+
+Track all tenant activity.
+
+**Hard multi-tenancy with vClusters:**
+
+For untrusted tenants:
+
+```yaml
+# vCluster provides separate Kubernetes per tenant:
+apiVersion: cluster.loft.sh/v1
+kind: VirtualCluster
+metadata:
+  name: tenant-a
+spec:
+  ...
+```
+
+Each tenant gets:
+- Own API server
+- Own etcd
+- Isolated namespaces
+- Their own Kubernetes experience
+
+Strong isolation, more complex.
+
+**Sandboxed runtimes:**
+
+For untrusted code:
+
+```yaml
+spec:
+  runtimeClassName: gvisor
+```
+
+gVisor or Kata Containers provide stronger isolation between containers.
+
+**Operational considerations:**
+
+**Tenant onboarding:**
+
+Automated provisioning:
+1. Create namespace
+2. Apply RBAC
+3. Set ResourceQuota
+4. Apply NetworkPolicies
+5. Apply default LimitRange
+6. Create tenant-specific resources
+
+Tools: Capsule, kiosk, HNC (Hierarchical Namespace Controller).
+
+**Tenant offboarding:**
+
+Cleanup procedure:
+1. Backup tenant data if needed
+2. Delete namespace (cascades to resources)
+3. Cleanup external resources (DNS, cloud)
+4. Update tenant tracking
+
+**Cost allocation:**
+
+```yaml
+metadata:
+  labels:
+    tenant: a
+    cost-center: customer-a
+```
+
+Tools (Kubecost) calculate per-tenant costs.
+
+**Common issues:**
+
+**Issue 1: Shared resources contention**
+
+Two tenants compete for cluster capacity.
+
+Fix: ResourceQuotas, priority classes.
+
+**Issue 2: Noisy neighbor**
+
+One tenant's workload affects another (CPU, network).
+
+Fix: limits, anti-affinity, node isolation.
+
+**Issue 3: Privilege escalation across tenants**
+
+Tenant gains access to another's resources.
+
+Fix: strict RBAC, regular audits, admission control.
+
+**Issue 4: Information leakage**
+
+Logs, metrics from one tenant visible to another.
+
+Fix: per-tenant logging/monitoring access.
+
+**Issue 5: API server overload**
+
+One tenant overloads API server affecting others.
+
+Fix: API Priority and Fairness.
+
+**Per-tenant monitoring:**
+
+```promql
+# Per-tenant resource usage:
+sum(rate(container_cpu_usage_seconds_total{namespace=~"tenant-.*"}[5m])) by (namespace)
+```
+
+Tenant-specific dashboards.
+
+**When to use separate clusters:**
+
+- Strict compliance requirements
+- High-security tenants
+- Different cluster lifecycles
+- Geographic isolation needs
+
+Separate clusters = strongest isolation, most operational cost.
+
+**Production scenarios:**
+
+1. **Soft multi-tenancy in dev cluster**: 20 teams shared dev cluster. Namespace per team, RBAC, NetworkPolicies. Worked for trusted internal teams.
+
+2. **vClusters for customer environments**: SaaS provided per-customer Kubernetes. vClusters gave each customer full Kubernetes experience. Strong isolation.
+
+3. **Separate clusters for prod tenants**: Multi-tenant cluster found inadequate for production isolation. Migrated to per-customer clusters. Higher cost but better isolation.
+
+4. **OPA Gatekeeper enforced isolation**: Policy ensured tenants couldn't create resources outside their namespace, no cluster-admin, required tenant labels. Self-service worked safely.
+
+5. **API server overload from one tenant**: Tenant's misconfigured operator polled at high rate. Affected other tenants. APF kicked in, rate-limited offender. Investigation, fix.
+
+---
+
+## 258. How do you isolate namespaces securely?
+
+Namespaces provide logical isolation. For security, additional controls are needed beyond namespace boundaries.
+
+**What namespaces give you:**
+
+- Resource scoping (different names per namespace)
+- RBAC scoping (Roles vs ClusterRoles)
+- ResourceQuota scoping
+- NetworkPolicy scoping
+
+**What namespaces don't give you:**
+
+- Network isolation (by default, all pods communicate)
+- Storage isolation
+- Node isolation
+- Strong security boundary
+
+You must add controls.
+
+**Isolation controls:**
+
+**Control 1: RBAC**
+
+```yaml
+# Per-namespace Role:
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: team-a
+  name: team-a-admin
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+```
+
+Bind to team's users/groups only:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: team-a
+  name: team-a-admin
+subjects:
+  - kind: Group
+    name: team-a
+roleRef:
+  kind: Role
+  name: team-a-admin
+```
+
+Team B can't access team A's namespace.
+
+**Avoid ClusterRoles for users:**
+
+Each ClusterRole grants permissions across all namespaces. Use only for legitimate cluster-wide needs.
+
+**Control 2: NetworkPolicies**
+
+Default-deny in each namespace:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: team-a
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+```
+
+Then explicit allows.
+
+**Cross-namespace allow:**
+
+```yaml
+ingress:
+  - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: team-b
+```
+
+Team A can be accessed from team B (if needed).
+
+**Namespace-scoped DNS:**
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+    ports:
+      - port: 53
+        protocol: UDP
+```
+
+DNS access required.
+
+**Control 3: ResourceQuota**
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    requests.cpu: "100"
+    requests.memory: "200Gi"
+    pods: "500"
+```
+
+One namespace can't consume cluster.
+
+**Control 4: LimitRange**
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: team-a
+spec:
+  limits:
+    - default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      type: Container
+```
+
+Sensible defaults for pods.
+
+**Control 5: Pod Security Standards**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+Pods in namespace must meet security profile.
+
+**Control 6: Admission policies**
+
+```yaml
+# Kyverno: enforce labels:
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-team-label
+spec:
+  rules:
+    - name: check-team-label
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["team-*"]
+      validate:
+        message: "Team label required"
+        pattern:
+          metadata:
+            labels:
+              team: "?*"
+```
+
+**Control 7: Service Account isolation**
+
+Each namespace has own service accounts:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app-sa
+  namespace: team-a
+```
+
+ServiceAccount tokens scoped to namespace.
+
+Disable default SA auto-mount:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: team-a
+automountServiceAccountToken: false
+```
+
+**Control 8: Image policies**
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: allowed-registries
+spec:
+  rules:
+    - name: check-registry
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["team-a"]
+      validate:
+        message: "Only images from team-a-registry allowed"
+        pattern:
+          spec:
+            containers:
+              - image: "team-a-registry.example.com/*"
+```
+
+Per-namespace image restrictions.
+
+**Control 9: Storage isolation**
+
+```yaml
+# Per-namespace storage class:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: team-a-storage
+provisioner: ebs.csi.aws.com
+parameters:
+  encrypted: "true"
+  kmsKeyId: ...team-a-kms-key
+allowedTopologies: ...
+```
+
+**Control 10: Audit logging**
+
+```yaml
+# Per-namespace audit policy:
+- level: RequestResponse
+  namespaces: ["team-a"]
+```
+
+Track all activity in sensitive namespaces.
+
+**Tools for namespace management:**
+
+**Capsule:**
+
+Tenant management:
+
+```yaml
+apiVersion: capsule.clastix.io/v1beta2
+kind: Tenant
+metadata:
+  name: team-a
+spec:
+  owners:
+    - name: alice
+      kind: User
+  resourceQuotas:
+    items:
+      - hard:
+          requests.cpu: "100"
+  namespaceOptions:
+    quota: 5   # Can create 5 namespaces
+```
+
+**HNC (Hierarchical Namespace Controller):**
+
+```
+parent-namespace/
+  child-1/
+  child-2/
+```
+
+Inheritance of policies.
+
+**vCluster:**
+
+Virtual clusters for stronger isolation than namespaces.
+
+**Namespace hierarchy considerations:**
+
+```
+team-a/
+  team-a-prod/
+  team-a-staging/
+  team-a-dev/
+```
+
+Logical organization.
+
+HNC propagates policies down hierarchy.
+
+**Pitfalls:**
+
+**Pitfall 1: ClusterRole pollution**
+
+User has ClusterRole, can do things in all namespaces. Defeats namespace isolation.
+
+Fix: use Role + RoleBinding.
+
+**Pitfall 2: Default service account permissions**
+
+Default SA might have permissions.
+
+Fix: explicit SA per workload, restrict default SA.
+
+**Pitfall 3: Missing NetworkPolicies**
+
+Namespace label != network isolation.
+
+Fix: default-deny + explicit allows.
+
+**Pitfall 4: Cross-namespace dependencies**
+
+Service in team-a uses Service in team-b. NetworkPolicy must allow.
+
+Document dependencies.
+
+**Pitfall 5: Webhook namespace selectors**
+
+Admission webhooks affect all namespaces by default. Be specific:
+
+```yaml
+namespaceSelector:
+  matchLabels:
+    apply-policy: "true"
+```
+
+**Verification:**
+
+Test isolation:
+
+```bash
+# As team-a user, try to access team-b:
+kubectl --as=alice -n team-b get pods
+# Should fail
+
+# Try to use ClusterRole:
+kubectl --as=alice get nodes
+# Should fail
+
+# Try cross-namespace network:
+kubectl exec -n team-a pod-a -- curl team-b-service.team-b
+# Should fail (with NetworkPolicy)
+```
+
+**Production scenarios:**
+
+1. **Namespace per team**: 30 teams, namespace each. RBAC per namespace, NetworkPolicies default-deny, ResourceQuotas. Clean isolation.
+
+2. **Cross-namespace access discovered**: Audit found team-a service called by team-b service. Required cross-namespace NetworkPolicy. Documented dependency.
+
+3. **PSS per namespace**: Different sensitivity per namespace. Production: restricted. System: privileged. Test: baseline. Appropriate security per use.
+
+4. **Capsule for self-service**: Capsule managed tenant lifecycle. Teams could create namespaces within their tenant. Self-service while maintaining boundaries.
+
+5. **HNC for hierarchical policies**: Policies set on parent namespace inherited by children. Easier policy management for hierarchical teams.
+
+---
+
+## 259. Explain OPA Gatekeeper use cases
+
+OPA (Open Policy Agent) Gatekeeper is a policy engine for Kubernetes. It enforces custom policies via admission control.
+
+**OPA basics:**
+
+OPA is a general-purpose policy engine. Uses Rego language for policies. Gatekeeper integrates OPA with Kubernetes admission.
+
+**Architecture:**
+
+```
+Kubernetes API Request
+       ↓
+Admission Webhook
+       ↓
+Gatekeeper (OPA)
+       ↓
+Constraint evaluation
+       ↓
+Allow or Deny
+```
+
+**Key concepts:**
+
+**ConstraintTemplate**: defines the policy schema in Rego.
+
+**Constraint**: instance of a template, applied to specific resources.
+
+**Example: require labels**
+
+**Step 1: ConstraintTemplate**
+
+```yaml
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+        
+        violation[{"msg": msg}] {
+          required := input.parameters.labels
+          provided := input.review.object.metadata.labels
+          missing := required - object.get(provided, "", {})
+          count(missing) > 0
+          msg := sprintf("missing labels: %v", [missing])
+        }
+```
+
+**Step 2: Constraint**
+
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: ns-must-have-team
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Namespace"]
+  parameters:
+    labels: ["team", "cost-center"]
+```
+
+Namespaces must have `team` and `cost-center` labels.
+
+**Common use cases:**
+
+**Use case 1: Image registry whitelist**
+
+ConstraintTemplate:
+
+```yaml
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sallowedrepos
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAllowedRepos
+      validation:
+        openAPIV3Schema:
+          properties:
+            repos:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sallowedrepos
+        
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          satisfied := [good | repo = input.parameters.repos[_]; good = startswith(container.image, repo)]
+          not any(satisfied)
+          msg := sprintf("container <%v> has invalid image repo <%v>", [container.name, container.image])
+        }
+```
+
+Constraint:
+
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedRepos
+metadata:
+  name: allowed-repos
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    repos:
+      - "myregistry.example.com/"
+      - "registry.k8s.io/"
+```
+
+Only images from approved registries.
+
+**Use case 2: Block privileged containers**
+
+```yaml
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8spspprivileged
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sPSPPrivileged
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8spspprivileged
+        
+        violation[{"msg": msg}] {
+          c := input.review.object.spec.containers[_]
+          c.securityContext.privileged
+          msg := sprintf("Privileged container is not allowed: %v", [c.name])
+        }
+```
+
+**Use case 3: Require resource limits**
+
+```yaml
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8scontainerlimits
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sContainerLimits
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8scontainerlimits
+        
+        violation[{"msg": msg}] {
+          c := input.review.object.spec.containers[_]
+          not c.resources.limits.cpu
+          msg := sprintf("Container %v needs CPU limit", [c.name])
+        }
+        
+        violation[{"msg": msg}] {
+          c := input.review.object.spec.containers[_]
+          not c.resources.limits.memory
+          msg := sprintf("Container %v needs memory limit", [c.name])
+        }
+```
+
+**Use case 4: Enforce labels**
+
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: must-have-owner
+spec:
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment"]
+  parameters:
+    labels: ["owner", "team", "environment"]
+```
+
+**Use case 5: Block latest tags**
+
+```yaml
+violation[{"msg": msg}] {
+  container := input.review.object.spec.containers[_]
+  endswith(container.image, ":latest")
+  msg := sprintf("Container %v uses :latest tag", [container.name])
+}
+```
+
+**Use case 6: Restrict namespaces for users**
+
+```yaml
+violation[{"msg": msg}] {
+  user := input.review.userInfo.username
+  ns := input.review.object.metadata.namespace
+  not allowed_namespace(user, ns)
+  msg := sprintf("User %v not allowed in namespace %v", [user, ns])
+}
+```
+
+**Use case 7: Require pod anti-affinity**
+
+For HA workloads:
+
+```yaml
+violation[{"msg": msg}] {
+  deployment := input.review.object
+  deployment.spec.replicas >= 2
+  not deployment.spec.template.spec.affinity.podAntiAffinity
+  msg := "Multi-replica deployments need pod anti-affinity"
+}
+```
+
+**Use case 8: Network policy required**
+
+```yaml
+violation[{"msg": msg}] {
+  ns := input.review.object.metadata.name
+  count([np | np := data.inventory.namespace[ns]["networking.k8s.io/v1"]["NetworkPolicy"][_]]) == 0
+  msg := sprintf("Namespace %v needs NetworkPolicy", [ns])
+}
+```
+
+**Use case 9: Pod priority restrictions**
+
+```yaml
+violation[{"msg": msg}] {
+  pod := input.review.object
+  pod.spec.priorityClassName == "system-cluster-critical"
+  not allowed_critical_user(input.review.userInfo)
+  msg := "Only system pods can use system-cluster-critical priority"
+}
+```
+
+**Use case 10: Mutation policies**
+
+Gatekeeper also supports mutation:
+
+```yaml
+apiVersion: mutations.gatekeeper.sh/v1
+kind: Assign
+metadata:
+  name: add-security-context
+spec:
+  applyTo:
+    - groups: [""]
+      kinds: ["Pod"]
+      versions: ["v1"]
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  location: "spec.securityContext.runAsNonRoot"
+  parameters:
+    assign:
+      value: true
+```
+
+Auto-add runAsNonRoot if not set.
+
+**Audit mode:**
+
+```yaml
+spec:
+  enforcementAction: dryrun   # Or warn
+```
+
+Logs violations but doesn't block. Useful for migration.
+
+**Constraint matching:**
+
+Narrow scope:
+
+```yaml
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces: ["production", "staging"]
+    excludedNamespaces: ["kube-system"]
+    labelSelector:
+      matchLabels:
+        require-policy: "true"
+```
+
+**Library of policies:**
+
+Gatekeeper library has many ready-to-use:
+
+```
+https://github.com/open-policy-agent/gatekeeper-library
+```
+
+Categories:
+- General security
+- PSP equivalents
+- Multi-tenancy
+- Networking
+- Custom
+
+**OPA Gatekeeper vs Kyverno:**
+
+| Aspect | Gatekeeper | Kyverno |
+|--------|------------|---------|
+| Language | Rego | YAML |
+| Learning curve | Steeper | Easier |
+| Mutation | Yes | Yes |
+| Generation | Limited | Yes |
+| Image verification | Limited | Built-in |
+| Performance | Good | Good |
+
+Most teams find Kyverno easier; Gatekeeper for advanced needs.
+
+**Performance considerations:**
+
+Gatekeeper adds admission latency:
+- Simple policies: <50ms
+- Complex policies: 100-500ms
+
+Optimize Rego for performance.
+
+**Monitoring:**
+
+```promql
+# Gatekeeper metrics:
+gatekeeper_violations  # Current violations
+gatekeeper_audit_duration_seconds  # Audit performance
+gatekeeper_constraint_count
+```
+
+**Production scenarios:**
+
+1. **Image registry enforcement**: Implemented K8sAllowedRepos. Only internal registry + approved public. Several attempts to deploy public images blocked. Educated team on registry policy.
+
+2. **Required labels for cost tracking**: Required `team`, `cost-center`, `environment` on all resources. Initially many violations, gradually fixed. Now cost allocation accurate.
+
+3. **Audit mode migration**: New constraints added in audit mode. Reviewed violations. Fixed apps. Switched to enforce. Avoided breaking deployments.
+
+4. **Library policies adopted**: Used Gatekeeper library. ~20 policies for common security needs. Saved writing custom policies.
+
+5. **Mutation for security defaults**: Auto-applied runAsNonRoot, drop ALL capabilities. Developers didn't need to remember; mutation set defaults.
+
+---
+
+## 260. How do you enforce policy-as-code?
+
+Policy-as-code (PaC) treats security and operational policies as code: versioned, reviewed, deployed. Enforces policies via tooling rather than documentation.
+
+**Why policy-as-code:**
+
+**Traditional approach:**
+- Policy in document
+- Manual review for compliance
+- Inconsistent enforcement
+- Slow response to changes
+
+**Policy-as-code:**
+- Policy in version control
+- Automated enforcement
+- Consistent across environments
+- Fast iteration
+
+**Components of PaC:**
+
+**Component 1: Policy storage**
+
+Git repository with policies:
+
+```
+policies/
+  ├── security/
+  │   ├── no-privileged.yaml
+  │   ├── require-resource-limits.yaml
+  │   └── allowed-registries.yaml
+  ├── compliance/
+  │   ├── pci-policies.yaml
+  │   └── soc2-policies.yaml
+  └── operations/
+      ├── require-labels.yaml
+      └── naming-conventions.yaml
+```
+
+**Component 2: Policy engine**
+
+- OPA Gatekeeper
+- Kyverno
+- Pod Security Standards (limited)
+- Falco (runtime)
+- Custom admission webhooks
+
+**Component 3: CI/CD integration**
+
+Pre-commit/PR checks:
+
+```yaml
+# .github/workflows/policy-check.yaml:
+name: Policy Check
+on: pull_request
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate policies
+        run: |
+          conftest test --policy policies/ deployments/
