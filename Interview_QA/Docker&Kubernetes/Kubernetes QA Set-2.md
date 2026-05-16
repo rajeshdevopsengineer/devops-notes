@@ -71912,3 +71912,9939 @@ Teams need to understand patterns.
 4. **Cost allocation via tags**: Mandatory tags enforced. Per-team cost reports. Teams optimized own usage. Total cost reduced 25%.
 
 5. **Compliance via policies**: OPA Gatekeeper enforced security policies. SOC 2 audit found compliance built-in to platform. Easy to demonstrate.
+
+# Kubernetes Networking (351-380)
+
+## 351. Explain Kubernetes networking model
+
+Kubernetes networking follows specific rules that all implementations must satisfy. Understanding the model helps troubleshoot and design.
+
+**Four networking requirements:**
+
+**Requirement 1: Pods can communicate with all other pods without NAT**
+
+```
+Pod A (10.244.1.5) → Pod B (10.244.2.10) directly
+No NAT, no port translation
+```
+
+Each pod has unique IP across cluster.
+
+**Requirement 2: Nodes can communicate with all pods without NAT**
+
+```
+Node (10.0.1.5) → Pod (10.244.2.10) directly
+```
+
+For kubelet to manage pods, monitoring, etc.
+
+**Requirement 3: A pod's IP from its own perspective matches what others see**
+
+```
+# Pod sees itself as:
+hostname -I → 10.244.1.5
+
+# Others see the pod as:
+10.244.1.5
+
+# Same IP, no translation
+```
+
+**Requirement 4: Services have stable IPs**
+
+```
+Service IP: 10.96.0.1 (virtual)
+Backing pods: change over time
+```
+
+**Network spaces:**
+
+```
+Node network: 10.0.0.0/16 (VM IPs)
+Pod network: 10.244.0.0/16 (pod IPs, cluster-wide)
+Service network: 10.96.0.0/12 (virtual IPs)
+```
+
+Three distinct spaces.
+
+**Pod-to-pod communication:**
+
+**Same node:**
+
+```
+Pod A → veth → bridge → veth → Pod B
+```
+
+Through Linux bridge (cbr0 or similar).
+
+**Different nodes:**
+
+```
+Pod A → veth → bridge → routing → Node A eth0
+                         ↓
+                    Underlying network
+                         ↓
+                    Node B eth0 → routing → bridge → veth → Pod B
+```
+
+Routing handled by CNI plugin.
+
+**Pod-to-service:**
+
+```
+Pod → Service IP (virtual)
+         ↓ (iptables/IPVS/eBPF)
+       Routed to actual pod IP
+```
+
+kube-proxy maintains rules.
+
+**Networking components:**
+
+**Pod side:**
+- veth pair (one end in pod, other in node)
+- Pod has its own network namespace
+- Network namespace isolates pod's network stack
+
+**Node side:**
+- Linux bridge (or alternative)
+- iptables / IPVS rules (from kube-proxy)
+- Routes to other nodes (via CNI)
+- Host interface(s)
+
+**Cluster side:**
+- CNI plugin (Calico, Cilium, etc.)
+- CoreDNS for service discovery
+- Service CIDR
+- Pod CIDR
+
+**Implementation choices:**
+
+The model is satisfied by various implementations:
+
+**Layer 2 (same broadcast domain):**
+
+If all nodes in same L2:
+- Direct routing
+- No encapsulation
+- Best performance
+
+**Layer 3 with routing:**
+
+Different subnets:
+- BGP for route distribution (Calico)
+- Static routes
+- IP-in-IP encapsulation if needed
+
+**Overlay (encapsulation):**
+
+VXLAN, IP-in-IP:
+- Pods virtual network on top of physical
+- Encapsulated packets between nodes
+- Works anywhere
+- Some performance overhead
+
+**Cloud-specific:**
+
+AWS VPC CNI: pods get VPC IPs directly.
+Azure CNI: pods get VNet IPs.
+GKE: alias IPs in VPC.
+
+**Service networking:**
+
+Services are virtual IPs. Implementation:
+
+**iptables mode (default older):**
+
+```bash
+# kube-proxy creates iptables rules:
+# For each service, rules route to pod IPs
+iptables -t nat -A KUBE-SERVICES ...
+```
+
+Performance degrades with many services (linear lookup).
+
+**IPVS mode:**
+
+```bash
+ipvsadm -l   # List virtual servers
+```
+
+Hash-based lookup. Better performance for many services.
+
+**eBPF mode (Cilium):**
+
+```
+eBPF programs in kernel
+Direct routing
+Even better performance
+```
+
+**DNS:**
+
+CoreDNS pods provide DNS for cluster:
+
+```
+Pod queries: my-service.namespace.svc.cluster.local
+CoreDNS responds with service IP
+Pod connects to service IP
+```
+
+**Network isolation:**
+
+Default: no isolation. All pods can communicate.
+
+**NetworkPolicies:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: allowed
+```
+
+Restricts pod-to-pod traffic.
+
+**External traffic:**
+
+**LoadBalancer:**
+
+```yaml
+apiVersion: v1
+kind: Service
+spec:
+  type: LoadBalancer
+```
+
+Cloud provider creates LB. Routes to NodePorts.
+
+**NodePort:**
+
+```yaml
+type: NodePort
+```
+
+Port on every node, kube-proxy forwards to service.
+
+**Ingress:**
+
+L7 routing:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+```
+
+Ingress controller does HTTP-level routing.
+
+**Production scenarios:**
+
+1. **Networking debug**: Pod-to-pod failed. Verified all 4 model requirements. Pod IPs in different ranges = different nodes. Issue was firewall blocking node-to-node traffic.
+
+2. **Service unreachable**: Service IP not responding. iptables showed correct rules. Endpoints empty - selector didn't match pod labels. Fixed labels.
+
+3. **DNS issues**: Pods couldn't resolve services. CoreDNS pods unhealthy. Increased replicas, configured HPA. Issue resolved.
+
+4. **Cross-cluster networking**: Two clusters, needed pod-to-pod. Set up Submariner for cross-cluster networking. Pods could communicate directly.
+
+5. **External access**: New service needed external exposure. LoadBalancer type. Cloud provider provisioned LB. Pods reachable externally.
+
+---
+
+## 352. How do Pods communicate across nodes?
+
+Cross-node pod communication is fundamental to Kubernetes. Different CNIs implement it differently, with various trade-offs.
+
+**General flow:**
+
+```
+Pod A on Node 1 → Pod B on Node 2
+
+1. Pod A sends packet to Pod B's IP
+2. Packet leaves Pod A via veth
+3. Reaches Node 1's network stack
+4. Routing determines: B is on Node 2
+5. Packet leaves Node 1 via physical interface
+6. Underlying network delivers to Node 2
+7. Node 2 routes to Pod B
+8. Packet arrives at Pod B
+```
+
+**Implementation approaches:**
+
+**Approach 1: Layer 2 (flat)**
+
+All nodes in same L2 broadcast domain:
+
+```
+Pod A (10.244.1.5) → ARP for Pod B
+Pod B (10.244.2.10) responds via Node 2
+Direct L2 communication
+```
+
+Requirements:
+- Nodes in same VLAN/subnet
+- Often limited to small clusters
+- Not common in cloud
+
+**Approach 2: Layer 3 with routing**
+
+Nodes in different L3 subnets:
+
+```
+Pod A → Node 1 routing table:
+  10.244.2.0/24 via 10.0.1.20 (Node 2)
+  
+Node 2 receives, routes to Pod B
+```
+
+**Route distribution:**
+
+Static routes: rarely used (doesn't scale).
+
+BGP (Calico):
+
+```
+Each node runs BGP daemon
+Advertises its pod subnet to other nodes
+Routes installed automatically
+```
+
+**Approach 3: Overlay networks**
+
+Encapsulate pod packets:
+
+```
+Pod A → packet to Pod B
+Node 1 encapsulates: outer header (Node 1 IP → Node 2 IP), inner: pod packet
+Sent through normal network
+Node 2 decapsulates, delivers to Pod B
+```
+
+**Overlay protocols:**
+
+**VXLAN:**
+
+```
+UDP-based encapsulation
+24-bit VNI (Virtual Network Identifier)
+Most common overlay
+Used by Flannel, Calico (optional), Cilium
+```
+
+**IP-in-IP:**
+
+```
+IP packet inside IP packet
+Simpler than VXLAN
+Used by Calico (default in some configs)
+```
+
+**Geneve:**
+
+```
+Extension of VXLAN
+More flexible
+Used by some CNIs
+```
+
+**Approach 4: Cloud-native**
+
+Cloud-specific, no overlay needed:
+
+**AWS VPC CNI:**
+
+```
+Pods get VPC IPs directly
+ENIs attached to nodes
+VPC routes pod traffic natively
+```
+
+**Azure CNI:**
+
+```
+Pods get VNet IPs
+Native VNet routing
+```
+
+**GKE alias IPs:**
+
+```
+Pods get IPs from secondary CIDR in VPC subnet
+VPC handles routing
+```
+
+**No encapsulation = better performance.**
+
+**Detailed flow examples:**
+
+**Calico (BGP):**
+
+```
+Setup:
+- Node 1: pods 10.244.1.0/24
+- Node 2: pods 10.244.2.0/24
+- BGP advertises subnets
+
+Pod A (10.244.1.5) on Node 1 → Pod B (10.244.2.10) on Node 2:
+
+1. Pod A sends packet (src: 10.244.1.5, dst: 10.244.2.10)
+2. Goes through veth to Node 1
+3. Node 1 has route: 10.244.2.0/24 via Node 2 IP (from BGP)
+4. Packet sent to Node 2 directly
+5. Node 2 has route: 10.244.2.10 via veth-pod-b
+6. Packet delivered to Pod B
+```
+
+No encapsulation. Direct routing.
+
+**Flannel VXLAN:**
+
+```
+Setup:
+- All nodes share overlay network
+- VXLAN tunnel between nodes
+
+Pod A → Pod B:
+
+1. Pod A sends packet
+2. Node 1 wraps packet in VXLAN
+   - Outer: Node 1 IP → Node 2 IP
+   - Inner: Pod A → Pod B
+3. Sent through UDP port 4789
+4. Node 2 receives, decapsulates
+5. Inner packet delivered to Pod B
+```
+
+**Cilium eBPF:**
+
+```
+Setup:
+- eBPF programs in kernel
+- Routes via eBPF maps
+
+Pod A → Pod B:
+
+1. Pod A sends packet
+2. eBPF program intercepts at egress
+3. Determines destination node
+4. Direct routing (or VXLAN if needed)
+5. eBPF at Node 2 routes to Pod B
+```
+
+Faster than iptables-based CNIs.
+
+**AWS VPC CNI:**
+
+```
+Setup:
+- Pods get VPC IPs (eth0 secondary IPs)
+- No overlay
+
+Pod A → Pod B:
+
+1. Pod A sends packet
+2. Looks like normal VPC traffic
+3. VPC routes to Node 2
+4. Node 2 delivers to Pod B's interface
+```
+
+Native VPC, no special handling.
+
+**Performance comparison:**
+
+| Approach | Throughput | Latency | Complexity |
+|----------|------------|---------|------------|
+| L2 flat | Highest | Lowest | Low scalability |
+| L3 routing (BGP) | High | Low | Medium |
+| VXLAN overlay | Medium | Higher (encap overhead) | Easy |
+| AWS VPC CNI | Highest | Lowest | Cloud-native |
+| Cilium eBPF | High | Low | Complex |
+
+**MTU considerations:**
+
+Encapsulation adds bytes:
+- VXLAN: 50 bytes overhead
+- IP-in-IP: 20 bytes overhead
+
+Set pod MTU lower than node MTU:
+
+```
+Node MTU: 1500
+VXLAN overhead: 50
+Pod MTU: 1450
+```
+
+Otherwise: fragmentation, performance degradation.
+
+**Cross-zone/region:**
+
+```
+Same zone: usually fast
+Cross-zone: 1-5ms additional latency
+Cross-region: 50-200ms+
+```
+
+Plan workload placement.
+
+**Network policies:**
+
+Implementation varies:
+
+```
+Calico: iptables or eBPF
+Cilium: eBPF
+Weave: iptables
+```
+
+CNI must support NetworkPolicy to enforce.
+
+**Troubleshooting:**
+
+**Check connectivity:**
+
+```bash
+# From Pod A to Pod B:
+kubectl exec pod-a -- ping pod-b-ip
+kubectl exec pod-a -- curl http://pod-b-ip:8080
+```
+
+**Check routes:**
+
+```bash
+# On node:
+ip route
+# Should show pod CIDRs of other nodes
+```
+
+**Check overlay (if applicable):**
+
+```bash
+# VXLAN interface:
+ip -d link show vxlan.calico
+
+# Check tunnels:
+bridge fdb show
+```
+
+**Production scenarios:**
+
+1. **Calico BGP**: Multi-zone cluster. Calico with BGP peering to underlying routers. Direct routing, no overlay overhead. Best performance.
+
+2. **VXLAN for compatibility**: On-prem cluster, complex network. VXLAN overlay worked everywhere. Slight performance hit acceptable.
+
+3. **AWS VPC CNI**: EKS cluster. Pods got VPC IPs. No overlay. Direct VPC routing. Best performance for AWS.
+
+4. **MTU issue**: Pod-to-pod failing for large packets. Found node MTU 9000, pod MTU 9000. VXLAN overhead caused fragmentation. Lowered pod MTU to 8950.
+
+5. **Cross-region latency**: Apps assumed local communication. Pods across regions added 80ms per call. Refactored to keep tightly coupled services in same region.
+
+---
+
+## 353. Explain overlay vs underlay networking
+
+These represent two fundamental approaches to multi-node pod networking. Each has trade-offs.
+
+**Underlay networking:**
+
+Pods use the physical network directly:
+
+```
+Physical/Cloud Network: 10.0.0.0/16
+Pod IPs from same range: 10.0.10.5, 10.0.20.10, etc.
+No encapsulation
+```
+
+**Examples:**
+- AWS VPC CNI
+- Azure CNI
+- GKE alias IPs
+- Calico without IPIP/VXLAN (BGP only)
+
+**Characteristics:**
+
+Pros:
+- Best performance (no encapsulation)
+- Lower latency
+- Direct visibility (debugging easier)
+- Cloud-native features work
+
+Cons:
+- IP planning required
+- Limited by physical network
+- IP exhaustion possible
+- Tight coupling with infrastructure
+
+**Overlay networking:**
+
+Pods on virtual network "over" physical:
+
+```
+Physical Network: 10.0.0.0/16 (nodes)
+Pod Network: 192.168.0.0/16 (overlay)
+Encapsulation: VXLAN, IP-in-IP, etc.
+```
+
+**Examples:**
+- Flannel (VXLAN)
+- Calico with IPIP
+- Weave
+
+**Characteristics:**
+
+Pros:
+- Independent of physical network
+- Works anywhere
+- IP plan flexible
+- Doesn't consume underlay IPs
+
+Cons:
+- Encapsulation overhead (~50 bytes)
+- Lower performance
+- More complex troubleshooting
+- MTU considerations
+
+**Detailed comparison:**
+
+**Performance:**
+
+```
+Underlay (AWS VPC CNI): native throughput, ~1ms latency same zone
+Overlay (VXLAN): ~10-20% throughput reduction, ~0.1-0.3ms extra latency
+```
+
+For most workloads: difference imperceptible.
+For high-performance: matters.
+
+**Visibility:**
+
+**Underlay:**
+
+```
+Pod sends to Pod B (10.0.20.5)
+Network sees: src=10.0.10.5 dst=10.0.20.5
+Traceable in cloud flow logs
+```
+
+Standard cloud tools work.
+
+**Overlay:**
+
+```
+Pod sends to Pod B
+Encapsulated: src=node1-ip dst=node2-ip (outer), src=pod1-ip dst=pod2-ip (inner)
+Cloud flow logs see only outer
+Need overlay-aware tools to see inner
+```
+
+Harder to debug.
+
+**IP space:**
+
+**Underlay:**
+
+```
+Need IPs from infrastructure subnet
+Each pod uses IP from VPC/VNet subnet
+Can exhaust quickly with many pods
+```
+
+Example: /24 subnet = 256 IPs.
+30 pods/node × 10 nodes = 300 pods. Exhausted.
+
+**Overlay:**
+
+```
+Pod CIDR independent of node subnet
+Can use large ranges (e.g., 10.244.0.0/16 = 65k IPs)
+No infrastructure pressure
+```
+
+**Choosing:**
+
+**Choose underlay when:**
+
+- Performance critical
+- Native cloud integration desired
+- IP space sufficient
+- Need cloud-native features (e.g., per-pod security groups in AWS)
+- Visibility into pod traffic via cloud tools
+
+**Choose overlay when:**
+
+- IP space limited
+- Network infrastructure inflexible
+- Multi-cloud/hybrid
+- Don't want infrastructure coupling
+- Performance acceptable for use case
+
+**Hybrid approaches:**
+
+**Calico with crossSubnet:**
+
+```yaml
+spec:
+  ipipMode: CrossSubnet
+```
+
+Underlay within subnet, overlay across subnets.
+
+**Cilium overlay or native:**
+
+```yaml
+# Cilium config:
+tunnel: vxlan   # Overlay
+# Or:
+tunnel: disabled
+routingMode: native   # Underlay
+```
+
+Configurable based on environment.
+
+**AWS VPC CNI with prefix delegation:**
+
+```yaml
+# More IPs per node via prefixes:
+WARM_PREFIX_TARGET: "1"
+ENABLE_PREFIX_DELEGATION: "true"
+```
+
+Mitigates VPC CNI IP density issues.
+
+**Real-world patterns:**
+
+**Pattern 1: Cloud-native (underlay)**
+
+```
+EKS with VPC CNI
+AKS with Azure CNI
+GKE with alias IPs
+
+Performance: best
+Integration: deep
+```
+
+**Pattern 2: Self-managed (overlay)**
+
+```
+On-prem clusters
+Multi-cloud
+Restricted network environments
+
+Flannel VXLAN
+Calico IPIP
+```
+
+**Pattern 3: Hybrid (Calico)**
+
+```
+Underlay within subnet (fast)
+Overlay across subnets (when needed)
+Best of both
+```
+
+**Pattern 4: eBPF (modern)**
+
+```
+Cilium native routing
+Underlay-like performance
+With eBPF features
+```
+
+**MTU considerations:**
+
+**Underlay:**
+
+```
+Pod MTU = Node MTU
+Usually 1500 (or 9000 for jumbo frames)
+```
+
+**Overlay:**
+
+```
+Pod MTU = Node MTU - encapsulation overhead
+1500 - 50 (VXLAN) = 1450
+1500 - 20 (IPIP) = 1480
+```
+
+Misconfiguration causes:
+- Fragmentation
+- Performance issues
+- Black holes (packets dropped silently)
+
+**Troubleshooting differences:**
+
+**Underlay:**
+
+```bash
+# Standard tools work:
+tcpdump on node
+VPC flow logs show pod IPs
+Network monitoring sees actual traffic
+```
+
+**Overlay:**
+
+```bash
+# Need overlay-aware:
+tcpdump for VXLAN port 4789
+Decode encapsulated packets
+Cloud flow logs miss inner traffic
+```
+
+**Production scenarios:**
+
+1. **AWS VPC CNI for performance**: Latency-sensitive trading app. Used VPC CNI underlay. Native VPC routing, no overlay overhead. Met latency SLA.
+
+2. **VXLAN for multi-cloud**: Hybrid cloud cluster. VXLAN overlay worked everywhere. Performance acceptable. Operational consistency.
+
+3. **IP exhaustion**: Started with VPC CNI on /24 subnet. Hit limit at 200 pods. Couldn't grow subnet. Migrated to AWS VPC CNI Overlay mode for IP independence.
+
+4. **MTU issue debugging**: After VXLAN deployment, intermittent packet loss for large requests. Tested with `ping -M do -s 1450`. Worked. `-s 1500` failed. MTU mismatch. Fixed.
+
+5. **Cilium native routing**: Started with VXLAN, performance issues. Switched to Cilium native routing (underlay-like with eBPF). Massive performance improvement.
+
+---
+
+## 354. Difference between Calico, Flannel, and Cilium
+
+Three popular CNIs with different approaches and capabilities.
+
+**Calico:**
+
+Mature, feature-rich CNI. Tigera maintains.
+
+**Architecture:**
+
+```
+Per node:
+- calico-node (BGP + Felix)
+  - Felix: programs Linux dataplane (iptables/eBPF)
+  - BIRD: BGP daemon for route advertisement
+
+Cluster:
+- calico-kube-controllers: manages policies, etc.
+```
+
+**Routing:**
+
+**Default: BGP**
+
+```
+Each node runs BGP
+Advertises its pod CIDR
+Direct L3 routing between nodes
+```
+
+**Alternatives:**
+
+```yaml
+# IPIP encapsulation:
+spec:
+  ipipMode: Always
+
+# VXLAN overlay:
+spec:
+  vxlanMode: Always
+
+# Cross-subnet only (hybrid):
+spec:
+  ipipMode: CrossSubnet
+```
+
+**Network policies:**
+
+```yaml
+# Standard K8s NetworkPolicy
+# Plus Calico-specific:
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: deny-all
+spec:
+  selector: all()
+  types: [Ingress, Egress]
+```
+
+GlobalNetworkPolicy: cluster-wide.
+NetworkPolicy: namespace-scoped.
+
+**Strengths:**
+
+- Best-of-breed NetworkPolicy
+- BGP for direct routing
+- Mature, widely deployed
+- eBPF dataplane option
+- Multi-cluster (with Calico Enterprise)
+
+**Use cases:**
+
+- Production clusters
+- Need advanced policies
+- Multi-cloud
+- BGP integration
+
+**Flannel:**
+
+Simpler CNI, focused on networking only.
+
+**Architecture:**
+
+```
+Per node:
+- flanneld: manages flannel network
+
+Cluster:
+- Subnet allocation per node
+```
+
+**Routing:**
+
+**Default: VXLAN overlay**
+
+```
+VXLAN tunnels between nodes
+UDP port 4789
+~50 byte overhead
+```
+
+**Alternatives:**
+
+```yaml
+# host-gw (direct routing, requires L2):
+backend:
+  type: host-gw
+
+# wireguard (encrypted):
+backend:
+  type: wireguard
+```
+
+**Network policies:**
+
+Flannel doesn't enforce NetworkPolicies by itself. Need:
+- Canal (Flannel + Calico for policies)
+- Cilium for policies
+
+**Strengths:**
+
+- Simple, easy to understand
+- Lightweight
+- Works in restricted environments
+- Established
+
+**Weaknesses:**
+
+- No native NetworkPolicy
+- Limited features
+- Less performant than alternatives
+
+**Use cases:**
+
+- Small clusters
+- Learning environments
+- Simple requirements
+- Compatibility with restricted networks
+
+**Cilium:**
+
+eBPF-based, modern CNI. Isovalent maintains.
+
+**Architecture:**
+
+```
+Per node:
+- cilium-agent: programs eBPF
+- envoy proxy (optional, for L7 features)
+
+Cluster:
+- cilium-operator: manages identities, policies
+- hubble (observability)
+```
+
+**Routing:**
+
+**Default options:**
+
+```yaml
+# VXLAN overlay (default):
+tunnel: vxlan
+
+# Native routing (underlay):
+tunnel: disabled
+routingMode: native
+
+# Geneve:
+tunnel: geneve
+```
+
+**Direct routing requires routing setup, similar to Calico BGP.**
+
+**eBPF features:**
+
+```yaml
+# Replace kube-proxy with eBPF:
+kubeProxyReplacement: strict
+
+# Socket-based load balancing:
+hostServices: enabled
+```
+
+Direct in-kernel datapath. No iptables/IPVS.
+
+**Network policies:**
+
+```yaml
+# Standard K8s NetworkPolicy
+# Plus Cilium-specific:
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: web
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+          rules:
+            http:
+              - method: "GET"
+                path: "/api/.*"
+```
+
+L7 policies (HTTP, gRPC, Kafka, DNS).
+
+**Hubble (observability):**
+
+```bash
+# See network flows:
+hubble observe
+
+# Service map:
+hubble ui
+```
+
+eBPF-based network observability.
+
+**Strengths:**
+
+- Best performance (eBPF)
+- L7 policies
+- Replace kube-proxy
+- Advanced observability
+- Service mesh capability (Cilium Service Mesh)
+
+**Use cases:**
+
+- Modern, performance-focused clusters
+- Need L7 features
+- Comprehensive observability
+- Cilium Service Mesh as alternative to Istio
+
+**Comparison:**
+
+| Feature | Calico | Flannel | Cilium |
+|---------|--------|---------|--------|
+| Routing | BGP (default), Overlay options | VXLAN (default), Direct | VXLAN, Native, Direct |
+| NetworkPolicy | Yes (rich) | No (needs Canal) | Yes (rich + L7) |
+| eBPF dataplane | Optional | No | Default |
+| L7 policies | No | No | Yes |
+| Performance | High | Medium | Highest |
+| Complexity | Medium | Low | High |
+| Observability | Limited | None | Hubble (great) |
+| kube-proxy replacement | No | No | Yes |
+
+**Performance comparison:**
+
+```
+Latency (same node):
+- Calico BGP: <1ms
+- Calico IPIP: 1-2ms
+- Flannel VXLAN: 1-2ms
+- Cilium VXLAN: 1-2ms
+- Cilium native: <1ms
+
+Throughput:
+- Native/BGP: ~95% of bare metal
+- VXLAN: ~75-85% of bare metal
+- eBPF native: ~95% of bare metal
+```
+
+**Choosing:**
+
+**Choose Calico when:**
+
+- Need mature, proven solution
+- Want BGP integration
+- Need advanced policies (without eBPF complexity)
+- Existing Calico expertise
+
+**Choose Flannel when:**
+
+- Simple requirements
+- Small cluster
+- Don't need NetworkPolicy (or using Canal)
+- Want simplest option
+
+**Choose Cilium when:**
+
+- Performance is priority
+- Need L7 policies
+- Want best observability
+- Building modern infrastructure
+- May add service mesh
+
+**Migration:**
+
+CNI swap requires:
+- New cluster (recommended)
+- Or careful in-place migration
+- Both not running simultaneously
+
+Not trivial. Plan carefully.
+
+**Production scenarios:**
+
+1. **Calico for enterprise**: Large enterprise with on-prem and cloud. Calico with BGP for direct routing. Mature NetworkPolicy. Reliable.
+
+2. **Flannel for simple cluster**: Small dev cluster. Flannel + VXLAN. Simple, works everywhere. No NetworkPolicy needs.
+
+3. **Cilium for modern stack**: New production cluster. Cilium with kube-proxy replacement. eBPF performance. Hubble for observability.
+
+4. **Migration to Cilium**: Started with Flannel. Needed NetworkPolicies. Migrated to Cilium. Got L7 policies bonus.
+
+5. **Calico BGP integration**: On-prem cluster. BGP peering with TOR switches. Pods directly routable from data center network.
+
+---
+
+## 355. Explain Cilium eBPF architecture
+
+Cilium uses eBPF for in-kernel networking, replacing traditional iptables-based approaches with faster, more flexible programs.
+
+**eBPF overview:**
+
+eBPF (extended Berkeley Packet Filter):
+- Programs run in Linux kernel
+- Safe (verified before loading)
+- Fast (in-kernel)
+- Dynamic (load/unload without reboot)
+- Attached to hooks (syscalls, network, etc.)
+
+**Cilium's use of eBPF:**
+
+```
+Application
+       ↓
+Socket layer ← eBPF (socket ops)
+       ↓
+TCP/IP stack
+       ↓
+XDP/TC ← eBPF (network)
+       ↓
+Network interface
+```
+
+eBPF programs attached at various points.
+
+**Architecture:**
+
+```
+┌─────────────────────────────────────┐
+│       Cilium Agent (per node)       │
+│  ┌──────────┐  ┌───────────────┐   │
+│  │ Policies │→ │  eBPF Programs │   │
+│  └──────────┘  └───────────────┘   │
+│         ↓             ↓             │
+└─────────────────────────────────────┘
+       ↓               ↓
+   kube-apiserver   Linux kernel
+                    (eBPF execution)
+```
+
+**Components:**
+
+**Cilium Agent (DaemonSet):**
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cilium
+spec:
+  template:
+    spec:
+      containers:
+        - name: cilium-agent
+          image: quay.io/cilium/cilium:v1.14.0
+```
+
+Per-node:
+- Watches Kubernetes API
+- Generates eBPF programs
+- Loads into kernel
+- Manages eBPF maps
+
+**Cilium Operator:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cilium-operator
+```
+
+Cluster-wide:
+- Identity management
+- IP allocation
+- Garbage collection
+
+**Hubble:**
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hubble-relay
+```
+
+Observability:
+- Flow logs
+- Service map
+- Network metrics
+
+**eBPF programs:**
+
+**Networking dataplane:**
+
+```c
+// Pseudo-eBPF for pod-to-pod:
+SEC("tc_egress")
+int handle_pod_egress(struct __sk_buff *skb) {
+    // Look up destination
+    // Apply policies
+    // Route packet
+    return TC_ACT_OK;
+}
+```
+
+Programs at:
+- TC (Traffic Control) for L2/L3
+- XDP (eXpress Data Path) for highest performance
+- Socket layer
+- Cgroup hooks
+
+**Service load balancing:**
+
+```c
+// eBPF replaces kube-proxy:
+SEC("socket")
+int sock_ops(struct bpf_sock_ops *skops) {
+    // Lookup service endpoint
+    // Connect directly to backend
+    // No iptables traversal
+    return 0;
+}
+```
+
+Direct backend connection, no DNAT chain traversal.
+
+**Network policies:**
+
+```c
+// L3/L4 policy enforcement:
+SEC("tc_ingress")
+int policy_check(struct __sk_buff *skb) {
+    // Look up source identity
+    // Check policy
+    // Allow or drop
+    return verdict;
+}
+```
+
+In-kernel policy evaluation.
+
+**L7 policies:**
+
+For HTTP, etc., Envoy proxy:
+
+```
+Pod ↔ eBPF redirect ↔ Envoy ↔ destination
+```
+
+Selective L7 inspection.
+
+**Identity-based networking:**
+
+Cilium assigns identity to workloads:
+
+```yaml
+# Pods with labels:
+labels:
+  app: frontend
+  team: web
+  
+→ Identity: 12345 (numeric)
+```
+
+Policies use identity, not IP:
+
+```yaml
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: frontend
+```
+
+Identity (frontend) allowed, regardless of which pod/IP.
+
+Benefits:
+- Pod restart = same identity, same policy
+- Cross-cluster identities (Cluster Mesh)
+
+**eBPF maps:**
+
+Data structures shared between eBPF and user space:
+
+```
+Service map: service → endpoints
+Policy map: identity → allowed identities
+NAT map: connection tracking
+```
+
+Programs read/write maps.
+
+**Replacing kube-proxy:**
+
+```yaml
+# Cilium config:
+kubeProxyReplacement: strict
+```
+
+Cilium handles all service routing via eBPF. No kube-proxy needed.
+
+**Benefits:**
+
+- Faster (in-kernel)
+- Smaller (no iptables)
+- Better observability
+- Direct socket-level redirection
+
+**Performance:**
+
+```
+iptables service lookup: O(n) linear scan
+eBPF service lookup: O(1) hash map
+```
+
+For 10,000 services:
+- iptables: ~milliseconds per packet
+- eBPF: microseconds
+
+**Hubble observability:**
+
+```bash
+# Flow logs:
+hubble observe --pod frontend-xxx
+
+# Service map:
+hubble ui
+
+# Network metrics:
+hubble metrics serve
+```
+
+Real-time visibility into:
+- Traffic flows
+- Policy decisions
+- Service dependencies
+- Performance
+
+**Encryption (WireGuard or IPSec):**
+
+```yaml
+# Cilium config:
+encryption:
+  enabled: true
+  type: wireguard
+```
+
+In-kernel encryption of pod traffic. Faster than userspace.
+
+**Service Mesh:**
+
+Cilium Service Mesh:
+
+```yaml
+# L7 features without sidecars:
+- mTLS (with SPIFFE)
+- HTTP routing
+- Traffic management
+- Observability
+```
+
+Sidecarless approach.
+
+**Cluster Mesh:**
+
+Connect multiple clusters:
+
+```yaml
+# Pods in cluster A access services in cluster B
+# Identity-based across clusters
+```
+
+Cross-cluster networking and policies.
+
+**Trade-offs:**
+
+Pros:
+- High performance
+- Rich features
+- Modern architecture
+- Excellent observability
+
+Cons:
+- Newer (less established than Calico)
+- More complex to debug
+- Kernel version requirements (4.19+ for many features)
+- Learning curve
+
+**Production scenarios:**
+
+1. **Cilium for performance**: High-throughput app. Cilium with native routing + kube-proxy replacement. 30% latency improvement vs Calico iptables.
+
+2. **L7 policies for API gateway**: API gateway needed HTTP-path-based authorization. Cilium L7 NetworkPolicies. No need for service mesh.
+
+3. **Hubble for debugging**: Network issues. Hubble showed exact flows, drops, latency per connection. Resolved quickly.
+
+4. **kube-proxy replacement**: 50k services in cluster. iptables performance issues. Replaced kube-proxy with Cilium eBPF. Performance restored.
+
+5. **Cluster Mesh for multi-cluster**: 5 clusters, needed cross-cluster service access. Cilium Cluster Mesh provided. Identity-based across clusters.
+
+---
+
+## 356. How does kube-proxy manage traffic?
+
+kube-proxy implements the Service abstraction. It maintains routing rules on each node to forward traffic from Service IPs to backing pods.
+
+**kube-proxy modes:**
+
+**Mode 1: iptables (default older clusters)**
+
+```
+For each service:
+- Chain in iptables
+- DNAT rules for each pod IP
+- Random selection
+```
+
+```bash
+# View rules:
+iptables -t nat -L KUBE-SERVICES -n
+iptables -t nat -L KUBE-SVC-XXX -n   # Per-service
+iptables -t nat -L KUBE-SEP-YYY -n   # Per-endpoint
+```
+
+**Flow:**
+
+```
+Pod sends to Service IP (10.96.0.1:80)
+       ↓
+iptables PREROUTING (KUBE-SERVICES)
+       ↓
+Match service IP/port → KUBE-SVC-XXX chain
+       ↓
+Random selection of endpoint (KUBE-SEP-YYY)
+       ↓
+DNAT to pod IP (10.244.1.5:8080)
+       ↓
+Packet routed to pod
+```
+
+**Limitations:**
+
+- O(n) lookup (linear scan)
+- Performance degrades with many services
+- Hard to debug with thousands of rules
+- iptables locking issues at scale
+
+**Mode 2: IPVS (default for many modern installs)**
+
+```bash
+# kubelet config:
+mode: "ipvs"
+```
+
+Uses Linux IPVS (IP Virtual Server):
+
+```bash
+# View rules:
+ipvsadm -L -n
+```
+
+**Algorithms:**
+
+```yaml
+ipvsScheduler: "rr"   # Round-robin
+# or:
+# lc - Least connections
+# wlc - Weighted least connections
+# sh - Source hashing (session persistence)
+```
+
+**Flow:**
+
+```
+Pod sends to Service IP
+       ↓
+IPVS table lookup (hash-based, O(1))
+       ↓
+Select backend per scheduler
+       ↓
+Forward to backend
+```
+
+**Advantages over iptables:**
+
+- O(1) lookup
+- Better for many services
+- More scheduling algorithms
+- Cleaner debugging
+
+**Mode 3: nftables (newer)**
+
+Successor to iptables. Some clusters supporting it.
+
+**Mode 4: eBPF (Cilium replaces kube-proxy)**
+
+Cilium with `kubeProxyReplacement: strict`:
+
+```
+No kube-proxy at all
+eBPF programs handle service routing
+Faster than iptables or IPVS
+```
+
+**How kube-proxy works:**
+
+**On startup:**
+
+```
+1. kube-proxy starts on each node
+2. Watches Services and Endpoints (or EndpointSlices)
+3. Programs local dataplane (iptables/IPVS/eBPF)
+4. Updates as resources change
+```
+
+**On Service creation:**
+
+```
+1. Service created in K8s
+2. kube-proxy detects via informer
+3. Resolves selector to endpoints
+4. Programs rules for each endpoint
+5. Repeats on changes
+```
+
+**EndpointSlices:**
+
+Modern Kubernetes uses EndpointSlices instead of Endpoints:
+
+```yaml
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: my-service-abc
+  labels:
+    kubernetes.io/service-name: my-service
+addressType: IPv4
+ports:
+  - port: 8080
+endpoints:
+  - addresses: ["10.244.1.5"]
+    conditions:
+      ready: true
+  - addresses: ["10.244.2.10"]
+    conditions:
+      ready: true
+```
+
+Each EndpointSlice has subset of endpoints. Better scaling than single Endpoints object.
+
+**Service types:**
+
+**ClusterIP:**
+
+```yaml
+apiVersion: v1
+kind: Service
+spec:
+  type: ClusterIP
+  clusterIP: 10.96.0.1
+```
+
+kube-proxy routes within cluster.
+
+**NodePort:**
+
+```yaml
+spec:
+  type: NodePort
+  ports:
+    - port: 80
+      nodePort: 30080
+```
+
+Port on every node. kube-proxy listens on node port, forwards to service.
+
+**LoadBalancer:**
+
+```yaml
+spec:
+  type: LoadBalancer
+```
+
+External LB created. Routes to NodePort. kube-proxy then routes to pods.
+
+**Headless:**
+
+```yaml
+spec:
+  clusterIP: None
+```
+
+No virtual IP. DNS returns pod IPs directly. kube-proxy doesn't get involved.
+
+**ExternalName:**
+
+```yaml
+spec:
+  type: ExternalName
+  externalName: db.example.com
+```
+
+DNS CNAME. No kube-proxy involvement.
+
+**Session affinity:**
+
+```yaml
+spec:
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+```
+
+Same client → same backend. Implementation:
+- iptables: complex hash
+- IPVS: `sh` scheduler
+
+**External traffic policy:**
+
+```yaml
+spec:
+  externalTrafficPolicy: Local
+```
+
+`Cluster` (default): traffic can hop between nodes.
+`Local`: traffic only to local pods. Preserves source IP.
+
+**Internal traffic policy:**
+
+```yaml
+spec:
+  internalTrafficPolicy: Local
+```
+
+Prefer local node's pods for ClusterIP traffic. Reduces cross-node traffic.
+
+**Topology aware routing:**
+
+```yaml
+metadata:
+  annotations:
+    service.kubernetes.io/topology-aware-hints: auto
+```
+
+Prefer endpoints in same zone. Reduces cross-zone egress costs.
+
+**Performance considerations:**
+
+```
+1000 services × 10 pods/service = 10000 endpoints
+
+iptables: 
+- ~10000 rules
+- Linear scan per packet
+- ~milliseconds per connection
+
+IPVS:
+- 1000 virtual services
+- Hash-based lookup
+- ~microseconds per connection
+
+eBPF:
+- Hash maps
+- Even faster
+- Lower memory
+```
+
+For large clusters: IPVS or eBPF.
+
+**Troubleshooting:**
+
+**Check kube-proxy health:**
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=kube-proxy
+
+# Logs:
+kubectl logs -n kube-system <kube-proxy-pod>
+```
+
+**Verify rules:**
+
+```bash
+# iptables:
+iptables -t nat -L KUBE-SERVICES | grep my-service
+
+# IPVS:
+ipvsadm -L -n | grep "10.96.0.1"
+```
+
+**Check endpoints:**
+
+```bash
+kubectl get endpoints my-service
+# Or:
+kubectl get endpointslices -l kubernetes.io/service-name=my-service
+```
+
+Empty = service has no backing pods.
+
+**Common issues:**
+
+**Issue 1: Service unreachable**
+
+Causes:
+- No endpoints (selector mismatch)
+- kube-proxy not running
+- iptables rules missing/broken
+
+**Issue 2: Wrong backend selected**
+
+Round-robin not balanced perfectly. Or session affinity issue.
+
+**Issue 3: Performance degradation at scale**
+
+iptables performance with many services.
+
+Fix: switch to IPVS or eBPF.
+
+**Issue 4: Source IP lost**
+
+Default `externalTrafficPolicy: Cluster` SNATs traffic.
+
+Fix: `externalTrafficPolicy: Local`.
+
+**Production scenarios:**
+
+1. **iptables to IPVS**: 5000+ services. iptables performance degrading. Switched to IPVS. Latency improved 10x.
+
+2. **Cilium replaces kube-proxy**: New cluster with Cilium. `kubeProxyReplacement: strict`. No kube-proxy. Faster service routing.
+
+3. **External IP preservation**: Web app needed real client IPs. Set `externalTrafficPolicy: Local`. Client IPs preserved.
+
+4. **Topology aware routing**: Cross-zone traffic costs high. Enabled topology aware routing. Cost reduced significantly.
+
+5. **Debugging service**: Service unreachable. `kubectl get endpoints` showed empty. Selector mismatched pod labels. Fixed labels.
+
+---
+
+## 357. Explain ClusterIP, NodePort, and LoadBalancer services
+
+These are three Service types with progressively more external accessibility.
+
+**ClusterIP (default):**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  type: ClusterIP
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+**Characteristics:**
+
+- Internal-only (within cluster)
+- Virtual IP from service CIDR
+- Accessible by cluster pods
+- Not directly accessible externally
+
+**Architecture:**
+
+```
+Cluster IP: 10.96.5.10 (assigned)
+       ↑
+Pods reach via:
+- Service IP
+- DNS: my-service.namespace.svc.cluster.local
+```
+
+**Use cases:**
+
+- Internal communication between pods
+- Backend services not exposed externally
+- Default for most services
+
+**NodePort:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  type: NodePort
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080   # Optional, 30000-32767
+```
+
+**Characteristics:**
+
+- Builds on ClusterIP
+- Also exposes on each node's IP
+- Port from range 30000-32767
+- Accessible externally via any node IP
+
+**Architecture:**
+
+```
+External access:
+  http://node-1-ip:30080
+  http://node-2-ip:30080
+  (any node)
+       ↓
+   Node's kube-proxy
+       ↓
+   Routes to ClusterIP
+       ↓
+   Forwards to pod
+```
+
+**Use cases:**
+
+- Development/testing
+- When LoadBalancer not available (on-prem without MetalLB)
+- Direct node access patterns
+
+**Limitations:**
+
+- Port range limited
+- Need to know node IPs
+- Not load-balanced externally
+- One port per service
+
+**LoadBalancer:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+**Characteristics:**
+
+- Builds on NodePort (and ClusterIP)
+- Cloud provider creates load balancer
+- External IP assigned
+- True external access
+
+**Architecture:**
+
+```
+Internet
+   ↓
+Cloud LB (assigned external IP)
+   ↓ (health checks nodes)
+NodePort on each healthy node
+   ↓
+ClusterIP
+   ↓
+Pods
+```
+
+**Provisioning:**
+
+```yaml
+# Service creates:
+spec:
+  type: LoadBalancer
+
+# Cloud controller manager:
+# Creates AWS ELB, Azure LB, GCP LB
+# Assigns external IP
+# Configures health checks
+```
+
+**Cloud-specific behaviors:**
+
+**AWS:**
+
+Default: Classic Load Balancer (or NLB with annotation).
+
+```yaml
+metadata:
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+```
+
+**Azure:**
+
+Azure Load Balancer.
+
+```yaml
+metadata:
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-sku: standard
+```
+
+**GCP:**
+
+Network Load Balancer.
+
+**Use cases:**
+
+- Production external services
+- Need stable external IP
+- Cloud-native deployments
+
+**Cost:**
+
+Each LoadBalancer = cloud LB cost:
+- AWS: ~$16-25/month per LB
+- Azure: ~$18/month
+- GCP: ~$18/month
+
+Many services × LoadBalancer = expensive.
+
+Solution: Ingress (one LB for many services).
+
+**Differences summary:**
+
+| Aspect | ClusterIP | NodePort | LoadBalancer |
+|--------|-----------|----------|--------------|
+| External access | No | Yes (via node IP) | Yes (via LB) |
+| Cost | Free | Free | Cloud LB cost |
+| Stability | Internal only | Node IP changes | Stable IP |
+| Source IP | Lost | Can preserve | Can preserve |
+| Port range | Any | 30000-32767 | Any |
+| Use case | Internal | Dev/testing | Production external |
+
+**Combining with externalTrafficPolicy:**
+
+```yaml
+spec:
+  externalTrafficPolicy: Local
+```
+
+For NodePort/LoadBalancer:
+
+**Cluster (default):**
+
+```
+External → Node A → routes to pod on Node B
+SNAT applied (source IP lost)
+Two hops, more latency
+```
+
+**Local:**
+
+```
+External → Node A → only pods on Node A
+Source IP preserved
+One hop
+But: nodes without pods don't accept traffic
+```
+
+LB only sends traffic to nodes with pods.
+
+**Internal LoadBalancer:**
+
+```yaml
+metadata:
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+```
+
+LoadBalancer with private IP. Only accessible within VPC/VNet.
+
+**Static IPs:**
+
+```yaml
+# Reserve cloud IP, assign to LB:
+metadata:
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-ipv4: "203.0.113.10"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: "203.0.113.10"
+```
+
+Pre-reserved IPs for DNS stability.
+
+**Multiple ports:**
+
+```yaml
+spec:
+  type: LoadBalancer
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: https
+      port: 443
+      targetPort: 8443
+```
+
+Single LB, multiple ports.
+
+**Type changes:**
+
+Can change service type:
+
+```yaml
+# From ClusterIP to LoadBalancer:
+kubectl patch svc my-service -p '{"spec":{"type":"LoadBalancer"}}'
+```
+
+But: may take minutes for LB provisioning.
+
+**Production scenarios:**
+
+1. **ClusterIP for internal**: Backend microservices use ClusterIP. Frontend talks to backends via DNS. No external exposure.
+
+2. **NodePort for dev**: Dev cluster without LoadBalancer. NodePort accessed via VPN-connected node IPs. Simple.
+
+3. **LoadBalancer per service expensive**: 30 services with LoadBalancer = $500/month in LB costs. Migrated to Ingress = 1 LB.
+
+4. **externalTrafficPolicy Local**: Web app needed real client IPs (for logging). Set to Local. IPs preserved. Some unbalanced traffic acceptable.
+
+5. **Internal LoadBalancer**: Internal admin tools. Internal LoadBalancer with private IP. Only VPN users could access.
+
+---
+
+## 358. What is headless service?
+
+A headless service has no cluster IP. DNS returns pod IPs directly. Used for specific patterns like StatefulSets and direct pod access.
+
+**Definition:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-headless-service
+spec:
+  clusterIP: None   # Makes it headless
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+**How it differs:**
+
+**Regular ClusterIP service:**
+
+```
+DNS query: my-service.default.svc.cluster.local
+       ↓
+Returns: 10.96.5.10 (single cluster IP)
+       ↓
+kube-proxy routes to one pod
+```
+
+**Headless service:**
+
+```
+DNS query: my-headless-service.default.svc.cluster.local
+       ↓
+Returns: 10.244.1.5, 10.244.2.10, 10.244.3.15 (all pod IPs)
+       ↓
+Client picks one (round-robin in some clients)
+```
+
+**No load balancing by kube-proxy.**
+
+**DNS records:**
+
+**A records:**
+
+```
+$ dig my-headless-service.default.svc.cluster.local
+
+my-headless-service.default.svc.cluster.local. IN A 10.244.1.5
+my-headless-service.default.svc.cluster.local. IN A 10.244.2.10
+my-headless-service.default.svc.cluster.local. IN A 10.244.3.15
+```
+
+All pod IPs returned.
+
+**SRV records:**
+
+```
+$ dig SRV _http._tcp.my-headless-service.default.svc.cluster.local
+
+_http._tcp.my-headless-service.default.svc.cluster.local. IN SRV 0 50 80 10-244-1-5.my-headless-service.default.svc.cluster.local.
+```
+
+Service discovery via DNS SRV.
+
+**Per-pod DNS:**
+
+Each pod has its own DNS:
+
+```
+10-244-1-5.my-headless-service.default.svc.cluster.local
+10-244-2-10.my-headless-service.default.svc.cluster.local
+```
+
+Can address specific pods.
+
+**StatefulSet integration:**
+
+StatefulSet requires headless service:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-statefulset
+spec:
+  clusterIP: None
+  selector:
+    app: my-statefulset
+
+---
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: my-statefulset
+spec:
+  serviceName: my-statefulset   # Headless service
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: my-statefulset
+```
+
+**Pod DNS:**
+
+```
+my-statefulset-0.my-statefulset.default.svc.cluster.local
+my-statefulset-1.my-statefulset.default.svc.cluster.local
+my-statefulset-2.my-statefulset.default.svc.cluster.local
+```
+
+Stable, predictable DNS for each replica.
+
+**Use cases:**
+
+**Use case 1: StatefulSets**
+
+Required. StatefulSet needs stable pod identities, headless service provides.
+
+**Use case 2: Direct pod access**
+
+Apps that handle load balancing themselves:
+- Distributed databases (Cassandra, MongoDB)
+- gRPC clients (do client-side LB)
+- Search clusters (Elasticsearch)
+
+**Use case 3: Service discovery**
+
+Apps discover all instances via DNS:
+
+```python
+# Python:
+import socket
+ips = socket.gethostbyname_ex('my-headless-service.default.svc.cluster.local')[2]
+# All pod IPs
+```
+
+Then load balance in application.
+
+**Use case 4: Custom load balancing**
+
+App connects to all backends, chooses based on app logic:
+- Closest geographically
+- Least loaded
+- Sticky sessions
+
+**Without selector:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-service
+spec:
+  clusterIP: None
+  ports:
+    - port: 80
+```
+
+No selector = no automatic endpoints. Define manually:
+
+```yaml
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: external-service   # Same name as service
+subsets:
+  - addresses:
+      - ip: 10.0.0.5   # External IP
+      - ip: 10.0.0.10
+    ports:
+      - port: 80
+```
+
+Headless service to external resources.
+
+**ExternalName headless:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-db
+spec:
+  type: ExternalName
+  externalName: db.example.com
+```
+
+DNS CNAME to external hostname. Different concept than headless.
+
+**Client behavior:**
+
+When app gets multiple IPs from DNS:
+
+```python
+import requests
+# Most HTTP clients use first IP
+response = requests.get('http://my-headless-service.default.svc.cluster.local')
+# Connects to first IP from DNS
+```
+
+Round-robin DNS gives some balancing but limited:
+- DNS caching
+- Connection pooling sticks to one
+- Not true load balancing
+
+For real LB: app must handle or use regular service.
+
+**Comparison:**
+
+| Aspect | Headless | Regular ClusterIP |
+|--------|----------|-------------------|
+| Cluster IP | None | Yes |
+| DNS returns | All pod IPs | Service IP |
+| Load balancing | None (or DNS RR) | kube-proxy |
+| Pod identity | Stable (with StatefulSet) | Not stable |
+| Use case | Direct access, StatefulSet | Standard |
+
+**Common patterns:**
+
+**Pattern 1: StatefulSet database**
+
+```yaml
+# Headless service for stable DNS:
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  clusterIP: None
+
+---
+
+# Plus ClusterIP for client access:
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-rw
+spec:
+  selector:
+    app: postgres
+    role: primary
+```
+
+Headless for replication, regular for client traffic.
+
+**Pattern 2: Distributed cache**
+
+```yaml
+# Redis Cluster:
+# Headless service for cluster discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster
+spec:
+  clusterIP: None
+  selector:
+    app: redis-cluster
+```
+
+Redis nodes discover each other via DNS.
+
+**Pattern 3: Custom service mesh**
+
+App-level service discovery:
+
+```python
+def get_backends():
+    ips = socket.gethostbyname_ex('backend.default.svc.cluster.local')[2]
+    return ips
+
+def call_backend(request):
+    backends = get_backends()
+    backend = select_backend(backends, request)
+    return requests.get(f"http://{backend}/api")
+```
+
+Custom routing logic.
+
+**Production scenarios:**
+
+1. **PostgreSQL StatefulSet**: Used headless service for PostgreSQL StatefulSet. Stable DNS per replica. Replication used pod DNS names.
+
+2. **Elasticsearch cluster**: ES nodes discover each other via headless service DNS. No kube-proxy involvement. Direct node-to-node.
+
+3. **gRPC client-side LB**: gRPC services used headless service. Client did client-side load balancing. Better than kube-proxy for gRPC.
+
+4. **MongoDB replica set**: Headless service for replica set DNS. Members configured by pod DNS. Stable across restarts.
+
+5. **External service abstraction**: Headless service with manual Endpoints for external database. App accessed via internal name. Easy to swap.
+
+---
+
+## 359. Explain Ingress architecture
+
+Ingress is the standard Kubernetes way to expose HTTP/HTTPS services externally. Architecture involves Ingress resources and Ingress controllers.
+
+**Components:**
+
+```
+Ingress Resource (declarative spec)
+        ↓
+Ingress Controller (implements spec)
+        ↓
+Load Balancer / Reverse Proxy
+        ↓
+Services / Pods
+```
+
+**Ingress Resource:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80
+    - host: web.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-service
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - api.example.com
+        - web.example.com
+      secretName: tls-cert
+```
+
+**Ingress Controllers:**
+
+Software that implements Ingress:
+
+- **NGINX Ingress Controller**: most popular
+- **Traefik**: modern, dynamic
+- **HAProxy Ingress**: high performance
+- **AWS Load Balancer Controller**: AWS-specific
+- **Azure Application Gateway**: Azure-specific
+- **GCE Ingress Controller**: GCP
+
+**How it works (NGINX example):**
+
+```
+1. Ingress resource created
+2. Ingress controller (pod) watches Ingress resources
+3. Generates nginx.conf with new rules
+4. Reloads nginx
+5. Traffic routed per Ingress rules
+```
+
+**Deployment of NGINX Ingress:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          image: registry.k8s.io/ingress-nginx/controller:v1.9.0
+          args:
+            - /nginx-ingress-controller
+            - --publish-service=$(POD_NAMESPACE)/ingress-nginx-controller
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-controller
+spec:
+  type: LoadBalancer
+  selector:
+    app: ingress-nginx
+  ports:
+    - name: http
+      port: 80
+    - name: https
+      port: 443
+```
+
+Architecture:
+
+```
+LoadBalancer Service (external IP)
+        ↓
+Ingress controller pods (nginx)
+        ↓ (based on Ingress rules)
+Backend services
+        ↓
+Pods
+```
+
+**Path types:**
+
+```yaml
+paths:
+  - path: /api
+    pathType: Prefix   # /api, /api/v1, /api/anything
+  - path: /exact
+    pathType: Exact    # Only /exact
+  - path: /old
+    pathType: ImplementationSpecific   # Controller-specific
+```
+
+**Host-based routing:**
+
+```yaml
+rules:
+  - host: api.example.com
+    http:
+      paths:
+        - backend:
+            service:
+              name: api-service
+  - host: web.example.com
+    http:
+      paths:
+        - backend:
+            service:
+              name: web-service
+```
+
+Same Ingress, different hosts routed differently.
+
+**Path-based routing:**
+
+```yaml
+rules:
+  - host: example.com
+    http:
+      paths:
+        - path: /api
+          backend:
+            service:
+              name: api-service
+        - path: /
+          backend:
+            service:
+              name: web-service
+```
+
+`/api/*` → api-service.
+`/*` (else) → web-service.
+
+**TLS:**
+
+```yaml
+spec:
+  tls:
+    - hosts: [example.com]
+      secretName: tls-secret
+```
+
+Secret contains cert and key:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tls-secret
+type: kubernetes.io/tls
+data:
+  tls.crt: <base64>
+  tls.key: <base64>
+```
+
+Ingress controller terminates TLS, forwards plain HTTP to backend.
+
+**Cert-manager integration:**
+
+```yaml
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    - hosts: [example.com]
+      secretName: example-com-tls
+```
+
+Cert-manager auto-provisions certificate.
+
+**Annotations (controller-specific):**
+
+```yaml
+metadata:
+  annotations:
+    # NGINX:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    
+    # AWS ALB:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+```
+
+Each controller has its own.
+
+**IngressClass:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
+```
+
+Multiple Ingress controllers in cluster, each watching its class.
+
+```yaml
+# Ingress specifies class:
+spec:
+  ingressClassName: nginx
+```
+
+**Architecture patterns:**
+
+**Pattern 1: Single ingress controller**
+
+```
+One ALB / Cloud LB
+        ↓
+Single Ingress controller (HA)
+        ↓
+Many Ingress resources
+        ↓
+Many services
+```
+
+Most common. Cost-effective.
+
+**Pattern 2: Multiple ingress controllers**
+
+```
+Internal LB → Internal Ingress controller → Internal services
+External LB → External Ingress controller → External services
+```
+
+Separate concerns.
+
+**Pattern 3: Cloud-managed + self-managed**
+
+```
+ALB → ALB Ingress (for external)
+NGINX Ingress (for internal cluster routing)
+```
+
+Different features, different controllers.
+
+**Pattern 4: Service mesh integration**
+
+```
+Ingress → Gateway (Istio/Envoy)
+       → Mesh
+       → Services
+```
+
+Ingress controller as mesh gateway.
+
+**HA Ingress controller:**
+
+```yaml
+spec:
+  replicas: 3
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: ingress-nginx
+                topologyKey: kubernetes.io/hostname
+```
+
+Multiple replicas, spread across nodes.
+
+**Performance:**
+
+NGINX Ingress can handle:
+- ~50,000 RPS per pod
+- TLS termination overhead
+- Scale horizontally with replicas
+
+**Monitoring:**
+
+```promql
+# Request rate:
+sum(rate(nginx_ingress_controller_requests[5m])) by (ingress)
+
+# Error rate:
+sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
+
+# Latency:
+histogram_quantile(0.99,
+  rate(nginx_ingress_controller_request_duration_seconds_bucket[5m])
+)
+```
+
+**Common issues:**
+
+**Issue 1: 502/503 errors**
+
+Backend service unavailable. Check:
+
+```bash
+kubectl get pods -l app=backend
+kubectl get endpoints backend-service
+```
+
+**Issue 2: TLS errors**
+
+```bash
+kubectl describe certificate my-cert
+# cert-manager status
+
+kubectl get secret tls-secret
+# Verify secret exists
+```
+
+**Issue 3: 404 errors**
+
+Wrong host/path:
+
+```bash
+kubectl describe ingress my-ingress
+# Verify rules
+```
+
+**Issue 4: Slow performance**
+
+```bash
+# Check Ingress controller resources:
+kubectl top pods -n ingress-nginx
+
+# Increase replicas if CPU-bound
+```
+
+**Production scenarios:**
+
+1. **NGINX Ingress for all services**: Single NGINX Ingress controller. 50+ services behind it. Single LB cost. Flexible routing.
+
+2. **AWS ALB for cloud-native**: Production used AWS ALB Ingress Controller. WAF integration, certificates from ACM. Cloud-native features.
+
+3. **TLS automation**: cert-manager + Let's Encrypt. All certificates automatic. No manual renewal.
+
+4. **Multi-tenant ingress**: Per-namespace Ingress with shared controller. Teams managed their own Ingress resources. Single LB cost.
+
+5. **HA ingress critical**: Ingress controller crashed. Site down. Added 3 replicas, anti-affinity. HA setup. Never down again.
+
+---
+
+## 360. Difference between Ingress and Gateway API
+
+Gateway API is the next-generation alternative to Ingress, addressing many of its limitations.
+
+**Ingress limitations:**
+
+**Limitation 1: Annotations for features**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+```
+
+Annotations are:
+- Controller-specific
+- Not standardized
+- Hard to validate
+- Documentation scattered
+
+**Limitation 2: Limited routing**
+
+Ingress supports:
+- Host
+- Path
+
+But not:
+- Headers
+- Query params
+- HTTP methods natively
+- Traffic splitting
+- Body content
+
+**Limitation 3: Role separation**
+
+Single resource includes:
+- Routing (developer concern)
+- TLS config (security)
+- Backend service (developer)
+- Class (infra)
+
+Hard to delegate.
+
+**Limitation 4: Limited protocols**
+
+HTTP/HTTPS focused. Other protocols awkward (TCP, gRPC).
+
+**Limitation 5: Vendor-specific features via annotations**
+
+Different across implementations.
+
+**Gateway API solution:**
+
+Multiple resource types with clear responsibilities:
+
+```
+GatewayClass: defines infrastructure (cloud-specific)
+Gateway: instance of infrastructure
+HTTPRoute / TLSRoute / TCPRoute: routing rules
+```
+
+**GatewayClass:**
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: example-gateway-class
+spec:
+  controllerName: example.com/gateway-controller
+```
+
+Infra team defines. Like StorageClass.
+
+**Gateway:**
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: example-gateway
+spec:
+  gatewayClassName: example-gateway-class
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        certificateRefs:
+          - name: tls-cert
+```
+
+Cluster operator or infrastructure team creates. Represents the load balancer.
+
+**HTTPRoute:**
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: example-route
+spec:
+  parentRefs:
+    - name: example-gateway
+  hostnames:
+    - example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-service
+          port: 80
+```
+
+Developer creates. Routes traffic.
+
+**Multiple route types:**
+
+```
+HTTPRoute: HTTP/HTTPS
+TLSRoute: TLS passthrough
+TCPRoute: TCP
+UDPRoute: UDP
+GRPCRoute: gRPC
+```
+
+Protocol-specific routes.
+
+**Advanced features:**
+
+**Header-based routing:**
+
+```yaml
+rules:
+  - matches:
+      - headers:
+          - name: x-environment
+            value: canary
+    backendRefs:
+      - name: canary-service
+  - matches:
+      - path:
+          type: PathPrefix
+          value: /
+    backendRefs:
+      - name: main-service
+```
+
+Route based on headers.
+
+**Query parameter routing:**
+
+```yaml
+matches:
+  - queryParams:
+      - name: version
+        value: v2
+```
+
+**HTTP method routing:**
+
+```yaml
+matches:
+  - method: POST
+```
+
+**Traffic splitting:**
+
+```yaml
+backendRefs:
+  - name: v1-service
+    weight: 80
+  - name: v2-service
+    weight: 20
+```
+
+80/20 split between versions. Built-in canary.
+
+**Request modifications:**
+
+```yaml
+rules:
+  - matches:
+      - path:
+          type: PathPrefix
+          value: /api/v1
+    filters:
+      - type: URLRewrite
+        urlRewrite:
+          path:
+            type: ReplacePrefixMatch
+            replacePrefixMatch: /api/v2
+    backendRefs:
+      - name: api-v2
+```
+
+Rewrite URL. Standardized, not annotation-based.
+
+**Header manipulation:**
+
+```yaml
+filters:
+  - type: RequestHeaderModifier
+    requestHeaderModifier:
+      set:
+        - name: X-Forwarded-For
+          value: $(REMOTE_ADDR)
+      remove:
+        - X-Internal-Header
+```
+
+**Comparison:**
+
+| Aspect | Ingress | Gateway API |
+|--------|---------|-------------|
+| Resource types | 1 (Ingress) | 3 (GatewayClass, Gateway, *Route) |
+| Roles | Mixed | Separated (infra, app) |
+| Features | Annotations | Native fields |
+| Protocols | HTTP/HTTPS | HTTP, TCP, UDP, TLS, gRPC |
+| Traffic splitting | Annotation-based | Native |
+| Header matching | Annotation | Native |
+| Maturity | GA, widely used | GA in 1.0 (Sept 2023), maturing |
+
+**Role separation:**
+
+```
+Infrastructure Team:
+├── GatewayClass (defines infrastructure)
+└── Gateway (provisions LB, manages TLS at gateway level)
+
+Application Team:
+└── HTTPRoute (routes to their service)
+```
+
+Developers focus on their routes. Infra team manages gateways.
+
+**Migration:**
+
+Both can coexist:
+
+```
+Existing Ingress: keep
+New services: use Gateway API
+Gradually migrate
+```
+
+**Ingress to Gateway API:**
+
+```yaml
+# Ingress:
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+spec:
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: my-service
+                port:
+                  number: 80
+
+# Equivalent Gateway API:
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+spec:
+  parentRefs:
+    - name: my-gateway
+  hostnames:
+    - example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: my-service
+          port: 80
+```
+
+**Implementations:**
+
+Gateway API needs controller implementation:
+
+- **NGINX Gateway Fabric**: NGINX implementation
+- **Envoy Gateway**: Envoy-based
+- **Istio Gateway**: Istio (now uses Gateway API)
+- **Cilium**: Cilium Gateway API
+- **HAProxy**: in development
+- **AWS Gateway API Controller**: AWS
+
+**Status:**
+
+- v1.0 GA: HTTPRoute, Gateway, GatewayClass
+- Other protocols experimental/beta
+- Widely adopted in 2024+
+
+**When to use which:**
+
+**Use Ingress when:**
+
+- Simple use cases
+- Established setup
+- All features fit
+- Don't need advanced routing
+
+**Use Gateway API when:**
+
+- Need advanced routing (headers, weights)
+- Want role separation
+- Multi-protocol needs (gRPC, TCP)
+- Building new infrastructure
+- Want future-proofing
+
+**Production scenarios:**
+
+1. **Gateway API adoption**: New cluster, chose Gateway API from start. Separation of concerns natural. Infra team managed Gateways, app teams managed Routes.
+
+2. **Mixed environment**: Existing Ingress staying, new services use Gateway API. Both work in same cluster. Gradual migration.
+
+3. **gRPC routing**: Needed gRPC routing with retries. GRPCRoute provided. Ingress would have required complex annotations.
+
+4. **Header-based canary**: Wanted to route by header (X-Canary-User). Gateway API native. Easy implementation.
+
+5. **Multi-tenant**: Multiple teams sharing cluster. Gateway API role separation: infra team owns Gateways, teams own Routes. Cleaner than Ingress annotations.
+
+---
+
+## 361. Explain service discovery in Kubernetes
+
+Service discovery lets workloads find each other dynamically. Kubernetes provides built-in mechanisms.
+
+**Methods:**
+
+**Method 1: DNS (most common)**
+
+CoreDNS provides cluster DNS:
+
+```python
+# In pod, simply use service name:
+response = requests.get('http://my-service:8080')
+# Or with FQDN:
+response = requests.get('http://my-service.default.svc.cluster.local:8080')
+```
+
+DNS handles resolution.
+
+**Method 2: Environment variables**
+
+Kubernetes injects env vars for services that existed before pod started:
+
+```bash
+# In pod:
+echo $MY_SERVICE_SERVICE_HOST
+# 10.96.5.10
+
+echo $MY_SERVICE_SERVICE_PORT
+# 8080
+```
+
+Limitations:
+- Pod must start after service
+- No update if service changes
+- Cluttered env
+
+**Method 3: Direct API queries**
+
+```python
+from kubernetes import client, config
+
+config.load_incluster_config()
+v1 = client.CoreV1Api()
+services = v1.list_namespaced_service(namespace='default')
+for svc in services.items:
+    print(svc.metadata.name, svc.spec.cluster_ip)
+```
+
+For complex logic. Not common.
+
+**DNS structure:**
+
+```
+<service>.<namespace>.svc.<cluster-domain>
+
+Example:
+my-service.default.svc.cluster.local
+```
+
+**Resolution paths:**
+
+In a pod, DNS searches resolve from short to long:
+
+```
+my-service                                  → expanded
+my-service.default                          → expanded
+my-service.default.svc                      → expanded
+my-service.default.svc.cluster.local        → resolved
+```
+
+Configured via `/etc/resolv.conf`:
+
+```
+search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+```
+
+**Cross-namespace:**
+
+```python
+# Same namespace:
+http://my-service:8080
+
+# Different namespace:
+http://my-service.other-namespace:8080
+# Or:
+http://my-service.other-namespace.svc.cluster.local:8080
+```
+
+**Service types and DNS:**
+
+**ClusterIP:**
+
+```
+my-service.default.svc.cluster.local → 10.96.5.10 (cluster IP)
+```
+
+A record to cluster IP.
+
+**Headless:**
+
+```
+my-headless.default.svc.cluster.local → 10.244.1.5, 10.244.2.10, 10.244.3.15
+```
+
+A records to all pod IPs.
+
+**ExternalName:**
+
+```
+my-external.default.svc.cluster.local → db.example.com (CNAME)
+```
+
+DNS CNAME to external.
+
+**Pod DNS:**
+
+For headless services, individual pods get DNS:
+
+```
+<pod-ip-with-dashes>.<service>.<namespace>.svc.cluster.local
+
+10-244-1-5.my-headless.default.svc.cluster.local
+```
+
+**StatefulSet:**
+
+```
+<pod-name>.<service>.<namespace>.svc.cluster.local
+
+my-statefulset-0.my-service.default.svc.cluster.local
+my-statefulset-1.my-service.default.svc.cluster.local
+my-statefulset-2.my-service.default.svc.cluster.local
+```
+
+Stable, predictable.
+
+**CoreDNS architecture:**
+
+```
+Pod DNS query
+       ↓
+kube-dns service (10.96.0.10:53)
+       ↓
+CoreDNS pods (in kube-system)
+       ↓
+Kubernetes API (for service info)
+       ↓
+Response to pod
+```
+
+**CoreDNS configuration:**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+            pods insecure
+            fallthrough in-addr.arpa ip6.arpa
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+```
+
+**Custom DNS entries:**
+
+```yaml
+# CoreDNS Corefile addition:
+example.com:53 {
+    forward . 10.0.0.10
+}
+```
+
+Forward specific domain to internal DNS.
+
+**External DNS:**
+
+```python
+# Pod querying external:
+requests.get('https://www.google.com')
+
+# CoreDNS forwards to upstream resolver
+```
+
+**Service mesh service discovery:**
+
+Service mesh (Istio, Linkerd) provides:
+
+- Service-to-service discovery
+- mTLS
+- Load balancing
+- Traffic management
+
+```yaml
+# Istio ServiceEntry for external:
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: external-api
+spec:
+  hosts:
+    - api.external.com
+  ports:
+    - number: 443
+      protocol: HTTPS
+```
+
+**Custom service discovery:**
+
+For complex needs, app-level:
+
+```python
+class ServiceDiscovery:
+    def __init__(self):
+        self.cache = {}
+    
+    def get_service(self, name):
+        if name not in self.cache:
+            ips = socket.gethostbyname_ex(f"{name}.default.svc.cluster.local")[2]
+            self.cache[name] = ips
+        return random.choice(self.cache[name])
+```
+
+**External service registration:**
+
+For services outside K8s:
+
+```yaml
+# ExternalName service:
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-db
+spec:
+  type: ExternalName
+  externalName: db.onprem.example.com
+
+# Or Endpoints:
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-db
+spec:
+  ports:
+    - port: 5432
+
+---
+
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: external-db
+subsets:
+  - addresses:
+      - ip: 10.0.0.5
+    ports:
+      - port: 5432
+```
+
+**Tools:**
+
+**ExternalDNS:**
+
+Manages external DNS based on Kubernetes:
+
+```yaml
+metadata:
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: api.example.com
+```
+
+ExternalDNS creates DNS records (Route 53, CloudDNS, etc.).
+
+**Production scenarios:**
+
+1. **DNS for inter-service**: Standard pattern. Services find each other via DNS. CoreDNS handled cluster traffic.
+
+2. **CoreDNS scaling**: 5000+ pods. CoreDNS hit limits. Scaled to 10 replicas with HPA. DNS performance restored.
+
+3. **Custom domain forwarding**: Apps needed to reach internal corporate DNS. Configured CoreDNS to forward `*.corp.example.com` to internal DNS server.
+
+4. **StatefulSet discovery**: Database cluster used StatefulSet. Pods discovered each other via predictable DNS names. Replication configured easily.
+
+5. **External-to-cluster**: Some services on-prem. Used ExternalName services. Apps used internal-looking names. Easy to swap targets later.
+
+---
+
+## 362. How do you debug network latency?
+
+Network latency issues require systematic investigation across multiple layers.
+
+**Categorize the problem:**
+
+**Where is latency?**
+
+```
+Client → Ingress → Service → Pod → External call
+   ↑       ↑          ↑       ↑          ↑
+  Browser  LB     kube-proxy  App     DB/API
+```
+
+Identify which segment.
+
+**Step 1: Measure**
+
+```bash
+# From pod:
+kubectl exec test-pod -- curl -o /dev/null -s -w '%{time_namelookup} %{time_connect} %{time_starttransfer} %{time_total}\n' http://target
+
+# Breakdown:
+# time_namelookup: DNS resolution
+# time_connect: TCP connection
+# time_starttransfer: First byte after TCP
+# time_total: Total time
+```
+
+**Step 2: DNS investigation**
+
+```bash
+# Time DNS:
+kubectl exec test-pod -- time nslookup my-service.default.svc.cluster.local
+
+# Should be <50ms
+
+# CoreDNS issues:
+kubectl logs -n kube-system -l k8s-app=kube-dns
+kubectl top pods -n kube-system -l k8s-app=kube-dns
+```
+
+**CoreDNS slow:**
+- Increase replicas
+- Add NodeLocal DNSCache
+- Increase cache TTL
+
+**NodeLocal DNSCache:**
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-local-dns
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      containers:
+        - name: node-cache
+          image: registry.k8s.io/dns/k8s-dns-node-cache:1.22.20
+```
+
+Local DNS cache per node. Reduces latency.
+
+**Step 3: TCP connection investigation**
+
+```bash
+# TCP latency:
+kubectl exec test-pod -- ping -c 10 target-service
+
+# TCP connect time:
+kubectl exec test-pod -- nc -zv -w 5 target 80
+```
+
+**Issues:**
+- Network policy blocking
+- Slow node-to-node
+- High packet loss
+
+**Step 4: Application latency**
+
+```bash
+# Time after connection:
+curl -w '%{time_starttransfer}\n' -o /dev/null -s http://service
+
+# Application taking long to respond:
+- Slow database queries
+- Inefficient code
+- Resource starvation
+```
+
+Check app metrics:
+
+```promql
+# Request duration:
+histogram_quantile(0.99,
+  rate(http_request_duration_seconds_bucket[5m])
+)
+```
+
+**Step 5: Network path**
+
+```bash
+# Trace path:
+kubectl exec test-pod -- traceroute target-ip
+
+# Identify slow hops
+```
+
+**Cross-zone latency:**
+
+```bash
+# Pods in different zones:
+kubectl get pods -o wide
+# Note nodes, zones
+
+# Same zone: ~1ms
+# Different zones: 1-5ms
+```
+
+Topology aware routing can help:
+
+```yaml
+metadata:
+  annotations:
+    service.kubernetes.io/topology-aware-hints: auto
+```
+
+Prefer same-zone endpoints.
+
+**Step 6: Resource starvation**
+
+```bash
+# Pod CPU throttling:
+kubectl top pods
+
+# Throttling causes latency:
+rate(container_cpu_cfs_throttled_periods_total[5m])
+/
+rate(container_cpu_cfs_periods_total[5m])
+```
+
+If high, increase CPU limits.
+
+**Step 7: Network policies**
+
+```bash
+# Check if policies cause overhead:
+kubectl get networkpolicies -A
+
+# Some policies (especially with many rules) add latency
+```
+
+**Step 8: CNI performance**
+
+```
+Calico iptables: O(n) for many rules
+Calico eBPF: O(1)
+Cilium eBPF: O(1)
+```
+
+For many services, eBPF helps.
+
+**Step 9: kube-proxy mode**
+
+```bash
+# Check mode:
+kubectl get configmap kube-proxy -n kube-system -o yaml | grep mode
+
+# iptables: slower at scale
+# IPVS: faster
+# eBPF (Cilium): fastest
+```
+
+**Step 10: Service mesh overhead**
+
+Service mesh adds latency:
+- Istio: 1-3ms
+- Linkerd: 1-2ms
+
+Check if needed for all services.
+
+**Step 11: External calls**
+
+```bash
+# External APIs:
+kubectl exec test-pod -- curl -w 'time_total: %{time_total}\n' https://external-api.com
+
+# Test from outside cluster:
+curl -w 'time_total: %{time_total}\n' https://external-api.com
+```
+
+If external slow from cluster but not elsewhere: egress issue.
+
+**Step 12: MTU issues**
+
+```bash
+# Test with large packet:
+kubectl exec test-pod -- ping -M do -s 1450 target-pod-ip
+
+# Should succeed. If fails: MTU mismatch
+```
+
+**Tools:**
+
+**Cilium Hubble:**
+
+```bash
+hubble observe --pod my-pod
+# Shows latencies, drops
+```
+
+**Istio:**
+
+```bash
+istioctl proxy-config cluster my-pod
+# Shows routing
+```
+
+**Prometheus:**
+
+```promql
+# Service-to-service latency (Istio):
+histogram_quantile(0.99,
+  rate(istio_request_duration_milliseconds_bucket[5m])
+)
+
+# Per-pod:
+sum by (source_pod, destination_service) (
+  rate(istio_request_duration_milliseconds_sum[5m])
+)
+```
+
+**Tracing:**
+
+OpenTelemetry/Jaeger:
+- Shows latency per span
+- Identifies slow services
+- Distributed view
+
+**Common latency sources:**
+
+**Source 1: DNS**
+
+```
+Slow DNS: 100-1000ms
+```
+
+Fix: NodeLocal DNSCache, scale CoreDNS.
+
+**Source 2: Cross-zone traffic**
+
+```
+Same zone: 1ms
+Cross zone: 3-5ms
+Cross region: 50-200ms
+```
+
+Fix: topology aware routing, anti-affinity.
+
+**Source 3: CPU throttling**
+
+```
+Throttled pod: variable latency
+```
+
+Fix: increase CPU limits, optimize app.
+
+**Source 4: Connection pooling**
+
+App makes new connection each request. TCP handshake overhead.
+
+Fix: connection pooling, HTTP keep-alive.
+
+**Source 5: TLS handshakes**
+
+```
+TLS 1.2 handshake: 100+ms
+TLS 1.3: ~50ms
+Session reuse: ~10ms
+```
+
+Fix: TLS session reuse, TLS 1.3.
+
+**Production scenarios:**
+
+1. **DNS resolution slow**: 200ms DNS lookups. CoreDNS overloaded. Added NodeLocal DNSCache. DNS down to <5ms.
+
+2. **Cross-zone overhead**: P99 latency 50ms higher than P50. Investigation: cross-zone calls. Added topology aware routing.
+
+3. **CPU throttling**: Random 100-500ms latency spikes. Found CPU throttling. Increased limits. Latency stabilized.
+
+4. **Connection pool exhausted**: App opened new connection per request. Connection pool full, waits. Increased pool. P99 dropped 80%.
+
+5. **MTU mismatch**: Random performance issues. After VXLAN deployment. Test with `ping -M do -s 1450`. MTU issue. Fixed.
+
+---
+
+## 363. Explain DNS resolution path
+
+DNS in Kubernetes follows specific paths. Understanding helps debug DNS issues.
+
+**Resolution flow:**
+
+```
+Pod application calls hostname
+        ↓
+glibc / DNS resolver
+        ↓ (uses /etc/resolv.conf)
+DNS query to cluster DNS (kube-dns service)
+        ↓ (10.96.0.10 typically)
+CoreDNS pod receives query
+        ↓
+CoreDNS checks:
+  - Is it cluster service? (kubernetes plugin)
+  - Is it pod DNS? (if enabled)
+  - Cache?
+  - Forward to upstream
+        ↓
+Response back to pod
+```
+
+**Pod's /etc/resolv.conf:**
+
+```
+nameserver 10.96.0.10
+search default.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+```
+
+**nameserver:** kube-dns service IP.
+
+**search:** suffixes tried for short names.
+
+**ndots:** number of dots in name before considered absolute.
+
+**ndots: 5 means:**
+
+```
+"my-service" → 0 dots → not absolute, try with search suffixes
+"my-service.default.svc.cluster.local" → 4 dots → also tries with suffixes
+"my-service.default.svc.cluster.local." → trailing dot → absolute, no suffixes
+```
+
+This causes extra DNS queries:
+
+```
+For "google.com" (1 dot):
+  Try: google.com.default.svc.cluster.local
+  Try: google.com.svc.cluster.local
+  Try: google.com.cluster.local
+  Try: google.com (absolute)
+
+4 queries for external lookup.
+```
+
+**Optimization:**
+
+```yaml
+# In pod spec:
+dnsConfig:
+  options:
+    - name: ndots
+      value: "1"
+```
+
+Reduce ndots for fewer queries (trade-off: less search suffix expansion).
+
+Or use FQDNs:
+
+```python
+# Always FQDN:
+requests.get('http://google.com.')   # Trailing dot
+# Skip search suffixes
+```
+
+**CoreDNS processing:**
+
+```yaml
+# Corefile (CoreDNS config):
+.:53 {
+    errors
+    health
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf
+    cache 30
+    loop
+    reload
+    loadbalance
+}
+```
+
+**Plugins:**
+
+**errors:** log errors.
+**health:** /health endpoint.
+**kubernetes:** Kubernetes service resolution.
+**prometheus:** metrics.
+**forward:** forward to upstream.
+**cache:** cache responses.
+**loop:** prevent loops.
+**reload:** reload on Corefile change.
+**loadbalance:** randomize responses.
+
+**Query types:**
+
+**Cluster service lookup:**
+
+```
+my-service.default.svc.cluster.local
+       ↓
+CoreDNS kubernetes plugin
+       ↓
+Resolves from Kubernetes API
+       ↓
+Returns service IP
+```
+
+**Pod DNS (if enabled):**
+
+```
+10-244-1-5.default.pod.cluster.local
+       ↓
+Resolves to pod IP 10.244.1.5
+```
+
+Disabled by default for security.
+
+**External lookup:**
+
+```
+www.google.com
+       ↓
+CoreDNS doesn't match cluster.local
+       ↓
+Forwarded to /etc/resolv.conf nameservers (node's DNS)
+       ↓
+Eventually upstream DNS (8.8.8.8, etc.)
+```
+
+**StatefulSet DNS:**
+
+```
+my-statefulset-0.my-service.default.svc.cluster.local
+
+CoreDNS:
+- Recognizes pattern (pod-name.service-name)
+- Resolves to specific pod IP
+```
+
+Stable DNS per pod.
+
+**Common issues:**
+
+**Issue 1: Slow DNS**
+
+```bash
+# Time queries:
+kubectl exec test-pod -- time nslookup google.com
+```
+
+Slow CoreDNS:
+- Increase replicas
+- HPA on CoreDNS
+- NodeLocal DNSCache
+
+**Issue 2: DNS failures**
+
+```bash
+kubectl exec test-pod -- nslookup my-service
+# Server failure or timeout
+```
+
+**Check CoreDNS:**
+
+```bash
+kubectl logs -n kube-system -l k8s-app=kube-dns
+
+# Look for errors
+```
+
+**Check service:**
+
+```bash
+kubectl get svc -n kube-system kube-dns
+# Should have endpoint
+```
+
+**Issue 3: Search suffix issues**
+
+```python
+# Code does:
+requests.get('http://my-service')
+
+# Resolves correctly if same namespace
+# Fails if different namespace (search doesn't include other ns)
+```
+
+Fix: use FQDN or namespace prefix.
+
+**Issue 4: ndots performance**
+
+External names cause many queries due to ndots:5.
+
+```bash
+# Tcpdump on CoreDNS:
+sudo tcpdump -i any port 53
+
+# See queries
+```
+
+Fix: lower ndots in pod, or always use FQDN.
+
+**Issue 5: DNS caching**
+
+```yaml
+# CoreDNS cache:
+cache 30
+```
+
+30-second cache. If service IP changes, 30s stale.
+
+**Issue 6: Loop detection**
+
+```
+CoreDNS forwards to /etc/resolv.conf
+/etc/resolv.conf points to CoreDNS
+Loop!
+```
+
+CoreDNS detects, refuses to start.
+
+Fix: forward to actual upstream:
+
+```
+forward . 8.8.8.8 8.8.4.4
+```
+
+**NodeLocal DNSCache:**
+
+DaemonSet, local DNS cache per node:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-local-dns
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      containers:
+        - name: node-cache
+          image: registry.k8s.io/dns/k8s-dns-node-cache
+```
+
+Benefits:
+- Reduces CoreDNS load
+- Local cache (faster)
+- Eliminates conntrack issues
+- Connection reuse
+
+**iptables redirects pod DNS to local cache:**
+
+```
+Pod DNS query → iptables → local DNS cache → CoreDNS (if cache miss)
+```
+
+**Cluster autoscaler interactions:**
+
+When nodes scale:
+- CoreDNS pods might need to scale
+- NodeLocal DNSCache: automatic per node
+
+**Custom DNS entries:**
+
+```yaml
+# CoreDNS Corefile:
+example.com:53 {
+    forward . 10.0.0.10
+}
+
+# Forward specific domain to internal DNS
+```
+
+Or:
+
+```yaml
+# rewrite plugin:
+rewrite name my-service.default.svc.cluster.local prod-service.default.svc.cluster.local
+```
+
+Redirect lookups.
+
+**Debugging:**
+
+**Pod-level:**
+
+```bash
+# Check resolv.conf:
+kubectl exec test-pod -- cat /etc/resolv.conf
+
+# Test DNS:
+kubectl exec test-pod -- nslookup kubernetes.default
+
+# Time queries:
+kubectl exec test-pod -- dig +short google.com
+```
+
+**CoreDNS-level:**
+
+```bash
+# Logs:
+kubectl logs -n kube-system -l k8s-app=kube-dns
+
+# Metrics:
+kubectl port-forward -n kube-system svc/kube-dns 9153:9153
+curl http://localhost:9153/metrics | grep coredns
+
+# Check forwarders:
+kubectl get configmap coredns -n kube-system -o yaml
+```
+
+**Production scenarios:**
+
+1. **CoreDNS overload**: 5000+ pods. CoreDNS hit 100% CPU. Added NodeLocal DNSCache. CoreDNS load dropped 80%.
+
+2. **External DNS slow**: ndots:5 caused 4 queries per external name. Lowered to ndots:1 for specific pods. Performance improved.
+
+3. **Cross-namespace failures**: App in namespace A called "service-b" expecting namespace B. Failed (search didn't include B). Fixed: use FQDN.
+
+4. **DNS loop**: New CoreDNS config forwarded to wrong upstream. Loop detected, CoreDNS crashed. Fixed config.
+
+5. **Conntrack issues**: With high DNS QPS, conntrack table filling. NodeLocal DNSCache eliminated this (uses TCP, no conntrack).
+
+---
+
+## 364. What are NetworkPolicies?
+
+NetworkPolicies are Kubernetes resources that control network traffic between pods. Foundation for network security in Kubernetes.
+
+**Default behavior:**
+
+Without NetworkPolicies: all pods can communicate freely.
+
+**With NetworkPolicies:**
+
+```
+Pod with policy applied:
+- Only allowed traffic flows
+- Others denied
+```
+
+**Basic structure:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: my-policy
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              role: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              role: database
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+**Components:**
+
+**podSelector:**
+
+```yaml
+podSelector:
+  matchLabels:
+    app: my-app
+```
+
+Which pods this policy applies to. Empty `{}` means all pods in namespace.
+
+**policyTypes:**
+
+```yaml
+policyTypes:
+  - Ingress   # Incoming traffic
+  - Egress    # Outgoing traffic
+```
+
+If only Ingress listed: egress remains default (allow all).
+
+**ingress rules:**
+
+What can come in:
+
+```yaml
+ingress:
+  - from:
+      - podSelector:
+          matchLabels:
+            app: frontend
+    ports:
+      - protocol: TCP
+        port: 8080
+```
+
+**egress rules:**
+
+What can go out:
+
+```yaml
+egress:
+  - to:
+      - podSelector:
+          matchLabels:
+            app: database
+    ports:
+      - protocol: TCP
+        port: 5432
+```
+
+**Selectors:**
+
+**podSelector:** match pods by labels.
+
+```yaml
+- podSelector:
+    matchLabels:
+      app: frontend
+```
+
+**namespaceSelector:** match namespaces.
+
+```yaml
+- namespaceSelector:
+    matchLabels:
+      environment: prod
+```
+
+**Combined:**
+
+```yaml
+- namespaceSelector:
+    matchLabels:
+      environment: prod
+  podSelector:
+    matchLabels:
+      app: frontend
+```
+
+Pods labeled app=frontend in namespaces labeled environment=prod.
+
+**ipBlock:**
+
+```yaml
+- ipBlock:
+    cidr: 10.0.0.0/8
+    except:
+      - 10.0.0.0/24
+```
+
+By IP range.
+
+**Default deny:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}   # All pods in namespace
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+No traffic allowed. Then explicitly allow what's needed.
+
+**Default deny ingress only:**
+
+```yaml
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+```
+
+Egress not restricted (allowed by default).
+
+**Examples:**
+
+**Allow only specific apps:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-access
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+        - podSelector:
+            matchLabels:
+              app: admin
+      ports:
+        - port: 8080
+```
+
+Backend accepts from frontend or admin on port 8080.
+
+**Allow DNS (always needed):**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+```
+
+**Allow egress to external:**
+
+```yaml
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - port: 443
+```
+
+Allow HTTPS to any external (excluding RFC1918).
+
+**Cross-namespace allow:**
+
+```yaml
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: frontend-ns
+          podSelector:
+            matchLabels:
+              app: web
+```
+
+Allow from app=web in frontend-ns namespace.
+
+**Implementation:**
+
+NetworkPolicy is just specification. CNI implements:
+
+```
+Calico: programs iptables (or eBPF)
+Cilium: programs eBPF
+Weave: iptables
+Flannel: no support (needs Canal)
+```
+
+Without supporting CNI, NetworkPolicies have no effect.
+
+**Limitations:**
+
+**Limitation 1: L3/L4 only**
+
+Standard NetworkPolicy is IP/port based:
+
+```yaml
+# Can:
+- Restrict by IP/CIDR
+- Restrict by pod labels
+- Restrict by port
+
+# Cannot:
+- HTTP path filtering
+- Header inspection
+- TLS SNI
+```
+
+For L7: Cilium NetworkPolicy or service mesh.
+
+**Limitation 2: No source rewriting**
+
+NetworkPolicy sees original source IP. If traffic NAT'd, source is NAT IP.
+
+**Limitation 3: No FQDN**
+
+Standard NetworkPolicy doesn't support hostnames:
+
+```yaml
+# Not possible:
+egress:
+  - to:
+      - host: api.example.com
+```
+
+Cilium extends:
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+spec:
+  egress:
+    - toFQDNs:
+        - matchName: api.example.com
+```
+
+**Limitation 4: Stateful tracking**
+
+NetworkPolicy is stateful (return traffic allowed). But not connection tracking visible.
+
+**Cilium extensions:**
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: web
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+          rules:
+            http:
+              - method: "GET"
+                path: "/api/v1/.*"
+```
+
+L7 policy: GET /api/v1/* only.
+
+**Testing:**
+
+```bash
+# Verify policy applied:
+kubectl describe networkpolicy my-policy
+
+# Test connection:
+kubectl exec test-pod -- nc -zv -w 5 target-service 8080
+
+# Without NetworkPolicy: success
+# With deny policy: failure
+```
+
+**Common pitfalls:**
+
+**Pitfall 1: Forgot DNS allow**
+
+Default-deny breaks DNS. Always allow DNS egress.
+
+**Pitfall 2: Forgot return traffic**
+
+NetworkPolicy is stateful, but some users think they need explicit return rules. Not needed.
+
+**Pitfall 3: namespaceSelector typo**
+
+Label must match. Easy to typo.
+
+**Pitfall 4: CNI doesn't support**
+
+Flannel doesn't enforce NetworkPolicies. Need to switch CNI or use Canal.
+
+**Tools:**
+
+**Cilium Hubble:**
+
+```bash
+hubble observe --verdict DROPPED
+# See what's being blocked
+```
+
+**Calico:**
+
+```bash
+calicoctl get networkpolicies -A
+```
+
+**Production scenarios:**
+
+1. **Default-deny adoption**: Migrated cluster to default-deny. Audited all required communication. Added explicit allows. Significantly improved security.
+
+2. **DNS issue**: After default-deny, all pods broken. Forgot DNS allow. Added, everything worked.
+
+3. **L7 policies**: Standard L3/L4 NetworkPolicy insufficient. Migrated to Cilium for HTTP-level controls.
+
+4. **Tenant isolation**: Multi-tenant cluster. Per-namespace default-deny + cross-namespace allow rules. Tenants isolated.
+
+5. **Egress restrictions**: Compliance required only specific external destinations. NetworkPolicy with ipBlock allowed only approved CIDRs. Compliance met.
+
+---
+
+## 365. How do you isolate namespaces using networking?
+
+Namespace network isolation prevents cross-namespace traffic. Multiple approaches.
+
+**Approach 1: Default-deny per namespace**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: my-namespace
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+Apply to each namespace. Then explicit allows.
+
+**Approach 2: Same-namespace only**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: same-namespace-only
+  namespace: my-namespace
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: my-namespace
+```
+
+Pods in `my-namespace` only accept traffic from same namespace.
+
+**Approach 3: Allow specific cross-namespace**
+
+```yaml
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: my-namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: frontend-ns
+```
+
+Same namespace + specific external namespace.
+
+**Approach 4: Label-based isolation**
+
+```yaml
+# Label namespaces:
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    environment: production
+    tenant: team-a
+```
+
+```yaml
+# Policy:
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tenant: team-a   # Same tenant only
+```
+
+Tenant-based.
+
+**Approach 5: Multi-tier isolation**
+
+```yaml
+# Frontend can talk to backend:
+spec:
+  podSelector:
+    matchLabels:
+      tier: backend
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tier: frontend
+          podSelector:
+            matchLabels:
+              tier: frontend
+
+# Backend can talk to database:
+spec:
+  podSelector:
+    matchLabels:
+      tier: database
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tier: backend
+```
+
+Tiered access.
+
+**Approach 6: Egress restrictions**
+
+```yaml
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # Same namespace:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: my-namespace
+    # DNS:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+    # External HTTPS:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+      ports:
+        - port: 443
+```
+
+Restrict egress destinations.
+
+**Approach 7: Cluster-wide policies (Calico)**
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  selector: all()
+  types:
+    - Ingress
+    - Egress
+```
+
+Applies to all namespaces.
+
+**Automation:**
+
+**Auto-create default-deny:**
+
+```yaml
+# Kyverno generates NetworkPolicy on namespace creation:
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-default-deny
+spec:
+  rules:
+    - name: generate-policy
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      generate:
+        kind: NetworkPolicy
+        name: default-deny
+        namespace: "{{request.object.metadata.name}}"
+        data:
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+              - Egress
+```
+
+Every new namespace automatically gets default-deny.
+
+**Verification:**
+
+```bash
+# Test isolation:
+kubectl exec -n ns-a test-pod -- curl http://service.ns-b.svc.cluster.local
+# Should fail with NetworkPolicy
+
+# Test same namespace:
+kubectl exec -n ns-a test-pod -- curl http://service.ns-a.svc.cluster.local
+# Should succeed
+```
+
+**Service mesh integration:**
+
+Mesh adds identity-based isolation:
+
+```yaml
+# Istio AuthorizationPolicy:
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: ns-isolation
+  namespace: my-namespace
+spec:
+  rules:
+    - from:
+        - source:
+            namespaces: [my-namespace]
+```
+
+NetworkPolicy at L3/L4 + mesh at L7 = defense in depth.
+
+**Patterns:**
+
+**Pattern 1: Strict per-namespace**
+
+```
+Each namespace: default-deny + same-namespace allow
+No cross-namespace by default
+Explicit policy for any cross-ns
+```
+
+Most secure, more management.
+
+**Pattern 2: Tier-based**
+
+```
+Frontend tier → Backend tier → Database tier
+Cross-tier explicitly allowed
+Within-tier any-to-any
+```
+
+Architectural isolation.
+
+**Pattern 3: Tenant-based**
+
+```
+Multiple teams, each with namespaces
+Tenant label on namespaces
+Same-tenant communication allowed
+Cross-tenant denied
+```
+
+Multi-tenancy.
+
+**Pattern 4: Shared services**
+
+```
+Most namespaces isolated
+Shared services namespace (monitoring, logging) accessible from all
+```
+
+Centralized services with isolation.
+
+**Common challenges:**
+
+**Challenge 1: Operational tools**
+
+Monitoring, logging, ingress controller need cluster-wide access.
+
+Fix: allow from their namespaces:
+
+```yaml
+ingress:
+  - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+```
+
+**Challenge 2: DNS**
+
+Always need DNS egress.
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+    ports:
+      - port: 53
+```
+
+**Challenge 3: Ingress controller**
+
+External traffic comes from Ingress controller namespace.
+
+```yaml
+ingress:
+  - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: ingress-nginx
+```
+
+**Challenge 4: Cluster services**
+
+API server access for some workloads:
+
+```yaml
+egress:
+  - to:
+      - ipBlock:
+          cidr: <api-server-ip>/32
+    ports:
+      - port: 443
+```
+
+**Production scenarios:**
+
+1. **Default-deny per namespace**: Implemented in all production namespaces. Reduced lateral movement risk. Many issues during rollout, but worth it.
+
+2. **Tenant isolation**: Multi-team cluster. Each team's namespaces had tenant label. NetworkPolicy enforced tenant boundary. Compromised team A couldn't reach team B.
+
+3. **Tier-based for app**: Frontend/backend/DB tiers in different namespaces. NetworkPolicy enforced tier boundaries. Even compromise of frontend couldn't reach DB directly.
+
+4. **Kyverno automation**: Auto-generated default-deny on namespace creation. No manual NetworkPolicy creation needed.
+
+5. **Service mesh + NetworkPolicy**: Both used. NetworkPolicy for L3/L4. Istio for L7 identity. Strong defense in depth.
+
+---
+
+## 366. Explain BGP integration in Kubernetes
+
+BGP (Border Gateway Protocol) provides dynamic routing for pod networks. Calico is the primary CNI using BGP in Kubernetes.
+
+**What BGP does:**
+
+```
+Routers advertise routes to each other
+Routes propagate
+Each router knows how to reach destinations
+```
+
+In Kubernetes context:
+- Each node advertises its pod CIDR
+- Other nodes learn routes
+- Direct routing without overlay
+
+**Why BGP:**
+
+**Without BGP (overlay):**
+
+```
+Pod packet encapsulated
+Sent through tunnel (VXLAN, IPIP)
+Decapsulated at destination
+Overhead, complexity
+```
+
+**With BGP:**
+
+```
+Pod packet routed natively
+Through underlying network
+No encapsulation
+Best performance
+```
+
+**Calico BGP architecture:**
+
+```
+Each node:
+- calico-node pod
+  - BIRD: BGP daemon
+  - Felix: dataplane programmer
+
+Node advertises pod CIDR via BGP
+Other nodes learn route
+Linux kernel routes packets directly
+```
+
+**BGP peering modes:**
+
+**Full mesh:**
+
+```
+Every node peers with every other node
+N nodes = N×(N-1)/2 peer connections
+
+For 100 nodes: 4950 BGP sessions
+Doesn't scale
+```
+
+**Route reflectors:**
+
+```
+Some nodes are route reflectors
+Other nodes peer only with reflectors
+Reflectors share routes among all
+
+For 100 nodes: ~100 peer connections (to reflectors)
+Scales well
+```
+
+**External peering:**
+
+```
+Cluster nodes peer with external routers (TOR switches, etc.)
+Pod CIDRs advertised to external network
+External routers can route to pod IPs directly
+Hybrid network integration
+```
+
+**Configuration:**
+
+**Basic Calico setup:**
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  logSeverityScreen: Info
+  nodeToNodeMeshEnabled: true   # Full mesh
+  asNumber: 64512
+```
+
+**BGP peering:**
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: external-router
+spec:
+  peerIP: 10.0.0.1
+  asNumber: 65000
+```
+
+Peers all nodes with external router.
+
+**Route reflectors:**
+
+```yaml
+# Mark some nodes as reflectors:
+apiVersion: projectcalico.org/v3
+kind: Node
+metadata:
+  name: node1
+spec:
+  bgp:
+    routeReflectorClusterID: 1.0.0.1
+
+# Disable mesh, use reflectors:
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  nodeToNodeMeshEnabled: false
+
+# Peer with reflectors:
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: reflector-peering
+spec:
+  peerSelector: route-reflector=true
+```
+
+**Use cases:**
+
+**Use case 1: On-prem with BGP**
+
+```
+Cluster nodes peer with TOR switches
+Pod IPs routable from data center network
+Apps can reach pods directly
+Better integration with existing infrastructure
+```
+
+**Use case 2: Multi-cluster routing**
+
+```
+Cluster A peers with Cluster B routers
+Pods in A can reach pods in B directly
+No NAT, no overlay between clusters
+```
+
+**Use case 3: Service exposure via BGP**
+
+```yaml
+# Calico advertises service IPs via BGP:
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+spec:
+  serviceClusterIPs:
+    - cidr: 10.96.0.0/12
+  serviceExternalIPs:
+    - cidr: 192.168.10.0/24
+```
+
+External clients route to service IPs directly. MetalLB-like functionality.
+
+**Use case 4: Anycast services**
+
+```yaml
+# Multiple nodes advertise same service IP:
+spec:
+  serviceLoadBalancerIPs:
+    - cidr: 10.0.50.0/24
+```
+
+Clients reach nearest pod via BGP routing.
+
+**Network design:**
+
+**Typical on-prem:**
+
+```
+TOR switches (BGP)
+       ↕
+Worker nodes (BGP) - per rack
+       ↕
+Pods
+```
+
+Each rack might have own AS number.
+
+**Cloud (limited BGP):**
+
+```
+AWS, Azure, GCP: limited BGP support
+Some support via Direct Connect / ExpressRoute
+Calico can still use BGP between nodes
+```
+
+**Encapsulation hybrid:**
+
+```yaml
+# IPIP only when crossing subnets:
+spec:
+  ipipMode: CrossSubnet
+```
+
+- Same subnet: BGP direct
+- Different subnets: IPIP encapsulation
+
+Best of both: performance + works across L3.
+
+**Comparison to overlay:**
+
+| Aspect | BGP (Calico) | Overlay (Flannel VXLAN) |
+|--------|--------------|-------------------------|
+| Performance | Best | Good |
+| Visibility | Native packets | Encapsulated |
+| Network integration | Direct routing | Tunnels |
+| Setup | More complex | Simpler |
+| Requirements | Network supports BGP | Any network |
+| Debugging | Standard tools | Need overlay-aware |
+
+**Troubleshooting:**
+
+**Verify BGP peers:**
+
+```bash
+# Calico:
+calicoctl node status
+
+# Shows peers and connection state
+```
+
+**Check routes:**
+
+```bash
+# On node:
+ip route
+# Look for routes to other pod CIDRs
+
+# BGP routes specifically:
+birdcl -s /var/run/calico/bird.ctl
+show route
+```
+
+**Common issues:**
+
+**Issue 1: BGP not peering**
+
+Causes:
+- Firewall blocking BGP port (179)
+- Wrong AS numbers
+- Mismatched configuration
+
+**Issue 2: Routes not advertised**
+
+```bash
+# Check Calico config:
+calicoctl get bgpconfiguration
+calicoctl get ippool
+```
+
+**Issue 3: Asymmetric routing**
+
+Packets out one path, return via another. Stateful firewalls might block.
+
+**Issue 4: BGP convergence**
+
+When topology changes, routes take time to converge. Brief connectivity issues.
+
+**MetalLB alternative:**
+
+MetalLB also uses BGP for service exposure:
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: BGPPeer
+metadata:
+  name: peer1
+spec:
+  peerAddress: 10.0.0.1
+  peerASN: 65000
+  myASN: 64500
+```
+
+Lightweight BGP for LoadBalancer services.
+
+**Production scenarios:**
+
+1. **On-prem Calico BGP**: Data center with BGP-capable switches. Calico peered with TOR. Pod IPs routable from corporate network. Apps reached pods directly.
+
+2. **Route reflectors for scale**: 200-node cluster. Full mesh BGP problematic. Implemented route reflectors. BGP sessions reduced 95%.
+
+3. **Service via BGP**: External clients needed direct service IP access. Calico advertised service IPs via BGP. No need for LoadBalancer.
+
+4. **Multi-cluster routing**: Two on-prem clusters. BGP peering between them. Pods in cluster A reached pods in cluster B directly.
+
+5. **CrossSubnet IPIP**: Cluster nodes in multiple subnets. Set CrossSubnet IPIP. Same-subnet BGP, cross-subnet encapsulation. Optimal mix.
+
+---
+
+## 367. How does MetalLB work?
+
+MetalLB provides LoadBalancer services for bare metal Kubernetes clusters. Cloud-managed Kubernetes has built-in LBs; MetalLB fills the gap.
+
+**Problem MetalLB solves:**
+
+In cloud:
+```yaml
+spec:
+  type: LoadBalancer
+```
+Cloud provider creates LB.
+
+On bare metal:
+```yaml
+spec:
+  type: LoadBalancer
+```
+Stays in `<pending>` forever.
+
+MetalLB provides LoadBalancer functionality.
+
+**Architecture:**
+
+```
+MetalLB components:
+- Controller (Deployment, 1 instance)
+- Speaker (DaemonSet, one per node)
+```
+
+**Controller:**
+- Watches Services
+- Assigns IPs from configured pools
+- Updates Service status
+
+**Speaker:**
+- Announces IPs externally
+- Two modes: Layer 2 or BGP
+
+**Layer 2 mode:**
+
+```
+One node responds to ARP for service IP
+Other nodes don't respond
+Traffic to service IP arrives at that node
+kube-proxy routes to pods
+```
+
+**Active-passive at IP level.** Failover if node dies.
+
+**Setup:**
+
+```yaml
+# IPAddressPool:
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.1.240-192.168.1.250
+```
+
+11 IPs available.
+
+```yaml
+# Layer 2 mode:
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default-pool
+```
+
+**Service:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+```
+
+MetalLB assigns IP from pool:
+
+```bash
+kubectl get svc my-service
+# EXTERNAL-IP: 192.168.1.240
+```
+
+**BGP mode:**
+
+```
+MetalLB speakers peer with external BGP routers
+Advertise service IPs
+Routers route traffic to cluster
+Multiple nodes can advertise (true LB)
+```
+
+**Configuration:**
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: BGPPeer
+metadata:
+  name: external-router
+  namespace: metallb-system
+spec:
+  myASN: 64500
+  peerASN: 65000
+  peerAddress: 10.0.0.1
+
+---
+
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default-pool
+```
+
+**Comparison Layer 2 vs BGP:**
+
+| Aspect | Layer 2 | BGP |
+|--------|---------|-----|
+| Active/Passive | Yes (one node) | Active-active possible |
+| Requirements | Same L2 network | BGP-capable routers |
+| Performance | Bottlenecked at active node | True load balancing |
+| Failover | Seconds | Seconds (BGP convergence) |
+| Setup complexity | Simple | More complex |
+
+**Layer 2 details:**
+
+```
+Service IP: 192.168.1.240
+Pool: 192.168.1.0/24
+
+When service created:
+- MetalLB picks IP from pool
+- Speaker on chosen node responds to ARP
+- Traffic arrives at that node
+- kube-proxy distributes to pods
+```
+
+**Failover:**
+
+```
+Active node fails
+Other speakers detect (via Kubernetes events)
+New leader elected
+New node responds to ARP
+Traffic routes to new node
+```
+
+**Limitations of Layer 2:**
+
+- Single node handles all traffic (bottleneck)
+- Bandwidth limited to one NIC
+- Brief downtime during failover
+
+**BGP details:**
+
+```
+Cluster peers with BGP routers
+Multiple speakers advertise service IP
+Router does ECMP (Equal-Cost Multi-Path)
+Traffic distributed across nodes
+```
+
+**Advantages:**
+
+- True load distribution
+- No single bottleneck
+- Better failover (BGP fast convergence)
+
+**Requires:**
+
+- BGP-capable routers
+- Routing configuration
+- More network expertise
+
+**Multi-pool:**
+
+```yaml
+# Different pools for different services:
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: prod-pool
+spec:
+  addresses:
+    - 192.168.1.240-192.168.1.250
+
+---
+
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: dev-pool
+spec:
+  addresses:
+    - 192.168.1.230-192.168.1.239
+```
+
+Annotate service:
+
+```yaml
+metadata:
+  annotations:
+    metallb.universe.tf/address-pool: dev-pool
+```
+
+**IP sharing:**
+
+```yaml
+metadata:
+  annotations:
+    metallb.universe.tf/allow-shared-ip: "shared-key"
+```
+
+Two services share one IP. Use case: TCP + UDP on same IP.
+
+**Sticky source IP:**
+
+```yaml
+spec:
+  externalTrafficPolicy: Local
+```
+
+Combined with MetalLB, preserves source IP.
+
+**Production considerations:**
+
+**Layer 2:**
+
+- Suitable for: small clusters, dev/test
+- IP pool must be in same L2 as cluster
+- Active-passive at IP level
+
+**BGP:**
+
+- Suitable for: production at scale
+- Better performance
+- Requires network coordination
+
+**Limitations:**
+
+- Doesn't replace true cloud LB
+- No automatic certificate management
+- Limited features compared to cloud LBs
+- Performance limited by node capacity
+
+**Alternatives:**
+
+**kube-vip:** similar functionality, alternative implementation.
+**PorterLB:** another bare metal LB.
+**Hardware LBs:** F5, Citrix integrate with Kubernetes via specific controllers.
+
+**Cloud LB equivalent on-prem:**
+
+For production on-prem:
+
+```
+MetalLB BGP + external BGP routers
++ Ingress controller
++ External DNS
++ cert-manager
+
+= Cloud-like experience
+```
+
+**Troubleshooting:**
+
+**Service still pending:**
+
+```bash
+# Check MetalLB:
+kubectl get pods -n metallb-system
+kubectl logs -n metallb-system deployment/controller
+```
+
+**Wrong IP assigned:**
+
+```bash
+# Check pools:
+kubectl get ipaddresspools -n metallb-system
+
+# Check service annotation
+kubectl describe svc my-service
+```
+
+**External access fails:**
+
+**Layer 2:**
+- Verify ARP working: `arp -a` on external client
+- Speaker logs
+
+**BGP:**
+- Check BGP session: from external router
+- Speaker logs
+
+**Production scenarios:**
+
+1. **MetalLB Layer 2 for small cluster**: Bare metal cluster, 10 nodes. MetalLB L2 mode. IP pool from corporate subnet. Simple, worked well.
+
+2. **BGP for production**: Data center cluster, 100+ nodes. MetalLB BGP with TOR switches. True load balancing across nodes. Production-grade.
+
+3. **IP exhaustion**: Started with small pool, ran out. Expanded pool. Services got new IPs (some breaking changes).
+
+4. **Layer 2 bottleneck**: Heavy traffic to one service. Active node CPU at 100%. Migrated to BGP. Load distributed across nodes.
+
+5. **MetalLB + cert-manager**: External services via MetalLB. cert-manager + Let's Encrypt. Cloud-like experience on bare metal.
+
+---
+
+## 368. Explain multi-cluster networking
+
+Multi-cluster networking connects multiple Kubernetes clusters. Required for cross-cluster service access, DR, and multi-region deployments.
+
+**Why multi-cluster:**
+
+- **Geographic distribution**: regions
+- **Tenant separation**: per-team/customer clusters
+- **DR**: failover clusters
+- **Scale**: too big for one cluster
+- **Compliance**: data sovereignty
+
+**Connectivity challenges:**
+
+```
+Cluster A: pod CIDR 10.244.0.0/16
+Cluster B: pod CIDR 10.245.0.0/16
+
+Issues:
+- Pod-to-pod across clusters?
+- Service discovery across?
+- Network policies cross-cluster?
+- Identity?
+- Encryption?
+```
+
+**Approaches:**
+
+**Approach 1: External access only**
+
+```
+Cluster A service exposed via LoadBalancer
+Cluster B pods access via external endpoint
+Traffic goes out and back
+```
+
+Simple but inefficient. Higher latency.
+
+**Approach 2: Direct pod-to-pod**
+
+Connect pod networks across clusters:
+
+- Submariner
+- Cilium Cluster Mesh
+- Calico Cluster Mesh
+- Tailscale / WireGuard
+
+**Approach 3: Service mesh multi-cluster**
+
+- Istio multi-cluster
+- Linkerd multi-cluster
+
+Service discovery and mTLS across clusters.
+
+**Submariner:**
+
+CNCF project for multi-cluster networking:
+
+```yaml
+# Components:
+- Gateway nodes (one per cluster)
+- Broker (cluster discovery)
+- Routes between clusters
+```
+
+**Setup:**
+
+```bash
+# Install broker (in one cluster):
+subctl deploy-broker --kubeconfig=cluster-a.kubeconfig
+
+# Join clusters:
+subctl join --kubeconfig=cluster-a.kubeconfig broker-info.subm
+subctl join --kubeconfig=cluster-b.kubeconfig broker-info.subm
+```
+
+**How it works:**
+
+```
+Cluster A pod → Gateway A
+Gateway A → encrypted tunnel → Gateway B
+Gateway B → Cluster B pod
+```
+
+**Service discovery:**
+
+```yaml
+# ServiceExport:
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: my-service
+```
+
+Service exported to other clusters.
+
+Access from another cluster:
+
+```
+my-service.namespace.svc.clusterset.local
+```
+
+Resolves to service in remote cluster.
+
+**Cilium Cluster Mesh:**
+
+```yaml
+# Enable cluster mesh:
+cilium clustermesh enable --context cluster-a
+cilium clustermesh enable --context cluster-b
+cilium clustermesh connect --context cluster-a --destination-context cluster-b
+```
+
+**Features:**
+
+- Cross-cluster pod-to-pod
+- Cross-cluster service discovery
+- Cross-cluster network policies
+- Identity-based across clusters
+
+**Global services:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    service.cilium.io/global: "true"
+spec:
+  selector:
+    app: my-app
+```
+
+Service spans clusters. Endpoints from all clusters.
+
+**Istio multi-cluster:**
+
+Multiple deployment models:
+
+**Single mesh, primary-remote:**
+
+```
+Primary cluster: control plane
+Remote clusters: data plane only
+```
+
+**Multi-primary:**
+
+```
+Each cluster: own control plane
+Federated
+```
+
+```yaml
+# Cross-cluster service:
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: cross-cluster-service
+spec:
+  hosts:
+    - my-service.cluster-b.local
+  endpoints:
+    - address: cluster-b-gateway-ip
+```
+
+**Network requirements:**
+
+```
+Clusters must be able to reach each other
+Options:
+- Cross-VPC peering (cloud)
+- Direct Connect / ExpressRoute (hybrid)
+- VPN
+- Public internet (with encryption)
+```
+
+**Non-overlapping CIDRs:**
+
+```
+Cluster A: 10.244.0.0/16
+Cluster B: 10.245.0.0/16
+Cluster C: 10.246.0.0/16
+```
+
+Plan from start.
+
+**Service discovery patterns:**
+
+**Pattern 1: Federated DNS**
+
+```
+my-service.cluster-a.global → cluster-a
+my-service.cluster-b.global → cluster-b
+```
+
+**Pattern 2: Shared DNS zone**
+
+```
+*.global.example.com
+DNS knows where each service is
+```
+
+**Pattern 3: Multi-cluster Services API (MCS)**
+
+```yaml
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: my-service
+
+---
+
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceImport
+metadata:
+  name: my-service
+```
+
+Standardized API across implementations.
+
+**Cross-cluster traffic patterns:**
+
+**Pattern 1: Active-passive**
+
+```
+Cluster A: primary
+Cluster B: standby (no traffic)
+Failover: traffic shifts to B
+```
+
+**Pattern 2: Active-active**
+
+```
+Both clusters serve traffic
+Geographic routing (closest)
+Load balancing
+```
+
+**Pattern 3: Cell-based**
+
+```
+Each cluster: complete cell (some users/data)
+Routing by user/tenant
+Failure isolated to cell
+```
+
+**Use cases:**
+
+**Use case 1: Disaster recovery**
+
+```
+Primary cluster: region A
+DR cluster: region B
+Data replicated
+Traffic shifts on failure
+```
+
+**Use case 2: Multi-region**
+
+```
+Users globally
+Cluster in each region
+Closer to users
+Lower latency
+```
+
+**Use case 3: Burst capacity**
+
+```
+Primary cluster handles normal load
+Secondary used for traffic spikes
+Auto-scale across clusters
+```
+
+**Use case 4: Team isolation**
+
+```
+Each team: own cluster
+Some services shared
+Multi-cluster networking for shared
+```
+
+**Costs:**
+
+**Network egress:**
+
+```
+Cross-region: $0.02-0.10/GB
+Cross-region adds significant cost
+```
+
+Plan for traffic patterns. Avoid unnecessary cross-cluster calls.
+
+**Operational complexity:**
+
+```
+Single cluster: complex
+Multi-cluster: much more complex
+- Multiple control planes
+- Network coordination
+- Cross-cluster troubleshooting
+- Identity federation
+```
+
+**Production scenarios:**
+
+1. **DR setup**: Primary in us-east-1, DR in us-west-2. Submariner connected. Apps failed over. Validated quarterly.
+
+2. **Cilium Cluster Mesh**: 5 production clusters. Cilium Cluster Mesh. Cross-cluster service access. Identity-based policies.
+
+3. **Istio multi-cluster**: Microservices across 3 regions. Istio multi-cluster mesh. mTLS across regions. Cross-cluster service discovery.
+
+4. **Hybrid cloud**: AWS + on-prem clusters. Submariner connected. Apps in AWS reached on-prem services directly.
+
+5. **Cost issues**: Initial setup had services chatting across regions. Egress costs exploded. Refactored to keep tightly-coupled services in same region.
+
+---
+
+## 369. How do you expose Stateful applications?
+
+Stateful applications (databases, message queues) have unique requirements for exposure due to their nature.
+
+**Challenges:**
+
+1. **Stable identity**: each replica is unique
+2. **Persistent connections**: clients reconnect to same instance
+3. **Different roles**: primary vs replica
+4. **Cluster-aware clients**: drivers may need topology
+5. **Direct pod access**: bypass load balancing sometimes
+
+**Exposure patterns:**
+
+**Pattern 1: Headless service for cluster operations**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+```
+
+Used by:
+- StatefulSet for stable DNS
+- Cluster members discovering each other
+- Replication
+
+**Pattern 2: Regular service for client access**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-rw
+spec:
+  selector:
+    app: postgres
+    role: primary
+  ports:
+    - port: 5432
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-ro
+spec:
+  selector:
+    app: postgres
+    role: replica
+  ports:
+    - port: 5432
+```
+
+Two services:
+- `postgres-rw`: writes go to primary
+- `postgres-ro`: reads from replicas
+
+**Pattern 3: Per-pod services**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-0
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: postgres-0
+  ports:
+    - port: 5432
+```
+
+Direct access to specific pod. Each gets its own service.
+
+Useful for:
+- Admin access
+- Backups
+- Targeted operations
+
+**Pattern 4: External exposure**
+
+For databases accessed from outside cluster:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-external
+spec:
+  type: LoadBalancer   # Or NodePort
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+```
+
+Or internal LoadBalancer for VPC-only access:
+
+```yaml
+metadata:
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+```
+
+**Pattern 5: ExternalName for external DB**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-rds
+spec:
+  type: ExternalName
+  externalName: mydb.region.rds.amazonaws.com
+```
+
+App accesses via internal name. Easy to swap to in-cluster DB.
+
+**Connection routing:**
+
+**Primary detection:**
+
+Some operators handle:
+
+```yaml
+# CloudNativePG provides:
+- postgres-rw service (writes)
+- postgres-r service (any node, including replicas for reads)
+- postgres-ro service (replicas only)
+```
+
+Operator updates labels on pods, services route based on labels.
+
+**Client-side topology awareness:**
+
+```python
+# MongoDB driver:
+client = MongoClient([
+    'mongodb://mongo-0.mongo:27017,mongo-1.mongo:27017,mongo-2.mongo:27017/?replicaSet=rs0'
+])
+```
+
+Driver knows about replica set, handles failover.
+
+**Cassandra:**
+
+```python
+cluster = Cluster([
+    'cassandra-0.cassandra.default.svc.cluster.local',
+    'cassandra-1.cassandra.default.svc.cluster.local',
+    'cassandra-2.cassandra.default.svc.cluster.local'
+])
+```
+
+Client connects to multiple nodes.
+
+**Sticky sessions:**
+
+Some stateful apps need session affinity:
+
+```yaml
+apiVersion: v1
+kind: Service
+spec:
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800   # 3 hours
+```
+
+Same client IP → same pod (for duration).
+
+**For Redis, RabbitMQ:**
+
+Connection-oriented. Client establishes long connection.
+
+**External access patterns:**
+
+**Pattern A: NodePort + DNS**
+
+```yaml
+spec:
+  type: NodePort
+```
+
+Each node has port. Use DNS round-robin or LB.
+
+**Pattern B: LoadBalancer**
+
+```yaml
+spec:
+  type: LoadBalancer
+```
+
+Cloud LB. Stable IP.
+
+**Pattern C: Ingress (for HTTP-based)**
+
+```yaml
+# For databases with HTTP API:
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+spec:
+  rules:
+    - host: my-db.example.com
+```
+
+Less common for traditional DBs (TCP).
+
+**Pattern D: TCP load balancer**
+
+Some Ingress controllers support TCP:
+
+```yaml
+# NGINX Ingress TCP:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tcp-services
+  namespace: ingress-nginx
+data:
+  "5432": "default/postgres-service:5432"
+```
+
+NGINX listens on TCP port, forwards to service.
+
+**Cross-cluster access:**
+
+For stateful apps spanning clusters:
+
+```yaml
+# ServiceExport (multi-cluster):
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: postgres
+```
+
+Accessible from other clusters via `postgres.namespace.svc.clusterset.local`.
+
+**Backup considerations:**
+
+```yaml
+# Per-pod service for backup tools:
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-backup-0
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: postgres-0
+  ports:
+    - port: 5432
+```
+
+Backup tools target specific pods.
+
+**Operator-managed:**
+
+Database operators (CloudNativePG, MongoDB Operator, etc.) typically:
+- Create headless service for cluster
+- Create RW service for primary
+- Create RO services for replicas
+- Manage failover (update labels)
+
+Use operators when possible.
+
+**StatefulSet integration:**
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres-headless   # Headless service
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: postgres
+```
+
+Pods get DNS:
+- `postgres-0.postgres-headless.default.svc.cluster.local`
+- `postgres-1.postgres-headless.default.svc.cluster.local`
+- `postgres-2.postgres-headless.default.svc.cluster.local`
+
+**Common issues:**
+
+**Issue 1: Connection storms**
+
+When pods restart, clients reconnect simultaneously.
+
+Mitigation:
+- Connection pooling
+- Backoff in clients
+- Pod anti-affinity (avoid simultaneous reboots)
+
+**Issue 2: Failover detection**
+
+Client doesn't know primary changed.
+
+Solutions:
+- Topology-aware drivers
+- Service mesh with health checks
+- Operator updates service labels
+
+**Issue 3: External access security**
+
+Database directly exposed = security risk.
+
+Solutions:
+- Internal LoadBalancer only
+- VPN access
+- Bastion host
+- Application-level access only
+
+**Production scenarios:**
+
+1. **PostgreSQL with operator**: CloudNativePG operator. Auto-managed primary/replica services. Apps used postgres-rw and postgres-ro. Operator handled failover.
+
+2. **Per-pod services for backups**: Created per-pod services. Backup tools used pod-specific service. Could backup specific replicas.
+
+3. **External DB via ExternalName**: Used AWS RDS. Internal app used `db.default.svc.cluster.local` via ExternalName. Easy to migrate later.
+
+4. **Cross-AZ Redis**: Redis cluster spans AZs. Headless service for cluster operations. Client-side topology aware. Survived AZ failure.
+
+5. **TCP Ingress for MongoDB**: External MongoDB clients. NGINX Ingress with TCP services. Single endpoint, routed to internal service.
+
+---
+
+## 370. Explain external traffic policies
+
+`externalTrafficPolicy` controls how external traffic to LoadBalancer/NodePort services is handled. Significant impact on source IP and traffic distribution.
+
+**Two values:**
+
+**Cluster (default):**
+
+```yaml
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+```
+
+**Behavior:**
+- Traffic distributes to all nodes
+- Each node can forward to pods on other nodes
+- Source IP NAT'd (lost)
+- Even distribution
+
+**Local:**
+
+```yaml
+spec:
+  externalTrafficPolicy: Local
+```
+
+**Behavior:**
+- Traffic only to nodes with pods
+- No cross-node forwarding
+- Source IP preserved
+- Potentially uneven distribution
+
+**Detailed comparison:**
+
+**Cluster:**
+
+```
+External client → LB → Node A (no pod) → Forward to Node B (has pod) → Pod
+                       ↓ SNAT applied
+                  Pod sees source = Node A IP, not client IP
+```
+
+Pros:
+- Even traffic distribution
+- All nodes accept traffic
+- Simple
+
+Cons:
+- Source IP lost (SNAT)
+- Extra hop (latency)
+- Less efficient
+
+**Local:**
+
+```
+External client → LB → Health checks find Node B (has pod) → Pod
+                                                              ↑
+                                                  No SNAT, source = client IP
+```
+
+Pros:
+- Source IP preserved
+- One hop (efficient)
+- Better for security (real client IP)
+
+Cons:
+- Imbalanced if pods not evenly distributed
+- Nodes without pods don't get traffic
+- LB needs health checks per node
+
+**When source IP matters:**
+
+```python
+# App code:
+@app.route('/api')
+def api():
+    client_ip = request.remote_addr
+    # With externalTrafficPolicy: Cluster: see node IP
+    # With externalTrafficPolicy: Local: see client IP
+```
+
+**Use cases for source IP:**
+
+- Logging real client IPs
+- Geographic-based features
+- IP allowlisting/denylisting
+- Compliance/audit trails
+
+**LoadBalancer health checks:**
+
+**Cluster:**
+
+```
+LB sends traffic to any healthy node
+All nodes return healthy
+```
+
+**Local:**
+
+```
+LB sends health check to NodePort
+Node without pod returns 503
+Node with pod returns 200
+LB only sends traffic to "healthy" nodes
+```
+
+**Health check port:**
+
+Different from service port. Auto-assigned.
+
+```bash
+# View:
+kubectl describe svc my-service
+# healthCheckNodePort: 31234
+```
+
+**Health check probe:**
+
+```
+LB → Node:healthCheckNodePort → kube-proxy on node
+       ↓
+   Pod on this node? → 200 OK : 503 Service Unavailable
+```
+
+**Pod distribution:**
+
+**Local mode requires:**
+
+```yaml
+# Multiple replicas:
+replicas: 3
+
+# Or anti-affinity for spread:
+spec:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: my-app
+            topologyKey: kubernetes.io/hostname
+```
+
+Ensure pods on multiple nodes. Otherwise, traffic concentrated.
+
+**Combination with internalTrafficPolicy:**
+
+```yaml
+spec:
+  internalTrafficPolicy: Local
+```
+
+Internal cluster traffic prefers same-node pods.
+
+Use case:
+- DaemonSets (always local pod available)
+- Reduce cross-node traffic
+- Lower latency
+
+**Practical examples:**
+
+**Web app needing real IPs:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: web-app
+```
+
+Plus pod anti-affinity to ensure distribution.
+
+**API behind WAF:**
+
+```yaml
+# WAF passes X-Forwarded-For header
+spec:
+  externalTrafficPolicy: Cluster   # OK, header has real IP
+```
+
+Cluster mode acceptable when proxy provides client IP.
+
+**Ingress controller:**
+
+```yaml
+# Ingress controller service:
+spec:
+  externalTrafficPolicy: Local
+```
+
+Real client IPs at Ingress. Forwarded to backends via X-Forwarded-For.
+
+**Imbalance issues:**
+
+**Scenario:**
+
+```
+3 pods, 5 nodes
+Local mode: only 3 nodes receive traffic
+2 nodes get nothing
+Imbalanced
+```
+
+**Solutions:**
+
+1. **More replicas:**
+
+```yaml
+replicas: 5   # Match node count
+```
+
+2. **DaemonSet:**
+
+```yaml
+kind: DaemonSet   # One per node
+```
+
+3. **Topology spread:**
+
+```yaml
+spec:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app: web-app
+```
+
+**NodePort behavior:**
+
+Same policies apply:
+
+```yaml
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+```
+
+External NodePort traffic preserves source IP.
+
+**Internal traffic (always cluster behavior):**
+
+Pods inside cluster reaching service:
+
+```python
+# Pod accesses service:
+requests.get('http://my-service:80')
+# Always cluster-style routing (kube-proxy)
+# externalTrafficPolicy doesn't apply
+```
+
+`internalTrafficPolicy: Local` changes this:
+
+```yaml
+spec:
+  internalTrafficPolicy: Local
+```
+
+Internal traffic also prefers local node.
+
+**Source IP preservation alternatives:**
+
+**Method 1: externalTrafficPolicy: Local**
+
+As described.
+
+**Method 2: HTTP X-Forwarded-For**
+
+```yaml
+# Ingress preserves via header:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
+```
+
+App reads header for real IP.
+
+**Method 3: PROXY protocol**
+
+```yaml
+# NLB with proxy protocol:
+metadata:
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
+```
+
+Protocol prepends client IP to TCP connection.
+
+**Cost considerations:**
+
+**Cluster mode:**
+
+- Cross-zone traffic (if pod on different zone from receiving node)
+- Adds inter-zone egress cost
+
+**Local mode:**
+
+- Less cross-zone (LB routes to nodes with pods directly)
+- Saves egress
+
+**Production scenarios:**
+
+1. **Source IP for logging**: Web app needed real client IPs. Changed to `externalTrafficPolicy: Local`. Logs showed actual IPs.
+
+2. **Imbalanced traffic**: Set Local mode. Pods on 3 of 10 nodes. Severely imbalanced. Added topology spread. Better distribution.
+
+3. **NLB with PROXY protocol**: Wanted source IP preservation without Local mode constraints. PROXY protocol on NLB. App parsed protocol. Real IPs preserved.
+
+4. **Ingress with Local**: NGINX Ingress service used Local. Real IPs at Ingress. Forwarded to backends. Backends could use real IP.
+
+5. **Cross-zone cost reduction**: Cluster mode caused significant cross-zone traffic. Switched to Local + topology spread. Saved 30% on inter-zone egress.
+
+---
+
+## 371. How do you secure east-west traffic?
+
+East-west traffic (within cluster) is often unsecured by default. Multiple layers needed for security.
+
+**Default state:**
+
+```
+Pod A → Pod B
+Plain HTTP/TCP
+No authentication
+No encryption
+Anyone in cluster can intercept
+```
+
+**Threat model:**
+
+- Compromised pod accessing other services
+- Network sniffing
+- Man-in-the-middle
+- Replay attacks
+- Unauthorized access
+
+**Defense layers:**
+
+**Layer 1: Network policies**
+
+L3/L4 isolation:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - port: 8080
+```
+
+Restricts who can talk to whom.
+
+**Layer 2: mTLS via service mesh**
+
+Encryption + authentication:
+
+```yaml
+# Istio:
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+All in-mesh traffic mTLS.
+
+**Layer 3: Authorization policies**
+
+L7 access control:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: backend-access
+spec:
+  selector:
+    matchLabels:
+      app: backend
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/frontend"]
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            paths: ["/api/v1/*"]
+```
+
+Service-level authorization.
+
+**Layer 4: Application authentication**
+
+App-level auth:
+
+```python
+# JWT validation:
+@app.route('/api')
+@require_jwt
+def api():
+    user = request.user
+    # ...
+```
+
+Defense in depth.
+
+**Layer 5: Encryption at network**
+
+CNI-level encryption:
+
+```yaml
+# Cilium WireGuard:
+spec:
+  encryption:
+    enabled: true
+    type: wireguard
+```
+
+All pod-to-pod encrypted.
+
+**Service mesh deep dive:**
+
+**Istio architecture:**
+
+```
+Apps in mesh have Envoy sidecar
+       ↓
+Sidecar handles:
+- mTLS (certificate-based identity)
+- Authorization
+- Routing
+- Observability
+```
+
+**Identity:**
+
+Each workload gets cryptographic identity:
+
+```
+spiffe://cluster.local/ns/production/sa/my-app
+```
+
+**mTLS handshake:**
+
+```
+Pod A → connect to Pod B
+       ↓
+Sidecar A intercepts
+Sidecar B receives
+       ↓
+Mutual cert exchange:
+- A presents cert for my-app SA
+- B presents cert for backend SA
+- Both verify each other
+       ↓
+Encrypted channel established
+```
+
+**STRICT vs PERMISSIVE:**
+
+```yaml
+mtls:
+  mode: STRICT      # Only mTLS allowed
+# OR
+mtls:
+  mode: PERMISSIVE  # mTLS or plain (transition)
+# OR  
+mtls:
+  mode: DISABLE     # No mTLS
+```
+
+**Linkerd mTLS:**
+
+```
+Automatic mTLS in Linkerd
+No configuration needed
+All meshed workloads get mTLS
+```
+
+**Authorization policies:**
+
+**Allow specific workloads:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: api-access
+spec:
+  selector:
+    matchLabels:
+      app: api
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/web"]
+            namespaces: ["production"]
+```
+
+Only specific SAs.
+
+**Deny by default:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: production
+spec:
+  {}
+```
+
+Default deny. Then allow explicit.
+
+**JWT-based:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+spec:
+  rules:
+    - from:
+        - source:
+            requestPrincipals: ["accounts.google.com/123"]
+```
+
+Authorize based on JWT claims.
+
+**Non-mesh approaches:**
+
+**Application-level TLS:**
+
+App opens TLS connection to peer:
+
+```python
+import ssl
+context = ssl.create_default_context()
+context.load_verify_locations('/etc/ssl/ca.crt')
+context.load_cert_chain('/etc/ssl/client.crt', '/etc/ssl/client.key')
+
+conn = http.client.HTTPSConnection('backend', context=context)
+```
+
+Complex; service mesh easier.
+
+**CNI encryption (no mesh):**
+
+**Cilium WireGuard:**
+
+```yaml
+spec:
+  encryption:
+    enabled: true
+    type: wireguard
+```
+
+All pod-to-pod encrypted at network layer.
+
+**Calico WireGuard:**
+
+```yaml
+spec:
+  wireguardEnabled: true
+```
+
+Similar.
+
+**Authentication for cluster API:**
+
+**API server access:**
+
+```yaml
+# OIDC:
+- --oidc-issuer-url=...
+- --oidc-client-id=kubernetes
+```
+
+Users authenticate via OIDC.
+
+**Service account tokens:**
+
+For workloads:
+
+```yaml
+# Bound projected tokens:
+spec:
+  containers:
+    - volumeMounts:
+        - name: token
+          mountPath: /var/run/secrets/tokens
+  volumes:
+    - name: token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: my-token
+              expirationSeconds: 3600
+              audience: my-api
+```
+
+Short-lived, audience-bound.
+
+**Zero-trust principles:**
+
+```
+Never trust based on network location
+Authenticate every connection
+Authorize every request
+Encrypt everything
+```
+
+**Implementation:**
+
+```
+Workload identity (SA)
+       ↓
+mTLS for transport
+       ↓
+Authorization policies
+       ↓
+JWT for users
+       ↓
+Audit everything
+```
+
+**Cilium identity-based:**
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: web
+            tier: frontend
+```
+
+Identity (labels) based, not IP. Survives pod restart.
+
+**Combination strategy:**
+
+```
+Layer 1: NetworkPolicy (L3/L4)
+Layer 2: Service mesh mTLS (transport security)
+Layer 3: AuthorizationPolicy (L7 access)
+Layer 4: App-level auth (defense in depth)
+Layer 5: Audit logs (visibility)
+```
+
+**Monitoring:**
+
+```promql
+# Istio mTLS coverage:
+sum(rate(istio_requests_total{security_policy="mutual_tls"}[5m]))
+/
+sum(rate(istio_requests_total[5m]))
+```
+
+Should be ~100% in strict mode.
+
+**Hubble for visibility:**
+
+```bash
+hubble observe --verdict DROPPED
+# See blocked traffic
+```
+
+**Production scenarios:**
+
+1. **Istio strict mTLS**: Migrated cluster to STRICT mTLS. All internal traffic encrypted. Strong identity verification. SOC 2 audit easier.
+
+2. **NetworkPolicy + Istio**: Defense in depth. NetworkPolicy at L3/L4. Istio for identity and encryption. Compromise of one layer didn't break security.
+
+3. **Cilium WireGuard**: Encrypted east-west without service mesh. WireGuard on Cilium. All pod traffic encrypted. Lower overhead than Istio.
+
+4. **API key elimination**: Replaced API keys for service-to-service auth with Istio mTLS identities. No more key rotation. Cleaner.
+
+5. **Compromise containment**: App vulnerability allowed RCE. mTLS prevented lateral movement (compromise had no valid cert for other services). Limited damage.
+
+---
+
+## 372. Explain service mesh networking
+
+Service mesh adds a dedicated infrastructure layer for service-to-service communication. Handles networking, security, observability.
+
+**Architecture:**
+
+```
+Application pods (with sidecar)
+       ↓
+Sidecar proxies (Envoy)
+       ↓ (intercepts all traffic)
+Control plane (Istiod, Linkerd controller)
+       ↓ (configures sidecars)
+```
+
+**Sidecar pattern:**
+
+```yaml
+spec:
+  containers:
+    - name: app
+      image: my-app
+    # Sidecar injected automatically:
+    - name: istio-proxy
+      image: docker.io/istio/proxyv2:latest
+```
+
+Every pod has proxy. All traffic flows through it.
+
+**What sidecar does:**
+
+```
+1. Intercept outbound traffic from app
+2. Apply policies (auth, retry, etc.)
+3. Establish mTLS to destination
+4. Forward to destination's sidecar
+5. Receive response
+6. Forward to app
+```
+
+App unaware.
+
+**Major service meshes:**
+
+**Istio:**
+
+- Most feature-rich
+- Envoy-based
+- Larger resource footprint
+- Steeper learning curve
+
+**Linkerd:**
+
+- Simpler, lighter
+- Custom Rust proxy
+- Easier to operate
+- Less feature-rich than Istio
+
+**Cilium Service Mesh:**
+
+- eBPF-based (no sidecars)
+- Newer
+- Network and mesh in one
+
+**Capabilities:**
+
+**Capability 1: Encrypted communication (mTLS)**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+All in-mesh traffic encrypted automatically.
+
+**Capability 2: Authentication**
+
+Workload identity via certificates:
+
+```
+Each pod gets cert for: cluster.local/ns/namespace/sa/serviceaccount
+Other pods verify identity
+```
+
+**Capability 3: Authorization**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+spec:
+  selector:
+    matchLabels:
+      app: api
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/web"]
+```
+
+Service-level authorization.
+
+**Capability 4: Traffic management**
+
+**Traffic splitting:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: my-app
+spec:
+  http:
+    - route:
+        - destination:
+            host: my-app
+            subset: v1
+          weight: 90
+        - destination:
+            host: my-app
+            subset: v2
+          weight: 10
+```
+
+Canary deployments.
+
+**Retries:**
+
+```yaml
+spec:
+  http:
+    - route:
+        - destination:
+            host: my-app
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+```
+
+**Timeouts:**
+
+```yaml
+spec:
+  http:
+    - timeout: 5s
+```
+
+**Circuit breakers:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+spec:
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+```
+
+**Capability 5: Observability**
+
+Automatic:
+- Request rate, errors, latency
+- Service dependencies
+- Distributed traces
+
+```promql
+# Auto-generated metrics:
+sum(rate(istio_requests_total[5m])) by (destination_service)
+```
+
+**Capability 6: Multi-cluster**
+
+```yaml
+# Cross-cluster service:
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: remote-service
+spec:
+  hosts:
+    - my-service.remote-cluster.local
+```
+
+Service mesh spans clusters.
+
+**Traffic flow with mesh:**
+
+**Without mesh:**
+
+```
+App A → Service A → Service B → App B
+         (L4 routing)
+```
+
+**With mesh:**
+
+```
+App A → Sidecar A → Sidecar B → App B
+                ↓
+        (L7 policies, mTLS, telemetry)
+```
+
+**Performance impact:**
+
+- Latency: 1-3ms per hop
+- CPU: 2-5% per sidecar
+- Memory: 50-200MB per sidecar
+
+For most apps: acceptable.
+
+For latency-critical: consider impact.
+
+**Sidecar-less alternatives:**
+
+**Cilium Service Mesh:**
+
+```
+eBPF in kernel
+No sidecars
+Less overhead
+Newer, less battle-tested
+```
+
+**Envoy ambient mesh (Istio):**
+
+```
+Per-node proxy (no per-pod sidecar)
+Ztunnel + waypoint proxies
+Less overhead
+```
+
+**Multi-cluster mesh:**
+
+**Single mesh:**
+
+```
+One control plane (or replicated)
+Multiple clusters
+Services discoverable across
+mTLS across clusters
+```
+
+**Multi-mesh:**
+
+```
+Multiple meshes federated
+More complex
+For very large/separate deployments
+```
+
+**Comparison:**
+
+| Aspect | Istio | Linkerd | Cilium |
+|--------|-------|---------|--------|
+| Architecture | Sidecars (or ambient) | Sidecars | eBPF (no sidecars) |
+| Proxy | Envoy | Linkerd2-proxy (Rust) | None (eBPF) |
+| mTLS | Yes | Yes (default) | Yes |
+| L7 features | Rich | Basic | Growing |
+| Performance | Good | Better | Best |
+| Complexity | High | Lower | Medium |
+| Multi-cluster | Mature | Yes | Yes (Cluster Mesh) |
+
+**When to use service mesh:**
+
+**Use service mesh when:**
+
+- Many microservices (10+)
+- Need zero-trust security
+- Want detailed observability
+- Multi-cluster needs
+- Compliance requires encryption
+
+**Don't use when:**
+
+- Few services (<10)
+- Performance critical (every ms counts)
+- Team can't operate it
+- Don't need its features
+
+**Operational considerations:**
+
+**Pros:**
+
+- Standardized security
+- Rich observability
+- Traffic management without code changes
+- Multi-cluster support
+
+**Cons:**
+
+- Operational complexity
+- Resource overhead
+- Learning curve
+- Another thing to manage
+
+**Migration:**
+
+Adding mesh to existing cluster:
+
+1. Install mesh
+2. Enable sidecar injection per namespace
+3. Test with low-risk services
+4. Gradual rollout
+5. Enable strict policies once stable
+
+**Production scenarios:**
+
+1. **Istio for compliance**: SOC 2 needed encrypted internal traffic. Adopted Istio with strict mTLS. Compliance achieved with little app changes.
+
+2. **Linkerd for simplicity**: Wanted mTLS but Istio complex. Adopted Linkerd. Simpler, met needs.
+
+3. **Cilium for performance**: Latency-sensitive app. Sidecars added too much latency. Cilium Service Mesh (eBPF). Performance preserved.
+
+4. **Traffic splitting**: Canary deployments via Istio VirtualService. 5% traffic to new version, gradually 100%. Easy rollback.
+
+5. **Observability win**: Without mesh, manual instrumentation. Istio auto-generated golden signals for all services. Standardized monitoring.
+
+---
+
+## 373. How do you debug packet loss?
+
+Packet loss causes various issues: dropped connections, retransmissions, slow apps. Systematic diagnosis required.
+
+**Symptoms:**
+
+- TCP retransmissions
+- Increased latency
+- Connection timeouts
+- Partial responses
+- Higher error rates
+
+**Step 1: Identify scope**
+
+```
+All pods affected? Network issue cluster-wide
+Specific pods? Pod or node issue
+Specific destinations? Routing/firewall
+Specific times? Capacity or contention
+```
+
+**Step 2: Measure baseline**
+
+```bash
+# Ping test:
+kubectl exec test-pod -- ping -c 100 target
+
+# Output:
+# 100 packets transmitted, 95 received, 5% packet loss
+```
+
+5% loss = significant.
+
+**Step 3: TCP-level diagnosis**
+
+```bash
+# Check TCP retransmissions:
+kubectl exec test-pod -- netstat -s | grep -i retrans
+```
+
+High retransmissions = packet loss.
+
+**Step 4: Network path**
+
+```bash
+# Trace route:
+kubectl exec test-pod -- traceroute target-ip
+
+# MTR (continuous):
+kubectl exec test-pod -- mtr -c 100 target-ip
+```
+
+MTR shows loss per hop:
+
+```
+Host                          Loss%   Snt
+gateway-1.example.com         0.0%   100
+intermediate-1.example.com    5.0%   100   <- Issue here
+final-hop.example.com         5.0%   100
+```
+
+**Step 5: Interface stats**
+
+```bash
+# On node:
+ip -s link show eth0
+# Or:
+cat /proc/net/dev
+```
+
+Look for:
+- RX errors
+- TX errors
+- Drops
+- Overruns
+
+**Step 6: TCP stats**
+
+```bash
+# Node:
+ss -s
+nstat -a
+```
+
+**Step 7: Conntrack**
+
+```bash
+# Conntrack table full causes drops:
+sudo conntrack -L | wc -l
+
+# Limit:
+sysctl net.netfilter.nf_conntrack_max
+```
+
+If approaching limit:
+
+```bash
+sysctl -w net.netfilter.nf_conntrack_max=1048576
+```
+
+**Step 8: MTU issues**
+
+```bash
+# Test with large packets:
+kubectl exec test-pod -- ping -M do -s 1450 target
+
+# If smaller works but larger fails: MTU mismatch
+```
+
+Find MTU:
+
+```bash
+# Binary search:
+ping -M do -s 1450 target   # Works
+ping -M do -s 1500 target   # Fails
+ping -M do -s 1475 target   # Try midpoint
+```
+
+**Common causes:**
+
+**Cause 1: Network congestion**
+
+```bash
+# Check bandwidth:
+iperf3 -c target
+
+# Should match expected
+# If much lower: congestion or limit
+```
+
+**Cause 2: NIC issues**
+
+```bash
+# Errors on NIC:
+ip -s link show eth0
+
+# Hardware issue if errors high
+```
+
+**Cause 3: Conntrack overflow**
+
+```bash
+# Check:
+dmesg | grep -i conntrack
+
+# Look for: "nf_conntrack: table full, dropping packet"
+```
+
+Fix: increase limits.
+
+**Cause 4: Iptables performance**
+
+Many rules = slow:
+
+```bash
+# Count rules:
+iptables-save | wc -l
+
+# Many thousands = potential issue
+```
+
+Switch to IPVS or eBPF.
+
+**Cause 5: CNI issues**
+
+```bash
+# Calico:
+kubectl logs -n kube-system -l k8s-app=calico-node
+
+# Cilium:
+kubectl logs -n kube-system -l k8s-app=cilium
+
+# Look for errors
+```
+
+**Cause 6: MTU mismatch**
+
+Common with overlays:
+
+```
+Node MTU: 9000 (jumbo frames)
+Overlay MTU: 8950 (VXLAN overhead)
+
+If pod set to 9000: large packets fragment/drop
+```
+
+Fix: align MTU.
+
+**Cause 7: Cross-zone issues**
+
+```bash
+# Pods in different zones, higher loss?
+kubectl get pods -o wide
+```
+
+Cloud provider issues, intermittent.
+
+**Cause 8: NodeLocal DNSCache issues**
+
+```
+DNS queries dropped → app errors
+Not technically packet loss but appears similar
+```
+
+Check NodeLocal DNS health.
+
+**Tools:**
+
+**tcpdump:**
+
+```bash
+# Capture on node:
+sudo tcpdump -i any -w /tmp/capture.pcap host target-ip
+
+# Analyze in Wireshark
+```
+
+**ss / netstat:**
+
+```bash
+# Active connections:
+ss -tan
+
+# Statistics:
+ss -s
+```
+
+**iperf3:**
+
+```bash
+# Throughput test:
+# Server:
+iperf3 -s
+
+# Client:
+iperf3 -c server-ip
+```
+
+**Cilium Hubble:**
+
+```bash
+hubble observe --verdict DROPPED
+# See dropped packets
+```
+
+**Specific scenarios:**
+
+**Scenario 1: Random drops**
+
+Possible causes:
+- NIC issues
+- Network congestion
+- Driver problems
+
+Check:
+- NIC error counters
+- Switch port stats (if accessible)
+- Time-based patterns
+
+**Scenario 2: Pod-to-pod drops**
+
+Possible causes:
+- NetworkPolicy blocking
+- CNI issues
+- Overlay issues
+
+Check:
+- NetworkPolicies
+- CNI logs
+- Try without overlay (if possible)
+
+**Scenario 3: Service drops**
+
+Possible causes:
+- kube-proxy rules wrong
+- Endpoints empty
+- Selector mismatch
+
+Check:
+- Service endpoints
+- kube-proxy logs
+- iptables rules
+
+**Scenario 4: External drops**
+
+Possible causes:
+- NAT gateway issues
+- Firewall
+- DNS
+
+Check:
+- NAT gateway metrics
+- Firewall logs
+- DNS resolution
+
+**Production scenarios:**
+
+1. **MTU mismatch**: New cluster, intermittent issues. ping -M do -s 1450 succeeded, -s 1500 failed. VXLAN overhead. Lowered pod MTU. Resolved.
+
+2. **Conntrack full**: High traffic, drops occurring. Conntrack table full. Increased max. No more drops.
+
+3. **NIC error**: Random drops on one node. Interface stats showed RX errors high. Bad NIC. Replaced node.
+
+4. **NetworkPolicy too strict**: After NetworkPolicy added, intermittent drops. Forgot DNS allow. Some queries dropped. Added DNS allow.
+
+5. **Cross-AZ issues**: AWS reported "increased packet loss in us-east-1c". Drained nodes in that AZ. Customers unaffected after.
+
+---
+
+## 374. Explain MTU mismatch issues
+
+MTU (Maximum Transmission Unit) mismatches cause subtle, hard-to-debug problems. Common in overlay networks.
+
+**MTU basics:**
+
+```
+MTU: largest packet size that can be transmitted
+Standard Ethernet: 1500 bytes
+Jumbo frames: 9000 bytes
+```
+
+**TCP MSS:**
+
+```
+MSS = MTU - IP header (20) - TCP header (20)
+For 1500 MTU: MSS = 1460
+```
+
+**Path MTU Discovery (PMTUD):**
+
+```
+Sender sends large packet with "Don't Fragment" flag
+Intermediate router has smaller MTU
+Returns ICMP "Fragmentation Needed"
+Sender reduces size, retries
+```
+
+PMTUD works when ICMP not blocked.
+
+**Why MTU matters in K8s:**
+
+**Overlay networks:**
+
+```
+Pod MTU: 1500 (configured)
+Node MTU: 1500
+VXLAN overhead: 50 bytes
+Actual usable for pod: 1450
+```
+
+If pod sends 1500-byte packet:
+- After VXLAN encapsulation: 1550 bytes
+- Exceeds node MTU
+- Fragmentation needed (slow)
+- Or dropped if DF set
+
+**Symptoms:**
+
+- Small requests work
+- Large requests fail or slow
+- "Connection reset" or timeouts
+- Web pages load partially
+- File transfers hang
+
+**Detection:**
+
+**Test 1: Ping with different sizes**
+
+```bash
+# Small packet (works):
+ping -c 5 -s 100 target
+
+# Large packet (may fail):
+ping -c 5 -s 1450 target
+
+# Don't Fragment (no PMTUD):
+ping -c 5 -M do -s 1500 target
+
+# Find MTU:
+ping -M do -s 1472 target   # 1472 + 28 (ICMP+IP) = 1500
+```
+
+**Test 2: TCP traceroute**
+
+```bash
+# TCP path MTU:
+tracepath target
+```
+
+**Test 3: Check interfaces**
+
+```bash
+# Show MTUs:
+ip link show
+
+# Output:
+# eth0: MTU 1500
+# vxlan.calico: MTU 1450
+# cali12345: MTU 1450
+```
+
+**Common scenarios:**
+
+**Scenario 1: VXLAN overlay**
+
+```
+Node MTU: 1500
+VXLAN adds 50 bytes
+Pod MTU should be: 1450
+```
+
+If pod set to 1500: problems.
+
+**Scenario 2: IPIP overlay**
+
+```
+Node MTU: 1500
+IPIP adds 20 bytes
+Pod MTU: 1480
+```
+
+**Scenario 3: Cloud provider differences**
+
+```
+AWS: standard MTU 1500, jumbo 9001
+Azure: 1500
+GCP: 1460 (uses smaller default)
+```
+
+Mismatch between clusters.
+
+**Scenario 4: VPN tunnels**
+
+```
+Internet path: 1500
+VPN adds overhead
+Inside VPN: 1400 or smaller
+```
+
+Pods behind VPN need smaller MTU.
+
+**Scenario 5: Jumbo frames**
+
+```
+Cluster uses jumbo: 9000
+Some path doesn't: 1500
+Drops between
+```
+
+**CNI MTU configuration:**
+
+**Calico:**
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: FelixConfiguration
+metadata:
+  name: default
+spec:
+  mtuIfacePattern: "^eth"
+```
+
+Or explicit:
+
+```yaml
+spec:
+  vxlanMTU: 1450
+  ipipMTU: 1480
+```
+
+**Flannel:**
+
+```yaml
+# Flannel config:
+net-conf.json: |
+  {
+    "Backend": {
+      "Type": "vxlan",
+      "MTU": 1450
+    }
+  }
+```
+
+**Cilium:**
+
+```yaml
+spec:
+  routingMode: tunnel
+  tunnel: vxlan
+  # MTU auto-detected typically
+```
+
+**Calculating MTU:**
+
+```
+Underlying interface MTU - encapsulation overhead
+
+VXLAN: -50
+IPIP: -20
+WireGuard: -80 (with encryption)
+IPSec: -73 (depending on cipher)
+```
+
+**Best practices:**
+
+**Practice 1: Don't change MTU casually**
+
+```
+Default cluster: usually works
+Custom needs: research thoroughly
+```
+
+**Practice 2: Test thoroughly**
+
+```bash
+# Test various sizes:
+for size in 100 500 1000 1400 1450 1500; do
+  ping -M do -s $size target
+done
+```
+
+**Practice 3: Consistent across cluster**
+
+```
+All nodes same MTU
+All pods same MTU
+No mismatches
+```
+
+**Practice 4: Account for overlays**
+
+```
+Pod MTU < Node MTU
+By overhead amount
+```
+
+**Practice 5: Document configurations**
+
+```yaml
+# Document MTU choices:
+# Node MTU: 9000 (jumbo)
+# VXLAN overhead: 50
+# Pod MTU: 8950
+```
+
+**Troubleshooting:**
+
+**Step 1: Identify symptoms**
+
+```
+Small packets work?
+Large packets fail?
+PMTUD blocked?
+```
+
+**Step 2: Find effective MTU**
+
+```bash
+# Binary search:
+ping -M do -s X target
+
+# Find largest X that works
+```
+
+**Step 3: Check interfaces**
+
+```bash
+# Node:
+ip link show
+
+# Pod:
+kubectl exec test-pod -- ip link show
+```
+
+**Step 4: Check overlay**
+
+```bash
+# Calico:
+calicoctl get felixconfiguration default -o yaml
+
+# Cilium:
+kubectl exec -n kube-system <cilium-pod> -- cilium status
+```
+
+**Step 5: Trace path**
+
+```bash
+tracepath target
+# Shows MTU per hop
+```
+
+**Fix examples:**
+
+**Fix 1: Set pod MTU correctly**
+
+CNI config to match:
+
+```yaml
+# Calico:
+spec:
+  vxlanMTU: 1450   # Node MTU - VXLAN overhead
+```
+
+**Fix 2: Disable encapsulation**
+
+If possible:
+
+```yaml
+# Calico with BGP:
+spec:
+  ipipMode: Never
+  vxlanMode: Never
+```
+
+Native routing, no overhead.
+
+**Fix 3: Adjust MSS clamping**
+
+```yaml
+# NGINX Ingress:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/server-snippet: |
+      proxy_set_header MSS_size 1400;
+```
+
+MSS clamping forces TCP to use smaller MSS.
+
+**Fix 4: TCP MSS via iptables**
+
+```bash
+# On node:
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+```
+
+Adjusts MSS based on PMTU.
+
+**ICMP requirements:**
+
+PMTUD requires ICMP "Fragmentation Needed":
+
+```
+Type 3, Code 4
+```
+
+If firewall blocks: PMTUD fails. Packets silently dropped.
+
+```bash
+# Verify ICMP allowed:
+iptables -L | grep icmp
+```
+
+**Production scenarios:**
+
+1. **VXLAN MTU**: New cluster, large uploads failed. Web requests OK. VXLAN MTU not adjusted. Pod 1500, node 1500, overhead caused fragmentation. Set pod to 1450.
+
+2. **VPN tunnel**: Pods behind VPN. MTU 1500 too large for tunnel. Set MSS clamping. Worked correctly.
+
+3. **Jumbo frames**: Set jumbo on nodes (9000). Forgot to update pod MTU. Pods still 1500 (wasted). Set pods to 8950. Throughput increased.
+
+4. **ICMP blocked**: Corporate firewall blocked ICMP. PMTUD broken. Random drops. Added explicit MSS clamping. Mitigated.
+
+5. **Cross-cloud MTU**: AWS (1500) and GCP (1460) clusters. Connectivity issues for large packets. Standardized at 1400. Reliable.
+
+---
+
+## 375. How do you troubleshoot ingress bottlenecks?
+
+Ingress controllers can become bottlenecks. Systematic diagnosis identifies and resolves issues.
+
+**Symptoms:**
+
+- High latency at ingress
+- 502/503/504 errors
+- Timeouts
+- Connection refused
+- High CPU
+
+on ingress pods
+
+**Step 1: Measure**
+
+```promql
+# Request rate per pod:
+sum by (pod) (rate(nginx_ingress_controller_requests[5m]))
+
+# Latency:
+histogram_quantile(0.99,
+  rate(nginx_ingress_controller_request_duration_seconds_bucket[5m])
+)
+
+# Errors:
+sum by (status) (rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
+```
+
+**Step 2: Check ingress controller resources**
+
+```bash
+kubectl top pods -n ingress-nginx
+
+# Look for:
+# - High CPU (limits hit?)
+# - High memory
+# - Restart counts
+```
+
+**Step 3: Replica count**
+
+```bash
+kubectl get deployment -n ingress-nginx ingress-nginx-controller
+
+# Single replica = SPOF and bottleneck
+# Should be 3+ for production
+```
+
+**Step 4: Backend health**
+
+```bash
+# Are backends healthy?
+kubectl get pods -l app=my-backend
+kubectl get endpoints my-backend
+```
+
+If backends unhealthy, ingress can't help.
+
+**Step 5: Connection issues**
+
+```bash
+# Check ingress controller logs:
+kubectl logs -n ingress-nginx <pod>
+
+# Look for:
+# - "upstream timeout"
+# - "no live upstreams"
+# - Connection errors
+```
+
+**Common bottlenecks:**
+
+**Bottleneck 1: Insufficient replicas**
+
+```yaml
+# Scale up:
+spec:
+  replicas: 5
+```
+
+Or HPA:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingress-nginx-hpa
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: ingress-nginx-controller
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+**Bottleneck 2: CPU limits**
+
+```yaml
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2
+    memory: 2Gi
+```
+
+If hitting limits, throttled. Increase or remove limits for ingress.
+
+**Bottleneck 3: Connection limits**
+
+```yaml
+# NGINX config:
+worker-connections: "10240"   # Per worker
+worker-processes: "auto"      # Match CPU
+```
+
+Default may be too low.
+
+**Bottleneck 4: Keepalive settings**
+
+```yaml
+# Backend keepalive:
+upstream-keepalive-connections: "100"
+upstream-keepalive-requests: "1000"
+upstream-keepalive-timeout: "60"
+```
+
+Reuse connections to backends. Reduces overhead.
+
+**Bottleneck 5: TLS performance**
+
+```yaml
+# Enable TLS session caching:
+ssl-session-cache: "shared:SSL:10m"
+ssl-session-timeout: "10m"
+
+# Use modern ciphers:
+ssl-protocols: "TLSv1.3 TLSv1.2"
+ssl-prefer-server-ciphers: "true"
+```
+
+**Bottleneck 6: Buffer sizes**
+
+```yaml
+proxy-buffer-size: "8k"
+proxy-buffers-number: "4"
+proxy-body-size: "100m"
+```
+
+For large requests/responses.
+
+**Bottleneck 7: Timeouts**
+
+```yaml
+proxy-connect-timeout: "5"
+proxy-read-timeout: "60"
+proxy-send-timeout: "60"
+```
+
+Balance: longer = more resource use, shorter = more errors.
+
+**Bottleneck 8: Backend slow**
+
+```promql
+# Backend latency:
+histogram_quantile(0.99,
+  rate(nginx_ingress_controller_upstream_response_time_seconds_bucket[5m])
+)
+```
+
+If backend slow, ingress accumulates pending.
+
+**Network issues:**
+
+**Issue: cross-zone traffic**
+
+```yaml
+# Topology aware routing:
+metadata:
+  annotations:
+    service.kubernetes.io/topology-aware-hints: auto
+```
+
+Prefer same-zone backends.
+
+**Issue: source IP preservation**
+
+```yaml
+# externalTrafficPolicy:
+spec:
+  externalTrafficPolicy: Local
+```
+
+Better for source IPs, but uneven distribution.
+
+**Cloud LB optimization:**
+
+**AWS ALB:**
+
+```yaml
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/target-type: ip
+    # Direct to pods, skip NodePort
+    
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=60
+    # Adjust as needed
+```
+
+**GCP HTTPS LB:**
+
+```yaml
+metadata:
+  annotations:
+    networking.gke.io/load-balancer-config: '{"backendConfig": {"name": "my-backend-config"}}'
+```
+
+**Anti-affinity:**
+
+```yaml
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: ingress-nginx
+              topologyKey: kubernetes.io/hostname
+```
+
+Spread ingress controller pods across nodes.
+
+**Monitoring dashboard:**
+
+Track:
+- Request rate
+- Latency percentiles
+- Error rate
+- CPU per pod
+- Memory per pod
+- Backend response time
+- Connection count
+
+```promql
+# Connections:
+nginx_ingress_controller_nginx_process_connections{state="active"}
+
+# Active backends:
+sum by (service) (
+  nginx_ingress_controller_endpoints
+)
+```
+
+**Specific error patterns:**
+
+**502 Bad Gateway:**
+
+Backend unreachable.
+
+```bash
+# Check endpoints:
+kubectl get endpoints my-service
+
+# Check backend pods:
+kubectl get pods -l app=my-app
+```
+
+**503 Service Unavailable:**
+
+No backends available.
+
+```
+- All pods crashed
+- Selector mismatch
+- PDB preventing all
+```
+
+**504 Gateway Timeout:**
+
+Backend slow.
+
+```
+- Application performance issue
+- Database slow
+- External call slow
+```
+
+**499 Client Closed Connection:**
+
+Client gave up before response.
+
+```
+- Client timeout shorter than response time
+- Browser canceled
+- Generally not ingress issue
+```
+
+**Capacity planning:**
+
+```
+Each NGINX Ingress pod handles:
+- ~50,000 RPS (depends on config)
+- ~10,000 concurrent connections
+- Limited by CPU
+
+Plan for peak:
+- 2x average traffic
+- Headroom for failures
+```
+
+**Best practices:**
+
+1. **Multiple replicas**: at least 3
+2. **Anti-affinity**: spread across nodes
+3. **HPA**: auto-scale on CPU
+4. **Resource requests/limits**: appropriate
+5. **Connection reuse**: keepalive
+6. **TLS optimization**: session caching
+7. **Monitor**: comprehensive metrics
+8. **Test under load**: know capacity
+
+**Production scenarios:**
+
+1. **Single replica bottleneck**: One ingress pod hit CPU limit. 502 errors during peak. Scaled to 5 replicas + HPA. Handled traffic.
+
+2. **TLS overhead**: TLS termination CPU-intensive. Added more replicas. Optimized TLS config (session reuse). Performance improved.
+
+3. **Buffer size too small**: Large file uploads failed. Increased proxy-body-size. Worked.
+
+4. **Backend slow**: 504 errors. Investigation: database queries slow. Optimized backend. Ingress errors resolved.
+
+5. **Connection count**: Hit worker-connections limit. Increased to 20480. Resolved.
+
+---
+
+## 376. Explain Envoy proxy architecture
+
+Envoy is a high-performance L7 proxy used in service meshes (Istio) and as standalone proxy. Understanding its architecture helps with debugging and optimization.
+
+**What Envoy is:**
+
+```
+High-performance C++ proxy
+Originally from Lyft
+Now CNCF graduated
+Used as data plane in service meshes
+```
+
+**Core concepts:**
+
+**Listener:**
+
+```yaml
+listeners:
+  - name: main
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+    filter_chains:
+      - filters:
+          - name: envoy.filters.network.http_connection_manager
+```
+
+Port + filters for incoming traffic.
+
+**Filter:**
+
+Process traffic at different levels:
+- Network filters (L4)
+- HTTP filters (L7)
+
+**Cluster:**
+
+```yaml
+clusters:
+  - name: my-backend
+    type: STRICT_DNS
+    connect_timeout: 5s
+    load_assignment:
+      cluster_name: my-backend
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: backend-svc
+                    port_value: 80
+```
+
+Group of upstream endpoints.
+
+**Endpoint:**
+
+Individual backend (host:port).
+
+**Route:**
+
+```yaml
+route_config:
+  name: local_route
+  virtual_hosts:
+    - name: backend
+      domains: ["*"]
+      routes:
+        - match:
+            prefix: "/api"
+          route:
+            cluster: my-backend
+```
+
+Mapping requests to clusters.
+
+**Architecture:**
+
+```
+Listener (port 8080)
+       ↓
+HTTP Connection Manager
+       ↓
+HTTP Filters (auth, rate limit, etc.)
+       ↓
+Router Filter
+       ↓
+Route Match
+       ↓
+Cluster (my-backend)
+       ↓
+Endpoint Selection (load balancing)
+       ↓
+Upstream Connection
+```
+
+**Configuration:**
+
+**Static:**
+
+```yaml
+# envoy.yaml:
+static_resources:
+  listeners: [...]
+  clusters: [...]
+```
+
+Loaded at start.
+
+**Dynamic (xDS):**
+
+Envoy fetches config from control plane:
+
+```
+LDS: Listener Discovery Service
+CDS: Cluster Discovery Service
+EDS: Endpoint Discovery Service
+RDS: Route Discovery Service
+SDS: Secret Discovery Service
+```
+
+In Istio: Istiod is the xDS server.
+
+**Filters:**
+
+**Network filters (L4):**
+
+- TCP proxy
+- HTTP Connection Manager
+- MongoDB proxy
+- Redis proxy
+- TLS inspection
+
+**HTTP filters (L7):**
+
+- Router
+- Authentication
+- Rate limiting
+- CORS
+- Compression
+- WAF rules
+- JWT validation
+- Authorization
+
+**Filter chain example:**
+
+```yaml
+http_filters:
+  - name: envoy.filters.http.jwt_authn
+    typed_config:
+      # JWT validation
+  - name: envoy.filters.http.rbac
+    typed_config:
+      # Authorization
+  - name: envoy.filters.http.ratelimit
+    typed_config:
+      # Rate limiting
+  - name: envoy.filters.http.router
+    typed_config:
+      # Routes to cluster (must be last)
+```
+
+Filters processed in order.
+
+**Load balancing:**
+
+Multiple algorithms:
+
+```yaml
+clusters:
+  - name: my-cluster
+    lb_policy: ROUND_ROBIN  # Default
+    # Other options:
+    # LEAST_REQUEST
+    # RING_HASH
+    # RANDOM
+    # MAGLEV
+```
+
+**Circuit breaking:**
+
+```yaml
+clusters:
+  - name: my-cluster
+    circuit_breakers:
+      thresholds:
+        - max_connections: 100
+          max_pending_requests: 100
+          max_requests: 1000
+          max_retries: 3
+```
+
+Prevents overwhelming backends.
+
+**Retries:**
+
+```yaml
+routes:
+  - match:
+      prefix: "/"
+    route:
+      cluster: my-cluster
+      retry_policy:
+        retry_on: "5xx,reset,connect-failure"
+        num_retries: 3
+        per_try_timeout: 2s
+```
+
+**Outlier detection:**
+
+```yaml
+clusters:
+  - name: my-cluster
+    outlier_detection:
+      consecutive_5xx: 5
+      interval: 30s
+      base_ejection_time: 30s
+      max_ejection_percent: 50
+```
+
+Eject unhealthy endpoints temporarily.
+
+**TLS:**
+
+```yaml
+transport_socket:
+  name: envoy.transport_sockets.tls
+  typed_config:
+    common_tls_context:
+      tls_certificates:
+        - certificate_chain:
+            filename: /certs/server.crt
+          private_key:
+            filename: /certs/server.key
+```
+
+mTLS, certificates, validation.
+
+**Observability:**
+
+**Access logs:**
+
+```yaml
+access_log:
+  - name: envoy.access_loggers.file
+    typed_config:
+      path: /var/log/envoy/access.log
+      format: "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" %RESPONSE_CODE%\n"
+```
+
+**Statistics:**
+
+```bash
+# Envoy admin port:
+curl http://localhost:15000/stats
+```
+
+Many metrics: connections, requests, errors, latency.
+
+**Tracing:**
+
+```yaml
+tracing:
+  http:
+    name: envoy.tracers.zipkin
+    typed_config:
+      collector_cluster: zipkin
+      collector_endpoint: "/api/v1/spans"
+```
+
+Distributed tracing.
+
+**Admin interface:**
+
+```yaml
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+```
+
+Useful endpoints:
+- `/clusters`: cluster status
+- `/listeners`: listener config
+- `/stats`: metrics
+- `/config_dump`: full config
+
+**In Istio:**
+
+```
+Envoy as sidecar (istio-proxy container)
+Istiod configures via xDS
+Manages all traffic for the pod
+```
+
+Pod traffic:
+
+```
+App → iptables redirect → Envoy → destination
+              ↓
+            (15001 outbound, 15006 inbound)
+```
+
+iptables rules redirect all traffic through Envoy.
+
+**Performance:**
+
+```
+~10,000 RPS per CPU core
+Sub-millisecond latency overhead
+Designed for high throughput
+```
+
+But:
+- 50-200MB memory per instance
+- CPU usage for TLS, filters
+
+**Standalone Envoy:**
+
+Can use without service mesh:
+
+```yaml
+# As edge proxy
+# As internal load balancer
+# As API gateway
+```
+
+**Envoy Gateway:**
+
+```yaml
+# Gateway API implementation:
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  gatewayClassName: envoy-gateway
+```
+
+Modern API gateway using Envoy.
+
+**Debugging:**
+
+**Check config:**
+
+```bash
+kubectl exec my-pod -c istio-proxy -- curl localhost:15000/config_dump
+```
+
+Full Envoy config.
+
+**Check clusters:**
+
+```bash
+istioctl proxy-config cluster my-pod
+```
+
+**Check listeners:**
+
+```bash
+istioctl proxy-config listener my-pod
+```
+
+**Check routes:**
+
+```bash
+istioctl proxy-config route my-pod
+```
+
+**Check endpoints:**
+
+```bash
+istioctl proxy-config endpoint my-pod
+```
+
+**Logs:**
+
+```bash
+kubectl logs my-pod -c istio-proxy
+```
+
+**Common issues:**
+
+**Issue 1: 503 service unavailable**
+
+Cluster has no endpoints. Check:
+
+```bash
+istioctl proxy-config cluster my-pod
+istioctl proxy-config endpoint my-pod
+```
+
+**Issue 2: TLS handshake failures**
+
+Cert issues. Check:
+
+```bash
+kubectl exec my-pod -c istio-proxy -- curl localhost:15000/certs
+```
+
+**Issue 3: High latency**
+
+Check filter performance. Many filters add up.
+
+**Issue 4: Memory growth**
+
+Connection leaks, slow drains.
+
+**Production scenarios:**
+
+1. **Envoy as API gateway**: Used Envoy standalone (no Istio). Custom config. High performance. Auth, rate limiting, routing.
+
+2. **Istio with Envoy**: Service mesh adoption. Envoy sidecars in all pods. mTLS, observability automatic.
+
+3. **Debugging via admin**: Service mesh issue. `/config_dump` showed exact routing. Identified misconfig.
+
+4. **Outlier detection**: Bad pod returning 5xx. Envoy ejected it temporarily. Other instances handled traffic. Self-healing.
+
+5. **Circuit breaker prevented cascade**: Backend slow. Circuit breaker opened. Failed fast instead of timing out. Other services unaffected.
+
+---
+
+## 377. How do you manage TLS termination?
+
+TLS termination decrypts HTTPS at a specific point. Choosing where (LB, ingress, app) affects security and performance.
+
+**Termination points:**
+
+**Point 1: Load balancer**
+
+```
+Internet → HTTPS → LB (decrypt) → HTTP → Pod
+```
+
+LB handles TLS. Backend gets HTTP.
+
+**Point 2: Ingress controller**
+
+```
+Internet → HTTPS → LB (TCP) → Ingress (decrypt) → HTTP → Pod
+```
+
+Ingress handles TLS.
+
+**Point 3: Pod (end-to-end)**
+
+```
+Internet → HTTPS → LB (TCP) → Ingress (pass-through) → HTTPS → Pod
+```
+
+Pod handles TLS itself.
+
+**Point 4: Service mesh mTLS**
+
+```
+Internet → HTTPS → Ingress (decrypt) → mTLS → Pod
+```
+
+Internal traffic encrypted via mesh.
+
+**Approach 1: LB termination**
+
+**AWS ALB:**
+
+```yaml
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+```
+
+ALB terminates. Backend gets HTTP.
+
+**Azure Application Gateway:**
+
+Similar, uses Key Vault certs.
+
+**GCP HTTPS LB:**
+
+```yaml
+metadata:
+  annotations:
+    networking.gke.io/managed-certificates: my-cert
+```
+
+**Pros:**
+- Managed by cloud
+- Auto-renewal possible
+- Less load on ingress controller
+
+**Cons:**
+- Plain HTTP inside cluster
+- Limited customization
+
+**Approach 2: Ingress termination**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+spec:
+  tls:
+    - hosts: [example.com]
+      secretName: tls-cert
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: my-service
+                port:
+                  number: 80
+```
+
+**Cert in Secret:**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tls-cert
+type: kubernetes.io/tls
+data:
+  tls.crt: <base64>
+  tls.key: <base64>
+```
+
+**Pros:**
+- Cluster-managed
+- Consistent across LBs
+- cert-manager integration
+
+**Cons:**
+- Ingress controller CPU
+- Cert management
+
+**Approach 3: Pod TLS**
+
+App handles TLS directly:
+
+```python
+from flask import Flask
+app = Flask(__name__)
+app.run(ssl_context=('/certs/cert.pem', '/certs/key.pem'))
+```
+
+Mount certs in pod:
+
+```yaml
+volumeMounts:
+  - name: certs
+    mountPath: /certs
+volumes:
+  - name: certs
+    secret:
+      secretName: tls-cert
+```
+
+**Pros:**
+- True end-to-end
+- App controls TLS
+
+**Cons:**
+- Complex
+- Cert distribution to apps
+- App CPU for TLS
+
+**Approach 4: Service mesh mTLS**
+
+```yaml
+# Istio:
+spec:
+  mtls:
+    mode: STRICT
+```
+
+mTLS for service-to-service.
+
+External TLS still terminated somewhere (LB or ingress).
+
+```
+Internet → HTTPS → Ingress (terminate) → 
+                                          ↓
+                                      mTLS (mesh) → Pod
+```
+
+**cert-manager:**
+
+Automates TLS certificates:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+```
+
+**Request cert:**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: example-com-tls
+spec:
+  secretName: example-com-tls
+  dnsNames:
+    - example.com
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+```
+
+cert-manager:
+1. Requests cert from Let's Encrypt
+2. Solves challenge (HTTP-01)
+3. Stores cert in Secret
+4. Auto-renews
+
+**Or via Ingress annotation:**
+
+```yaml
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    - hosts: [example.com]
+      secretName: example-com-tls
+```
+
+Auto-creates Certificate resource.
+
+**TLS configuration:**
+
+**Modern TLS:**
+
+```yaml
+# NGINX Ingress:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-protocols: "TLSv1.2 TLSv1.3"
+    nginx.ingress.kubernetes.io/ssl-ciphers: "ECDHE-ECDSA-AES256-GCM-SHA384:..."
+    nginx.ingress.kubernetes.io/ssl-prefer-server-ciphers: "true"
+```
+
+**HSTS:**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+```
+
+Forces HTTPS for future visits.
+
+**HTTP to HTTPS redirect:**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+```
+
+**Cert renewal:**
+
+**Let's Encrypt:**
+
+```
+Certs valid 90 days
+cert-manager renews 30 days before expiry
+Automatic
+```
+
+**Internal CA (Vault):**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: vault-issuer
+spec:
+  vault:
+    server: https://vault.example.com
+    path: pki/sign/my-role
+```
+
+**Custom CA:**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: my-ca
+spec:
+  ca:
+    secretName: ca-secret
+```
+
+**Wildcard certs:**
+
+```yaml
+spec:
+  dnsNames:
+    - "*.example.com"
+  issuerRef:
+    name: letsencrypt-prod
+  # Requires DNS-01 challenge:
+```
+
+DNS validation for wildcards.
+
+**Multi-domain SAN:**
+
+```yaml
+spec:
+  dnsNames:
+    - example.com
+    - www.example.com
+    - api.example.com
+```
+
+Single cert, multiple domains.
+
+**Monitoring:**
+
+```promql
+# Cert expiry:
+certmanager_certificate_expiration_timestamp_seconds
+
+# Days until expiry:
+(certmanager_certificate_expiration_timestamp_seconds - time()) / 86400
+```
+
+**Alert:**
+
+```yaml
+- alert: CertExpiringSoon
+  expr: (certmanager_certificate_expiration_timestamp_seconds - time()) / 86400 < 7
+  labels:
+    severity: warning
+```
+
+**Production scenarios:**
+
+1. **cert-manager + Let's Encrypt**: All public certs automated. Renewal automatic. Zero manual intervention for years.
+
+2. **Wildcard cert**: Multiple subdomains. Wildcard via DNS-01. Single cert, many domains.
+
+3. **mTLS via Istio**: External TLS at Ingress. Internal mTLS via Istio. Defense in depth.
+
+4. **Vault PKI**: Internal services. Vault-issued certs via cert-manager. 30-day rotation. Strong, automated.
+
+5. **Cert expiry alert**: cert-manager failed once (rate limit). Alert at 7 days. Manual renewal. Prevented outage.
+
+---
+
+## 378. Explain API Gateway vs Ingress controller
+
+Both expose services externally but have different focus and capabilities.
+
+**Ingress controller:**
+
+Basic Kubernetes-native HTTP routing:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+spec:
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: my-service
+                port:
+                  number: 80
+```
+
+**Capabilities:**
+
+- HTTP/HTTPS routing (host/path)
+- TLS termination
+- Basic auth
+- Rate limiting (via annotations)
+
+**Limitations:**
+
+- L7 HTTP focus
+- Limited features
+- Annotation-based extensions
+
+**API Gateway:**
+
+Comprehensive API management platform:
+
+**Capabilities:**
+
+- All ingress features
+- Authentication (OAuth, JWT, API keys)
+- Rate limiting (sophisticated)
+- Request transformation
+- Response transformation
+- API versioning
+- Quotas
+- Analytics
+- Developer portal
+- API documentation
+- Caching
+- WAF integration
+
+**Tools:**
+
+**Ingress controllers:**
+- NGINX Ingress
+- Traefik
+- HAProxy
+
+**API gateways:**
+- Kong
+- Ambassador (Emissary)
+- AWS API Gateway
+- Apigee
+- Azure API Management
+
+**Some overlap:**
+
+Modern Ingress controllers add API gateway features:
+- NGINX with Lua scripts
+- Traefik with middlewares
+
+**Some API gateways act as Ingress:**
+- Kong Ingress Controller
+- Ambassador as Ingress
+
+**Comparison:**
+
+| Feature | Ingress | API Gateway |
+|---------|---------|-------------|
+| Basic routing | Yes | Yes |
+| TLS | Yes | Yes |
+| Authentication | Basic | Comprehensive |
+| Rate limiting | Basic | Advanced |
+| Transformation | Limited | Yes |
+| API management | No | Yes |
+| Developer portal | No | Usually yes |
+| Analytics | Basic | Comprehensive |
+| Cost | Free | Often paid |
+
+**Kong example:**
+
+```yaml
+# Kong Ingress with plugins:
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: rate-limit
+config:
+  minute: 100
+plugin: rate-limiting
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-api
+  annotations:
+    konghq.com/plugins: rate-limit
+spec:
+  rules:
+    - host: api.example.com
+```
+
+Rich plugin ecosystem:
+- Authentication (key, JWT, OAuth)
+- Rate limiting
+- Transformations
+- Logging
+- WAF
+
+**Ambassador example:**
+
+```yaml
+apiVersion: getambassador.io/v3alpha1
+kind: AuthService
+metadata:
+  name: auth
+spec:
+  auth_service: auth-service:3000
+  path_prefix: /verify
+
+---
+
+apiVersion: getambassador.io/v3alpha1
+kind: Mapping
+metadata:
+  name: my-api
+spec:
+  prefix: /api/
+  service: my-service
+  rewrite: /
+```
+
+**AWS API Gateway:**
+
+Different model: managed service, not in cluster.
+
+```
+Client → AWS API Gateway → ALB or directly to pods
+```
+
+Features:
+- API keys, usage plans
+- Lambda authorizers
+- Request/response transformation
+- Caching
+- AWS WAF integration
+
+**Use cases:**
+
+**Use Ingress when:**
+
+- Simple HTTP routing
+- TLS termination
+- Internal services
+- Cluster-native preference
+- Cost-sensitive
+
+**Use API Gateway when:**
+
+- Public APIs
+- Need API management
+- Multiple auth methods
+- Rate limiting per consumer
+- Analytics requirements
+- Developer portal
+- Quotas and billing
+
+**Both pattern:**
+
+```
+Ingress (cluster-internal routing)
+     ↓
+API Gateway (external APIs with full features)
+     ↓
+Backend services
+```
+
+Or:
+
+```
+External: API Gateway (managed)
+Internal: Ingress (cluster-native)
+```
+
+**Cloud-managed:**
+
+**AWS:**
+- API Gateway + ALB Ingress
+- Different responsibilities
+
+**Azure:**
+- API Management + Application Gateway
+
+**GCP:**
+- Apigee + GKE Ingress
+
+**Authentication patterns:**
+
+**Ingress:**
+
+```yaml
+# Basic auth:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: basic-auth
+
+# OAuth via subrequest:
+nginx.ingress.kubernetes.io/auth-url: "https://oauth2-proxy/auth"
+```
+
+Limited.
+
+**API Gateway:**
+
+```yaml
+# Multiple methods supported natively:
+- API keys
+- JWT validation
+- OAuth 2.0
+- mTLS
+- Custom (Lambda, etc.)
+```
+
+**Rate limiting:**
+
+**Ingress:**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+```
+
+Per IP, basic.
+
+**API Gateway:**
+
+```yaml
+# Per API key:
+# Per user:
+# Quotas (daily, monthly):
+# Tier-based (free vs paid):
+# Burst handling:
+```
+
+Sophisticated.
+
+**Transformations:**
+
+**Ingress:**
+
+Limited, mostly headers.
+
+**API Gateway:**
+
+```yaml
+# Kong example:
+plugin: request-transformer
+config:
+  add:
+    headers:
+      - "X-Service-Version:v1"
+  remove:
+    headers:
+      - "Authorization"
+```
+
+Request/response modification.
+
+**Developer experience:**
+
+**Ingress:**
+
+```
+Kubernetes-native
+Manage via kubectl
+Limited API consumer experience
+```
+
+**API Gateway:**
+
+```
+Developer portal
+API documentation
+API key management
+Self-service signup
+Analytics dashboard
+```
+
+For public APIs: significant value.
+
+**Production scenarios:**
+
+1. **Ingress + Kong**: Internal routing via NGINX Ingress. External APIs via Kong API Gateway. Different concerns.
+
+2. **AWS API Gateway**: Public APIs via AWS API Gateway. Managed, scaled automatically. Backend in EKS.
+
+3. **Ambassador for L7**: Replaced Ingress with Ambassador. Got API management features. Single tool for routing + API management.
+
+4. **Apigee for enterprise**: Complex API needs. Adopted Apigee. Developer portal, analytics, monetization.
+
+5. **NGINX with Lua**: Wanted some API features without separate gateway. Lua scripts in NGINX added auth, rate limiting. Sufficient.
+
+---
+
+## 379. How do you implement DDoS protection?
+
+DDoS (Distributed Denial of Service) attacks overwhelm services. Multi-layer protection essential.
+
+**DDoS types:**
+
+**Volumetric:**
+- Massive bandwidth
+- Saturates connection
+- Examples: UDP floods, amplification
+
+**Protocol:**
+- SYN floods
+- Ping of death
+- Fragmented packets
+
+**Application layer (L7):**
+- HTTP floods
+- Slowloris
+- Resource exhaustion
+
+**Protection layers:**
+
+**Layer 1: Cloud DDoS protection**
+
+**AWS Shield:**
+- Standard (free, automatic)
+- Advanced (paid, more comprehensive)
+
+**Azure DDoS Protection:**
+- Basic (free)
+- Standard (paid)
+
+**GCP Cloud Armor:**
+- Adaptive protection
+- ML-based detection
+
+**Cloudflare:**
+- Comprehensive DDoS protection
+- Anycast network
+- Many tiers
+
+**Coverage:**
+
+```
+Cloud DDoS handles:
+- Volumetric
+- Protocol-level
+- Some L7
+```
+
+For most clusters: cloud DDoS protection essential.
+
+**Layer 2: WAF**
+
+```yaml
+# AWS ALB with WAF:
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:...
+```
+
+Blocks:
+- SQL injection
+- XSS
+- Known attack patterns
+- Bot signatures
+
+**WAF rules:**
+
+```
+- AWSManagedRulesCommonRuleSet (OWASP Top 10)
+- AWSManagedRulesKnownBadInputsRuleSet
+- AWSManagedRulesBotControlRuleSet
+- AWSManagedRulesIPReputationList
+- Geographic restrictions
+```
+
+**Layer 3: Rate limiting**
+
+**At LB:**
+
+```yaml
+# AWS WAF rate-based rule:
+- type: rate-based-rule
+  limit: 10000   # Per IP per 5 min
+```
+
+**At Ingress:**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+```
+
+**At API Gateway:**
+
+```yaml
+# Kong:
+plugin: rate-limiting
+config:
+  minute: 100
+  hour: 10000
+```
+
+Per-IP, per-API-key, etc.
+
+**Layer 4: Resource limits**
+
+Prevent app from being overwhelmed:
+
+```yaml
+spec:
+  containers:
+    - resources:
+        limits:
+          cpu: 1
+          memory: 1Gi
+```
+
+Auto-scale on load:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+spec:
+  maxReplicas: 50   # Handle bursts
+```
+
+**Layer 5: Application defenses**
+
+**Connection limits:**
+
+```python
+# Application-level connection limits
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app)
+
+# Limit concurrent connections
+```
+
+**Request validation:**
+
+```python
+@app.route('/api')
+def api():
+    # Reject oversized requests
+    if request.content_length > 10000:
+        return 'Request too large', 413
+```
+
+**Timeouts:**
+
+```yaml
+# Ingress:
+nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+```
+
+Short timeouts prevent Slowloris.
+
+**Layer 6: Detection**
+
+**Monitoring:**
+
+```promql
+# Sudden traffic spike:
+rate(http_requests_total[5m]) > 10 * avg_over_time(rate(http_requests_total[5m])[1d:5m])
+
+# High error rate:
+rate(http_errors_total[5m]) > 100
+```
+
+**Alerts:**
+
+```yaml
+- alert: TrafficSpike
+  expr: rate(http_requests_total[5m]) > 10 * avg_over_time(rate(http_requests_total[5m])[1d:5m])
+  for: 5m
+```
+
+**Layer 7: Geographic blocking**
+
+If attack from specific region:
+
+```yaml
+# Cloudflare:
+firewall_rules:
+  - expression: "(ip.geoip.country eq \"XX\")"
+    action: block
+```
+
+**Layer 8: IP reputation**
+
+Block known bad IPs:
+
+```yaml
+# AWS WAF:
+- ManagedRuleGroupConfig:
+    AWSManagedRulesAmazonIpReputationList
+```
+
+**Layer 9: Bot management**
+
+```yaml
+# Cloudflare bot management
+# Or AWS Bot Control
+# Identifies and challenges bots
+```
+
+JavaScript challenge:
+- Real browsers solve
+- Bots fail
+
+**Layer 10: CAPTCHA**
+
+For authenticated endpoints:
+
+```python
+# Show CAPTCHA after failed attempts:
+if failed_attempts > 5:
+    require_captcha()
+```
+
+**Anycast network:**
+
+Cloudflare, AWS Global Accelerator:
+- Multiple POPs globally
+- DDoS distributed across many points
+- No single point overwhelmed
+
+**Architecture:**
+
+```
+Internet
+   ↓
+Cloudflare/AWS Shield (volumetric)
+   ↓
+WAF (application layer)
+   ↓
+Cloud LB (rate limiting)
+   ↓
+Ingress (rate limiting, auth)
+   ↓
+Service Mesh (mTLS)
+   ↓
+App (resource limits, validation)
+```
+
+**Specific attacks:**
+
+**SYN flood:**
+
+```
+Many SYN packets, no completion
+Fills connection table
+```
+
+Defenses:
+- SYN cookies (Linux)
+- Cloud DDoS protection
+- Connection limits
+
+**HTTP flood:**
+
+```
+Many HTTP requests
+Exhausts app resources
+```
+
+Defenses:
+- Rate limiting per IP
+- Bot management
+- Caching
+
+**Slowloris:**
+
+```
+Many slow connections
+Hold open as long as possible
+```
+
+Defenses:
+- Connection timeouts
+- Limit slow connections
+- Nginx/HAProxy mitigations
+
+**Amplification:**
+
+```
+DNS amplification, NTP amplification
+Cloud provider protection
+```
+
+Defenses:
+- Cloud DDoS
+- Block UDP if not needed
+
+**Response plan:**
+
+**Detection:**
+
+```
+Monitoring alerts
+Sudden traffic spike
+Unusual patterns
+```
+
+**Triage:**
+
+```
+Verify attack (not legitimate spike)
+Identify type
+Identify source (geographic, IPs)
+```
+
+**Mitigation:**
+
+```
+Enable additional protections:
+- Stricter rate limits
+- Block source IPs
+- Geographic blocking
+- CAPTCHA challenges
+- Reduce request sizes
+```
+
+**Communication:**
+
+```
+Status page
+Customer notification (if affected)
+```
+
+**Post-incident:**
+
+```
+Analyze attack
+Improve defenses
+Add monitoring
+Test mitigation
+```
+
+**Practice:**
+
+Tabletop exercises:
+- Simulate attack
+- Practice response
+- Identify gaps
+
+**Cost:**
+
+```
+Cloud DDoS protection: $0 (basic) to $3000+/month (advanced)
+WAF: $5-100/month + per-request
+CDN/anycast: $20-500/month
+
+Cost of attack: outage, revenue loss, reputation
+```
+
+Prevention generally cheaper.
+
+**Production scenarios:**
+
+1. **AWS Shield + WAF**: Standard protection. Stopped basic attacks automatically. WAF blocked SQL injection attempts. Adequate for most.
+
+2. **Cloudflare for DDoS**: Major attack hit. Cloudflare absorbed traffic. Origin untouched. Saved by anycast.
+
+3. **Rate limit blocked attack**: Brute force on login. Rate limit triggered. Attacker blocked after 100 attempts/min.
+
+4. **Bot management**: Bots scraping data. Cloudflare bot management. JavaScript challenge. Bots blocked.
+
+5. **DDoS response drill**: Quarterly drill. Practiced enabling stricter rate limits. Real attack mitigated faster because practiced.
+
+---
+
+## 380. Explain IPv6 support in Kubernetes
+
+IPv6 support has evolved. Modern Kubernetes supports IPv6-only and dual-stack (IPv4+IPv6) configurations.
+
+**Why IPv6:**
+
+- IPv4 address exhaustion
+- More addresses (340 undecillion vs 4 billion)
+- Some cloud providers IPv6-only options
+- Future-proofing
+- Compliance in some regions
+
+**Kubernetes IPv6 stages:**
+
+**Stage 1: IPv6-only (older)**
+
+```
+Pod IPs: IPv6
+Service IPs: IPv6
+No IPv4
+```
+
+Limited adoption.
+
+**Stage 2: Dual-stack (1.21+)**
+
+```
+Pods can have IPv4 and IPv6
+Services can be IPv4, IPv6, or both
+Flexible
+```
+
+GA in 1.23.
+
+**Configuring dual-stack:**
+
+**Cluster config:**
+
+```yaml
+# kube-apiserver:
+--service-cluster-ip-range=10.96.0.0/12,fd00:10:96::/108
+--cluster-cidr=10.244.0.0/16,fd00:10:244::/64
+```
+
+Two CIDR ranges per family.
+
+**kube-controller-manager:**
+
+```yaml
+--cluster-cidr=10.244.0.0/16,fd00:10:244::/64
+--service-cluster-ip-range=10.96.0.0/12,fd00:10:96::/108
+--node-cidr-mask-size-ipv4=24
+--node-cidr-mask-size-ipv6=64
+```
+
+**kube-proxy:**
+
+```yaml
+--cluster-cidr=10.244.0.0/16,fd00:10:244::/64
+```
+
+**kubelet:**
+
+```yaml
+--node-ip=10.0.0.5,fd00::5
+```
+
+**Service types:**
+
+**Single-stack service:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  ipFamilies: [IPv4]
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+```
+
+**IPv6-only:**
+
+```yaml
+spec:
+  ipFamilies: [IPv6]
+```
+
+**Dual-stack:**
+
+```yaml
+spec:
+  ipFamilies: [IPv4, IPv6]
+  ipFamilyPolicy: PreferDualStack
+```
+
+**Policies:**
+
+- **SingleStack**: one IP family only
+- **PreferDualStack**: dual if possible, single otherwise
+- **RequireDualStack**: must be dual
+
+**Pods:**
+
+```yaml
+spec:
+  containers:
+    - name: app
+      ...
+# Gets IPv4 + IPv6 addresses if cluster supports
+```
+
+**DNS:**
+
+```
+my-service.default.svc.cluster.local
+A record: 10.96.5.10 (IPv4)
+AAAA record: fd00:10:96::5 (IPv6)
+```
+
+Both returned. App picks one.
+
+**Service type LoadBalancer:**
+
+```yaml
+spec:
+  type: LoadBalancer
+  ipFamilies: [IPv4, IPv6]
+```
+
+Cloud provider creates dual-stack LB.
+
+**Ingress:**
+
+```yaml
+spec:
+  rules:
+    - host: example.com
+```
+
+Ingress controller listens on both.
+
+**CNI support:**
+
+Different CNIs have different IPv6 support:
+
+**Calico:**
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: ipv6-pool
+spec:
+  cidr: fd00:10:244::/64
+  ipipMode: Never
+  natOutgoing: false
+```
+
+Native IPv6 support.
+
+**Cilium:**
+
+```yaml
+spec:
+  ipv6:
+    enabled: true
+```
+
+eBPF-based, full IPv6 support.
+
+**Flannel:**
+
+Limited IPv6 support historically. Check current state.
+
+**Cloud provider support:**
+
+**EKS:**
+- IPv6 support since 2021
+- AWS VPC CNI dual-stack mode
+
+```bash
+# Cluster:
+aws eks create-cluster \
+  --kubernetes-network-config ipFamily=ipv6
+```
+
+```yaml
+# VPC CNI for IPv6:
+env:
+  - name: ENABLE_IPv6
+    value: "true"
+```
+
+**AKS:**
+- Dual-stack support
+- Both IPv4 and IPv6 service ranges
+
+```bash
+az aks create \
+  --ip-families IPv4,IPv6
+```
+
+**GKE:**
+- Dual-stack supported
+
+```bash
+gcloud container clusters create my-cluster \
+  --enable-ip-alias \
+  --stack-type=IPV4_IPV6
+```
+
+**Common patterns:**
+
+**Pattern 1: Dual-stack everywhere**
+
+```yaml
+ipFamilies: [IPv4, IPv6]
+ipFamilyPolicy: RequireDualStack
+```
+
+Most flexibility.
+
+**Pattern 2: IPv4 with selective IPv6**
+
+```yaml
+# Most services IPv4:
+ipFamilies: [IPv4]
+
+# External services IPv6:
+ipFamilies: [IPv4, IPv6]
+```
+
+**Pattern 3: IPv6-only**
+
+```yaml
+# All services IPv6:
+ipFamilies: [IPv6]
+```
+
+For IPv6-mandated environments.
+
+**Challenges:**
+
+**Challenge 1: Legacy apps**
+
+Old apps may not support IPv6.
+
+Fix: dual-stack, app gets IPv4.
+
+**Challenge 2: NetworkPolicy**
+
+```yaml
+# Need IPv6 CIDR support in CNI:
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: fd00::/8
+```
+
+**Challenge 3: External services**
+
+External services may be IPv4-only:
+
+```yaml
+# ExternalName:
+spec:
+  type: ExternalName
+  externalName: legacy.example.com
+```
+
+App must support both.
+
+**Challenge 4: NAT64**
+
+If pod IPv6-only but needs to reach IPv4 external:
+
+```
+NAT64 / DNS64
+Or proxy via IPv4 node
+```
+
+**Challenge 5: Monitoring tools**
+
+Some tools don't handle IPv6 well.
+
+**Testing:**
+
+```bash
+# Verify pod IPv6:
+kubectl get pod my-pod -o jsonpath='{.status.podIPs}'
+
+# Should show both:
+# [{"ip":"10.244.1.5"},{"ip":"fd00:10:244::1:5"}]
+
+# Test connectivity:
+kubectl exec my-pod -- ping6 -c 5 other-pod-ipv6
+```
+
+**Service test:**
+
+```bash
+kubectl get svc my-service -o yaml
+# Check ipFamilies
+# Check ClusterIPs (should have both)
+```
+
+**Production scenarios:**
+
+1. **Dual-stack cluster**: Migrated to dual-stack. Existing IPv4 unchanged. New deployments could use IPv6. Gradual adoption.
+
+2. **IPv6-only for compliance**: Government deployment required IPv6. Cluster IPv6-only. Apps tested for IPv6 compatibility.
+
+3. **EKS IPv6**: VPC IP exhaustion. Migrated to IPv6. Massive address space. No more exhaustion.
+
+4. **Legacy app issue**: Old Java app didn't bind to IPv6. JVM flag needed. Added `-Djava.net.preferIPv6Addresses=true`.
+
+5. **NAT64 for hybrid**: IPv6-only pods needed IPv4 external services. NAT64 + DNS64 in cluster. Translated transparently.
