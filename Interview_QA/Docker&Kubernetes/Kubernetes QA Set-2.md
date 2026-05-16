@@ -69459,3 +69459,2456 @@ Dashboards updated manually become stale.
 
 5. **Customer-impact translation**: Engineering metrics meant nothing to executives. Translated to "% customers affected" and dollar impact. Resonated immediately.
 
+# GitOps & CI/CD: Comprehensive Guide
+
+## 291. GitOps Principles
+
+GitOps is an operational framework that applies DevOps best practices (version control, collaboration, compliance, CI/CD) to infrastructure automation. The four core principles are:
+
+1. **Declarative**: The entire system state is described declaratively (YAML/JSON manifests rather than imperative scripts).
+2. **Versioned and Immutable**: Desired state is stored in Git, providing a single source of truth with complete audit history.
+3. **Pulled Automatically**: Software agents automatically pull declared state from Git (no manual `kubectl apply`).
+4. **Continuously Reconciled**: Agents continuously observe actual state and reconcile any drift from the desired state.
+
+**Benefits**: improved developer experience, stronger security (no cluster credentials in CI), better reliability through automated rollback, and full auditability via Git history.
+
+---
+
+## 292. ArgoCD vs FluxCD
+
+| Aspect | ArgoCD | FluxCD |
+|---|---|---|
+| **UI** | Rich web UI with visualizations | CLI-first, no native UI (Weave GitOps adds one) |
+| **Architecture** | Monolithic controller set | Modular GitOps Toolkit (source, kustomize, helm, notification controllers) |
+| **Multi-tenancy** | AppProjects with RBAC | Tenant CRDs with namespace isolation |
+| **Sync model** | Pull-based, manual or auto-sync | Pull-based, fully automated |
+| **App definition** | Application CRD | Kustomization/HelmRelease CRDs |
+| **Multi-cluster** | Hub-and-spoke from single ArgoCD | Each cluster runs its own Flux |
+| **Image automation** | Argo Image Updater (separate) | Built-in image automation controllers |
+| **Best for** | Teams wanting visibility and control | Teams preferring composability and automation |
+
+---
+
+## 293. ArgoCD Architecture
+
+ArgoCD consists of three main components:
+
+**API Server** — gRPC/REST server exposing the API for the Web UI, CLI, and CI/CD systems. Handles authentication, RBAC enforcement, Git webhook events, and credential management.
+
+**Repository Server** — Internal service that maintains a local cache of Git repositories. Generates Kubernetes manifests from Helm charts, Kustomize overlays, Jsonnet, or plain YAML when given repo URL, revision, path, and parameters.
+
+**Application Controller** — Kubernetes controller that continuously watches running applications and compares the live state against the desired state in Git. Detects `OutOfSync` state and optionally takes corrective action.
+
+Supporting components include Redis (caching), Dex (SSO/OIDC), ApplicationSet Controller (templating Applications), and Notifications Controller.
+
+---
+
+## 294. How ArgoCD Detects Drift
+
+ArgoCD uses a three-state comparison model:
+
+1. **Desired State** — Manifests rendered from Git at the target revision.
+2. **Live State** — Actual resources currently in the cluster (fetched via Kubernetes API).
+3. **Last-Applied State** — Tracked through `kubectl.kubernetes.io/last-applied-configuration` annotations or Server-Side Apply field ownership.
+
+The Application Controller runs a reconciliation loop (default every 3 minutes, configurable via `timeout.reconciliation`) that performs a diff between desired and live state. Differences mark the application as `OutOfSync`. With `selfHeal: true` enabled, ArgoCD automatically reverts manual cluster changes. Webhooks from Git providers trigger immediate reconciliation rather than waiting for the poll interval.
+
+Drift detection respects `ignoreDifferences` rules (e.g., ignore `spec.replicas` if HPA manages it) using JSON pointers or JQ path expressions.
+
+---
+
+## 295. GitOps Repository Structure
+
+Two dominant patterns exist:
+
+**Monorepo (single repo, multiple environments)**
+
+```
+infra-repo/
+├── apps/
+│   ├── frontend/
+│   │   ├── base/
+│   │   │   ├── deployment.yaml
+│   │   │   ├── service.yaml
+│   │   │   └── kustomization.yaml
+│   │   └── overlays/
+│   │       ├── dev/
+│   │       ├── staging/
+│   │       └── prod/
+│   └── backend/
+├── clusters/
+│   ├── dev-cluster/
+│   ├── staging-cluster/
+│   └── prod-cluster/
+└── infrastructure/
+    ├── ingress-nginx/
+    ├── cert-manager/
+    └── monitoring/
+```
+
+**Repo-per-team or repo-per-environment** separates concerns more strictly but adds coordination overhead.
+
+**Best practices**: separate app source code from manifest repos, use a `clusters/` folder where each cluster declares which apps it runs (App-of-Apps pattern), and avoid mixing environment-specific values in `base/`.
+
+---
+
+## 296. Managing Secrets in GitOps
+
+Plain secrets in Git are an anti-pattern. Common solutions:
+
+**Sealed Secrets (Bitnami)** — Encrypts secrets with a controller's public key; only the in-cluster controller can decrypt. Safe to commit to Git.
+
+**External Secrets Operator (ESO)** — Stores a `SecretStore` reference in Git pointing to AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager, or Azure Key Vault. ESO syncs values into native Kubernetes Secrets.
+
+**SOPS (Mozilla)** — Encrypts YAML/JSON files using KMS, age, or PGP. Decrypted at apply time via the Helm Secrets plugin or Flux's built-in SOPS support.
+
+**HashiCorp Vault with Vault Agent Injector or CSI driver** — Secrets never touch etcd; injected directly into pods.
+
+**Best practices**: rotate keys regularly, use short-lived dynamic secrets where possible, enforce RBAC on Secret resources, and enable encryption-at-rest for etcd.
+
+---
+
+## 297. Progressive Delivery Strategies
+
+Progressive delivery extends continuous delivery by gradually exposing changes to users with automated guardrails. Key strategies:
+
+- **Canary** — Route a small percentage of traffic to the new version; gradually increase based on health metrics.
+- **Blue-Green** — Run two environments in parallel; switch traffic atomically.
+- **A/B Testing** — Route traffic based on user attributes (cookie, header, geography) to compare versions.
+- **Shadow / Mirror Deployment** — Duplicate production traffic to the new version without serving responses to users; pure observation.
+- **Feature Flags** — Decouple deployment from release; toggle features per user, segment, or percentage at runtime.
+
+Tools: **Argo Rollouts**, **Flagger** (Flux ecosystem), **LaunchDarkly**, **Unleash**. Metrics gates typically tie into Prometheus, Datadog, or New Relic for automatic promotion/abort decisions.
+
+---
+
+## 298. Implementing Canary Deployments
+
+Using **Argo Rollouts** with a traffic-shaping mesh (Istio, NGINX, AWS ALB, etc.):
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: api-rollout
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      canaryService: api-canary
+      stableService: api-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: api-vs
+            routes:
+              - primary
+      steps:
+        - setWeight: 10
+        - pause: {duration: 5m}
+        - analysis:
+            templates:
+              - templateName: success-rate
+        - setWeight: 25
+        - pause: {duration: 10m}
+        - setWeight: 50
+        - pause: {duration: 10m}
+        - setWeight: 100
+```
+
+The `AnalysisTemplate` queries Prometheus for error rate or latency. If thresholds fail, the rollout aborts and rolls back automatically. Without a mesh, weight is approximated through replica ratios, which is less precise.
+
+---
+
+## 299. Blue-Green Deployment in Kubernetes
+
+Two complete environments (Blue = current, Green = new) run in parallel. Traffic switches atomically via a Service selector change.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+spec:
+  strategy:
+    blueGreen:
+      activeService: app-active      # production traffic
+      previewService: app-preview    # internal testing
+      autoPromotionEnabled: false    # require manual approval
+      scaleDownDelaySeconds: 300     # keep Blue running for rollback
+      prePromotionAnalysis:
+        templates:
+          - templateName: smoke-tests
+```
+
+**Pros**: instant rollback (flip selector back), full testing on production-identical infrastructure.
+**Cons**: requires 2× resources during transition; stateful workloads need careful handling of data migrations and connection draining.
+
+---
+
+## 300. Automating Rollbacks
+
+Multiple layers of automation exist:
+
+**Deployment-level** — Kubernetes Deployments retain ReplicaSet history (`revisionHistoryLimit`). `kubectl rollout undo` reverts to the previous revision.
+
+**Argo Rollouts** — `AnalysisRun` failures during canary or blue-green phases automatically abort and revert traffic to the stable version.
+
+**ArgoCD** — Set `syncPolicy.automated.selfHeal: true` to revert manual drift. For bad commits, revert the Git commit; ArgoCD reconciles automatically (Git is the source of truth, so never `kubectl rollout undo` in a GitOps world).
+
+**SLO-based rollback** — Tools like Keptn or custom controllers watch Prometheus SLOs and trigger Git revert PRs when error budgets burn too fast.
+
+**Database considerations**: rollbacks become risky once schema migrations apply. Use backward-compatible migrations (expand-contract pattern) so the previous app version still works.
+
+---
+
+## 301. Helm Chart Best Practices
+
+- **Pin chart and image versions** explicitly; never use `latest`.
+- **Use `values.schema.json`** to validate user-supplied values at install time.
+- **Provide sensible defaults** in `values.yaml`; document every value with comments.
+- **Use named templates** (`_helpers.tpl`) for labels, selectors, and common metadata to avoid drift between resources.
+- **Apply standard labels**: `app.kubernetes.io/name`, `app.kubernetes.io/instance`, `app.kubernetes.io/version`, `app.kubernetes.io/managed-by`.
+- **Set resource requests/limits** by default; expose via values.
+- **Avoid embedding secrets**; integrate with external secret managers.
+- **Test charts** with `helm lint`, `helm template`, and `helm test` hooks.
+- **Use library charts** for shared logic across multiple application charts.
+- **Sign charts** with Cosign or Helm provenance for supply chain integrity.
+- **Document with `NOTES.txt`** to give users post-install guidance.
+
+---
+
+## 302. Helm vs Kustomize
+
+| Aspect | Helm | Kustomize |
+|---|---|---|
+| **Approach** | Templating (Go templates) | Overlay/patching (strategic merge & JSON patches) |
+| **Packaging** | Charts (tarballs), versioned, registry-distributable | Plain YAML directories |
+| **Variables** | Rich `values.yaml` with conditionals/loops | No variables; only patches and replacements |
+| **Lifecycle** | Install/upgrade/rollback/uninstall with release tracking | Stateless — just renders YAML |
+| **Hooks** | Pre/post install, upgrade, delete hooks | None native |
+| **Learning curve** | Steeper (template syntax) | Gentler (plain YAML) |
+| **Best for** | Distributing reusable apps (off-the-shelf software) | Customizing your own apps across environments |
+
+The two are often **combined**: Helm renders the chart, Kustomize patches the output for environment-specific tweaks.
+
+---
+
+## 303. Helm Hooks
+
+Hooks let charts execute Jobs/Pods at specific points in a release lifecycle. Defined via `helm.sh/hook` annotations:
+
+| Hook | When it runs |
+|---|---|
+| `pre-install` | After templates rendered, before resources created |
+| `post-install` | After all resources are loaded |
+| `pre-upgrade` | Before resources upgraded |
+| `post-upgrade` | After upgrade completes |
+| `pre-delete` | Before any resources deleted |
+| `post-delete` | After all resources deleted |
+| `pre-rollback` / `post-rollback` | Around rollbacks |
+| `test` | Run by `helm test` |
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+```
+
+Common uses: database migrations, secret pre-creation, cleanup tasks, smoke tests. Hooks are **not tracked as part of the release**, so subsequent upgrades won't manage them as drift.
+
+---
+
+## 304. Multi-Environment Deployments
+
+Several patterns work well:
+
+**Kustomize overlays** — A `base/` directory plus `overlays/{dev,staging,prod}/` with environment-specific patches.
+
+**Helm value files** — One chart with `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`.
+
+**ArgoCD ApplicationSet** — Templates Applications across environments/clusters from a generator (List, Cluster, Git directory, matrix):
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+spec:
+  generators:
+    - list:
+        elements:
+          - cluster: dev
+            url: https://dev.k8s.example.com
+          - cluster: prod
+            url: https://prod.k8s.example.com
+  template:
+    metadata:
+      name: '{{cluster}}-myapp'
+    spec:
+      source:
+        helm:
+          valueFiles:
+            - 'values-{{cluster}}.yaml'
+```
+
+**Promotion model** — Changes flow dev → staging → prod via PRs that bump image tags or values. Tools like Kargo formalize this pipeline.
+
+---
+
+## 305. CI/CD Pipeline Design for Kubernetes
+
+A typical pipeline separates **CI (build/test artifacts)** from **CD (deploy via GitOps)**:
+
+**CI stage**:
+1. Lint code, run unit tests
+2. Static analysis (SAST), dependency scanning (SCA)
+3. Build container image with reproducible build (Buildpacks, ko, or Docker BuildKit)
+4. Scan image for CVEs (Trivy, Grype)
+5. Sign image (Cosign) and generate SBOM
+6. Push to registry with immutable tag (Git SHA, not `latest`)
+
+**CD stage** (GitOps):
+1. Update image tag in manifests/values via PR (Renovate, Argo Image Updater)
+2. Required reviews and policy checks on the PR
+3. Merge triggers ArgoCD/Flux reconciliation
+4. Progressive rollout with health checks and analysis
+5. Auto-rollback on failure
+
+**Key principle**: the CI system never has cluster credentials. It only writes to Git. The cluster pulls. This dramatically reduces the blast radius of CI compromise.
+
+---
+
+## 306. Securing Supply Chain Pipelines
+
+Apply defense in depth aligned with **SLSA** (Supply-chain Levels for Software Artifacts):
+
+- **Source integrity** — Signed commits (Sigstore Gitsign), protected branches, mandatory reviews.
+- **Build integrity** — Hermetic, reproducible builds in ephemeral runners; pin build dependencies.
+- **Artifact signing** — Sign images and Helm charts with Cosign; verify signatures via admission policies (Kyverno, Connaisseur).
+- **SBOM generation** — Produce SBOMs (Syft, CycloneDX) and attach as attestations.
+- **Vulnerability scanning** — Scan at build time and continuously in registries (Trivy, Grype, Snyk).
+- **Provenance attestations** — SLSA provenance via GitHub Actions, Tekton Chains, or Buildkite signed builds.
+- **Admission control** — Block unsigned, unscanned, or untrusted-registry images in-cluster.
+- **Secret hygiene** — OIDC federation to cloud providers; no long-lived credentials in CI.
+- **Dependency management** — Renovate/Dependabot, lockfiles, private package proxies.
+
+---
+
+## 307. Image Promotion Workflows
+
+Promotion moves a tested, immutable image through environments without rebuilding:
+
+**Tag-based promotion** — Same digest, retagged: `myapp:abc123` → `myapp:abc123-staging` → `myapp:abc123-prod`. Simple but mutable tags can confuse.
+
+**Digest-based promotion (preferred)** — Reference images by immutable digest (`myapp@sha256:...`). The Git PR updates the digest reference in higher-environment values files.
+
+**Registry-based promotion** — Separate registries per environment (`dev-registry/`, `prod-registry/`). Promotion copies the image between registries (e.g., with `crane copy`). Allows policy enforcement at registry boundaries.
+
+**Tooling** — Kargo orchestrates promotion stages. Argo Image Updater watches registries and opens PRs. GitHub Actions or Tekton tasks copy digests between values files.
+
+The golden rule: **promoted artifacts must be byte-identical to what was tested**. Never rebuild for production.
+
+---
+
+## 308. Database Migrations
+
+Migrations are the hardest part of Kubernetes deploys because they're stateful and irreversible. Strategies:
+
+**Pre-deploy migration Job** — Run via Helm `pre-upgrade` hook or ArgoCD `PreSync` hook. Risk: app downtime if migration fails or takes long.
+
+**Init container migration** — Each pod runs migrations on startup. Risky with multiple replicas (leader election needed via tools like `migrate` with advisory locks).
+
+**Expand-contract (recommended)** — Decouple schema changes from code releases:
+1. **Expand**: Add new columns/tables, deploy schema change first (backward compatible).
+2. **Migrate**: Deploy app version that writes to both old and new.
+3. **Backfill**: Move old data to new structure.
+4. **Contract**: Deploy app version reading only from new structure.
+5. **Cleanup**: Drop old columns in a later migration.
+
+This pattern keeps rollbacks safe because old code still works against the new schema.
+
+**Tools**: Flyway, Liquibase, Atlas Operator, schemahero. For zero-downtime large-table changes, use `gh-ost` or `pt-online-schema-change`.
+
+---
+
+## 309. GitOps for Multi-Cluster Environments
+
+Three common topologies:
+
+**Hub-and-Spoke (ArgoCD)** — One central ArgoCD instance manages many clusters. Easy to operate but creates a single point of failure and a security target (it holds credentials to every cluster).
+
+**Hub-of-Hubs** — Regional ArgoCD instances each manage local clusters, with a top-level instance managing the regional ones. Scales better and limits blast radius.
+
+**Per-Cluster Agent (Flux model)** — Each cluster runs its own controller pulling from Git. Highly resilient (no central failure), but harder to get a global view.
+
+**Patterns**:
+- Use **ApplicationSets** with cluster generators to template apps across many clusters.
+- Store **cluster configuration** (which apps run where) declaratively in Git.
+- Apply **cluster-specific overlays** via labels matched in the generator.
+- Use a tool like **Cluster API** to declaratively provision clusters themselves; GitOps then bootstraps the workloads.
+
+For fleet-scale (hundreds of clusters), look at Open Cluster Management, Rancher Fleet, or Karmada.
+
+---
+
+## 310. Policy Checks in CI/CD
+
+Shift policy left: catch violations in PRs rather than at admission time.
+
+**In CI (pre-merge)**:
+- **OPA/Conftest** — Run Rego policies against Kubernetes YAML in pipelines.
+- **Kyverno CLI** — Same policies that run as admission webhooks can validate manifests locally.
+- **Datree, Kubescape, Polaris** — Best-practice and security checks.
+- **Checkov, tfsec** — For Terraform/IaC.
+- **Trivy config** — Misconfiguration scanning for K8s manifests, Dockerfiles, Helm charts.
+
+**In CD (pre-sync)**:
+- **ArgoCD pre-sync hooks** that run Conftest or Kyverno against rendered manifests.
+- **Validating Admission Policies / Webhooks** (Kyverno, Gatekeeper) enforce at apply time as a last line of defense.
+
+**Example policies**: no `:latest` tags, required labels, no privileged containers, required network policies, required resource limits, only signed images allowed, namespaces must have owner annotations.
+
+**Best practice**: define policies once and run them at every gate (PR, CI, admission). Use **policy-as-code in Git** and version policies alongside infrastructure.
+
+---
+
+This covers the full GitOps and CI/CD interview spectrum from foundational principles through advanced multi-cluster and supply-chain concerns. Let me know if you'd like to drill deeper into any specific area — say, a hands-on Argo Rollouts example, a complete Kustomize repo layout, or a detailed Kyverno policy set.
+
+# Kubernetes Deployment & CI/CD: Advanced Topics
+
+## 311. Kubernetes Deployment Strategies
+
+Kubernetes supports multiple deployment strategies, each with different tradeoffs:
+
+**Recreate** — Terminate all old pods, then create new ones. Causes downtime but is simple and resource-efficient. Use for dev environments or apps that can't run two versions simultaneously (incompatible schemas, singleton processes).
+
+```yaml
+spec:
+  strategy:
+    type: Recreate
+```
+
+**RollingUpdate (default)** — Gradually replace old pods with new ones. Configured via `maxSurge` (extra pods allowed above desired) and `maxUnavailable` (pods that can be down during update).
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+```
+
+**Blue-Green** — Two complete environments; flip traffic atomically via Service selector. Requires Argo Rollouts or manual orchestration. Instant rollback, double resource cost.
+
+**Canary** — Route a small percentage of traffic to the new version; gradually increase. Best with a service mesh or Argo Rollouts for traffic precision.
+
+**A/B Testing** — Route based on user attributes (headers, cookies, geography) rather than percentage. Useful for experimentation.
+
+**Shadow** — Mirror production traffic to the new version without serving responses to users. Pure observation, useful for testing performance against real workloads.
+
+**Choosing the right strategy** depends on statefulness, blast radius tolerance, resource budget, and observability maturity. Stateless web services typically use RollingUpdate or Canary; databases and stateful systems often need Recreate plus expand-contract migrations.
+
+---
+
+## 312. Integrating Security Scanning
+
+Security scanning must happen at every stage — "shift left and shield right":
+
+**Pre-commit**:
+- Secret detection (Gitleaks, TruffleHog) via pre-commit hooks.
+- IDE plugins for SAST.
+
+**CI pipeline**:
+- **SAST** (Semgrep, SonarQube, CodeQL) — Static code analysis for vulnerabilities.
+- **SCA** (Snyk, Dependabot, Renovate) — Scan dependencies for known CVEs.
+- **Container scanning** (Trivy, Grype, Clair) — Scan built images before pushing.
+- **IaC scanning** (Checkov, tfsec, Trivy config, kube-linter) — Validate Terraform, Helm charts, Kubernetes manifests.
+- **License compliance** (FOSSA, Snyk License Compliance).
+- **SBOM generation** (Syft, CycloneDX) attached as artifact attestations.
+
+**Pre-deploy**:
+- Admission policies (Kyverno, Gatekeeper) verify image signatures (Cosign), block untrusted registries, enforce non-root users.
+- Conftest/OPA validates rendered manifests against organizational policies.
+
+**Runtime**:
+- **Runtime detection** (Falco, Tetragon) — Detect suspicious syscalls, file access, network connections.
+- **CNAPP/CWPP tools** (Wiz, Prisma Cloud, Aqua) — Continuous posture management.
+- **Continuous image rescanning** in registries — CVEs are disclosed daily, so yesterday's clean image may be vulnerable today.
+
+**Best practice**: fail the pipeline on **critical/high CVEs with available fixes**, warn on others. Avoid blanket failure — it breeds bypass culture.
+
+---
+
+## 313. Jenkins Kubernetes Plugin
+
+The Jenkins Kubernetes plugin runs build agents as ephemeral pods rather than maintaining a static pool of VMs. The Jenkins controller schedules a pod for each build, the pod runs the job, and Kubernetes deletes it on completion.
+
+**Architecture**:
+- Jenkins controller runs in or outside the cluster.
+- The plugin uses a `ServiceAccount` with permissions to create/delete pods in a designated namespace.
+- A `PodTemplate` defines the agent pod spec (containers, volumes, labels).
+- When a job needs an agent, the plugin creates a pod with a JNLP container that connects back to the controller.
+
+**Example pipeline using a pod template**:
+
+```groovy
+pipeline {
+  agent {
+    kubernetes {
+      yaml '''
+        apiVersion: v1
+        kind: Pod
+        spec:
+          containers:
+          - name: maven
+            image: maven:3.9-eclipse-temurin-21
+            command: ['cat']
+            tty: true
+          - name: docker
+            image: docker:24-cli
+            command: ['cat']
+            tty: true
+            volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+          volumes:
+          - name: docker-sock
+            hostPath:
+              path: /var/run/docker.sock
+      '''
+    }
+  }
+  stages {
+    stage('Build') {
+      steps {
+        container('maven') { sh 'mvn -B package' }
+        container('docker') { sh 'docker build -t app .' }
+      }
+    }
+  }
+}
+```
+
+**Benefits**: elastic scaling, isolated builds, per-job custom tooling, no agent VM maintenance.
+
+---
+
+## 314. Dynamic Agents on Kubernetes
+
+Dynamic (ephemeral) agents are spun up per build and destroyed afterward. Common patterns across CI tools:
+
+**Jenkins** — Kubernetes plugin with `PodTemplate` definitions (see above).
+
+**GitLab Runner** — Kubernetes executor creates a pod per job with multiple containers (build, helper, services).
+
+```yaml
+[[runners]]
+  executor = "kubernetes"
+  [runners.kubernetes]
+    namespace = "gitlab-runners"
+    cpu_request = "500m"
+    memory_request = "1Gi"
+    service_account = "gitlab-runner"
+```
+
+**GitHub Actions** — Actions Runner Controller (ARC) provisions self-hosted runners as pods. Supports autoscaling via `RunnerScaleSet`.
+
+**Tekton / Argo Workflows** — Natively run every step as a Kubernetes pod; no separate agent concept.
+
+**Best practices**:
+- **Resource requests/limits** prevent noisy-neighbor issues.
+- **Image caching** via a pull-through registry or persistent volumes for dependencies (`~/.m2`, `~/.gradle`, `node_modules`).
+- **Avoid Docker-in-Docker**; prefer Kaniko, Buildah, or BuildKit rootless for image builds.
+- **Use spot/preemptible nodes** for cost savings; taint them and tolerate in agent pods.
+- **Namespace per team** with ResourceQuotas and NetworkPolicies for isolation.
+- **Cleanup orphaned pods** — set `activeDeadlineSeconds` and TTL controllers.
+
+---
+
+## 315. Tekton Pipelines
+
+Tekton is a Kubernetes-native, open-source CI/CD framework. Everything is a Kubernetes CRD, and every step runs in a container.
+
+**Core resources**:
+
+- **Task** — A reusable unit of work consisting of one or more `steps` (each a container).
+- **TaskRun** — An invocation of a Task with specific parameters.
+- **Pipeline** — A graph of Tasks with ordering, conditionals, and parameter passing.
+- **PipelineRun** — An invocation of a Pipeline.
+- **Workspace** — Shared storage (PVC, ConfigMap, Secret, emptyDir) between Tasks.
+- **Trigger** — EventListener + TriggerBinding + TriggerTemplate to start runs from webhooks.
+
+**Example Task**:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-image
+spec:
+  params:
+    - name: image
+  workspaces:
+    - name: source
+  steps:
+    - name: build
+      image: gcr.io/kaniko-project/executor:latest
+      args:
+        - --dockerfile=Dockerfile
+        - --context=$(workspaces.source.path)
+        - --destination=$(params.image)
+```
+
+**Strengths**: serverless (no controller pool), composable Tasks from Tekton Hub, native to Kubernetes, integrates with Tekton Chains for SLSA provenance, and Tekton Results for run history.
+
+**Weaknesses**: verbose YAML, steeper learning curve than Jenkins, smaller ecosystem of pre-built integrations.
+
+---
+
+## 316. Managing Helm Releases at Scale
+
+As Helm releases multiply across teams and clusters, manual `helm install/upgrade` becomes untenable. Patterns that scale:
+
+**GitOps with HelmRelease CRDs (Flux)** or **Helm-templated ArgoCD Applications**:
+
+```yaml
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: ingress-nginx
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: ingress-nginx
+      version: '4.10.x'
+      sourceRef:
+        kind: HelmRepository
+        name: ingress-nginx
+  values:
+    controller:
+      replicaCount: 3
+```
+
+**Chart repositories** — Host private charts in OCI registries (Harbor, ECR, GHCR). Sign with Cosign.
+
+**Umbrella charts** — Aggregate dependencies for related apps, but beware deep dependency chains becoming brittle.
+
+**Renovate / Argo Image Updater** — Automate version bumps via PRs, with policy controls per environment.
+
+**ChartMuseum or OCI registries** — Centralize private chart distribution.
+
+**Standardization** — Internal "library charts" provide common templates (labels, probes, network policies); application charts inherit them. Reduces drift and enforces standards.
+
+**Release tracking** — Use `helm-controller` from Flux or ArgoCD's Application view rather than `helm list` on each cluster.
+
+**Drift detection** — `helm diff` plugin in pre-merge checks; ArgoCD/Flux auto-reconcile.
+
+---
+
+## 317. Argo Rollouts
+
+Argo Rollouts is a Kubernetes controller providing advanced deployment strategies (canary, blue-green, experimentation) with automated analysis and rollback.
+
+**Architecture**:
+- **Rollout CRD** replaces standard Deployment.
+- **Rollouts Controller** manages ReplicaSets and traffic shaping.
+- **AnalysisTemplate / AnalysisRun** evaluate metrics from Prometheus, Datadog, New Relic, CloudWatch, Wavefront, etc.
+- **Experiment CRD** runs parallel ReplicaSets for short-lived A/B tests.
+
+**Canary with metric-based analysis**:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+spec:
+  strategy:
+    canary:
+      steps:
+        - setWeight: 20
+        - pause: {duration: 5m}
+        - analysis:
+            templates:
+              - templateName: success-rate
+            args:
+              - name: service-name
+                value: api
+        - setWeight: 50
+        - pause: {duration: 10m}
+        - setWeight: 100
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+spec:
+  metrics:
+    - name: success-rate
+      interval: 1m
+      successCondition: result[0] >= 0.95
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            sum(rate(http_requests_total{service="{{args.service-name}}",status!~"5.."}[2m]))
+            /
+            sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+```
+
+**Traffic routing integrations**: Istio, Linkerd, NGINX, ALB, Traefik, Apache APISIX, Gateway API. Without a mesh, weight is approximated through replica counts.
+
+**Rollout dashboard** — Web UI and `kubectl argo rollouts` plugin provide visualization, manual promotion/abort, and step-by-step control.
+
+---
+
+## 318. Implementing Feature Flags
+
+Feature flags decouple deployment from release. Code is deployed dark; flags control exposure independently.
+
+**Flag types**:
+- **Release toggles** — Hide incomplete work; remove after launch.
+- **Experiment toggles** — A/B test variants.
+- **Ops toggles** — Kill switches, circuit breakers.
+- **Permission toggles** — Premium features, beta access.
+
+**Implementation options**:
+
+**SaaS platforms** — LaunchDarkly, Split.io, Statsig, ConfigCat. Rich targeting (user attributes, geography, percentage rollout), experimentation, audit logs.
+
+**Open source** — Unleash, OpenFeature (vendor-neutral spec), Flagsmith, GrowthBook.
+
+**DIY** — ConfigMaps + environment variables, but you lose dynamic updates, targeting, and audit trails.
+
+**Example with OpenFeature**:
+
+```javascript
+const client = OpenFeature.getClient();
+const showNewCheckout = await client.getBooleanValue(
+  'new-checkout-flow',
+  false,
+  { userId: user.id, country: user.country }
+);
+if (showNewCheckout) renderNewCheckout(); else renderLegacyCheckout();
+```
+
+**Best practices**:
+- **Default to off** — Flags ship disabled.
+- **Time-box temporary flags** — Track flag age; remove stale ones (technical debt accumulates fast).
+- **Test both branches** — Both flag states need test coverage.
+- **Use flags in canary deploys** — Combine progressive delivery with progressive exposure.
+- **Audit flag changes** — Treat flag flips like deploys; require approval for production-critical flags.
+
+---
+
+## 319. Deployment Freeze Strategies
+
+Deployment freezes pause deployments during high-risk windows (peak shopping, year-end close, regulatory reporting, conferences, on-call gaps).
+
+**Types**:
+
+- **Hard freeze** — No production deploys at all. Only break-glass for sev1 incidents.
+- **Soft freeze** — Deploys allowed with elevated approval (incident commander, VP eng).
+- **Service-scoped freeze** — Specific services frozen; others continue (e.g., freeze payments during Black Friday but allow internal tools).
+- **Region-scoped freeze** — Some regions frozen due to local events or compliance.
+
+**Implementation mechanisms**:
+
+- **Branch protection** — Block merges to `main` during the window via GitHub Actions or GitLab approval rules.
+- **GitOps policies** — Kyverno policy denying ArgoCD syncs based on a `freeze` ConfigMap or label.
+- **Pipeline guards** — CI checks a calendar (Google Calendar, PagerDuty schedule, or a `freeze.yaml` in the repo) and aborts.
+- **Manual approval gates** — Require sign-off from an on-call lead during the freeze window.
+
+**Example Kyverno policy**:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deployment-freeze
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: block-during-freeze
+      match:
+        any:
+          - resources:
+              kinds: ['Deployment', 'StatefulSet']
+              namespaces: ['production']
+      preconditions:
+        all:
+          - key: '{{ request.operation }}'
+            operator: Equals
+            value: UPDATE
+      validate:
+        message: 'Production deployments are frozen. Contact #incidents for break-glass.'
+        deny:
+          conditions:
+            any:
+              - key: '{{ time_now_utc() }}'
+                operator: GreaterThanOrEquals
+                value: '2026-11-25T00:00:00Z'
+              - key: '{{ time_now_utc() }}'
+                operator: LessThanOrEquals
+                value: '2026-12-01T00:00:00Z'
+```
+
+**Best practices**:
+- **Communicate early** — Announce freeze dates weeks in advance.
+- **Document break-glass procedures** — Who approves, how to bypass, what gets paged.
+- **Allow tested, automated patches** — Security patches shouldn't be frozen indefinitely.
+- **Avoid long freezes** — They create deploy backlogs that destabilize the system when unfrozen (deploy-Monday problem).
+
+---
+
+## 320. Handling Failed Production Deployments
+
+A disciplined incident response process minimizes damage:
+
+**Detect quickly**:
+- Synthetic monitoring + RUM detect user-facing issues fast.
+- SLO burn-rate alerts (Prometheus + Alertmanager) trigger before customers complain.
+- Deployment markers in Grafana/Datadog correlate spikes with releases.
+
+**Stabilize first, investigate later**:
+1. **Roll back immediately** — Don't debug in production while users suffer. Revert the Git commit (GitOps reconciles) or trigger Argo Rollouts abort.
+2. **Activate kill switches** — Disable feature flags for the broken feature; route around degraded components.
+3. **Scale up healthy replicas** — Buy headroom while you investigate.
+4. **Page the right people** — Service owner, SRE on-call, and incident commander.
+
+**During the incident**:
+- **Single source of truth** — Incident channel (Slack/Teams) with timeline.
+- **Designate roles** — Incident commander (coordinates), comms lead (updates stakeholders), tech leads (investigate).
+- **Avoid simultaneous changes** — One change at a time so you know what worked.
+- **Communicate externally** — Update status page; under-promise, over-deliver on ETAs.
+
+**After resolution**:
+- **Blameless postmortem** — Focus on system gaps, not individuals.
+- **Action items with owners and deadlines** — Track in your normal backlog.
+- **Look for systemic causes** — Why did tests miss it? Why did canary analysis not catch it? Why was rollback slow?
+- **Improve guardrails** — Better tests, smaller deploys, tighter canary gates, faster rollback automation.
+
+**Common root causes to look for**:
+- Insufficient canary duration or sample size.
+- Missing or wrong analysis metrics.
+- Database migration incompatibility with the previous app version (broken rollback path).
+- Configuration drift between staging and production.
+- Cold-start performance issues that don't appear under low canary traffic.
+- Cache warm-up requirements not accounted for.
+
+**Long-term prevention**:
+- Smaller, more frequent deploys (smaller blast radius).
+- Better observability (RED/USE metrics, distributed tracing).
+- Backward-compatible migrations (expand-contract).
+- Chaos engineering to validate rollback paths.
+- Game days that practice rollback under pressure.
+
+The mature answer isn't "don't have failures" — it's "fail safely, recover quickly, and learn systematically."
+
+---
+name: external-secrets
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::...:role/external-secrets
+```
+
+ESO uses IRSA, no static credentials.
+
+**AKS Workload Identity:**
+
+```yaml
+metadata:
+  annotations:
+    azure.workload.identity/client-id: <client-id>
+```
+
+**GKE Workload Identity:**
+
+```yaml
+metadata:
+  annotations:
+    iam.gke.io/gcp-service-account: external-secrets@project.iam.gserviceaccount.com
+```
+
+**Use case 3: CSI Driver for direct mounting**
+
+Secrets Store CSI Driver:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: aws-secrets
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: prod/db/credentials
+        objectType: secretsmanager
+```
+
+```yaml
+# Pod:
+spec:
+  containers:
+    - volumeMounts:
+        - name: secrets-store
+          mountPath: /mnt/secrets
+  volumes:
+    - name: secrets-store
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: aws-secrets
+```
+
+Secrets mounted as files. Never in K8s Secrets.
+
+**Key rotation:**
+
+**Automatic in cloud:**
+
+```bash
+# AWS Secrets Manager:
+aws secretsmanager rotate-secret \
+  --secret-id prod/db/credentials \
+  --rotation-rules AutomaticallyAfterDays=30
+```
+
+ESO picks up new value (refresh interval).
+Apps re-read.
+
+**Manual rotation:**
+
+```bash
+# Generate new key in KMS:
+aws kms create-key
+
+# Update EncryptionConfiguration to use new key
+# Re-save all secrets to encrypt with new key
+# Remove old key (after migration complete)
+```
+
+**Audit:**
+
+All cloud KMS operations logged:
+
+```
+AWS CloudTrail: every KMS API call
+Azure Monitor: Key Vault audit logs
+GCP Audit Logs: Cloud KMS operations
+```
+
+Track:
+- Who accessed which key
+- When
+- What operation
+
+Critical for compliance.
+
+**Performance:**
+
+KMS adds latency:
+- API call (~10-50ms)
+- Caching helps (KMS plugin caches)
+
+```yaml
+providers:
+  - kms:
+      cachesize: 1000   # Cache up to 1000 keys
+```
+
+**Production scenarios:**
+
+1. **EKS with AWS KMS**: Enabled KMS encryption. Secrets in etcd encrypted with customer key. CloudTrail showed all access.
+
+2. **External Secrets + Secrets Manager**: Migrated from K8s Secrets to AWS Secrets Manager. ESO synced. Centralized secret management.
+
+3. **CSI driver for compliance**: PCI compliance required secrets never in K8s. CSI driver mounted from cloud directly.
+
+4. **Workload Identity adoption**: Removed all static credentials. Used IRSA/Workload Identity. Compliance and security improved.
+
+5. **Key rotation**: Annual KMS key rotation. Old keys retained for decryption, new keys for encryption. No downtime.
+
+---
+
+## 346. Explain identity federation use cases
+
+Identity federation connects identities across systems. In Kubernetes context, often between cloud IAM and Kubernetes.
+
+**Federation concepts:**
+
+**Federated identity:**
+
+```
+Identity in system A
+       ↓ (federation)
+Trusted by system B
+       ↓
+System B grants access without separate account
+```
+
+**OIDC (OpenID Connect):**
+
+Modern federation standard. Used in many integrations.
+
+**SAML:**
+
+Older standard. Enterprise SSO.
+
+**Use cases:**
+
+**Use case 1: Workload identity (covered earlier)**
+
+Kubernetes SA → cloud IAM role
+- IRSA (AWS)
+- Workload Identity (GCP)
+- Workload Identity (Azure)
+
+Pods access cloud without keys.
+
+**Use case 2: Human authentication**
+
+Users authenticate via corporate identity provider:
+
+**OIDC for kubectl:**
+
+```yaml
+# kube-apiserver:
+- --oidc-issuer-url=https://accounts.google.com
+- --oidc-client-id=<client-id>
+- --oidc-username-claim=email
+- --oidc-groups-claim=groups
+```
+
+Users authenticate via Google/Okta/AD. kubectl uses OIDC token.
+
+**Use case 3: Cross-cloud federation**
+
+Federate identity between clouds:
+
+```
+AWS IAM ←→ GCP IAM ←→ Azure AD
+```
+
+Workload in one cloud accesses resources in another.
+
+**AWS Cognito Identity Pools:**
+
+```yaml
+# Federate external identities to AWS:
+Cognito → temporary AWS credentials
+```
+
+**Use case 4: Multi-cluster federation**
+
+Same identity across clusters:
+
+```
+Cluster A in us-east
+Cluster B in eu-west
+User authenticates once, access both
+```
+
+Via shared OIDC provider.
+
+**Use case 5: CI/CD federation**
+
+GitHub Actions → Cloud:
+
+```yaml
+# GitHub OIDC token → AWS IAM role
+permissions:
+  id-token: write
+
+jobs:
+  deploy:
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::...:role/github-actions
+```
+
+No long-lived secrets.
+
+**Use case 6: Application user federation**
+
+App allows login via Google/Facebook/etc.:
+
+```
+User → Google login → Token
+       ↓
+App verifies token → Logs in user
+```
+
+Common pattern for SaaS apps.
+
+**Implementing OIDC:**
+
+**Step 1: Identity provider**
+
+```
+Google
+Okta
+Auth0
+Keycloak (self-hosted)
+Azure AD
+```
+
+**Step 2: Register application**
+
+In provider, create app:
+
+```
+Application name
+Redirect URIs
+Allowed scopes
+Client ID
+Client secret (if needed)
+```
+
+**Step 3: Configure consumer**
+
+**For kubectl:**
+
+```yaml
+# Cluster config:
+- --oidc-issuer-url=https://my-idp.example.com
+- --oidc-client-id=kubernetes
+- --oidc-username-claim=email
+- --oidc-groups-claim=groups
+```
+
+**For app:**
+
+```python
+# OIDC client library:
+from authlib.integrations.flask_client import OAuth
+
+oauth = OAuth(app)
+oauth.register(
+    name='google',
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration'
+)
+```
+
+**Step 4: User auth flow**
+
+```
+1. User → app
+2. App redirects to IdP
+3. User authenticates with IdP
+4. IdP redirects back with code
+5. App exchanges code for ID token
+6. App uses claims from token
+```
+
+**Token validation:**
+
+```python
+# Verify token signature, claims
+from authlib.jose import jwt
+token = jwt.decode(token_string, public_key)
+```
+
+Tokens are JWTs.
+
+**Groups and authorization:**
+
+After authentication, authorize based on groups:
+
+```yaml
+# RBAC binding:
+subjects:
+  - kind: Group
+    name: kubernetes-admins   # OIDC group
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+```
+
+Groups come from OIDC token.
+
+**Cross-cloud examples:**
+
+**Example 1: GitHub → AWS**
+
+```yaml
+# GitHub Actions OIDC:
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123:role/github-actions
+    aws-region: us-east-1
+```
+
+AWS trusts GitHub's OIDC. Issues temp credentials.
+
+**Example 2: GitHub → GCP**
+
+```yaml
+- uses: google-github-actions/auth@v2
+  with:
+    workload_identity_provider: projects/123/locations/global/workloadIdentityPools/github/providers/github
+    service_account: my-sa@project.iam.gserviceaccount.com
+```
+
+**Example 3: AWS → Azure**
+
+Use OIDC federation:
+
+```
+AWS workload uses STS token
+Azure trusts AWS OIDC
+Access Azure resources
+```
+
+Less common but possible.
+
+**Benefits:**
+
+1. **No long-lived credentials**: tokens are short-lived
+2. **Centralized auth**: single source of truth
+3. **MFA support**: via IdP
+4. **Audit trail**: in IdP
+5. **Easier offboarding**: remove from IdP, all access revoked
+
+**Common patterns:**
+
+**Pattern 1: kubectl via OIDC**
+
+```
+Users login via corporate SSO (Okta)
+kubectl uses OIDC token
+RBAC based on groups
+```
+
+**Pattern 2: CI/CD via federation**
+
+```
+GitHub Actions OIDC
+AWS/GCP/Azure trusts GitHub
+Temp credentials per workflow
+```
+
+**Pattern 3: Pod identity**
+
+```
+K8s SA → federated identity → cloud resources
+No static credentials
+```
+
+**Pattern 4: User-facing app**
+
+```
+End users login via social OAuth
+App federates identity
+Authorization based on claims
+```
+
+**Production scenarios:**
+
+1. **OIDC for kubectl**: Migrated from kubeconfig to OIDC via Okta. Departures auto-remove access. Compliance happy.
+
+2. **GitHub OIDC for CI**: Removed AWS keys from GitHub. OIDC federation. Short-lived credentials per workflow.
+
+3. **Cross-cloud federation**: Multi-cloud apps. AWS workload accessed Azure storage via OIDC federation.
+
+4. **App user federation**: SaaS allowed Google/GitHub login. Easier onboarding. No password management for users.
+
+5. **Workload identity standardization**: All pod-to-cloud auth via workload identity (IRSA/WI). No static credentials anywhere.
+
+---
+
+## 347. How do you secure API endpoints?
+
+API endpoints exposed via Ingress are common attack targets. Multiple layers of security required.
+
+**Layers of API security:**
+
+```
+Internet
+   ↓
+Cloud LB (DDoS protection)
+   ↓
+WAF (application-level)
+   ↓
+Ingress (TLS termination)
+   ↓
+Authentication (OAuth, API keys)
+   ↓
+Rate limiting
+   ↓
+Authorization (per endpoint)
+   ↓
+Application
+```
+
+**Layer 1: Cloud-level protection**
+
+**DDoS:**
+
+```
+AWS Shield (Standard free, Advanced paid)
+Azure DDoS Protection
+GCP Cloud Armor
+```
+
+Protects against volumetric attacks.
+
+**Layer 2: WAF**
+
+Web Application Firewall blocks common attacks:
+
+```yaml
+# ALB WAF:
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:...
+```
+
+WAF rules:
+- OWASP Top 10
+- SQL injection
+- XSS
+- Bot protection
+- Geographic blocking
+
+**Layer 3: TLS**
+
+```yaml
+spec:
+  tls:
+    - hosts: [api.example.com]
+      secretName: tls-cert
+```
+
+Strong TLS:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-protocols: "TLSv1.2 TLSv1.3"
+    nginx.ingress.kubernetes.io/ssl-ciphers: "ECDHE+AES256:!aNULL:!MD5:!DSS"
+```
+
+HSTS:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+```
+
+**Layer 4: Authentication**
+
+**API Keys:**
+
+```yaml
+# In header:
+Authorization: Api-Key xxx
+```
+
+Simple but limited:
+- Hard to rotate
+- All-or-nothing
+- No user identity
+
+**OAuth 2.0 / OIDC:**
+
+```yaml
+# JWT token:
+Authorization: Bearer eyJ...
+```
+
+Better:
+- Standardized
+- User identity in token
+- Short-lived
+- Refresh tokens
+
+**mTLS:**
+
+```yaml
+# Client cert required:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    nginx.ingress.kubernetes.io/auth-tls-secret: "default/ca-secret"
+```
+
+Strong authentication via certificates.
+
+**OAuth2 Proxy:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+spec:
+  template:
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy
+          args:
+            - --provider=oidc
+            - --oidc-issuer-url=https://auth.example.com
+            - --client-id=...
+            - --redirect-url=https://api.example.com/oauth2/callback
+```
+
+Then Ingress requires auth:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "https://oauth2-proxy/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://oauth2-proxy/oauth2/start"
+```
+
+**JWT validation:**
+
+```yaml
+# Istio:
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: jwt-auth
+spec:
+  selector:
+    matchLabels:
+      app: api
+  jwtRules:
+    - issuer: "https://auth.example.com"
+      jwksUri: "https://auth.example.com/.well-known/jwks.json"
+```
+
+Service mesh validates JWT.
+
+**Layer 5: Rate limiting**
+
+```yaml
+# NGINX:
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+    nginx.ingress.kubernetes.io/limit-rpm: "100"
+```
+
+Per-IP rate limits.
+
+**More sophisticated:**
+
+```yaml
+# Per-user via JWT claim:
+nginx.ingress.kubernetes.io/limit-by-header: "X-User-ID"
+```
+
+**Cloud-native rate limiting:**
+
+```
+AWS API Gateway: per-API key
+Azure API Management: tiered
+GCP API Gateway: configurable
+```
+
+**Layer 6: Authorization**
+
+Even after authentication, check permissions:
+
+```python
+@app.route('/api/admin')
+@require_auth
+@require_role('admin')
+def admin_endpoint():
+    ...
+```
+
+Per-endpoint authorization.
+
+**Layer 7: Input validation**
+
+```python
+from pydantic import BaseModel
+
+class CreateUserRequest(BaseModel):
+    email: EmailStr
+    age: int
+    
+    @validator('age')
+    def age_must_be_positive(cls, v):
+        if v < 0:
+            raise ValueError('Age must be positive')
+        return v
+```
+
+Reject malformed/malicious input.
+
+**Layer 8: Security headers**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "Content-Security-Policy: default-src 'self'";
+      more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+```
+
+**Layer 9: CORS**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST"
+```
+
+Restrict cross-origin requests.
+
+**Layer 10: API gateway**
+
+For complex APIs, dedicated API gateway:
+
+```
+Kong
+Ambassador
+AWS API Gateway
+Apigee
+```
+
+Features:
+- Routing
+- Auth
+- Rate limiting
+- Transformation
+- Analytics
+
+**Cloud API gateways:**
+
+**AWS API Gateway:**
+
+```
+REST API or HTTP API
+Cognito auth
+WAF integration
+Per-stage rate limiting
+Usage plans, API keys
+```
+
+**Azure API Management:**
+
+```
+Comprehensive API platform
+Developer portal
+Subscriptions
+```
+
+**GCP API Gateway:**
+
+```
+API config + gateways
+Auth options
+Monitoring
+```
+
+**Production scenarios:**
+
+1. **Defense in depth**: WAF + OAuth + rate limiting + input validation. Multi-layer protection. Single failure doesn't compromise.
+
+2. **OAuth2 Proxy for admin tools**: Grafana, dashboards behind OAuth2 Proxy. Corporate SSO required. No public access.
+
+3. **API Gateway for partners**: B2B API exposed via API Gateway. API keys per partner. Per-partner rate limits. Comprehensive auth.
+
+4. **mTLS for service-to-service**: Internal APIs required client certificates. Defense beyond network.
+
+5. **Rate limiting saved**: Brute force attempt on login. Rate limit kicked in at 100 req/min per IP. Attack ineffective.
+
+---
+
+## 348. Explain node image upgrade strategies
+
+Node OS images need regular updates for security patches. Strategies balance disruption with currency.
+
+**Why update node images:**
+
+- Security patches (CVEs)
+- Kernel updates
+- Runtime updates (containerd, etc.)
+- Cloud provider improvements
+
+**Update frequency:**
+
+```
+Critical security: ASAP
+Standard security: monthly
+Feature updates: quarterly
+```
+
+**Update methods:**
+
+**Method 1: Replace nodes**
+
+```
+1. Provision new nodes with new image
+2. Cordon old nodes (no new pods)
+3. Drain old nodes (evict existing pods)
+4. Terminate old nodes
+```
+
+Default approach for managed Kubernetes.
+
+**Method 2: In-place patching**
+
+```
+1. SSH to node
+2. Apply patches (apt update, yum update)
+3. Reboot
+```
+
+Not recommended for K8s:
+- Inconsistent state
+- Hard to track
+- Can break things
+
+**Cloud-specific:**
+
+**AKS Node Image:**
+
+```bash
+# Check available:
+az aks nodepool get-upgrades \
+  --cluster-name myAKSCluster \
+  --resource-group myResourceGroup \
+  --name workpool
+
+# Upgrade:
+az aks nodepool upgrade \
+  --cluster-name myAKSCluster \
+  --resource-group myResourceGroup \
+  --name workpool \
+  --node-image-only
+```
+
+OS patches without K8s version change.
+
+**Auto-upgrade:**
+
+```bash
+az aks update --node-os-upgrade-channel NodeImage
+```
+
+Channels:
+- None
+- Unmanaged
+- SecurityPatch
+- NodeImage
+
+**EKS AMI:**
+
+EKS releases new AMI versions regularly.
+
+**Managed Node Groups:**
+
+```bash
+# Update node group to latest AMI:
+aws eks update-nodegroup-version \
+  --cluster-name my-cluster \
+  --nodegroup-name workers \
+  --force
+```
+
+**Custom AMI:**
+
+If using custom AMI, update yourself:
+
+```bash
+# Update launch template:
+aws ec2 create-launch-template-version \
+  --launch-template-id lt-xxx \
+  --source-version 1 \
+  --launch-template-data '{"ImageId": "ami-new"}'
+```
+
+**Karpenter:**
+
+```yaml
+spec:
+  amiFamily: AL2
+  amiSelector:
+    aws::owners:
+      - amazon
+```
+
+Karpenter automatically uses latest AMI matching criteria.
+
+**Bottlerocket:**
+
+```yaml
+amiFamily: Bottlerocket
+```
+
+Bottlerocket has automatic OS updates.
+
+**GKE:**
+
+**Auto-upgrade (default):**
+
+```bash
+gcloud container node-pools update my-pool \
+  --enable-autoupgrade
+```
+
+Google handles node image updates automatically.
+
+**Manual:**
+
+```bash
+gcloud container node-pools upgrade my-pool \
+  --cluster my-cluster
+```
+
+**Strategies:**
+
+**Strategy 1: Rolling replacement**
+
+```
+1 node at a time
+Slow but minimal impact
+```
+
+```bash
+# AKS:
+az aks nodepool update --max-surge 1
+
+# EKS:
+--update-config maxUnavailable=1
+```
+
+**Strategy 2: Surge upgrades**
+
+```
+Add extra nodes during upgrade
+Drain old faster
+```
+
+```bash
+az aks nodepool update --max-surge 33%
+```
+
+**Strategy 3: Blue-green node pool**
+
+```
+1. Create new node pool with new image
+2. Cordon old pool
+3. Drain old pool (pods move to new)
+4. Verify
+5. Delete old pool
+```
+
+Most safe. Most resource use.
+
+**PodDisruptionBudgets:**
+
+Critical for safe upgrades:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app-pdb
+spec:
+  minAvailable: 50%
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+Drain respects PDB. Won't evict if would violate.
+
+**Timing considerations:**
+
+```
+Off-peak hours for upgrades
+Avoid known traffic patterns
+Coordinate across regions
+```
+
+**Maintenance windows:**
+
+```bash
+# AKS:
+az aks maintenanceconfiguration add \
+  --schedule-type Weekly \
+  --day-of-week Sunday \
+  --start-time 02:00
+```
+
+Schedule auto-upgrades.
+
+**Monitoring during upgrade:**
+
+```promql
+# Watch:
+- Pod restart count
+- Pending pods
+- Error rates
+- Latency
+```
+
+Alert on issues.
+
+**Bottlerocket considerations:**
+
+Bottlerocket designed for containers:
+- Immutable
+- Atomic updates
+- Smaller attack surface
+
+```yaml
+# Karpenter with Bottlerocket:
+amiFamily: Bottlerocket
+```
+
+Easier updates than traditional Linux.
+
+**Production scenarios:**
+
+1. **Monthly AKS patches**: Set auto-upgrade for security patches monthly. Scheduled Sundays 2am. No engineer intervention.
+
+2. **EKS Karpenter automation**: Karpenter automatically used latest AMI. Nodes replaced as needed. No manual AMI management.
+
+3. **GKE auto-upgrade**: Enabled for all clusters. Google handled image updates. Engineering effort: zero.
+
+4. **Critical CVE response**: Spring4Shell announced. Updated node images same day. All nodes replaced within hours.
+
+5. **PDB prevented disruption**: Upgrade started. PDB on critical service prevented all replicas being evicted. Single replica disrupted at a time.
+
+---
+
+## 349. How do you migrate on-prem Kubernetes to cloud?
+
+Migration to cloud is complex. Multi-phase approach minimizes risk.
+
+**Migration phases:**
+
+**Phase 1: Assess**
+
+Audit:
+- Workloads (count, types)
+- Dependencies (databases, external services)
+- Data (size, sensitivity)
+- Networking (CIDRs, integrations)
+- Storage (PV sizes, types)
+- Operational tools
+
+**Phase 2: Plan**
+
+Decisions:
+- Target cloud (AWS/Azure/GCP/multiple)
+- Architecture (single cluster vs multi)
+- Migration approach (lift-and-shift vs refactor)
+- Timeline
+- Rollback strategy
+
+**Phase 3: Prepare**
+
+Build cloud infrastructure:
+- Networks
+- Cluster
+- Storage
+- Monitoring
+- CI/CD
+
+**Phase 4: Migrate**
+
+Move workloads:
+- Pilot (one app)
+- Production
+- Validate
+- Decommission on-prem
+
+**Phase 5: Optimize**
+
+Post-migration:
+- Right-size
+- Cloud-native features
+- Cost optimization
+
+**Migration approaches:**
+
+**Lift-and-shift:**
+
+```
+Same apps, K8s manifests
+Run in cloud K8s
+Minimal changes
+```
+
+Fastest but doesn't leverage cloud benefits.
+
+**Re-platform:**
+
+```
+Some refactoring
+Use cloud K8s features
+Cloud-managed services for some components
+```
+
+Balance of speed and benefit.
+
+**Re-architect:**
+
+```
+Significant refactoring
+Cloud-native patterns
+Serverless components
+```
+
+Most benefit, most time.
+
+**Data migration:**
+
+Most complex part.
+
+**Strategy 1: Backup-restore**
+
+```
+1. Take backup on-prem
+2. Transfer to cloud
+3. Restore in cloud
+```
+
+Downtime during cutover.
+
+**Strategy 2: Database replication**
+
+```
+1. Set up replication on-prem → cloud
+2. Wait for sync
+3. Cutover (writes to cloud)
+4. Remove on-prem
+```
+
+Minimal downtime.
+
+**Strategy 3: Dual-write**
+
+```
+1. App writes to both on-prem and cloud
+2. Verify consistency
+3. Switch reads to cloud
+4. Stop on-prem writes
+```
+
+Most complex, least downtime.
+
+**Velero for K8s objects:**
+
+```bash
+# On-prem:
+velero backup create migration-backup \
+  --include-namespaces app1,app2
+
+# Cloud:
+velero restore create --from-backup migration-backup
+```
+
+Backs up resources (not data).
+
+**Connectivity during migration:**
+
+Hybrid connection essential:
+
+```
+Site-to-site VPN, Direct Connect, ExpressRoute, Cloud Interconnect
+On-prem and cloud talk
+Apps can be split during migration
+```
+
+**Step-by-step example:**
+
+**Pre-migration:**
+
+```
+1. Document all workloads
+2. Identify dependencies
+3. Build target architecture
+4. Plan cutover dates
+```
+
+**Build cloud:**
+
+```
+1. Set up cloud account/subscription
+2. Configure networking (VPC, subnets)
+3. Set up VPN/Direct Connect to on-prem
+4. Provision K8s cluster (EKS/AKS/GKE)
+5. Install cluster components (CNI, ingress, monitoring)
+6. Set up CI/CD pipelines
+7. Configure DNS, certificates
+```
+
+**Pilot migration:**
+
+```
+1. Choose low-risk app
+2. Deploy to cloud cluster
+3. Test functionality
+4. Test failover scenarios
+5. Validate performance
+6. Document learnings
+```
+
+**Production migration (per app):**
+
+```
+1. Deploy to cloud (along with on-prem)
+2. Set up data replication
+3. Validate cloud version works
+4. Cutover: route traffic to cloud
+5. Monitor closely
+6. After stability: decommission on-prem
+```
+
+**Common challenges:**
+
+**Challenge 1: IP overlap**
+
+On-prem and cloud have overlapping CIDRs.
+
+Fix:
+- Plan non-overlapping CIDRs from start
+- NAT if can't change
+- Re-IP one side (painful)
+
+**Challenge 2: DNS**
+
+On-prem DNS records hardcoded.
+
+Fix:
+- DNS migration plan
+- Conditional forwarding during transition
+- Update records gradually
+
+**Challenge 3: Storage**
+
+PV sizes, types differ in cloud.
+
+Fix:
+- Map on-prem storage classes to cloud
+- May need refactor for cloud-native storage
+
+**Challenge 4: External integrations**
+
+Apps connect to on-prem databases, services.
+
+Fix:
+- Update connection strings
+- Keep some on-prem (hybrid)
+- Migrate dependent services together
+
+**Challenge 5: Identity**
+
+On-prem AD, cloud has different IAM.
+
+Fix:
+- Federation (AD Connect, etc.)
+- Identity sync
+- Cloud IAM equivalents
+
+**Challenge 6: Stateful workloads**
+
+Databases, queues with state.
+
+Fix:
+- Cloud-managed services (RDS, Cosmos DB, Cloud SQL)
+- Or run in K8s with proper storage
+
+**Challenge 7: Networking complexity**
+
+Cluster networking different in cloud.
+
+Fix:
+- Understand cloud networking
+- May need to adjust NetworkPolicies
+- Test thoroughly
+
+**Best practices:**
+
+1. **Start small**: pilot with non-critical
+2. **Hybrid period**: not all-at-once
+3. **Test extensively**: every aspect
+4. **Plan rollback**: for each migration
+5. **Monitor closely**: during and after
+6. **Document everything**: helps future migrations
+7. **Train team**: cloud K8s is different
+
+**Cost considerations:**
+
+Cloud often initially more expensive:
+- Egress costs
+- Higher per-resource costs
+- New tooling
+
+But:
+- Reduced operational burden
+- Better scaling
+- Less idle capacity
+- Cloud-native services
+
+Long-term TCO often favorable.
+
+**Production scenarios:**
+
+1. **3-year migration**: 200 apps, 4 data centers → AWS. Phased over 3 years. Started with non-critical. Each phase learned, improved.
+
+2. **Hybrid period challenges**: Apps in cloud, DBs on-prem. Latency added to every call. Eventually migrated DBs too.
+
+3. **Lift-and-shift first**: Initial migration kept things mostly same. Worked but didn't leverage cloud. Phase 2: refactor for cloud-native.
+
+4. **Velero migration**: Used Velero to backup all K8s resources. Restored in cloud. Smooth Kubernetes object migration.
+
+5. **Data the hardest**: K8s easy. Data migration consumed most time. Cross-region replication, dual-write, cutover all challenging.
+
+---
+
+## 350. Explain enterprise landing zone considerations
+
+Landing zones provide standardized cloud foundation. Critical for enterprise Kubernetes deployments.
+
+**What's a landing zone:**
+
+Pre-configured cloud environment:
+- Identity
+- Networking
+- Security baselines
+- Compliance controls
+- Operations tooling
+
+New apps deploy into existing landing zone. Standardized, secure.
+
+**Components:**
+
+**Identity:**
+
+```
+Cloud identity provider (AWS IAM Identity Center, Azure AD, GCP Cloud Identity)
+Federated with corporate IdP
+SSO for users
+Service principals/SAs for automation
+```
+
+**Networking:**
+
+```
+Hub-and-spoke topology
+Hub: shared services
+Spokes: workload VPCs/VNets
+Connectivity: VPN, Direct Connect, ExpressRoute
+DNS strategy
+Firewall rules
+```
+
+**Multi-account/multi-subscription:**
+
+```
+AWS Organizations
+Azure subscriptions
+GCP projects/folders
+
+Separate accounts:
+- Production
+- Non-production
+- Security
+- Sandbox
+- etc.
+```
+
+Account separation for blast radius.
+
+**Security baselines:**
+
+```
+Logging enabled everywhere
+Encryption requirements
+Access policies
+Compliance controls
+Vulnerability scanning
+```
+
+**For Kubernetes landing zone:**
+
+**Account structure:**
+
+```
+Org
+├── Security account (audit logs, GuardDuty)
+├── Shared services (CI/CD, monitoring)
+├── Production
+│   ├── EKS cluster account A
+│   └── EKS cluster account B
+├── Non-production
+│   ├── Staging cluster
+│   └── Dev cluster
+└── Sandbox (free for experimentation)
+```
+
+**Network design:**
+
+```
+Transit Gateway / Virtual WAN connects accounts
+
+Production VPC:
+- Public subnets (LB)
+- Private subnets (nodes)
+- Database subnets
+- TGW attachment
+
+Non-production VPC:
+- Similar
+- Smaller CIDRs
+
+Shared services VPC:
+- DNS
+- CI/CD
+- Monitoring
+```
+
+**Cluster baseline:**
+
+Pre-installed in every cluster:
+- Ingress controller
+- Cert-manager
+- External Secrets
+- Monitoring (Prometheus, Grafana)
+- Logging (Fluent Bit)
+- Security (Falco, OPA Gatekeeper)
+- Network policies (default-deny)
+
+**Standardization tools:**
+
+**Terraform modules:**
+
+```hcl
+module "eks_cluster" {
+  source = "git::https://...//modules/eks-cluster"
+  
+  cluster_name = "my-cluster"
+  vpc_id = module.vpc.vpc_id
+  ...
+}
+```
+
+Reusable modules ensure consistency.
+
+**Helm charts:**
+
+```yaml
+# Standard app chart:
+- Ingress
+- Service
+- Deployment
+- HPA
+- PDB
+- NetworkPolicy
+```
+
+Apps use standard chart.
+
+**ArgoCD ApplicationSets:**
+
+```yaml
+# Deploy same baseline to all clusters:
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+spec:
+  generators:
+    - clusters: {}
+  template:
+    spec:
+      source:
+        repoURL: ...
+        path: cluster-baseline
+```
+
+Every cluster gets baseline.
+
+**Compliance and governance:**
+
+**Policies:**
+
+```yaml
+# OPA Gatekeeper enforce:
+- Image registry allowlist
+- Required labels
+- Resource limits required
+- No privileged containers
+- Required NetworkPolicies
+```
+
+**Tagging:**
+
+```yaml
+# Mandatory tags:
+- cost-center
+- team
+- environment
+- application
+- compliance-scope
+```
+
+For cost allocation, compliance.
+
+**Cost management:**
+
+```
+Per-account billing
+Cost allocation tags
+Showback/chargeback
+Budget alerts
+```
+
+**Operational excellence:**
+
+```
+Standard runbooks
+Documented procedures
+On-call rotations
+Incident management
+Post-mortem process
+```
+
+**Implementation:**
+
+**Phase 1: Foundation**
+
+```
+1. Cloud accounts/subscriptions
+2. Identity and access
+3. Networking
+4. Security baselines
+5. Operations tools
+```
+
+**Phase 2: Kubernetes baseline**
+
+```
+1. Standard cluster module
+2. Baseline addons (ingress, monitoring, etc.)
+3. Security policies
+4. CI/CD pipelines
+5. GitOps setup
+```
+
+**Phase 3: Application deployment**
+
+```
+1. Standard Helm charts
+2. Self-service for teams
+3. Documentation
+4. Training
+```
+
+**Phase 4: Continuous improvement**
+
+```
+Iterate based on usage
+Add new capabilities
+Update baselines
+```
+
+**Common patterns:**
+
+**Pattern 1: Strict standardization**
+
+```
+Everything from approved patterns
+Limited team autonomy
+Highest consistency
+```
+
+For: regulated industries.
+
+**Pattern 2: Paved road**
+
+```
+Recommended patterns
+Teams can deviate but support reduced
+Balance autonomy and consistency
+```
+
+Most common.
+
+**Pattern 3: Self-service**
+
+```
+Platform team provides building blocks
+Teams compose their own
+Maximum autonomy
+```
+
+For: tech-savvy orgs.
+
+**Tools:**
+
+**AWS Control Tower:**
+
+Sets up AWS landing zone.
+
+**Azure Landing Zones:**
+
+Azure landing zones via Azure Bicep/ARM.
+
+**Google Cloud Landing Zones:**
+
+GCP landing zones via Terraform modules.
+
+**Open source:**
+
+- AWS Landing Zone Accelerator (LZA)
+- Cloud Foundation Toolkit (GCP)
+- Azure Enterprise-Scale Landing Zones
+
+**Considerations:**
+
+**Consideration 1: Don't over-engineer**
+
+Start simple. Add complexity as needed.
+
+**Consideration 2: Team enablement**
+
+Provide tools and patterns. Teams need to be productive.
+
+**Consideration 3: Iteration**
+
+Landing zone evolves. Not one-and-done.
+
+**Consideration 4: Documentation**
+
+Without docs, landing zone fails.
+
+**Consideration 5: Training**
+
+Teams need to understand patterns.
+
+**Production scenarios:**
+
+1. **Enterprise landing zone**: Fortune 500 set up AWS landing zone. 100s of teams. Standard patterns. Compliance built-in. New apps deployed in days, not months.
+
+2. **Multi-cloud landing zones**: AWS + Azure landing zones. Similar patterns. Teams could deploy to either. Multi-cloud flexibility.
+
+3. **GitOps for cluster management**: ArgoCD managed all clusters from Git. Baseline configurations deployed automatically. Drift detected and fixed.
+
+4. **Cost allocation via tags**: Mandatory tags enforced. Per-team cost reports. Teams optimized own usage. Total cost reduced 25%.
+
+5. **Compliance via policies**: OPA Gatekeeper enforced security policies. SOC 2 audit found compliance built-in to platform. Easy to demonstrate.
