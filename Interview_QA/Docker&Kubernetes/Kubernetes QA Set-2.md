@@ -81848,3 +81848,6828 @@ kubectl get svc my-service -o yaml
 4. **Legacy app issue**: Old Java app didn't bind to IPv6. JVM flag needed. Added `-Djava.net.preferIPv6Addresses=true`.
 
 5. **NAT64 for hybrid**: IPv6-only pods needed IPv4 external services. NAT64 + DNS64 in cluster. Translated transparently.
+
+# Kubernetes Storage (381-400)
+
+## 381. Explain Kubernetes storage architecture
+
+Kubernetes storage is layered, with abstractions separating workload concerns from infrastructure details.
+
+**Architecture layers:**
+
+```
+Pod (uses volume)
+        ↓
+Volume claim (PVC)
+        ↓
+Volume (PV)
+        ↓
+StorageClass (provisioner)
+        ↓
+CSI Driver
+        ↓
+Storage backend (EBS, GCE PD, NFS, Ceph, etc.)
+```
+
+**Core concepts:**
+
+**Volume:**
+
+Directory accessible to containers in a pod:
+
+```yaml
+spec:
+  containers:
+    - name: app
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      emptyDir: {}   # Or other types
+```
+
+Lives as long as the pod.
+
+**Volume types:**
+
+**Ephemeral:**
+- emptyDir: temporary, deleted with pod
+- configMap: from ConfigMap
+- secret: from Secret
+- downwardAPI: pod metadata
+
+**Persistent:**
+- persistentVolumeClaim: persistent storage
+- csi: CSI driver direct
+
+**Host-based:**
+- hostPath: node's filesystem (avoid in production)
+- local: local node storage (PV-managed)
+
+**PersistentVolume (PV):**
+
+Cluster resource representing storage:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: my-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  awsElasticBlockStore:
+    volumeID: vol-xxx
+```
+
+Admin manages PVs (or dynamic provisioning creates).
+
+**PersistentVolumeClaim (PVC):**
+
+Pod's request for storage:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+```
+
+User creates. Kubernetes binds to PV.
+
+**StorageClass:**
+
+Defines storage type, parameters:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+volumeBindingMode: WaitForFirstConsumer
+```
+
+Templates for dynamic provisioning.
+
+**Binding:**
+
+```
+PVC created
+    ↓
+Kubernetes finds matching PV (or creates via StorageClass)
+    ↓
+PVC bound to PV
+    ↓
+Pod uses PVC
+    ↓
+Volume mounted in pod
+```
+
+**Lifecycle:**
+
+```
+Provisioning: PV created (static or dynamic)
+       ↓
+Binding: PVC matched to PV
+       ↓
+Using: Pod mounts PV via PVC
+       ↓
+Releasing: Pod deleted, PVC remains
+       ↓
+Reclaiming: PVC deleted (PV based on reclaim policy)
+```
+
+**CSI (Container Storage Interface):**
+
+Standard interface for storage:
+
+```
+CSI Driver:
+- Controller plugin (cluster-wide operations)
+- Node plugin (per-node operations)
+```
+
+Plugs into Kubernetes via:
+
+```yaml
+provisioner: ebs.csi.aws.com   # In StorageClass
+```
+
+**Access modes:**
+
+**ReadWriteOnce (RWO):**
+- Single node read/write
+- Most block storage (EBS, Persistent Disks)
+
+**ReadOnlyMany (ROX):**
+- Multiple nodes read-only
+
+**ReadWriteMany (RWX):**
+- Multiple nodes read/write
+- File systems (NFS, EFS, Azure Files)
+
+**ReadWriteOncePod (RWOP):**
+- Single pod read/write (1.22+)
+- Stricter than RWO
+
+**Reclaim policies:**
+
+```yaml
+spec:
+  persistentVolumeReclaimPolicy: Retain   # Or Delete
+```
+
+**Retain:**
+- PV stays after PVC deleted
+- Data preserved
+- Manual cleanup
+
+**Delete:**
+- PV and underlying storage deleted
+- Common for dynamic provisioning
+
+**Volume modes:**
+
+```yaml
+spec:
+  volumeMode: Filesystem   # Default, or Block
+```
+
+**Filesystem:**
+- Mounted as filesystem
+- Common
+
+**Block:**
+- Raw block device
+- Apps manage filesystem
+- Databases sometimes
+
+**Storage drivers (in-tree vs CSI):**
+
+**In-tree (deprecated):**
+- Built into Kubernetes
+- gcePersistentDisk, awsElasticBlockStore, etc.
+- Being removed
+
+**CSI:**
+- External
+- Pluggable
+- Standard interface
+- Future
+
+**Volume snapshotting:**
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: snap-class
+driver: ebs.csi.aws.com
+deletionPolicy: Delete
+
+---
+
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: snap-1
+spec:
+  volumeSnapshotClassName: snap-class
+  source:
+    persistentVolumeClaimName: my-pvc
+```
+
+Point-in-time copies.
+
+**Volume cloning:**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+spec:
+  dataSource:
+    name: source-pvc
+    kind: PersistentVolumeClaim
+```
+
+PVC cloned from another.
+
+**Storage capacity tracking:**
+
+Scheduler considers storage capacity:
+
+```yaml
+# CSIStorageCapacity objects:
+# Show available capacity per topology
+# Scheduler picks nodes with capacity
+```
+
+**Topology awareness:**
+
+```yaml
+# StorageClass:
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: topology.ebs.csi.aws.com/zone
+        values: [us-east-1a]
+```
+
+PV created in specific zone. Pod schedules there.
+
+**Production scenarios:**
+
+1. **Database with PVC**: PostgreSQL StatefulSet with PVC. Storage survived pod restarts. Data preserved across deployments.
+
+2. **Dynamic provisioning**: StorageClass with EBS. PVCs auto-created EBS volumes. No manual storage management.
+
+3. **CSI migration**: Old in-tree EBS plugin → CSI driver. Better features, future-proof.
+
+4. **Snapshot-based backup**: Volume snapshots before upgrades. Quick restore option. Combined with Velero.
+
+5. **Topology-aware**: Multi-zone cluster. Storage created in same zone as pod. Avoided cross-zone latency.
+
+---
+
+## 382. Difference between PV and PVC
+
+PV and PVC are related but separate concepts. Understanding the relationship clarifies storage management.
+
+**PersistentVolume (PV):**
+
+Infrastructure resource. Represents actual storage:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: my-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  awsElasticBlockStore:
+    volumeID: vol-abc123
+    fsType: ext4
+```
+
+**Characteristics:**
+
+- Cluster-scoped (not namespaced)
+- Provisioned by admin or dynamically
+- Has actual capacity
+- Linked to backend storage
+- Lifecycle independent of pods
+
+**PersistentVolumeClaim (PVC):**
+
+User's request for storage:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+```
+
+**Characteristics:**
+
+- Namespaced
+- Created by users/apps
+- Specifies requirements
+- Bound to a PV
+- Used by pods
+
+**Analogy:**
+
+```
+PV = node (compute resource)
+PVC = pod (compute request)
+
+PV = bottle of water (storage resource)
+PVC = thirsty person needing water (storage request)
+```
+
+**Binding process:**
+
+```
+1. PVC created with requirements
+2. Kubernetes finds matching PV:
+   - capacity >= request
+   - accessModes match
+   - storageClassName match
+3. If match found: bind
+4. If no match + StorageClass: provision new PV
+5. PVC.spec.volumeName set to PV name
+6. PV.status.phase = Bound
+```
+
+**Matching criteria:**
+
+```yaml
+# PVC asks for:
+spec:
+  resources:
+    requests:
+      storage: 10Gi   # At least 10Gi
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+
+# Matches PV if:
+spec:
+  capacity:
+    storage: >= 10Gi   # Equal or larger
+  accessModes: [ReadWriteOnce]   # Has this mode
+  storageClassName: standard   # Same class
+```
+
+**One-to-one binding:**
+
+```
+1 PVC ↔ 1 PV
+```
+
+PV can only be bound to one PVC at a time.
+
+**Lifecycle states:**
+
+**PV:**
+- Available: not bound
+- Bound: bound to PVC
+- Released: PVC deleted but PV not cleaned
+- Failed: automatic reclamation failed
+
+**PVC:**
+- Pending: waiting for binding
+- Bound: bound to PV
+- Lost: PV no longer exists
+
+**Static vs dynamic:**
+
+**Static:**
+
+```yaml
+# Admin creates PV manually:
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pre-provisioned-pv
+spec:
+  capacity:
+    storage: 10Gi
+  awsElasticBlockStore:
+    volumeID: vol-existing
+```
+
+User creates PVC, binds to existing PV.
+
+**Dynamic:**
+
+```yaml
+# StorageClass provisions on demand:
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  storageClassName: standard
+  # No PV exists yet
+  # Created automatically
+```
+
+Storage created when PVC created.
+
+**Using in pod:**
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: app
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: my-pvc   # Reference PVC
+```
+
+Pod uses PVC, not PV directly.
+
+**Why two objects:**
+
+Separation of concerns:
+
+```
+Admin (cluster operator):
+- Provisions PVs
+- Manages StorageClasses
+- Sets policies
+
+User (application owner):
+- Requests storage (PVC)
+- Doesn't care about backend details
+- Specifies needs
+```
+
+Like Service vs Pod:
+- Service: stable abstraction
+- Pod: implementation
+
+Like PVC vs PV:
+- PVC: stable request
+- PV: actual storage
+
+**Deletion behavior:**
+
+```
+PVC deleted:
+- Pod can no longer use storage
+- PV reclaim policy determines:
+  - Retain: PV stays, data preserved
+  - Delete: PV and backend deleted
+```
+
+**Resizing:**
+
+```yaml
+# Edit PVC:
+spec:
+  resources:
+    requests:
+      storage: 20Gi   # Was 10Gi
+```
+
+If StorageClass `allowVolumeExpansion: true`:
+- PV expanded
+- File system expanded (if supported)
+
+**Bound state:**
+
+```bash
+kubectl get pv
+# NAME    CAPACITY   STATUS    CLAIM
+# pv-1    10Gi       Bound     default/my-pvc
+
+kubectl get pvc
+# NAME      STATUS   VOLUME
+# my-pvc    Bound    pv-1
+```
+
+**Cross-namespace:**
+
+PVC in namespace A can only bind to PV (cluster-scoped) available to it.
+
+PVC not visible cross-namespace. Pod in A can't use PVC in B.
+
+**Common patterns:**
+
+**Pattern 1: Dynamic provisioning**
+
+```yaml
+# Most common:
+# StorageClass + PVC = automatic PV
+```
+
+**Pattern 2: Static PV for special storage**
+
+```yaml
+# NFS share already exists:
+apiVersion: v1
+kind: PersistentVolume
+spec:
+  nfs:
+    server: nfs.example.com
+    path: /exports/data
+
+# PVC binds to it
+```
+
+**Pattern 3: StatefulSet with VolumeClaimTemplates**
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+PVC created per replica automatically.
+
+**Common issues:**
+
+**Issue 1: PVC stuck pending**
+
+```bash
+kubectl describe pvc my-pvc
+# Look at events
+```
+
+Causes:
+- No matching PV
+- StorageClass doesn't exist
+- Provisioner issues
+- Quotas exceeded
+
+**Issue 2: PV stuck released**
+
+PVC deleted but PV not cleaning up.
+
+```bash
+kubectl get pv
+# Status: Released
+```
+
+Manual cleanup:
+
+```bash
+# Edit PV, remove claimRef
+kubectl patch pv my-pv -p '{"spec":{"claimRef":null}}'
+```
+
+**Issue 3: Multi-pod RWO**
+
+Multiple pods want RWO PVC. Only one can mount.
+
+Fix: use ReadWriteMany (different storage type).
+
+**Production scenarios:**
+
+1. **Dynamic provisioning standard**: All apps use dynamic via StorageClass. No manual PV creation. Operationally simple.
+
+2. **Static PV for legacy NFS**: Existing NFS share. Manually created PV. PVC bound. Apps used it.
+
+3. **StatefulSet pattern**: 5-replica StatefulSet with volumeClaimTemplates. 5 PVCs auto-created. Each replica got own storage.
+
+4. **PVC stuck pending**: New service couldn't get PVC. StorageClass was wrong name. Fixed, bound immediately.
+
+5. **PV cleanup**: Old PVs in Released state piling up. Wrote cleanup script. Manual review, then deletion.
+
+---
+
+## 383. Explain StorageClass
+
+StorageClass defines parameters for dynamic provisioning. Templates for creating storage of specific types.
+
+**Concept:**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+```
+
+**Key fields:**
+
+**provisioner:**
+
+CSI driver name:
+
+```yaml
+provisioner: ebs.csi.aws.com           # AWS EBS
+provisioner: disk.csi.azure.com        # Azure Disk
+provisioner: pd.csi.storage.gke.io     # GCP PD
+provisioner: csi.trident.netapp.io     # NetApp
+provisioner: openebs.io/local          # Local storage
+```
+
+**parameters:**
+
+Provisioner-specific:
+
+```yaml
+# AWS EBS:
+parameters:
+  type: gp3           # Volume type
+  iops: "3000"        # Provisioned IOPS
+  throughput: "125"   # Provisioned throughput (MB/s)
+  encrypted: "true"
+  kmsKeyId: arn:aws:kms:...
+
+# Azure Disk:
+parameters:
+  skuName: Premium_LRS
+  cachingMode: ReadWrite
+  
+# GCP PD:
+parameters:
+  type: pd-ssd
+  replication-type: regional-pd
+```
+
+**reclaimPolicy:**
+
+```yaml
+reclaimPolicy: Delete   # Default, delete on PVC deletion
+# or
+reclaimPolicy: Retain   # Keep PV (and data)
+```
+
+**allowVolumeExpansion:**
+
+```yaml
+allowVolumeExpansion: true   # Can resize PVC
+```
+
+**volumeBindingMode:**
+
+```yaml
+volumeBindingMode: Immediate
+# Or:
+volumeBindingMode: WaitForFirstConsumer
+```
+
+**Immediate:**
+- PV created when PVC created
+- Independent of pod scheduling
+- May create in wrong zone
+
+**WaitForFirstConsumer:**
+- PV creation delayed until pod scheduled
+- Considers pod constraints
+- Creates in correct zone
+- Recommended for zonal storage
+
+**allowedTopologies:**
+
+Restrict where storage created:
+
+```yaml
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: topology.ebs.csi.aws.com/zone
+        values:
+          - us-east-1a
+          - us-east-1b
+```
+
+**Multiple StorageClasses:**
+
+Different tiers:
+
+```yaml
+# Premium:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: premium
+parameters:
+  type: io2
+  iops: "10000"
+
+---
+
+# Standard:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+parameters:
+  type: gp3
+
+---
+
+# Cold:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cold
+parameters:
+  type: sc1
+```
+
+Apps choose:
+
+```yaml
+spec:
+  storageClassName: premium   # Or standard, cold
+```
+
+**Default StorageClass:**
+
+```yaml
+metadata:
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+```
+
+If PVC doesn't specify StorageClass: uses default.
+
+**Cloud-specific examples:**
+
+**AWS EBS (gp3):**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+**AWS EFS (ReadWriteMany):**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-abc123
+  directoryPerms: "700"
+```
+
+**Azure Managed Disk:**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: managed-premium
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+**Azure Files (RWX):**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: azurefile
+provisioner: file.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+```
+
+**GCP Persistent Disk:**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pd-ssd
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  replication-type: none
+```
+
+**GCP Regional PD:**
+
+```yaml
+parameters:
+  type: pd-ssd
+  replication-type: regional-pd
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: topology.gke.io/zone
+        values:
+          - us-central1-a
+          - us-central1-b
+```
+
+Replicated across 2 zones.
+
+**Local storage:**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-storage
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+```
+
+No dynamic provisioning. Admin pre-creates local PVs.
+
+**Best practices:**
+
+**Practice 1: WaitForFirstConsumer**
+
+```yaml
+volumeBindingMode: WaitForFirstConsumer
+```
+
+For zonal storage. Pod's zone considered.
+
+**Practice 2: Encryption by default**
+
+```yaml
+parameters:
+  encrypted: "true"
+```
+
+Or customer-managed keys for compliance.
+
+**Practice 3: Allow expansion**
+
+```yaml
+allowVolumeExpansion: true
+```
+
+Future-proofing.
+
+**Practice 4: Appropriate reclaim policy**
+
+```yaml
+# Dev:
+reclaimPolicy: Delete
+
+# Prod data:
+reclaimPolicy: Retain
+```
+
+Don't accidentally delete production data.
+
+**Practice 5: Multiple tiers**
+
+```
+premium: critical databases
+standard: most workloads
+economical: backups, archives
+```
+
+Match storage to workload.
+
+**Performance considerations:**
+
+```yaml
+# AWS gp3:
+parameters:
+  type: gp3
+  iops: "3000"        # Up to 16,000
+  throughput: "125"   # Up to 1,000 MB/s
+```
+
+Pay only for what's needed.
+
+```yaml
+# AWS io2:
+parameters:
+  type: io2
+  iops: "20000"       # Up to 64,000
+```
+
+Extreme performance.
+
+**Cost considerations:**
+
+```
+Storage type pricing varies:
+- HDD: cheapest
+- SSD: middle
+- Premium SSD / NVMe: most expensive
+- High-IOPS: priced per IOPS
+```
+
+Choose appropriate StorageClass for use case.
+
+**Usage in PVC:**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+spec:
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+If StorageClassName empty: uses default.
+
+**StatefulSet:**
+
+```yaml
+volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      storageClassName: fast-ssd
+```
+
+Each replica gets PVC of this StorageClass.
+
+**Production scenarios:**
+
+1. **Multiple tiers**: premium (databases), standard (apps), cold (logs). Apps chose appropriate. Cost-optimized.
+
+2. **WaitForFirstConsumer**: Multi-zone cluster. PVCs immediately bound to wrong zone. Changed to WaitForFirstConsumer. Bound after pod scheduled. Correct zone.
+
+3. **Encryption mandatory**: Compliance required encryption. Default StorageClass enforced it. All new PVCs encrypted.
+
+4. **Regional PD for HA**: Critical database used regional PD StorageClass. Survived zone failure. Data preserved.
+
+5. **Expansion enabled**: Database grew. Resized PVC. Storage auto-expanded. No downtime.
+
+---
+
+## 384. How does dynamic provisioning work?
+
+Dynamic provisioning automatically creates PVs when PVCs are created. Eliminates manual PV management.
+
+**Without dynamic provisioning:**
+
+```
+1. Admin pre-creates PVs
+2. User creates PVC
+3. Kubernetes binds PVC to matching PV
+4. If no match: PVC pending forever
+```
+
+Manual, doesn't scale.
+
+**With dynamic provisioning:**
+
+```
+1. Admin creates StorageClass
+2. User creates PVC referencing StorageClass
+3. Provisioner sees PVC
+4. Provisioner creates backend storage (EBS, etc.)
+5. PV created automatically
+6. PVC bound to new PV
+```
+
+Automatic.
+
+**Components:**
+
+**StorageClass:**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+```
+
+**Provisioner:**
+
+CSI driver that creates storage:
+
+```yaml
+# AWS EBS CSI driver:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ebs-csi-controller
+spec:
+  template:
+    spec:
+      containers:
+        - name: csi-provisioner
+        - name: csi-attacher
+        - name: csi-snapshotter
+        - name: csi-resizer
+        - name: ebs-plugin
+```
+
+Runs as deployment + DaemonSet:
+- Controller: cluster-wide ops (create, delete)
+- Node: per-node ops (mount, unmount)
+
+**Flow:**
+
+```
+1. User creates PVC:
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+
+2. Kubernetes API stores PVC, marks pending
+
+3. External provisioner (CSI driver controller) watches:
+- Sees PVC in pending state
+- Reads StorageClass parameters
+- Calls cloud API:
+  
+aws ec2 create-volume \
+  --size 10 \
+  --volume-type gp3 \
+  --availability-zone us-east-1a
+
+4. Cloud creates EBS volume: vol-abc123
+
+5. Provisioner creates PV:
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pvc-xyz   # Auto-named
+spec:
+  capacity:
+    storage: 10Gi
+  awsElasticBlockStore:
+    volumeID: vol-abc123
+  claimRef:
+    name: my-pvc
+
+6. PVC bound:
+
+Status:
+  Phase: Bound
+  Volume: pvc-xyz
+```
+
+**Topology-aware:**
+
+With `WaitForFirstConsumer`:
+
+```
+1. PVC created
+2. Provisioner waits (no PV yet)
+3. Pod created, scheduler picks node
+4. Scheduler considers PVC requirements
+5. Pod scheduled to node in us-east-1a
+6. Provisioner notified
+7. Creates volume in us-east-1a
+8. PV created
+9. PVC bound
+10. Pod starts
+```
+
+Volume in correct zone.
+
+**Immediate binding:**
+
+```yaml
+volumeBindingMode: Immediate
+```
+
+Volume created immediately when PVC created. May be wrong zone.
+
+**Multi-zone considerations:**
+
+```yaml
+# Restrict zones:
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: topology.ebs.csi.aws.com/zone
+        values:
+          - us-east-1a
+          - us-east-1b
+```
+
+Volume created in one of allowed zones.
+
+**Resize:**
+
+```
+1. User edits PVC: storage 10Gi → 20Gi
+2. Resizer controller detects change
+3. Calls cloud API to resize volume
+4. Once volume resized, filesystem expanded
+5. PV capacity updated
+6. PVC capacity updated
+```
+
+Requires:
+
+```yaml
+StorageClass:
+  allowVolumeExpansion: true
+```
+
+**Snapshot:**
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: my-snapshot
+spec:
+  source:
+    persistentVolumeClaimName: my-pvc
+```
+
+Snapshotter controller:
+1. Sees snapshot request
+2. Calls cloud API: create snapshot
+3. Creates VolumeSnapshotContent
+4. Status: ReadyToUse
+
+**Restore from snapshot:**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+spec:
+  dataSource:
+    name: my-snapshot
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+New volume created from snapshot data.
+
+**Cloning:**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+spec:
+  dataSource:
+    name: source-pvc
+    kind: PersistentVolumeClaim
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+Source PVC cloned to new PVC.
+
+**Common issues:**
+
+**Issue 1: PVC stuck pending**
+
+```bash
+kubectl describe pvc my-pvc
+# Events show error
+```
+
+Causes:
+- StorageClass doesn't exist
+- Provisioner not running
+- Cloud quota exceeded
+- Permissions issue (IAM)
+
+**Issue 2: Wrong zone**
+
+Pod and PV in different zones:
+
+```bash
+kubectl describe pv my-pv
+# zone: us-east-1a
+
+kubectl describe pod my-pod
+# nodeName: node-in-us-east-1b
+```
+
+Pod can't mount. Fix: use WaitForFirstConsumer.
+
+**Issue 3: Quota exceeded**
+
+```
+Cloud EBS limit: 1000 volumes
+Hit limit
+```
+
+Request quota increase.
+
+**Issue 4: CSI driver issues**
+
+```bash
+# Check driver:
+kubectl get pods -n kube-system -l app=ebs-csi-controller
+
+# Logs:
+kubectl logs -n kube-system <pod>
+```
+
+**Multiple provisioners:**
+
+```yaml
+# StorageClass 1:
+provisioner: ebs.csi.aws.com   # AWS
+
+# StorageClass 2:
+provisioner: efs.csi.aws.com   # NFS
+
+# StorageClass 3:
+provisioner: openebs.io/local  # Local
+```
+
+Different storage types in same cluster.
+
+**Performance:**
+
+Dynamic provisioning latency:
+
+```
+PVC creation → volume ready: 10-60 seconds typically
+Cloud API latency
+Volume initialization time
+```
+
+Plan for this in app startup.
+
+**Best practices:**
+
+1. **Use StorageClass**: enable dynamic provisioning
+2. **WaitForFirstConsumer**: for zonal storage
+3. **Set reclaim policy**: Retain for prod data
+4. **Enable expansion**: future-proof
+5. **Use snapshots**: backups
+6. **Monitor provisioners**: ensure healthy
+7. **Plan quotas**: avoid hitting cloud limits
+
+**Production scenarios:**
+
+1. **Standardized via dynamic**: All teams used dynamic provisioning. No manual PV management. Scaled easily.
+
+2. **WaitForFirstConsumer adoption**: Multi-zone cluster. Pods stuck on wrong zone PVs. Migrated to WaitForFirstConsumer. Issues resolved.
+
+3. **Cross-cluster restore**: Snapshot from cluster A. Restored as PVC in cluster B. Migration tool worked across clusters.
+
+4. **Quota issue**: Hit EBS limit during scale up. PVCs pending. Requested quota increase. Provisioning resumed.
+
+5. **CSI migration**: In-tree EBS plugin → CSI driver. Dynamic provisioning continued seamlessly. Better features post-migration.
+
+---
+
+## 385. Explain CSI architecture
+
+CSI (Container Storage Interface) is the standard for storage plugins in Kubernetes. Decouples storage drivers from Kubernetes core.
+
+**Why CSI:**
+
+Before CSI:
+- Storage drivers built into Kubernetes
+- Tight coupling
+- Required Kubernetes releases for new drivers
+- "in-tree" plugins
+
+After CSI:
+- External drivers
+- Standardized interface
+- Independent release cycle
+- "out-of-tree" plugins
+- Container Storage Interface specification
+
+**Architecture:**
+
+```
+Kubernetes ↔ CSI Driver:
+├── Controller Plugin (cluster-wide ops)
+│   - Provision/delete volumes
+│   - Attach/detach volumes
+│   - Create/delete snapshots
+└── Node Plugin (per-node ops)
+    - Stage/unstage volumes
+    - Publish/unpublish (mount/unmount)
+```
+
+**Controller plugin:**
+
+Runs as Deployment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ebs-csi-controller
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v3.5.0
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.3.0
+        - name: csi-snapshotter
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v6.2.0
+        - name: csi-resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v1.8.0
+        - name: ebs-plugin
+          image: amazon/aws-ebs-csi-driver:v1.21.0
+```
+
+**Sidecars (Kubernetes maintained):**
+
+- **external-provisioner**: handles dynamic provisioning
+- **external-attacher**: handles attach/detach
+- **external-snapshotter**: handles snapshots
+- **external-resizer**: handles resize
+- **livenessprobe**: health checks
+- **node-driver-registrar**: registers node plugin
+
+**Vendor plugin (the driver):**
+
+Implements CSI spec. Talks to backend (EBS, etc.).
+
+**Node plugin:**
+
+Runs as DaemonSet:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebs-csi-node
+spec:
+  template:
+    spec:
+      containers:
+        - name: ebs-plugin
+        - name: node-driver-registrar
+        - name: liveness-probe
+      volumes:
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+```
+
+Mounts host kubelet directory. Mounts volumes for pods.
+
+**Communication:**
+
+Sidecars and plugin communicate via Unix socket:
+
+```
+/csi/csi.sock
+```
+
+gRPC over Unix socket.
+
+**CSI workflow:**
+
+**Volume creation:**
+
+```
+1. User creates PVC
+2. external-provisioner watches PVCs
+3. Calls CSI CreateVolume RPC on plugin
+4. Plugin calls cloud API (e.g., aws.CreateVolume)
+5. Returns volume ID
+6. Provisioner creates PV
+7. PV bound to PVC
+```
+
+**Volume attachment:**
+
+```
+1. Pod scheduled to node
+2. external-attacher detects need to attach
+3. Calls CSI ControllerPublishVolume RPC
+4. Plugin attaches volume to node (e.g., AWS attach EBS to instance)
+5. Volume available at /dev/xvdf on node
+```
+
+**Volume mount:**
+
+```
+1. kubelet on node sees pod needs volume
+2. Calls node plugin via CSI NodeStageVolume
+3. Plugin formats (if needed) and mounts volume to staging path
+4. kubelet calls NodePublishVolume
+5. Plugin bind-mounts to pod's volume path
+6. Pod sees volume in container
+```
+
+**Volume unmount/detach:**
+
+Reverse process when pod deleted.
+
+**CSI specification:**
+
+Standard RPCs:
+
+**Controller service:**
+- CreateVolume
+- DeleteVolume
+- ControllerPublishVolume (attach)
+- ControllerUnpublishVolume (detach)
+- ControllerExpandVolume
+- CreateSnapshot
+- DeleteSnapshot
+- ListSnapshots
+
+**Node service:**
+- NodeStageVolume
+- NodeUnstageVolume
+- NodePublishVolume (mount)
+- NodeUnpublishVolume (unmount)
+- NodeExpandVolume
+
+**Identity service:**
+- GetPluginInfo
+- GetPluginCapabilities
+- Probe
+
+**Driver registration:**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: ebs.csi.aws.com
+spec:
+  attachRequired: true
+  podInfoOnMount: false
+  volumeLifecycleModes:
+    - Persistent
+```
+
+Tells Kubernetes about the driver.
+
+**Common CSI drivers:**
+
+**Cloud:**
+- AWS EBS CSI Driver
+- Azure Disk CSI Driver
+- GCP Persistent Disk CSI Driver
+- AWS EFS CSI Driver
+- Azure Files CSI Driver
+
+**Storage systems:**
+- Ceph CSI
+- NetApp Trident
+- Portworx
+- Longhorn
+- vSphere CSI
+
+**Local:**
+- Local Path Provisioner
+- TopoLVM
+- OpenEBS
+
+**Features supported:**
+
+Different CSI drivers support different features:
+
+| Feature | Required? |
+|---------|-----------|
+| Dynamic provisioning | Optional |
+| Snapshots | Optional |
+| Cloning | Optional |
+| Expansion | Optional |
+| Block volumes | Optional |
+| Topology | Optional |
+
+Check driver docs for support.
+
+**Pod inline ephemeral volumes:**
+
+CSI ephemeral volumes:
+
+```yaml
+spec:
+  containers:
+    - name: app
+      volumeMounts:
+        - name: temp
+          mountPath: /tmp
+  volumes:
+    - name: temp
+      csi:
+        driver: example.csi
+        volumeAttributes:
+          size: "1Gi"
+```
+
+Ephemeral, no PV/PVC.
+
+**Generic ephemeral volumes:**
+
+```yaml
+spec:
+  containers:
+    - name: app
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      ephemeral:
+        volumeClaimTemplate:
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: standard
+            resources:
+              requests:
+                storage: 1Gi
+```
+
+PVC created with pod, deleted with pod.
+
+**CSI migration:**
+
+In-tree plugins being removed. Migration to CSI:
+
+```yaml
+# Kubernetes intercepts in-tree calls
+# Routes to CSI driver
+# Transparent to users
+```
+
+Mostly automatic for users.
+
+**Debugging:**
+
+**Check CSI controller:**
+
+```bash
+kubectl get pods -n kube-system -l app=ebs-csi-controller
+kubectl logs -n kube-system <pod> -c ebs-plugin
+```
+
+**Check node plugin:**
+
+```bash
+kubectl get pods -n kube-system -l app=ebs-csi-node
+```
+
+**Check CSI driver:**
+
+```bash
+kubectl get csidrivers
+```
+
+**Check storage events:**
+
+```bash
+kubectl get events --sort-by='.lastTimestamp' | grep -i volume
+```
+
+**Production scenarios:**
+
+1. **AWS EBS CSI**: EKS default. Dynamic provisioning, snapshots, expansion. Standard for AWS.
+
+2. **CSI migration**: Cluster used in-tree EBS plugin. Auto-migrated to CSI when upgraded. Transparent.
+
+3. **Multiple CSI drivers**: EBS + EFS + custom. Different StorageClasses. Apps chose appropriate.
+
+4. **Driver issue**: New CSI driver had bug. Volumes stuck attaching. Driver logs identified issue. Updated driver.
+
+5. **Snapshot CSI**: Used CSI snapshots for backup. Quick PIT copies. Restore tested regularly.
+
+---
+
+## 386. Difference between block and file storage
+
+Block and file are fundamental storage models with different characteristics.
+
+**Block storage:**
+
+```
+Raw block device (like a disk)
+Pod sees: /dev/sda1
+Pod formats: mkfs.ext4 /dev/sda1
+Pod mounts: mount /dev/sda1 /data
+```
+
+**Characteristics:**
+
+- Raw access to storage
+- Single attachment (typically)
+- Fast (low overhead)
+- App controls filesystem
+- Examples: AWS EBS, Azure Disk, GCP PD
+
+**Filesystem storage:**
+
+```
+Pre-formatted, network-mounted filesystem
+Pod sees: /data (mounted)
+Pod uses: standard file operations
+```
+
+**Characteristics:**
+
+- Pre-formatted filesystem
+- Multi-pod access
+- Network protocol (NFS, SMB)
+- More overhead
+- Examples: NFS, AWS EFS, Azure Files, GCP Filestore
+
+**Kubernetes representation:**
+
+**Block in PV:**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+spec:
+  volumeMode: Block   # Block device
+  accessModes:
+    - ReadWriteOnce
+  awsElasticBlockStore:
+    volumeID: vol-xxx
+```
+
+Pod usage:
+
+```yaml
+spec:
+  containers:
+    - name: app
+      volumeDevices:
+        - name: data
+          devicePath: /dev/xvda
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: my-pvc
+```
+
+App sees raw block device.
+
+**Filesystem in PV:**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+spec:
+  volumeMode: Filesystem   # Default
+  accessModes:
+    - ReadWriteOnce
+  awsElasticBlockStore:
+    volumeID: vol-xxx
+    fsType: ext4
+```
+
+Pod usage:
+
+```yaml
+spec:
+  containers:
+    - name: app
+      volumeMounts:
+        - name: data
+          mountPath: /data
+```
+
+App sees mount point.
+
+**Comparison:**
+
+| Aspect | Block | Filesystem |
+|--------|-------|------------|
+| Access pattern | Raw device | File operations |
+| Multi-pod | Usually no | Yes (NFS, EFS) |
+| Performance | Fastest | Slightly slower |
+| Use cases | Databases | Shared content |
+| Filesystem control | App | Provider/admin |
+| Protocols | iSCSI, FC | NFS, SMB |
+
+**Block storage use cases:**
+
+**Databases:**
+
+```yaml
+# PostgreSQL with block storage:
+spec:
+  containers:
+    - name: postgres
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: postgres-pvc   # EBS or similar
+```
+
+Why block:
+- Performance (low overhead)
+- Single-writer pattern
+- Database manages its own files
+
+**Single-writer apps:**
+
+App that's the only writer to data:
+- Caches
+- Logs
+- Single-instance apps
+
+**Raw block (advanced):**
+
+```yaml
+spec:
+  containers:
+    - name: app
+      volumeDevices:
+        - name: data
+          devicePath: /dev/xvda
+```
+
+App formats and uses raw device. Use cases:
+- Some databases
+- High-performance scenarios
+- Custom filesystems
+
+**Filesystem storage use cases:**
+
+**Shared content:**
+
+```yaml
+# Multiple pods reading same files:
+spec:
+  containers:
+    - name: web
+      volumeMounts:
+        - name: content
+          mountPath: /var/www
+  volumes:
+    - name: content
+      persistentVolumeClaim:
+        claimName: shared-content-pvc   # EFS, Azure Files
+```
+
+**ML training data:**
+
+```yaml
+# Multiple training pods accessing dataset:
+volumes:
+  - name: dataset
+    persistentVolumeClaim:
+      claimName: ml-dataset
+```
+
+**Logs aggregation:**
+
+```yaml
+# Apps write logs to shared filesystem:
+volumes:
+  - name: logs
+    persistentVolumeClaim:
+      claimName: shared-logs
+```
+
+**User uploads:**
+
+```yaml
+# Web app, uploads visible across replicas:
+volumes:
+  - name: uploads
+    persistentVolumeClaim:
+      claimName: uploads-pvc
+```
+
+**Performance comparison:**
+
+**Block (EBS gp3):**
+
+```
+IOPS: up to 16,000
+Throughput: up to 1,000 MB/s
+Latency: <1ms
+```
+
+**File (EFS):**
+
+```
+Throughput: variable (scales with size)
+Latency: ~1-3ms
+IOPS: depends on mode
+```
+
+For high-IOPS: block.
+For throughput/sharing: file.
+
+**Cost:**
+
+**Block:**
+
+```
+AWS gp3: $0.08/GB/month
+Azure Premium SSD: $0.12/GB/month
+GCP pd-ssd: $0.17/GB/month
+```
+
+**File:**
+
+```
+AWS EFS Standard: $0.30/GB/month (~4x block)
+Azure Files Premium: $0.20/GB/month
+GCP Filestore: $0.20/GB/month
+```
+
+File typically more expensive.
+
+**Backup:**
+
+**Block:**
+- Cloud-native snapshots
+- Fast (incremental)
+- Easy automation
+
+**File:**
+- Snapshots (varies by provider)
+- Or backup tools (Velero with restic)
+- Often slower
+
+**Encryption:**
+
+Both support encryption:
+
+```yaml
+# StorageClass:
+parameters:
+  encrypted: "true"
+```
+
+At rest. In transit varies.
+
+**Mixed usage:**
+
+```yaml
+# Database (block) + uploads (file):
+spec:
+  containers:
+    - name: app
+      volumeMounts:
+        - name: db
+          mountPath: /var/lib/postgres
+        - name: uploads
+          mountPath: /var/uploads
+  volumes:
+    - name: db
+      persistentVolumeClaim:
+        claimName: postgres-pvc   # Block
+    - name: uploads
+      persistentVolumeClaim:
+        claimName: uploads-pvc    # File (RWX)
+```
+
+Different storage for different needs.
+
+**StatefulSet pattern:**
+
+```yaml
+# StatefulSet with block storage:
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]   # Block
+        storageClassName: ebs-gp3
+```
+
+Each replica gets own block volume.
+
+**Production scenarios:**
+
+1. **Postgres on block**: PostgreSQL StatefulSet. Per-replica EBS volumes. Fast IOPS. Replication for HA.
+
+2. **Web app shared uploads**: 5 web replicas. Shared EFS for uploads. All replicas saw same files.
+
+3. **ML training shared data**: 20 GPU pods training. EFS with training data. Shared access, no duplication.
+
+4. **Cost optimization**: Audited storage. Moved cold logs from EBS to EFS. Cheaper for that use case.
+
+5. **Block for performance**: Latency-sensitive cache (Redis). EBS io2 for max IOPS. EFS would have been too slow.
+
+---
+
+## 387. Explain StatefulSet persistent storage handling
+
+StatefulSets provide stable, persistent storage per pod. Unlike Deployments which share storage, each StatefulSet replica gets its own.
+
+**Deployment vs StatefulSet storage:**
+
+**Deployment:**
+
+```yaml
+spec:
+  template:
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: shared-pvc   # All replicas share
+```
+
+All replicas use same PVC. Requires RWX (or single replica).
+
+**StatefulSet:**
+
+```yaml
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+Each replica gets its own PVC.
+
+**Naming:**
+
+```
+StatefulSet: my-app
+Replicas: 3
+PVC names:
+- data-my-app-0
+- data-my-app-1
+- data-my-app-2
+```
+
+Stable, predictable.
+
+**Lifecycle:**
+
+**Creation:**
+
+```
+StatefulSet created with 3 replicas
+       ↓
+Pod my-app-0 created
+       ↓
+PVC data-my-app-0 created
+       ↓
+PV provisioned (via StorageClass)
+       ↓
+PVC bound
+       ↓
+Pod uses PVC, starts
+       ↓
+Pod my-app-1 created (only after my-app-0 ready)
+       ↓
+... etc.
+```
+
+Sequential creation, each with own storage.
+
+**Pod restart:**
+
+```
+Pod my-app-1 dies
+       ↓
+StatefulSet recreates Pod my-app-1
+       ↓
+Same name
+       ↓
+Same PVC (data-my-app-1)
+       ↓
+Same data
+```
+
+Data preserved across restarts.
+
+**Scale up:**
+
+```
+Scale 3 → 5
+       ↓
+Create my-app-3, my-app-4
+       ↓
+Create PVCs data-my-app-3, data-my-app-4
+       ↓
+New storage for new pods
+```
+
+**Scale down:**
+
+```
+Scale 5 → 3
+       ↓
+Delete my-app-4, my-app-3
+       ↓
+PVCs remain (data-my-app-3, data-my-app-4)
+       ↓
+Data preserved (in case scaling back up)
+```
+
+PVCs not auto-deleted!
+
+**PVC retention:**
+
+```yaml
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain     # Or Delete
+    whenScaled: Retain      # Or Delete
+```
+
+Control behavior:
+- `whenDeleted`: when StatefulSet deleted
+- `whenScaled`: when scaled down
+
+**Headless service:**
+
+StatefulSet requires headless service:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+spec:
+  clusterIP: None
+  selector:
+    app: my-app
+```
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  serviceName: my-app   # Headless service name
+```
+
+Per-pod DNS:
+
+```
+my-app-0.my-app.default.svc.cluster.local
+my-app-1.my-app.default.svc.cluster.local
+my-app-2.my-app.default.svc.cluster.local
+```
+
+Stable DNS for each replica.
+
+**Use cases:**
+
+**Use case 1: Databases**
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+Each PostgreSQL replica:
+- Own storage
+- Own identity (postgres-0, postgres-1, postgres-2)
+- Stable DNS
+
+**Use case 2: Distributed systems**
+
+Cassandra, Elasticsearch, Kafka:
+
+```yaml
+# Cassandra StatefulSet:
+spec:
+  serviceName: cassandra
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: cassandra
+          env:
+            - name: CASSANDRA_SEEDS
+              value: "cassandra-0.cassandra.default.svc.cluster.local"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 500Gi
+```
+
+**Use case 3: Stateful microservices**
+
+Apps that need:
+- Persistent state
+- Stable identity
+- Ordered scaling
+
+**StatefulSet update strategies:**
+
+**RollingUpdate (default):**
+
+```yaml
+spec:
+  updateStrategy:
+    type: RollingUpdate
+```
+
+Updates one pod at a time, ordinal order (high to low typically).
+
+**OnDelete:**
+
+```yaml
+spec:
+  updateStrategy:
+    type: OnDelete
+```
+
+Manual: must delete pods for update.
+
+**Pod management policy:**
+
+```yaml
+spec:
+  podManagementPolicy: OrderedReady   # Default
+# Or:
+spec:
+  podManagementPolicy: Parallel
+```
+
+**OrderedReady:** sequential creation/deletion.
+**Parallel:** all pods at once.
+
+**Storage migration:**
+
+Moving StatefulSet data:
+
+**Approach 1: Volume snapshot**
+
+```
+Snapshot data-my-app-0
+Restore to data-new-app-0
+Recreate StatefulSet pointing to new PVCs
+```
+
+**Approach 2: pg_dump (for Postgres)**
+
+```bash
+# Dump from old:
+kubectl exec postgres-0 -- pg_dump database > backup.sql
+
+# Restore to new:
+kubectl exec new-postgres-0 -- psql database < backup.sql
+```
+
+App-specific data migration.
+
+**Approach 3: Velero**
+
+```bash
+# Backup with data:
+velero backup create my-backup \
+  --include-namespaces production
+
+# Restore:
+velero restore create --from-backup my-backup
+```
+
+Backs up PVs and re-creates.
+
+**Common patterns:**
+
+**Pattern 1: Per-replica storage**
+
+Default. Each replica own storage.
+
+**Pattern 2: Shared + per-replica**
+
+```yaml
+spec:
+  template:
+    spec:
+      volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: data
+          mountPath: /data
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-pvc   # RWX, all replicas share
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]   # Per replica
+```
+
+Some shared, some per-replica.
+
+**Pattern 3: Multiple PVCs per replica**
+
+```yaml
+volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 100Gi
+  - metadata:
+      name: logs
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 50Gi
+```
+
+Multiple PVCs per pod.
+
+**Backup considerations:**
+
+**Per-pod backups:**
+
+Each pod's PVC can be backed up independently:
+
+```bash
+# Velero by label:
+velero backup create db-backup --selector app=postgres
+```
+
+Or snapshot per PVC:
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: postgres-0-snap
+spec:
+  source:
+    persistentVolumeClaimName: data-postgres-0
+```
+
+**Common issues:**
+
+**Issue 1: PVC stuck after scale-down**
+
+By default, PVCs retained. Manually delete:
+
+```bash
+kubectl delete pvc data-my-app-3
+kubectl delete pvc data-my-app-4
+```
+
+Or set retention policy.
+
+**Issue 2: Pod stuck on wrong node**
+
+PVC in zone A. Pod scheduled to zone B. Can't mount.
+
+Fix: use WaitForFirstConsumer in StorageClass.
+
+**Issue 3: Slow startup**
+
+Sequential pod creation = slow for large StatefulSets.
+
+Fix: `podManagementPolicy: Parallel` (if app supports).
+
+**Production scenarios:**
+
+1. **PostgreSQL StatefulSet**: 3 replicas, per-replica EBS. Replication configured. Survived pod restarts, node failures.
+
+2. **Cassandra cluster**: 5-node Cassandra. StatefulSet with volumeClaimTemplates. 500Gi per node. Distributed data.
+
+3. **Scale-down preservation**: Scaled from 5 to 3. PVCs preserved. Later scaled back to 5. Original data still there.
+
+4. **Storage migration**: Migrated PostgreSQL to new storage class. Velero backup, restore to new cluster. Data preserved.
+
+5. **MongoDB replica set**: 3 MongoDB pods. Headless service for replica set discovery. Per-pod storage. Stable identities.
+
+---
+
+## 388. How do you expand Persistent Volumes?
+
+PV expansion (resize) allows growing storage without downtime. Requires CSI driver support.
+
+**Prerequisites:**
+
+```yaml
+# StorageClass must allow:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+provisioner: ebs.csi.aws.com
+allowVolumeExpansion: true
+```
+
+**Expansion process:**
+
+**Step 1: Edit PVC**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  resources:
+    requests:
+      storage: 20Gi   # Was 10Gi
+```
+
+Or:
+
+```bash
+kubectl patch pvc my-pvc -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+```
+
+**Step 2: Resizer detects**
+
+External resizer (CSI sidecar) detects PVC update.
+
+**Step 3: Volume resize**
+
+```
+1. Calls CSI ControllerExpandVolume
+2. Driver calls cloud API (e.g., aws.ModifyVolume)
+3. Cloud resizes underlying volume
+4. New capacity available
+```
+
+**Step 4: Filesystem resize**
+
+```
+1. PV capacity updated
+2. Kubernetes signals filesystem expansion needed
+3. On node where pod runs:
+   - CSI NodeExpandVolume called
+   - Filesystem expanded (e.g., resize2fs, xfs_growfs)
+4. PVC status updated
+```
+
+**Step 5: Verification**
+
+```bash
+kubectl get pvc my-pvc
+# Capacity should show new size
+
+kubectl exec my-pod -- df -h /data
+# Filesystem should show new size
+```
+
+**Online vs offline expansion:**
+
+**Online:**
+- Pod doesn't need to restart
+- Filesystem expanded while mounted
+- Modern (1.15+) supports for most types
+
+**Offline:**
+- Pod needs restart
+- Volume detached, resized, reattached
+- Older or specific drivers
+
+**CSI capability:**
+
+```yaml
+# Check driver capabilities:
+kubectl get csidrivers
+```
+
+Different drivers support different:
+- ExpandVolume: cloud volume resize
+- NodeExpand: filesystem resize while mounted
+
+**Cloud-specific limits:**
+
+**AWS EBS:**
+
+```
+gp2/gp3: 1 GiB to 16 TiB
+Wait 6 hours between modifications
+```
+
+**Azure Disk:**
+
+```
+Different sizes available
+```
+
+**GCP Persistent Disk:**
+
+```
+1 GiB to 64 TiB
+```
+
+Check cloud docs for limits.
+
+**Expansion limitations:**
+
+**Can shrink? No.**
+
+Kubernetes doesn't support shrinking PVCs:
+
+```yaml
+# Not allowed:
+spec:
+  resources:
+    requests:
+      storage: 5Gi   # Was 10Gi
+```
+
+Will fail validation.
+
+Need new smaller PVC, migrate data.
+
+**Filesystem support:**
+
+- ext4: supports online expand
+- xfs: supports online expand
+- Some others: may require offline
+
+**Block volumes:**
+
+```yaml
+volumeMode: Block
+```
+
+App responsible for using new size. No filesystem to expand.
+
+**StatefulSet expansion:**
+
+```yaml
+# Edit volumeClaimTemplate:
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        resources:
+          requests:
+            storage: 20Gi   # Was 10Gi
+```
+
+But Kubernetes doesn't automatically expand existing PVCs:
+
+```
+StatefulSet template change:
+- New replicas: new size
+- Existing replicas: still old size
+```
+
+Manual expansion:
+
+```bash
+# Expand each PVC:
+kubectl patch pvc data-postgres-0 -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+kubectl patch pvc data-postgres-1 -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+kubectl patch pvc data-postgres-2 -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+```
+
+Then optionally restart pods to trigger filesystem expand if not online.
+
+**Monitoring:**
+
+```promql
+# PVC capacity:
+kube_persistentvolumeclaim_resource_requests_storage_bytes
+
+# Usage:
+kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes
+```
+
+Alert before full:
+
+```yaml
+- alert: PVCNearlyFull
+  expr: |
+    kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.9
+  for: 15m
+  labels:
+    severity: warning
+```
+
+**Automated expansion:**
+
+Some operators auto-expand based on usage:
+
+```
+- CloudNativePG (PostgreSQL)
+- Some Velero plugins
+- Custom controllers
+```
+
+**Best practices:**
+
+1. **Plan ahead**: monitor usage, expand before full
+2. **Enable in StorageClass**: allowVolumeExpansion
+3. **Test in dev**: verify expansion works
+4. **Don't shrink**: not supported
+5. **Right size initially**: avoid frequent expansions
+6. **Monitor**: alerts before full
+
+**Common issues:**
+
+**Issue 1: Allowance not enabled**
+
+```yaml
+# StorageClass missing:
+allowVolumeExpansion: true
+```
+
+Add and reapply (existing PVCs need StorageClass updated).
+
+**Issue 2: Cloud quota**
+
+Cloud-level quota limits.
+
+**Issue 3: Maximum size reached**
+
+Hit cloud's per-volume limit. Need different solution (multiple volumes, etc.).
+
+**Issue 4: Filesystem not expanding**
+
+```bash
+# Verify filesystem size:
+kubectl exec my-pod -- df -h /data
+
+# If not expanded, check kubelet logs
+```
+
+May need pod restart for older drivers.
+
+**Issue 5: Driver doesn't support**
+
+```bash
+kubectl describe csidriver <driver>
+# Check capabilities
+```
+
+Some drivers don't support expansion.
+
+**Production scenarios:**
+
+1. **Database growth**: PostgreSQL PVC at 90%. Expanded from 100Gi to 200Gi. Online, no downtime.
+
+2. **StatefulSet manual expand**: Cassandra cluster needed more storage. Manually expanded each PVC. Restart pods one at a time.
+
+3. **Automated monitoring**: Set alerts at 80% usage. Engineer notified, planned expansion. Never hit 100%.
+
+4. **Right-sizing**: Initial estimates too low. Frequent expansions disruptive. Re-estimated. Started with more headroom.
+
+5. **Cloud limit hit**: One PVC at AWS EBS limit (16TB). Couldn't expand. Migrated to multi-volume setup. Complex.
+
+---
+
+## 389. Explain storage reclaim policies
+
+Reclaim policies define what happens to a PV when its PVC is deleted. Critical for data protection.
+
+**Two main policies:**
+
+**Delete:**
+
+```yaml
+spec:
+  persistentVolumeReclaimPolicy: Delete
+```
+
+PVC deletion → PV deletion → backend storage deleted.
+
+**Retain:**
+
+```yaml
+spec:
+  persistentVolumeReclaimPolicy: Retain
+```
+
+PVC deletion → PV remains (status: Released) → data preserved.
+
+**Recycle (deprecated):**
+
+```yaml
+spec:
+  persistentVolumeReclaimPolicy: Recycle
+```
+
+PV scrubbed (rm -rf) and made Available again. Not recommended, deprecated.
+
+**Default behavior:**
+
+```yaml
+# StorageClass:
+reclaimPolicy: Delete   # Default
+```
+
+If not specified in StorageClass.
+
+**For production data:**
+
+```yaml
+# Custom StorageClass:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: prod-data
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Retain
+parameters:
+  type: gp3
+```
+
+Protect production data.
+
+**Effect of Delete:**
+
+```
+1. User deletes PVC
+2. Kubernetes marks PV for deletion
+3. PV deleted
+4. CSI driver called: DeleteVolume
+5. Backend storage deleted (e.g., aws.DeleteVolume)
+6. Data permanently lost
+```
+
+Irreversible. Be careful.
+
+**Effect of Retain:**
+
+```
+1. User deletes PVC
+2. PV status: Released
+3. PV NOT deleted
+4. Backend storage preserved
+5. PV cannot be auto-bound to new PVC
+6. Manual cleanup or rebinding needed
+```
+
+Data safe.
+
+**Rebinding Retained PV:**
+
+```yaml
+# After PVC deleted, PV is Released
+# Cannot be bound automatically (claimRef set)
+
+# Manual rebinding:
+kubectl edit pv my-pv
+# Remove spec.claimRef section
+```
+
+Or via patch:
+
+```bash
+kubectl patch pv my-pv -p '{"spec":{"claimRef":null}}'
+```
+
+Then PV available, can be bound by new PVC.
+
+**Cleaning up Retain PVs:**
+
+After Retain, need manual cleanup if not reusing:
+
+```bash
+# 1. Delete PV:
+kubectl delete pv my-pv
+
+# 2. Cloud volume still exists. Delete manually:
+aws ec2 delete-volume --volume-id vol-xxx
+```
+
+Two steps for safety.
+
+**Per-PVC override:**
+
+```yaml
+# Specific PVC needs Retain:
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+  annotations:
+    # Some implementations support per-PVC override
+spec:
+  storageClassName: standard
+```
+
+Less common. Usually controlled by StorageClass.
+
+**Volume retention for StatefulSet:**
+
+```yaml
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain   # When StatefulSet deleted
+    whenScaled: Retain    # When scaled down
+```
+
+Independent of PV reclaim policy.
+
+**Combinations:**
+
+| StatefulSet retention | PV reclaim | Behavior |
+|----------------------|------------|----------|
+| Retain + Retain | Both preserved | Safest |
+| Delete + Delete | Everything deleted | Cleanup |
+| Retain + Delete | PVC stays, PV may delete | Confusing |
+| Delete + Retain | PVC deleted, PV stays | Recovery possible |
+
+**Decision criteria:**
+
+**Use Delete when:**
+
+- Test/dev environments
+- Truly ephemeral data
+- Want automatic cleanup
+- Predictable cost
+
+**Use Retain when:**
+
+- Production data
+- Compliance requires preservation
+- Recovery option important
+- Manual control preferred
+
+**Cost considerations:**
+
+```
+Delete: pay only while in use
+Retain: pay for retained PVs until manually deleted
+```
+
+Forgotten Retain PVs accumulate costs.
+
+**Monitoring Retain PVs:**
+
+```bash
+# Released PVs:
+kubectl get pv | grep Released
+
+# Old PVs:
+kubectl get pv -o json | jq '.items[] | select(.status.phase=="Released") | {name: .metadata.name, age: .metadata.creationTimestamp}'
+```
+
+Audit periodically.
+
+**Recovery workflow:**
+
+```
+1. PVC accidentally deleted
+2. PV in Released state (Retain policy)
+3. Cloud volume still exists
+4. Create new PVC with specific volumeName:
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+spec:
+  storageClassName: ""   # Empty to skip dynamic
+  volumeName: my-pv      # Direct binding
+  resources:
+    requests:
+      storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+
+5. Remove claimRef from PV first (if needed)
+6. PVC binds to existing PV
+7. Pod uses, data restored
+```
+
+**Backup vs Retain:**
+
+Retain is NOT a backup:
+- Single point of failure
+- No version history
+- Data corruption persists
+
+**True backup needed separately:**
+
+```bash
+# Velero with snapshots:
+velero backup create my-backup --include-namespaces production
+```
+
+Snapshots preserved separately.
+
+**Best practices:**
+
+1. **Production: Retain**: by default
+2. **Dev/test: Delete**: easier cleanup
+3. **Monitor released PVs**: prevent accumulation
+4. **Document policy**: team awareness
+5. **True backups**: don't rely on Retain alone
+6. **Cleanup procedures**: regular review
+
+**StorageClass strategy:**
+
+```yaml
+# Multiple StorageClasses for different policies:
+
+# Production data:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: production
+reclaimPolicy: Retain
+
+# Development:
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: development
+reclaimPolicy: Delete
+```
+
+Apps choose appropriate.
+
+**Cluster-wide policies:**
+
+OPA Gatekeeper or admission webhooks:
+
+```yaml
+# Enforce Retain for production namespaces:
+violation[{"msg": msg}] {
+  input.review.object.kind == "PersistentVolume"
+  input.review.object.spec.persistentVolumeReclaimPolicy == "Delete"
+  startswith(input.review.namespace, "prod-")
+  msg := "Production PVs must use Retain reclaim policy"
+}
+```
+
+**Production scenarios:**
+
+1. **Accidental deletion saved**: Engineer deleted PVC accidentally. Retain policy. PV preserved. Recreated PVC, data intact.
+
+2. **Test cluster Delete**: Test/dev StorageClass: Delete. PVCs deleted with namespace cleanup. No orphaned volumes.
+
+3. **Released PV accumulation**: Forgot cleanup of Released PVs. $5000/month in unused storage. Implemented monitoring + cleanup.
+
+4. **Migration via Retain**: Cluster migration. Used Retain to preserve PVs during PVC recreation. Data safe.
+
+5. **Compliance Retain**: Audit required data retention. All production storage Retain. Compliance verified.
+
+---
+
+## 390. How do you secure persistent storage?
+
+Storage security spans encryption, access control, network, and operational practices.
+
+**Layers of security:**
+
+**Layer 1: Encryption at rest**
+
+Data encrypted on disk:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: encrypted
+parameters:
+  encrypted: "true"
+  # Or with customer-managed key:
+  kmsKeyId: arn:aws:kms:us-east-1:123:key/abc
+```
+
+**AWS EBS:**
+
+```yaml
+parameters:
+  encrypted: "true"
+  kmsKeyId: arn:aws:kms:...
+```
+
+**Azure Disk:**
+
+```yaml
+parameters:
+  diskEncryptionSetID: /subscriptions/.../diskEncryptionSets/my-set
+```
+
+**GCP:**
+
+```yaml
+parameters:
+  disk-encryption-kms-key: projects/.../cryptoKeys/my-key
+```
+
+**Layer 2: Encryption in transit**
+
+For networked storage (NFS, iSCSI):
+
+```yaml
+# NFS with TLS (mount options):
+spec:
+  mountOptions:
+    - nfsvers=4.1
+    - tls
+```
+
+Cloud file services:
+- AWS EFS: TLS in transit available
+- Azure Files: TLS supported
+- GCP Filestore: TLS option
+
+**Layer 3: Access control**
+
+**Namespace isolation:**
+
+```yaml
+# PVC in namespace A:
+# Not visible to pods in namespace B
+```
+
+**RBAC:**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pvc-manager
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "delete"]
+```
+
+Control who can create/modify PVCs.
+
+**Layer 4: Filesystem permissions**
+
+```yaml
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+```
+
+`fsGroup`: changes ownership of volume to specified group. Files writable by group.
+
+Without proper setup: mount might be root-owned, app can't write.
+
+**Layer 5: Pod security**
+
+```yaml
+spec:
+  securityContext:
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    capabilities:
+      drop: [ALL]
+```
+
+Reduce attack surface.
+
+**Layer 6: Network policies**
+
+```yaml
+# Restrict storage backend access:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+spec:
+  podSelector: {}
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.0.5.0/24   # Storage subnet
+      ports:
+        - port: 2049   # NFS
+```
+
+**Layer 7: Backup encryption**
+
+```yaml
+# Velero with encrypted backups:
+spec:
+  backupStorageLocation:
+    config:
+      kmsKeyId: arn:aws:kms:...
+```
+
+Backups also encrypted.
+
+**Encryption details:**
+
+**Key management:**
+
+**Provider-managed:**
+
+```yaml
+parameters:
+  encrypted: "true"
+  # Default key (provider-managed)
+```
+
+Cloud provider manages keys. Simple.
+
+**Customer-managed (BYOK):**
+
+```yaml
+parameters:
+  encrypted: "true"
+  kmsKeyId: arn:aws:kms:...
+```
+
+You manage keys. Required for some compliance.
+
+**Customer-supplied (full control):**
+
+```
+Some providers: bring your own encryption keys
+More complex
+For strict compliance
+```
+
+**Encryption verification:**
+
+```bash
+# AWS EBS:
+aws ec2 describe-volumes --volume-id vol-xxx --query 'Volumes[0].Encrypted'
+
+# Azure:
+az disk show --name my-disk --query encryptionSettings
+
+# GCP:
+gcloud compute disks describe my-disk --format='value(diskEncryptionKey)'
+```
+
+**Pod-level encryption:**
+
+```yaml
+# Application encrypts:
+spec:
+  containers:
+    - name: app
+      env:
+        - name: ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-encryption-key
+              key: key
+```
+
+App encrypts data before writing. Highest security but complex.
+
+**Database encryption:**
+
+```yaml
+# PostgreSQL TDE:
+env:
+  - name: POSTGRES_ENCRYPTION
+    value: "AES256"
+```
+
+Database-level encryption + storage encryption = defense in depth.
+
+**Sensitive secrets:**
+
+For files containing secrets:
+
+```yaml
+# Use Secrets, not PVCs:
+volumes:
+  - name: secrets
+    secret:
+      secretName: app-secrets
+```
+
+Secrets mounted, not in PVC.
+
+**External Secrets Operator:**
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+spec:
+  secretStoreRef:
+    name: vault-backend
+  target:
+    name: app-secrets
+  data:
+    - secretKey: password
+      remoteRef:
+        key: prod/db
+```
+
+Secrets from Vault, never in PVC.
+
+**Audit logging:**
+
+```yaml
+# Audit storage operations:
+- level: Metadata
+  resources:
+    - group: ""
+      resources: ["persistentvolumes", "persistentvolumeclaims"]
+```
+
+Track who accessed/modified storage.
+
+**Compliance considerations:**
+
+**GDPR:**
+- Encryption at rest
+- Right to erasure (delete data)
+- Audit logs
+
+**HIPAA:**
+- Encryption at rest and in transit
+- Access controls
+- Audit logs
+
+**PCI-DSS:**
+- Encryption (strong algorithms)
+- Key management
+- Access logs
+
+**Best practices:**
+
+1. **Encrypt everything**: at rest by default
+2. **Customer-managed keys**: for sensitive data
+3. **In-transit encryption**: for networked storage
+4. **fsGroup**: proper permissions
+5. **RBAC on PVCs**: control creation
+6. **Audit**: log storage operations
+7. **Backups encrypted**: not just live data
+8. **No secrets in PVCs**: use Secrets/Vault
+
+**Common issues:**
+
+**Issue 1: Permissions denied**
+
+```
+Pod can't write to mounted volume
+```
+
+Fix: fsGroup or correct user/group.
+
+**Issue 2: Encryption not verified**
+
+Assumed encrypted but isn't.
+
+Fix: verify with cloud APIs, automate checks.
+
+**Issue 3: Key rotation**
+
+Old data encrypted with old keys.
+
+Fix: re-encrypt or use envelope encryption.
+
+**Issue 4: Cross-account access**
+
+PV in one account, accessed from another.
+
+Fix: explicit IAM policies, encrypted keys shared properly.
+
+**Production scenarios:**
+
+1. **Encryption by default**: All StorageClasses set encrypted=true. Customer-managed KMS keys for compliance.
+
+2. **Compliance audit**: HIPAA audit. Demonstrated encryption at rest (AWS EBS), in transit (EFS TLS), audit logs. Passed.
+
+3. **fsGroup fix**: New app couldn't write. Found mount root-owned. Added fsGroup to securityContext. App could write.
+
+4. **Vault for secrets**: Stopped putting secrets in PVCs. External Secrets + Vault. Secrets rotated, audited.
+
+5. **Backup encryption**: Velero backups to S3. Customer-managed KMS for backup bucket. Encrypted at rest.
+
+---
+
+## 391. Explain RWX vs RWO access modes
+
+Access modes define how PVs can be mounted by pods. Critical for understanding storage capabilities.
+
+**Access modes:**
+
+**ReadWriteOnce (RWO):**
+
+```yaml
+accessModes:
+  - ReadWriteOnce
+```
+
+- Single node read/write
+- Most common
+- Block storage (EBS, Azure Disk, PDs)
+- Multiple pods on same node can share
+- Single node access only
+
+**ReadOnlyMany (ROX):**
+
+```yaml
+accessModes:
+  - ReadOnlyMany
+```
+
+- Multiple nodes read-only
+- Less common
+- For shared read-only data
+
+**ReadWriteMany (RWX):**
+
+```yaml
+accessModes:
+  - ReadWriteMany
+```
+
+- Multiple nodes read/write
+- File systems (NFS, EFS, Azure Files, GCP Filestore)
+- True multi-pod access
+
+**ReadWriteOncePod (RWOP):**
+
+```yaml
+accessModes:
+  - ReadWriteOncePod
+```
+
+- Single pod read/write (1.22+)
+- Stricter than RWO
+- Use case: ensure only one pod uses storage
+
+**Detailed comparison:**
+
+**RWO behavior:**
+
+```
+Pod A on Node 1: mounts PVC ✓
+Pod B on Node 1: can mount same PVC ✓ (same node)
+Pod C on Node 2: cannot mount ✗
+```
+
+Single node attachment. Multiple pods on that node can share.
+
+**RWX behavior:**
+
+```
+Pod A on Node 1: mounts PVC ✓
+Pod B on Node 2: mounts same PVC ✓
+Pod C on Node 3: mounts same PVC ✓
+```
+
+Multi-node simultaneous access.
+
+**Storage type support:**
+
+| Type | RWO | RWX | ROX |
+|------|-----|-----|-----|
+| AWS EBS | Yes | No | No |
+| AWS EFS | Yes | Yes | Yes |
+| Azure Disk | Yes | No | No |
+| Azure Files | Yes | Yes | Yes |
+| GCP PD | Yes | No (mostly) | Yes |
+| GCP Filestore | Yes | Yes | Yes |
+| NFS | Yes | Yes | Yes |
+| Ceph RBD | Yes | No | No |
+| CephFS | Yes | Yes | Yes |
+
+**When to use RWO:**
+
+**Databases:**
+
+```yaml
+# PostgreSQL StatefulSet:
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ebs-gp3
+```
+
+Single pod owns the database files.
+
+**Single-instance apps:**
+
+```yaml
+# Redis primary:
+spec:
+  replicas: 1
+  volumeClaimTemplates:
+    - spec:
+        accessModes: [ReadWriteOnce]
+```
+
+**Per-pod storage:**
+
+```yaml
+# StatefulSet with per-pod data:
+volumeClaimTemplates:
+  - spec:
+      accessModes: [ReadWriteOnce]
+```
+
+Each replica gets own PVC.
+
+**When to use RWX:**
+
+**Shared content:**
+
+```yaml
+# Web servers sharing uploads:
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - volumeMounts:
+            - name: uploads
+              mountPath: /var/uploads
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: shared-uploads   # RWX
+```
+
+All replicas see same files.
+
+**ML training data:**
+
+```yaml
+# Multiple training pods, shared dataset:
+volumes:
+  - name: dataset
+    persistentVolumeClaim:
+      claimName: training-data
+```
+
+**Centralized logs:**
+
+```yaml
+# Multiple apps writing to shared logs:
+volumes:
+  - name: logs
+    persistentVolumeClaim:
+      claimName: shared-logs
+```
+
+**When to use ROX:**
+
+**Shared read-only data:**
+
+```yaml
+# Static content:
+volumes:
+  - name: static
+    persistentVolumeClaim:
+      claimName: static-content   # ROX
+```
+
+Multiple replicas read, none write.
+
+Less common in practice (RWX with read-only mount more flexible).
+
+**Multiple access modes:**
+
+PV can support multiple:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+spec:
+  accessModes:
+    - ReadWriteOnce
+    - ReadOnlyMany
+```
+
+PVC requests one mode:
+
+```yaml
+spec:
+  accessModes:
+    - ReadOnlyMany   # Use as read-only
+```
+
+**Block storage limitation:**
+
+Block storage (EBS) physically can't be RWX. The disk can only attach to one VM.
+
+For RWX with cloud:
+- AWS: use EFS
+- Azure: use Azure Files
+- GCP: use Filestore
+- On-prem: NFS, CephFS
+
+**Performance differences:**
+
+**RWO (block):**
+- Fast (direct disk)
+- Lower latency
+- Higher IOPS
+
+**RWX (file):**
+- Slower (network filesystem)
+- Higher latency
+- Lower throughput (depending on type)
+
+```
+EBS gp3: ~500 MB/s, <1ms latency
+EFS: depends on mode, ~MB/s to GB/s, few ms latency
+```
+
+For high-performance: RWO.
+For sharing: RWX.
+
+**RWOP (1.22+):**
+
+Newer mode for stricter control:
+
+```yaml
+accessModes:
+  - ReadWriteOncePod
+```
+
+Only one pod can use, even on same node. Use case:
+- Ensure singleton
+- Strict ownership
+
+**Hybrid patterns:**
+
+**Pattern 1: Block + File**
+
+```yaml
+spec:
+  containers:
+    - volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgres   # RWO for data
+        - name: backups
+          mountPath: /backups            # RWX for shared backups
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: postgres-data
+    - name: backups
+      persistentVolumeClaim:
+        claimName: shared-backups
+```
+
+**Pattern 2: Per-replica + shared**
+
+```yaml
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]   # Per replica
+  template:
+    spec:
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: shared-config   # RWX
+```
+
+**Cost considerations:**
+
+```
+RWO (EBS): $0.08-0.20/GB/month
+RWX (EFS): $0.30/GB/month (Standard)
+```
+
+RWX typically more expensive.
+
+For mostly-read shared data: consider object storage (S3) with mount tools (Mountpoint for S3, s3fs).
+
+**Performance optimization:**
+
+**RWX optimization:**
+
+```yaml
+# EFS performance mode:
+parameters:
+  performanceMode: maxIO   # Higher throughput
+  # Or:
+  performanceMode: generalPurpose   # Lower latency
+```
+
+**Caching:**
+
+```yaml
+# Apps cache from RWX locally:
+emptyDir: {}   # Local cache
+# Periodic sync from RWX
+```
+
+**Production scenarios:**
+
+1. **Database RWO**: PostgreSQL StatefulSet. Per-replica RWO EBS. Each replica owns data. Replication for HA.
+
+2. **Web app RWX**: 5 web replicas sharing uploads via EFS. RWX necessary. EFS performance acceptable.
+
+3. **ML training RWX**: 20 training pods sharing dataset. EFS RWX. Reduced duplication.
+
+4. **Mixed pattern**: App with database (RWO) and shared config (RWX). Different PVCs.
+
+5. **RWOP for singleton**: Critical singleton service. Used RWOP to ensure only one pod. Prevented split-brain.
+
+---
+
+## 392. How do you troubleshoot volume mount failures?
+
+Volume mount failures prevent pods from starting. Systematic troubleshooting required.
+
+**Common error messages:**
+
+```
+- "FailedMount"
+- "AttachVolume failed"
+- "MountVolume failed"
+- "Permission denied"
+- "Volume not found"
+```
+
+**Step 1: Check pod events**
+
+```bash
+kubectl describe pod my-pod
+
+# Events section:
+# Warning  FailedMount  ...  Unable to attach or mount volumes
+```
+
+**Step 2: Check PVC status**
+
+```bash
+kubectl get pvc my-pvc
+# Status: Pending? Bound?
+
+kubectl describe pvc my-pvc
+# Events
+```
+
+**Step 3: Check PV status**
+
+```bash
+kubectl get pv
+
+kubectl describe pv my-pv
+# Look for issues
+```
+
+**Common issues:**
+
+**Issue 1: PVC pending**
+
+```bash
+kubectl describe pvc my-pvc
+
+# Possible causes:
+# - StorageClass doesn't exist
+# - No matching PV (static)
+# - Provisioner not running
+```
+
+**Fix:**
+
+```bash
+# Check StorageClass:
+kubectl get storageclass
+
+# Check provisioner:
+kubectl get pods -n kube-system -l app=ebs-csi-controller
+```
+
+**Issue 2: Wrong zone**
+
+```
+PV in us-east-1a
+Pod scheduled in us-east-1b
+Can't attach
+```
+
+**Diagnosis:**
+
+```bash
+# Pod node:
+kubectl describe pod my-pod | grep Node
+
+# Node zone:
+kubectl get node <node> -o yaml | grep zone
+
+# PV zone:
+kubectl describe pv my-pv | grep zone
+```
+
+**Fix:**
+
+Use `volumeBindingMode: WaitForFirstConsumer` in StorageClass.
+
+For existing: delete pod, may reschedule to correct zone (won't work if PV stuck in wrong zone).
+
+**Issue 3: Volume already attached**
+
+```
+"Volume is already attached to one or more instances"
+```
+
+Block volume only attaches to one node. If previous attachment didn't clean up:
+
+```bash
+# Manual force detach (cloud-specific):
+aws ec2 detach-volume --volume-id vol-xxx --force
+```
+
+**Issue 4: CSI driver issues**
+
+```bash
+# Check CSI controller:
+kubectl get pods -n kube-system -l app=ebs-csi-controller
+kubectl logs -n kube-system <pod> -c csi-attacher
+
+# Check node plugin:
+kubectl get pods -n kube-system -l app=ebs-csi-node
+kubectl logs -n kube-system <pod>
+```
+
+Look for errors.
+
+**Issue 5: Permissions (IAM)**
+
+```
+"AccessDenied" in CSI logs
+```
+
+For EKS: IRSA misconfigured.
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ebs-csi-controller-sa
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::...:role/ebs-csi-role
+```
+
+Verify role has EBS permissions.
+
+**Issue 6: File permissions**
+
+```
+Pod starts but can't write to volume
+"Permission denied"
+```
+
+**Fix:**
+
+```yaml
+spec:
+  securityContext:
+    fsGroup: 1000
+    runAsUser: 1000
+```
+
+**Or init container:**
+
+```yaml
+initContainers:
+  - name: volume-permissions
+    image: busybox
+    command: ['sh', '-c', 'chmod -R 777 /data']
+    volumeMounts:
+      - name: data
+        mountPath: /data
+```
+
+**Issue 7: NFS mount failure**
+
+```
+"mount failed: exit status 32"
+```
+
+Causes:
+- NFS server unreachable
+- Mount options wrong
+- Firewall blocking
+
+**Diagnosis:**
+
+```bash
+# From node:
+mount -t nfs server:/path /tmp/test
+# See actual error
+
+# Network:
+telnet server 2049
+```
+
+**Issue 8: PVC bound but pod can't mount**
+
+```bash
+# Check kubelet logs on node:
+journalctl -u kubelet -n 100
+
+# Or for systemd nodes:
+ssh node
+journalctl -u kubelet
+```
+
+Look for mount-specific errors.
+
+**Issue 9: Capacity issues**
+
+```
+"InsufficientStorage"
+```
+
+Cloud quota or volume too large.
+
+Check cloud limits.
+
+**Issue 10: Multi-attach error**
+
+```
+"Multi-Attach error for volume"
+```
+
+RWO volume, multiple pods trying to mount.
+
+Common after pod recreation if old pod stuck terminating.
+
+**Fix:**
+
+```bash
+# Force delete stuck pod:
+kubectl delete pod stuck-pod --force --grace-period=0
+```
+
+**Step 4: Check node**
+
+```bash
+# Volume attached to node?
+kubectl get volumeattachment
+
+# On node (if accessible):
+lsblk
+# See attached disks
+```
+
+**Step 5: Test mount manually**
+
+For NFS:
+
+```bash
+# On node:
+mkdir /tmp/test
+mount -t nfs server:/exports /tmp/test
+```
+
+For EBS:
+
+```bash
+# Verify attachment:
+aws ec2 describe-volumes --volume-id vol-xxx
+```
+
+**Step 6: Check CSI driver health**
+
+```bash
+# Status:
+kubectl get csidriver
+
+# Pods:
+kubectl get pods -n kube-system | grep csi
+
+# Sidecar errors:
+kubectl logs <csi-controller-pod> -c csi-provisioner
+kubectl logs <csi-controller-pod> -c csi-attacher
+kubectl logs <csi-controller-pod> -c csi-resizer
+```
+
+**Step 7: Verify cloud-side**
+
+```bash
+# Cloud volume status:
+aws ec2 describe-volumes --volume-id vol-xxx
+# Or:
+az disk show ...
+# Or:
+gcloud compute disks describe ...
+```
+
+Volume in expected state?
+
+**Diagnostic checklist:**
+
+```
+1. PVC exists and Bound?
+2. PV exists?
+3. PV in correct zone (matches pod)?
+4. CSI controller healthy?
+5. CSI node plugin healthy on target node?
+6. Cloud volume exists?
+7. Volume attached to correct node?
+8. Filesystem readable/writable?
+9. Permissions correct (fsGroup, runAsUser)?
+10. NetworkPolicy allowing storage backend?
+```
+
+**Common fixes summary:**
+
+```yaml
+# Fix 1: WaitForFirstConsumer
+StorageClass:
+  volumeBindingMode: WaitForFirstConsumer
+
+# Fix 2: fsGroup
+Pod:
+  securityContext:
+    fsGroup: 1000
+
+# Fix 3: Init container for permissions
+initContainers:
+  - name: chown
+    command: ['chown', '-R', '1000:1000', '/data']
+
+# Fix 4: Multiple replicas with RWO
+StatefulSet (per-pod PVC):
+  volumeClaimTemplates: ...
+
+# Fix 5: RWX for multi-pod
+PVC:
+  accessModes: [ReadWriteMany]
+StorageClass: efs (or similar)
+```
+
+**Production scenarios:**
+
+1. **Wrong zone error**: PVC stuck. PV in us-east-1a, pods scheduled to us-east-1b. Migrated to WaitForFirstConsumer. Resolved.
+
+2. **fsGroup issue**: New app couldn't write. Pod ran as user 1000, but volume root-owned. Added fsGroup: 1000. Files writable.
+
+3. **CSI driver crash**: CSI controller crashed, new PVCs stuck. Restarted driver. Resolved.
+
+4. **Multi-attach after force-delete**: Pod force-deleted, but volume still showed attached. Manual cloud detach. New pod could attach.
+
+5. **NFS mount failed**: Firewall blocking 2049. Allowed. Mount worked.
+
+---
+
+## 393. Explain distributed storage systems
+
+Distributed storage systems provide storage across multiple nodes with replication, scalability, and fault tolerance.
+
+**Why distributed storage:**
+
+- Scale beyond single node
+- High availability (replication)
+- Performance (parallel I/O)
+- Cloud-independent
+- Better economics at scale
+
+**Architecture patterns:**
+
+**Replicated:**
+
+```
+Data: A, B, C
+Node 1: A, B, C
+Node 2: A, B, C
+Node 3: A, B, C
+
+3 copies of everything
+```
+
+**Sharded:**
+
+```
+Data: A, B, C, D, E, F
+Node 1: A, B
+Node 2: C, D
+Node 3: E, F
+
+Distributed, not replicated
+```
+
+**Replicated + sharded (typical):**
+
+```
+Data: A, B, C
+Replicas: 3 per data piece
+
+Node 1: A, B, C
+Node 2: A, B, C
+Node 3: A, B, C
+
+Each piece on 3 nodes
+```
+
+**Popular systems:**
+
+**Ceph:**
+
+```
+Distributed object/block/file storage
+RADOS: object store core
+RBD: block (most used in K8s)
+CephFS: filesystem
+
+Components:
+- OSDs (Object Storage Daemons): store data
+- MONs (Monitors): cluster state
+- MDS (Metadata Servers): for CephFS
+- RGW (RADOS Gateway): S3 API
+```
+
+Mature, comprehensive.
+
+**Longhorn:**
+
+```
+Built for Kubernetes
+By Rancher
+Easier to operate than Ceph
+Block storage focus
+Snapshots, backups
+```
+
+**Portworx:**
+
+```
+Commercial
+Multi-cloud, multi-cluster
+Easy operations
+Premium features
+```
+
+**OpenEBS:**
+
+```
+Multiple "engines":
+- cStor
+- Jiva
+- Mayastor (NVMe)
+- LocalPV
+
+Flexible
+```
+
+**Rook:**
+
+```
+Operator for storage in K8s
+Manages Ceph, NFS, etc.
+Day-2 operations easier
+```
+
+**MinIO:**
+
+```
+S3-compatible object storage
+Distributed
+Easy to deploy
+```
+
+**Comparison:**
+
+| System | Type | Complexity | Performance | Use case |
+|--------|------|------------|-------------|----------|
+| Ceph | Block/Object/File | High | Good | Comprehensive |
+| Longhorn | Block | Low | Good | Easy K8s storage |
+| Portworx | All | Medium | Excellent | Enterprise |
+| OpenEBS | Block | Low-Medium | Varies | Flexible |
+| Rook | Manages others | Low operationally | N/A | Day-2 ops |
+| MinIO | Object | Low | Very good | S3 alternative |
+
+**Deployment in Kubernetes:**
+
+**Ceph via Rook:**
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v17
+  dataDirHostPath: /var/lib/rook
+  mon:
+    count: 3
+  storage:
+    useAllNodes: true
+    useAllDevices: false
+    deviceFilter: "^sd[b-z]"
+```
+
+Rook operator deploys Ceph.
+
+**Block storage:**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: replicapool
+  imageFormat: "2"
+```
+
+**Longhorn:**
+
+```bash
+helm install longhorn longhorn/longhorn \
+  --namespace longhorn-system \
+  --create-namespace
+```
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn
+provisioner: driver.longhorn.io
+parameters:
+  numberOfReplicas: "3"
+  staleReplicaTimeout: "30"
+```
+
+**Concepts:**
+
+**Replication factor:**
+
+```
+3 replicas: data survives 2 simultaneous failures
+2 replicas: survives 1 failure
+1 replica: no redundancy
+```
+
+Trade-off: replicas vs storage cost.
+
+**Erasure coding:**
+
+```
+Like RAID 5/6 but distributed
+More efficient than replication
+Slower performance
+```
+
+For cost optimization at scale.
+
+**Quorum:**
+
+```
+Writes succeed when majority confirm
+Maintains consistency
+```
+
+**Failure domains:**
+
+```
+Spread replicas across:
+- Nodes
+- Racks
+- Datacenters
+- Regions
+```
+
+Prevents correlated failures.
+
+**Performance characteristics:**
+
+**Latency:**
+
+```
+Local NVMe: <0.1ms
+Distributed (Ceph): 1-5ms
+Cloud (EBS): <1ms
+```
+
+Network adds latency.
+
+**Throughput:**
+
+Scales with nodes:
+
+```
+1 node: limited by node
+10 nodes: 10x potential
+Limited by network
+```
+
+**IOPS:**
+
+Parallel I/O across nodes:
+
+```
+Single disk: 10k IOPS
+10 nodes: 100k+ IOPS potential
+```
+
+**Hyperconverged:**
+
+```
+Storage on same nodes as workloads
+No separate storage cluster
+Common pattern
+```
+
+**Disaggregated:**
+
+```
+Dedicated storage nodes
+Workloads on compute nodes
+Separation of concerns
+```
+
+**Backup integration:**
+
+```yaml
+# Velero with CSI snapshots:
+spec:
+  snapshotMoveData: true
+```
+
+Distributed storage often has snapshot support.
+
+**Multi-cluster:**
+
+```
+Some support cross-cluster:
+- Portworx Mirror
+- Ceph multi-site
+- Longhorn DR
+```
+
+For disaster recovery.
+
+**Operational considerations:**
+
+**Hardware:**
+
+```
+NVMe SSDs ideal
+Network: 10G+ recommended
+Memory: substantial for caching
+CPU: significant for parallel ops
+```
+
+**Capacity planning:**
+
+```
+Reserved overhead: 20%+ (rebalancing)
+Replication factor multiplies
+Growth projections
+```
+
+**Monitoring:**
+
+```
+- Cluster health
+- Replica status
+- Performance metrics
+- Capacity utilization
+- Failed disks
+```
+
+**Day-2 operations:**
+
+```
+- Adding/removing nodes
+- Replacing disks
+- Upgrades
+- Backup/restore
+- Performance tuning
+```
+
+Significant operational burden.
+
+**Cost considerations:**
+
+**Cloud-managed:**
+- EBS, Azure Disk, GCP PD
+- Cloud handles operations
+- Per-GB pricing
+
+**Self-managed distributed:**
+- Lower per-GB if scale large
+- Operational cost
+- Cluster management
+
+Break-even varies. Often 100TB+ for cost benefit.
+
+**Production scenarios:**
+
+1. **Rook Ceph on-prem**: Bare metal cluster, 50 nodes. Rook deploys Ceph. Block + S3 storage. Operational but complex.
+
+2. **Longhorn for small cluster**: Smaller cluster, didn't want Ceph complexity. Longhorn deployed easily. Adequate performance.
+
+3. **OpenEBS Mayastor**: NVMe performance critical. OpenEBS Mayastor (NVMe-over-Fabrics). Bare-metal performance with K8s ease.
+
+4. **MinIO for object**: Needed S3 storage in cluster. MinIO deployed. Apps used as S3. Backups, ML data.
+
+5. **Portworx for enterprise**: Multi-cluster, multi-cloud. Portworx commercial. Strong DR features. Premium support.
+
+---
+
+## 394. Difference between Ceph, Longhorn, and Portworx
+
+Three popular Kubernetes-friendly distributed storage solutions with different trade-offs.
+
+**Ceph:**
+
+**Architecture:**
+
+```
+Multi-component, complex:
+- OSDs (data daemons)
+- MONs (cluster state)
+- MDS (metadata for CephFS)
+- RGW (S3 API)
+- Crush algorithm for placement
+```
+
+**Storage types:**
+
+- **RBD**: Block storage (most used)
+- **CephFS**: POSIX filesystem
+- **RGW**: S3-compatible object
+
+**Strengths:**
+
+- Most mature distributed storage
+- Multi-protocol support
+- Massive scale (PB+)
+- Open source
+- Battle-tested
+
+**Weaknesses:**
+
+- Complex operations
+- Learning curve
+- Resource intensive
+- Tuning complexity
+
+**Deployment:**
+
+Best via Rook operator:
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v17
+  storage:
+    useAllNodes: true
+```
+
+**Longhorn:**
+
+**Architecture:**
+
+```
+Designed for Kubernetes:
+- Manager (control plane)
+- Engine (per-volume, in user space)
+- Replica (per-volume, on nodes)
+```
+
+**Storage type:**
+
+- Block storage only
+- RWO primarily
+
+**Strengths:**
+
+- Built for Kubernetes
+- Simple operations
+- Good UI
+- Snapshots, backups, DR built-in
+- Easier learning curve
+
+**Weaknesses:**
+
+- Block only (no file, no object)
+- Less mature than Ceph
+- Performance: good but not best
+- Limited multi-cluster
+
+**Deployment:**
+
+```bash
+helm install longhorn longhorn/longhorn \
+  --namespace longhorn-system
+```
+
+Single command setup.
+
+**Portworx:**
+
+**Architecture:**
+
+```
+Commercial, proprietary:
+- Storage virtualization layer
+- Runs on existing storage
+- Multi-cloud, multi-cluster
+```
+
+**Storage types:**
+
+- Block
+- Some file features
+
+**Strengths:**
+
+- Excellent performance
+- Easy operations
+- Multi-cluster, multi-cloud
+- Strong DR
+- Enterprise support
+- Cloud-native features (autoscaling, etc.)
+
+**Weaknesses:**
+
+- Commercial (cost)
+- Vendor lock-in
+- Less transparency
+
+**Deployment:**
+
+```yaml
+# Portworx operator manages
+apiVersion: portworx.io/v1
+kind: StorageCluster
+```
+
+**Comparison:**
+
+| Aspect | Ceph | Longhorn | Portworx |
+|--------|------|----------|----------|
+| License | Open source | Open source | Commercial |
+| Cost | Free | Free | $$ |
+| Complexity | High | Low | Medium |
+| Block storage | Yes | Yes | Yes |
+| File storage | Yes (CephFS) | No | Limited |
+| Object storage | Yes (RGW) | No | No |
+| Snapshots | Yes | Yes | Yes |
+| Backup | Manual/Velero | Built-in | Built-in |
+| Multi-cluster | Yes (complex) | DR only | Excellent |
+| Maturity | Very mature | Mature | Mature |
+| Operations | Complex | Easy | Easy |
+| Performance | Good | Good | Excellent |
+| Best for | Large scale, multi-protocol | K8s-first orgs | Enterprise |
+
+**Detailed features:**
+
+**Ceph features:**
+
+- CRUSH placement algorithm
+- Rebalancing
+- Multi-site replication
+- Cache tiering
+- Compression
+- Encryption
+
+**Longhorn features:**
+
+- Snapshots
+- Backups to S3/NFS
+- DR (cross-cluster)
+- UI for management
+- Volume expansion
+- Built-in monitoring
+
+**Portworx features:**
+
+- Stork (scheduler integration)
+- KubeMotion (migration)
+- Multi-cloud
+- Cross-region async replication
+- App-aware snapshots
+- Backup/restore
+- Encryption
+- Capacity management
+
+**Performance comparison:**
+
+Rough benchmarks (varies widely):
+
+```
+Local NVMe baseline: 1000k IOPS, 5GB/s
+
+Ceph RBD: 50-80% of local
+Longhorn: 30-60% of local
+Portworx: 70-90% of local (their claim)
+```
+
+For mission-critical performance: Portworx often wins.
+
+**Resource requirements:**
+
+**Ceph:**
+
+```
+3+ MONs (small)
+OSD: 4GB RAM + 1 CPU per OSD
+MDS: 4GB RAM
+Significant for large clusters
+```
+
+**Longhorn:**
+
+```
+Manager: 256MB RAM
+Engine per volume: ~50MB RAM
+Lighter than Ceph
+```
+
+**Portworx:**
+
+```
+Similar to Longhorn
+Some overhead for features
+```
+
+**Operational complexity:**
+
+**Ceph:**
+
+```
+Day 1: hard
+Day 2: harder
+Requires Ceph expertise
+Rook helps but doesn't eliminate
+```
+
+**Longhorn:**
+
+```
+Day 1: easy
+Day 2: manageable
+K8s native, familiar
+```
+
+**Portworx:**
+
+```
+Day 1: easy
+Day 2: easy (vendor supports)
+```
+
+**When to choose:**
+
+**Choose Ceph when:**
+
+- Need multi-protocol (block + file + object)
+- Have Ceph expertise
+- Massive scale (PB)
+- Want full open source
+- Time to learn
+
+**Choose Longhorn when:**
+
+- K8s-first organization
+- Block storage sufficient
+- Want simple operations
+- Smaller scale
+- Free preferred
+
+**Choose Portworx when:**
+
+- Enterprise environment
+- Need best performance
+- Multi-cluster requirements
+- Have budget
+- Want vendor support
+
+**Cost comparison:**
+
+**Ceph:** free, operational cost high.
+
+**Longhorn:** free, low operational cost.
+
+**Portworx:** licensed, low operational cost.
+
+For 100TB cluster:
+
+```
+Ceph: free + 1-2 engineers
+Longhorn: free + occasional management
+Portworx: $50k-200k/year + minimal ops
+```
+
+ROI depends on team and scale.
+
+**Migration:**
+
+Between these is complex:
+- Different APIs
+- Different snapshot formats
+- Apps may need updates
+
+Migration usually:
+- Backup with Velero
+- Restore on new storage
+- Some downtime
+
+**Production scenarios:**
+
+1. **Ceph at scale**: 500TB Ceph cluster. Block + S3. Operational team of 2. Complex but powerful.
+
+2. **Longhorn for ease**: Smaller cluster (50TB). Longhorn deployed in hour. Engineers learned in days. Good fit.
+
+3. **Portworx for enterprise**: Multi-cloud deployment. Portworx for cross-cloud DR. Premium features paid off.
+
+4. **Ceph + Longhorn**: Different tiers. Ceph for big shared storage. Longhorn for fast block per app.
+
+5. **Migration from Ceph**: Team didn't have Ceph expertise. Migrated to Longhorn. Operational burden dropped.
+
+---
+
+## 395. Explain snapshotting in Kubernetes
+
+Volume snapshots are point-in-time copies of volumes. Essential for backups, cloning, and testing.
+
+**CSI Volume Snapshots:**
+
+Standard Kubernetes API for snapshots:
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: my-snapshot
+spec:
+  volumeSnapshotClassName: csi-snapclass
+  source:
+    persistentVolumeClaimName: my-pvc
+```
+
+**Components:**
+
+**VolumeSnapshotClass:**
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-snapclass
+driver: ebs.csi.aws.com
+deletionPolicy: Delete
+parameters:
+  # Driver-specific
+```
+
+Defines how snapshots are taken.
+
+**VolumeSnapshot:**
+
+User creates this to request snapshot.
+
+**VolumeSnapshotContent:**
+
+Cluster-scoped, represents actual snapshot. Like PV for volumes.
+
+**Snapshot workflow:**
+
+```
+1. User creates VolumeSnapshot referring to PVC
+2. external-snapshotter detects
+3. Calls CSI CreateSnapshot RPC
+4. Driver creates cloud snapshot (e.g., aws.CreateSnapshot)
+5. VolumeSnapshotContent created
+6. VolumeSnapshot ready
+```
+
+**Restore from snapshot:**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: restored-pvc
+spec:
+  storageClassName: standard
+  dataSource:
+    name: my-snapshot
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+New PVC created from snapshot. Data restored.
+
+**Snapshot characteristics:**
+
+**Point-in-time:**
+
+```
+Snapshot at T1: contains data at T1
+Subsequent writes don't affect snapshot
+```
+
+**Incremental (typically):**
+
+```
+First snapshot: full
+Subsequent: only changes
+Efficient storage
+```
+
+**Storage:**
+
+```
+Cloud snapshots: stored by provider (S3, etc.)
+Block storage snapshots: usually copy-on-write
+```
+
+**Performance:**
+
+```
+Taking snapshot: fast (seconds to minutes)
+Restoring: depends on size
+```
+
+**Use cases:**
+
+**Use case 1: Backups**
+
+```yaml
+# Daily snapshots:
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: postgres-daily-2025-01-15
+spec:
+  source:
+    persistentVolumeClaimName: postgres-data
+```
+
+Automate with CronJob or backup tool.
+
+**Use case 2: Pre-upgrade**
+
+```bash
+# Before risky operation:
+kubectl apply -f snapshot.yaml
+
+# Perform upgrade
+# Verify
+
+# If problem, restore
+```
+
+**Use case 3: Testing**
+
+```yaml
+# Restore production data to test cluster:
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-data
+spec:
+  dataSource:
+    name: prod-snapshot
+    kind: VolumeSnapshot
+```
+
+Test against realistic data.
+
+**Use case 4: Cloning**
+
+```yaml
+# Clone PVC:
+apiVersion: v1
+kind: PersistentVolumeClaim
+spec:
+  dataSource:
+    name: source-pvc
+    kind: PersistentVolumeClaim
+```
+
+Direct PVC cloning (similar to snapshot+restore).
+
+**Use case 5: Disaster recovery**
+
+```
+Snapshot PVCs
+Replicate snapshots to another region
+Disaster: restore from snapshots
+```
+
+**Application consistency:**
+
+**Crash-consistent:**
+
+```
+Snapshot taken without app coordination
+Like a power outage
+App must handle on recovery
+```
+
+Most databases handle this fine (journal recovery).
+
+**Application-consistent:**
+
+```
+App flushes buffers
+Filesystem sync'd
+Snapshot taken
+```
+
+Better but requires coordination.
+
+**Pre-snapshot hook:**
+
+```yaml
+# Velero hooks:
+spec:
+  template:
+    metadata:
+      annotations:
+        pre.hook.backup.velero.io/command: '["pg_dump", "..."]'
+```
+
+Run pre-snapshot operations.
+
+**Snapshot to backup:**
+
+```yaml
+# Velero with CSI snapshots:
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: my-backup
+spec:
+  snapshotMoveData: true
+```
+
+Snapshot, then copy to backup storage (S3).
+
+**Snapshot policies:**
+
+Some operators automate:
+
+```yaml
+# Snapshot every day, keep 30:
+apiVersion: snapshotpolicy.k8s.io/v1alpha1
+kind: SnapshotPolicy
+spec:
+  schedule: "0 2 * * *"
+  retention: 30
+```
+
+Custom resource via operator.
+
+**Cross-cluster restore:**
+
+```
+1. Snapshot in cluster A
+2. Export snapshot to S3 (Velero)
+3. Import in cluster B
+4. Create PVC from snapshot
+```
+
+**Cost considerations:**
+
+```
+Snapshots typically charged separately:
+AWS EBS snapshots: $0.05/GB/month
+Azure Disk snapshots: similar
+GCP PD snapshots: similar
+
+Many snapshots = cost
+```
+
+**Retention policies:**
+
+```yaml
+# Delete old snapshots:
+# Custom controller, or backup tool
+```
+
+Without cleanup, snapshots accumulate.
+
+**Best practices:**
+
+1. **Regular snapshots**: automated, not manual
+2. **Retention policies**: prevent accumulation
+3. **Test restore**: verify snapshots usable
+4. **App-consistent when possible**: for databases especially
+5. **Cross-region copies**: for DR
+6. **Monitor**: ensure snapshots succeeding
+7. **Document**: which snapshots, what for
+
+**Limitations:**
+
+- Not all CSI drivers support
+- Some cloud limits (max snapshots per volume)
+- Cross-region replication varies
+- Application-consistency requires coordination
+
+**Common issues:**
+
+**Issue 1: Driver doesn't support snapshots**
+
+Check:
+
+```bash
+kubectl get volumesnapshotclass
+# May be empty if driver doesn't support
+```
+
+**Issue 2: Snapshot stuck**
+
+```bash
+kubectl describe volumesnapshot my-snap
+# Events show error
+```
+
+**Issue 3: Restored data corrupted**
+
+App not crash-consistent. Need app-consistent snapshots.
+
+**Issue 4: Cross-region not supported**
+
+Standard CSI snapshots region-specific. Need additional tooling.
+
+**Production scenarios:**
+
+1. **Daily PostgreSQL snapshots**: CronJob created daily snapshots. Retained 30 days. Recovery point ~24h.
+
+2. **Pre-upgrade safety**: Before major K8s upgrade, snapshotted all PVCs. Upgrade had issue. Restored from snapshots. Saved.
+
+3. **Test data refresh**: Weekly: snapshot prod, restore to staging. Realistic test data without manual export/import.
+
+4. **Velero with CSI**: Velero uses CSI snapshots for backup. Includes data. Cross-region copy. Comprehensive DR.
+
+5. **Snapshot accumulation cost**: Forgot retention. 1000+ snapshots. $2000/month surprise. Implemented retention policy.
+
+---
+
+## 396. How do you backup Stateful workloads?
+
+Stateful workload backup requires both Kubernetes objects and data. Multiple approaches.
+
+**What to backup:**
+
+```
+1. Kubernetes resources (Deployments, StatefulSets, etc.)
+2. Configuration (ConfigMaps, Secrets)
+3. Persistent data (PVCs)
+4. Custom resources (operators)
+5. Cluster-level resources (RBAC, etc.)
+```
+
+**Backup strategies:**
+
+**Strategy 1: Velero**
+
+Most popular Kubernetes backup tool:
+
+```bash
+# Install:
+velero install \
+  --provider aws \
+  --plugins velero/velero-plugin-for-aws:v1.7.0 \
+  --bucket my-backup-bucket \
+  --backup-location-config region=us-east-1 \
+  --snapshot-location-config region=us-east-1
+```
+
+**Backup:**
+
+```bash
+# Backup namespace:
+velero backup create my-backup \
+  --include-namespaces production
+```
+
+What Velero does:
+- Backs up K8s resources (YAML to S3)
+- Takes volume snapshots (CSI)
+- Optional: data movement (Kopia/Restic)
+
+**Restore:**
+
+```bash
+velero restore create --from-backup my-backup
+```
+
+Recreates resources and PVCs.
+
+**Strategy 2: Application-aware backup**
+
+For databases:
+
+```bash
+# PostgreSQL:
+kubectl exec postgres-0 -- pg_dump database > backup.sql
+
+# MySQL:
+kubectl exec mysql-0 -- mysqldump database > backup.sql
+
+# MongoDB:
+kubectl exec mongo-0 -- mongodump
+```
+
+Then upload to S3 or similar.
+
+App-consistent. App handles transactions.
+
+**Strategy 3: Operator-managed**
+
+Database operators often handle:
+
+```yaml
+# CloudNativePG:
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: daily-backup
+spec:
+  schedule: "0 2 * * *"
+  cluster:
+    name: my-postgres
+```
+
+Operator orchestrates backup.
+
+**Strategy 4: Volume snapshots only**
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: db-snap
+spec:
+  source:
+    persistentVolumeClaimName: db-data
+```
+
+Simple, fast. Crash-consistent.
+
+**Velero deep dive:**
+
+**Architecture:**
+
+```
+Velero server (Deployment in cluster)
+       ↓ (uses CSI for snapshots)
+Storage (PVCs)
+
+Velero server (writes K8s resources to S3)
+       ↓
+S3 (or similar object storage)
+```
+
+**Schedule:**
+
+```yaml
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: daily-backup
+spec:
+  schedule: "0 2 * * *"
+  template:
+    includedNamespaces:
+      - production
+    ttl: "720h"   # 30 days
+```
+
+**Hooks:**
+
+```yaml
+# Pre-backup hook (e.g., flush DB):
+metadata:
+  annotations:
+    pre.hook.backup.velero.io/command: '["pg_dump", "-f", "/tmp/dump.sql"]'
+    pre.hook.backup.velero.io/container: postgres
+```
+
+App-consistent backups.
+
+**Restore options:**
+
+```bash
+# Restore to different namespace:
+velero restore create --from-backup my-backup \
+  --namespace-mappings production:staging
+
+# Restore specific resources:
+velero restore create --from-backup my-backup \
+  --include-resources persistentvolumeclaims
+```
+
+**Cross-cluster restore:**
+
+```bash
+# Backup in cluster A
+# Configure cluster B with same backup location
+# Restore in cluster B
+velero restore create --from-backup my-backup
+```
+
+Migration tool.
+
+**Database-specific approaches:**
+
+**PostgreSQL:**
+
+**pg_dump:**
+
+```bash
+kubectl exec postgres-0 -- pg_dump -Fc database > backup.dump
+```
+
+Logical backup. Slower for restore.
+
+**pg_basebackup:**
+
+```bash
+kubectl exec postgres-0 -- pg_basebackup -D /backups/base
+```
+
+Physical backup. Faster restore.
+
+**Continuous archiving:**
+
+```yaml
+# PostgreSQL config:
+archive_command = 'aws s3 cp %p s3://my-bucket/wal/%f'
+```
+
+WAL files archived continuously. Point-in-time recovery possible.
+
+**MongoDB:**
+
+**mongodump:**
+
+```bash
+kubectl exec mongo-0 -- mongodump --out /backups
+```
+
+**Oplog tailing:**
+
+```bash
+mongodump --oplog
+# Backs up with oplog for PIT recovery
+```
+
+**MySQL:**
+
+**mysqldump:**
+
+```bash
+kubectl exec mysql-0 -- mysqldump --all-databases > backup.sql
+```
+
+**XtraBackup:**
+
+```bash
+xtrabackup --backup --target-dir=/backups
+```
+
+Hot backup, faster restore.
+
+**Combined approach:**
+
+```yaml
+# Velero for K8s resources + database operator for app-consistent data:
+1. Velero backs up K8s resources daily
+2. CloudNativePG creates app-consistent backups continuously
+3. WAL archive continuous
+4. Recovery: combine resources from Velero + data from CloudNativePG
+```
+
+**Retention:**
+
+```yaml
+# Velero TTL:
+spec:
+  ttl: "720h"   # 30 days
+
+# Tiered:
+- Daily: 7 days
+- Weekly: 4 weeks
+- Monthly: 12 months
+```
+
+**Storage:**
+
+```yaml
+# Backup destinations:
+- AWS S3
+- Azure Blob
+- GCS
+- MinIO (on-prem)
+- NFS
+```
+
+Off-cluster storage for disaster recovery.
+
+**Encryption:**
+
+```yaml
+# Velero with encrypted bucket:
+spec:
+  config:
+    serverSideEncryption: aws:kms
+    kmsKeyId: alias/backups
+```
+
+Encrypted at rest.
+
+**Testing restores:**
+
+Critical:
+
+```bash
+# Restore to test namespace monthly:
+velero restore create test-restore-$(date +%Y%m) \
+  --from-backup latest-backup \
+  --namespace-mappings production:test-restore
+
+# Verify data integrity
+# Document any issues
+```
+
+Untested backup = no backup.
+
+**Backup monitoring:**
+
+```promql
+# Backup success:
+velero_backup_success_total
+
+# Last successful backup:
+velero_backup_last_successful_timestamp
+
+# Backup size:
+velero_backup_total_bytes
+```
+
+Alert on failures:
+
+```yaml
+- alert: BackupFailed
+  expr: time() - velero_backup_last_successful_timestamp > 86400
+  labels:
+    severity: critical
+```
+
+**RPO/RTO:**
+
+**RPO:** how much data loss acceptable.
+- Daily backups: RPO 24 hours
+- Continuous: RPO seconds
+
+**RTO:** how long to recover.
+- Velero restore: minutes to hours
+- Database-specific: depends
+
+**Best practices:**
+
+1. **Regular backups**: automated, scheduled
+2. **Multiple locations**: cross-region
+3. **Test restores**: monthly minimum
+4. **App-consistent**: for databases
+5. **Retention policies**: comply with requirements
+6. **Monitoring**: alert on failures
+7. **Documentation**: restore procedures clear
+8. **Disaster recovery plan**: complete strategy
+
+**Production scenarios:**
+
+1. **Velero daily**: Daily backups via Velero. 30-day retention. Cross-region copy. Tested restore quarterly.
+
+2. **PostgreSQL operator**: CloudNativePG with continuous WAL archive. PIT recovery possible. Recovery to any second in last 7 days.
+
+3. **Restore drill**: Found Velero backups didn't include CRDs. Fixed. Important to test.
+
+4. **Multi-tier retention**: Daily 7 days, weekly 4 weeks, monthly 12 months, yearly 7 years. Compliance.
+
+5. **Cross-cluster migration**: Velero backed up cluster A. Restored to cluster B. Production migrated.
+
+---
+
+## 397. Explain storage performance tuning
+
+Storage performance affects application performance. Tuning involves storage layer, K8s configuration, and application behavior.
+
+**Performance dimensions:**
+
+```
+IOPS: I/O operations per second
+Throughput: MB/s
+Latency: milliseconds per operation
+```
+
+**Different workloads emphasize different:**
+
+```
+Database (transactional): IOPS, latency
+Analytics: throughput
+Caches: latency, IOPS
+Logs: throughput
+```
+
+**Layer 1: Storage type selection**
+
+**Cloud storage tiers:**
+
+**AWS:**
+
+```yaml
+parameters:
+  type: gp3       # General purpose
+  # Or:
+  type: io2       # High IOPS
+  # Or:
+  type: st1       # Throughput
+```
+
+```
+gp3: up to 16k IOPS, 1000 MB/s
+io2: up to 64k IOPS, 1000 MB/s
+io2 Block Express: up to 256k IOPS
+```
+
+**Azure:**
+
+```yaml
+parameters:
+  skuName: Premium_LRS        # SSD
+  # Or:
+  skuName: PremiumV2_LRS      # SSD v2 (configurable)
+  # Or:
+  skuName: UltraSSD_LRS       # Ultra SSD
+```
+
+**GCP:**
+
+```yaml
+parameters:
+  type: pd-ssd
+  # Or:
+  type: hyperdisk-extreme     # Newest, highest perf
+```
+
+Match storage tier to workload.
+
+**Layer 2: Volume sizing**
+
+Cloud storage often: bigger = faster:
+
+**AWS gp3:**
+
+```
+3000 IOPS baseline (any size)
+Add IOPS up to 16k (max)
+Add throughput up to 1000 MB/s
+```
+
+**AWS gp2 (older):**
+
+```
+3 IOPS per GB (1 GB = 3 IOPS)
+1 TB = 3000 IOPS
+Burstable
+```
+
+**GCP PD:**
+
+```
+IOPS scales with size
+Larger disk = more IOPS
+```
+
+Sometimes oversizing for performance.
+
+**Layer 3: Provisioned IOPS**
+
+```yaml
+# AWS gp3:
+parameters:
+  type: gp3
+  iops: "10000"
+  throughput: "500"
+```
+
+Pay more for performance.
+
+**Layer 4: Filesystem choice**
+
+Default usually ext4. Alternatives:
+
+**XFS:**
+
+```yaml
+parameters:
+  fsType: xfs
+```
+
+Better for large files, parallel access.
+
+**ZFS:**
+
+Compression, snapshots built-in. Less common in K8s.
+
+**Btrfs:**
+
+Snapshots, cloning. Less mature for production.
+
+**Layer 5: Mount options**
+
+```yaml
+spec:
+  mountOptions:
+    - noatime
+    - nodiratime
+```
+
+`noatime`: don't update access times. Significant perf win.
+
+**For databases:**
+
+```yaml
+mountOptions:
+  - noatime
+  - data=writeback   # ext4
+```
+
+Async writes. Risk: data loss on crash.
+
+**Layer 6: Pod placement**
+
+Avoid cross-zone storage:
+
+```yaml
+# Pod and PV same zone:
+volumeBindingMode: WaitForFirstConsumer
+```
+
+**Layer 7: Application tuning**
+
+**Database-specific:**
+
+**PostgreSQL:**
+
+```yaml
+# Config:
+shared_buffers: 4GB
+work_mem: 64MB
+maintenance_work_mem: 1GB
+effective_cache_size: 12GB
+```
+
+Use available memory.
+
+**MongoDB:**
+
+```yaml
+# Config:
+storage:
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 16
+```
+
+**Layer 8: Caching**
+
+**App caching:**
+
+```yaml
+# Local cache (emptyDir):
+volumes:
+  - name: cache
+    emptyDir:
+      sizeLimit: 10Gi
+```
+
+Local SSD for cache.
+
+**Layer 9: Connection pooling**
+
+For databases:
+
+```python
+# Pool connections, reuse:
+pool = create_engine('postgresql://...', pool_size=20)
+```
+
+Reduce connection overhead.
+
+**Layer 10: Read replicas**
+
+```yaml
+# PostgreSQL with replicas:
+spec:
+  replicas:
+    - role: primary
+    - role: replica
+    - role: replica
+```
+
+Distribute reads.
+
+**Measuring performance:**
+
+**fio (testing):**
+
+```bash
+kubectl run fio --rm -it --image=ljishen/fio -- \
+  --filename=/data/test \
+  --rw=randread \
+  --bs=4k \
+  --iodepth=32 \
+  --size=1g \
+  --runtime=60 \
+  --name=test
+```
+
+Realistic test.
+
+**Application-level:**
+
+```promql
+# Database query duration:
+rate(pg_stat_database_blocks_fetched[5m])
+```
+
+**Volume metrics:**
+
+```promql
+# Read/write ops:
+rate(node_disk_io_time_seconds_total[5m])
+
+# Latency:
+rate(node_disk_read_time_seconds_total[5m]) / rate(node_disk_reads_completed_total[5m])
+```
+
+**Optimization patterns:**
+
+**Pattern 1: Tiered storage**
+
+```
+Hot data: Premium SSD
+Warm: Standard SSD
+Cold: HDD or object
+```
+
+Move data between tiers.
+
+**Pattern 2: Local SSD for cache**
+
+```yaml
+# Local NVMe for cache:
+volumes:
+  - name: cache
+    emptyDir: {}
+    # Or local PV with NVMe
+```
+
+Fast local cache + slower persistent storage.
+
+**Pattern 3: RAM disk**
+
+```yaml
+volumes:
+  - name: ramdisk
+    emptyDir:
+      medium: Memory
+      sizeLimit: 1Gi
+```
+
+In-memory storage. Fastest, but volatile.
+
+**Pattern 4: Separate logs from data**
+
+```yaml
+volumeMounts:
+  - name: data
+    mountPath: /var/lib/postgres/data
+  - name: logs
+    mountPath: /var/lib/postgres/logs
+volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: data-pvc   # Fast SSD
+  - name: logs
+    persistentVolumeClaim:
+      claimName: logs-pvc   # Standard SSD
+```
+
+Different tiers for different data.
+
+**Bottleneck identification:**
+
+```bash
+# On node:
+iostat -xz 1
+
+# Look for:
+# - Disk %util (saturation)
+# - High await (latency)
+# - High queue depth
+```
+
+```bash
+# In pod:
+dd if=/dev/zero of=/data/test bs=1M count=1000 oflag=direct
+# Throughput test
+```
+
+**Common issues:**
+
+**Issue 1: IOPS limit hit**
+
+```
+EBS gp3 at 3000 IOPS, app needs 10k
+```
+
+Increase IOPS:
+
+```yaml
+parameters:
+  iops: "10000"
+```
+
+**Issue 2: Cross-zone latency**
+
+```
+Pod in zone A
+PV in zone B (Regional PD)
+Latency higher
+```
+
+Mostly avoid via topology awareness.
+
+**Issue 3: Network bottleneck (RWX)**
+
+```
+EFS: limited by network
+Increase if needed
+```
+
+**Issue 4: Filesystem fragmentation**
+
+Old filesystems fragment over time. Defrag (XFS):
+
+```bash
+xfs_fsr /data
+```
+
+**Issue 5: Snapshot impact**
+
+Active snapshots can affect performance briefly.
+
+**Production scenarios:**
+
+1. **gp3 with custom IOPS**: PostgreSQL needed 10k IOPS. Default gp3 had 3k. Increased provisioned IOPS. Performance recovered.
+
+2. **Local NVMe cache**: Web app with database. Added local NVMe for cache. Database load dropped 70%.
+
+3. **XFS for analytics**: Large file analytics. ext4 fragmenting. Migrated to XFS. Better performance.
+
+4. **Mount options**: Added noatime to all volumes. ~10% IOPS reduction (atime writes). Free perf.
+
+5. **Wrong storage tier**: Used Premium SSD everywhere. Audit: many low-perf workloads. Migrated some to Standard. Cost savings, perf unchanged.
+
+---
+
+## 398. How do you migrate storage between clusters?
+
+Storage migration between clusters is complex due to bound nature of PVs. Several approaches.
+
+**Why migrate:**
+
+- Cluster upgrade (rebuild approach)
+- Multi-cluster migration
+- DR scenarios
+- Region/cloud changes
+- Storage class changes
+
+**Approach 1: Velero (backup/restore)**
+
+```bash
+# Cluster A: backup
+velero backup create migration-backup \
+  --include-namespaces production
+
+# Cluster B: configure same backup location
+# Restore
+velero restore create --from-backup migration-backup
+```
+
+Velero copies:
+- Kubernetes resources
+- Volume data (via snapshots or restic/kopia)
+
+**Approach 2: CSI snapshot then restore**
+
+```yaml
+# Cluster A: snapshot
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: migrate-snap
+spec:
+  source:
+    persistentVolumeClaimName: source-pvc
+```
+
+```
+1. Snapshot in cluster A
+2. Export snapshot to S3/GCS (provider-specific)
+3. Import in cluster B
+4. Create PVC from snapshot
+```
+
+Cloud-specific. Not all support cross-cluster.
+
+**Approach 3: Storage-level replication**
+
+Some storage systems support:
+
+**Portworx:**
+
+```yaml
+apiVersion: stork.libopenstorage.org/v1alpha1
+kind: Migration
+metadata:
+  name: migrate-app
+spec:
+  clusterPair: cluster-pair
+  includeResources: true
+  startApplications: true
+  namespaces:
+    - production
+```
+
+**Ceph RBD-Mirror:**
+
+Async replication of RBD images across clusters.
+
+**Cloud-native:**
+
+```
+AWS DRS (Disaster Recovery Service)
+Azure Site Recovery
+GCP backup and DR
+```
+
+**Approach 4: Application-level**
+
+Database-specific replication:
+
+**PostgreSQL:**
+
+```yaml
+# Logical replication:
+# Cluster A: publisher
+CREATE PUBLICATION mypub FOR ALL TABLES;
+
+# Cluster B: subscriber
+CREATE SUBSCRIPTION mysub
+  CONNECTION 'host=cluster-a port=5432 user=replicator'
+  PUBLICATION mypub;
+```
+
+Or physical replication via streaming.
+
+**MongoDB:**
+
+```yaml
+# Cross-cluster replica set:
+rs.add({host: "cluster-b-mongo-0", priority: 0, hidden: true})
+```
+
+Add member in target cluster. Sync. Promote.
+
+**Approach 5: Manual export/import**
+
+```bash
+# Cluster A: dump
+kubectl exec db-0 -- pg_dump database > backup.sql
+
+# Cluster B: load
+kubectl exec db-0 -- psql database < backup.sql
+```
+
+Simple but requires downtime usually.
+
+**Migration considerations:**
+
+**Consideration 1: Downtime**
+
+```
+Live migration: harder, complex
+With downtime: simpler, often acceptable
+```
+
+**Consideration 2: Data consistency**
+
+```
+App-consistent: better
+Crash-consistent: usually OK for databases
+```
+
+**Consideration 3: Storage class changes**
+
+```
+Source: ebs-gp2
+Target: ebs-gp3
+
+May require new PV, data copy
+```
+
+**Consideration 4: Volume size**
+
+```
+Source PV: 100GB
+Target PV: 200GB (after expansion)
+```
+
+Plan capacity.
+
+**Consideration 5: Access modes**
+
+```
+Source: RWO
+Target: must support same
+```
+
+**Migration patterns:**
+
+**Pattern 1: Active-passive then cutover**
+
+```
+1. Set up target cluster (without traffic)
+2. Replicate data continuously
+3. Verify
+4. Cutover: route traffic to target
+5. Decommission source
+```
+
+Minimal downtime.
+
+**Pattern 2: Blue-green**
+
+```
+Old: cluster A (production)
+New: cluster B (built fresh)
+
+Run both for a time
+Switch over
+Keep A for rollback
+```
+
+**Pattern 3: Big bang**
+
+```
+1. Schedule downtime
+2. Stop services on A
+3. Backup everything
+4. Restore to B
+5. Verify
+6. Update DNS
+```
+
+Simplest, longest downtime.
+
+**Tools for migration:**
+
+**Velero:**
+
+```bash
+velero backup create migration
+velero restore create --from-backup migration
+```
+
+**Stork (Portworx):**
+
+```yaml
+kind: Migration
+spec:
+  namespaces: [production]
+```
+
+**Kopia/Restic:**
+
+Direct data sync to remote storage.
+
+**rsync:**
+
+Old-school, for shared filesystems.
+
+**Database-specific:**
+
+```
+pg_basebackup + WAL streaming
+mongodump + restore
+mysqldump + restore
+```
+
+**Common scenarios:**
+
+**Scenario 1: Cross-region migration**
+
+```
+us-east-1 cluster → eu-west-1 cluster
+
+Approach:
+1. Velero backup with snapshot replication
+2. Volume snapshots copied cross-region (cloud-specific)
+3. Restore in target region
+4. Update DNS
+```
+
+**Scenario 2: Storage class change**
+
+```
+gp2 → gp3 migration
+
+Approach:
+1. Snapshot existing volumes
+2. Restore to gp3 storage class
+3. Update apps to use new PVCs
+4. Delete old PVCs after verification
+```
+
+**Scenario 3: Cloud migration**
+
+```
+AWS to GCP
+
+Approach:
+1. Database: native replication (PostgreSQL logical)
+2. Files: rsync or rclone to GCS
+3. K8s resources: Velero or manual
+4. Verify, cutover
+```
+
+**Best practices:**
+
+1. **Test in non-prod**: rehearse migration
+2. **Backup before**: have rollback option
+3. **Verify data**: checksums, row counts
+4. **Document procedure**: detailed steps
+5. **Monitor**: throughout migration
+6. **Communicate**: stakeholders aware
+7. **Rollback plan**: if migration fails
+
+**Verification:**
+
+```bash
+# Row counts:
+kubectl exec source-db -- psql -c "SELECT count(*) FROM users"
+kubectl exec target-db -- psql -c "SELECT count(*) FROM users"
+
+# Checksums:
+md5sum /data/file1
+```
+
+**Common issues:**
+
+**Issue 1: Slow data transfer**
+
+Large data, limited bandwidth.
+
+Solutions:
+- Cloud-specific tools (Snowball, Data Box)
+- Parallel transfers
+- Compression
+
+**Issue 2: Application incompatibility**
+
+```
+Source K8s version: 1.24
+Target: 1.28
+Resources may have API changes
+```
+
+Test, fix manifests.
+
+**Issue 3: Storage class differences**
+
+```
+Source: 10k IOPS
+Target: 3k IOPS
+Performance regression
+```
+
+Match or exceed source.
+
+**Issue 4: Network connectivity**
+
+Cross-cluster networking needed for live migration.
+
+VPN, peering, etc.
+
+**Production scenarios:**
+
+1. **Cross-region DR migration**: Production us-east-1 to eu-west-1. Velero with cross-region snapshots. 4-hour migration window. Successful.
+
+2. **GP2 to GP3**: All volumes migrated via snapshot/restore. Storage class change. ~20% cost saving. Performance unchanged or better.
+
+3. **AWS to GCP**: 6-month project. PostgreSQL logical replication for databases. rclone for files. Cutover with 30min downtime.
+
+4. **Cluster upgrade**: New 1.28 cluster. Velero migrated all workloads from 1.24 cluster. Old decommissioned after stable.
+
+5. **Storage system change**: From EBS to Portworx. App-by-app migration. Stork orchestrated. Gradual, low risk.
+
+---
+
+## 399. Explain storage encryption
+
+Storage encryption protects data at rest and in transit. Multiple layers, technologies, key management options.
+
+**Encryption types:**
+
+**At rest:**
+
+```
+Data on disk encrypted
+Decrypted when read
+Protects against physical theft, unauthorized access
+```
+
+**In transit:**
+
+```
+Data in transit (network) encrypted
+TLS, IPSec, etc.
+Protects against eavesdropping
+```
+
+**In use (rare):**
+
+```
+Data encrypted even in memory
+Confidential computing
+Specialized hardware
+```
+
+**At rest in cloud K8s:**
+
+**AWS EBS:**
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: encrypted
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  kmsKeyId: arn:aws:kms:us-east-1:123:key/abc
+```
+
+**Key management:**
+
+```
+Default key (AWS managed): "aws/ebs"
+Customer-managed key: your KMS key
+```
+
+**Azure Disk:**
+
+```yaml
+parameters:
+  diskEncryptionSetID: /subscriptions/.../diskEncryptionSets/my-set
+```
+
+**GCP Persistent Disk:**
+
+```yaml
+parameters:
+  disk-encryption-kms-key: projects/.../cryptoKeys/my-key
+```
+
+**In transit for storage:**
+
+**NFS over TLS:**
+
+```yaml
+spec:
+  mountOptions:
+    - nfsvers=4.2
+    - tls
+```
+
+**AWS EFS:**
+
+```yaml
+parameters:
+  encryptInTransit: "true"
+```
+
+**Azure Files:**
+
+```yaml
+parameters:
+  protocol: smb   # SMB 3.0+ supports encryption
+```
+
+**Encryption layers:**
+
+**Cloud provider:**
+
+Manages keys, encryption happens transparently. Easy.
+
+**Customer-managed (BYOK):**
+
+You provide keys. Control, audit. Required for some compliance.
+
+**Customer-supplied (CSEK):**
+
+You provide encryption keys per operation. Maximum control. Complex.
+
+**Application-level:**
+
+```python
+# App encrypts before writing:
+encrypted = encrypt(data, key)
+file.write(encrypted)
+```
+
+Highest security but complex.
+
+**Kubernetes secrets encryption:**
+
+Secrets in etcd:
+
+```yaml
+# EncryptionConfiguration:
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: <base64-encoded>
+      - identity: {}
+```
+
+Or KMS:
+
+```yaml
+providers:
+  - kms:
+      name: aws-kms
+      endpoint: unix:///var/run/kmsplugin/socket.sock
+      cachesize: 100
+      timeout: 3s
+```
+
+**EKS:**
+
+```bash
+aws eks update-cluster-config \
+  --name my-cluster \
+  --encryption-config '[{
+    "resources": ["secrets"],
+    "provider": {"keyArn": "arn:aws:kms:..."}
+  }]'
+```
+
+**Key rotation:**
+
+**Cloud-managed:**
+
+```bash
+# AWS automatic rotation:
+aws kms enable-key-rotation --key-id alias/my-key
+```
+
+Auto-rotates yearly.
+
+**Manual rotation:**
+
+```
+1. Create new key version
+2. Re-encrypt secrets (new key as primary)
+3. Keep old key for decryption
+4. Eventually retire old key
+```
+
+**Encryption verification:**
+
+```bash
+# AWS:
+aws ec2 describe-volumes --volume-id vol-xxx --query 'Volumes[0].Encrypted'
+
+# Azure:
+az disk show --name my-disk --query encryption
+
+# GCP:
+gcloud compute disks describe my-disk --format='value(diskEncryptionKey)'
+```
+
+**Compliance:**
+
+**PCI-DSS:**
+
+```
+Strong encryption (AES-256)
+Key management with separation of duties
+Audit access to keys
+```
+
+**HIPAA:**
+
+```
+Encryption at rest required
+Encryption in transit
+Audit logs
+```
+
+**GDPR:**
+
+```
+Encryption recommended (not strictly required)
+Right to erasure
+```
+
+**Customer-managed keys benefits:**
+
+- Control over key lifecycle
+- Independent rotation
+- Revocation power
+- Audit access
+- Compliance requirements
+
+**Workflows:**
+
+**Workflow 1: New cluster with encryption**
+
+```
+1. Create KMS key
+2. Cluster created with encryption enabled
+3. StorageClass uses encryption
+4. All new PVCs encrypted
+```
+
+**Workflow 2: Existing cluster, add encryption**
+
+```
+1. Create new StorageClass with encryption
+2. Migrate workloads (snapshot/restore) to new PVCs
+3. Verify
+4. Delete old unencrypted PVCs
+```
+
+Tedious but achievable.
+
+**Workflow 3: Key rotation**
+
+```
+1. Create new key version
+2. Update EncryptionConfiguration with new key first
+3. Re-encrypt all secrets:
+   kubectl get secrets --all-namespaces -o json | kubectl replace -f -
+4. Keep old key for ~30 days
+5. Remove old key
+```
+
+**Backup encryption:**
+
+```yaml
+# Velero with encrypted backups:
+spec:
+  config:
+    kmsKeyId: arn:aws:kms:...
+```
+
+Backups also encrypted.
+
+**Decryption:**
+
+For investigation/forensics:
+
+```bash
+# AWS Snapshot, decrypt:
+aws ec2 copy-snapshot \
+  --source-region us-east-1 \
+  --source-snapshot-id snap-xxx \
+  --destination-region us-east-1 \
+  --kms-key-id alias/decrypted-key
+```
+
+Access to data requires KMS access.
+
+**Best practices:**
+
+1. **Encrypt by default**: enforce via policy
+2. **Customer-managed keys**: for sensitive data
+3. **Separate key per workload**: blast radius
+4. **Key rotation**: automated yearly
+5. **Audit access**: who accessed keys
+6. **Cross-region keys**: for DR
+7. **Test recovery**: ensure can decrypt
+8. **Document**: key management procedures
+
+**Common issues:**
+
+**Issue 1: Key permissions**
+
+```
+EKS node doesn't have KMS access
+Volume mount fails
+```
+
+Fix: IAM role for nodes with KMS permissions.
+
+**Issue 2: Cross-account key**
+
+```
+Volume encrypted with key in account A
+Cluster in account B
+Need cross-account access
+```
+
+KMS key policy must allow account B.
+
+**Issue 3: Key deletion**
+
+```
+Key deleted but data still exists
+Data unrecoverable
+```
+
+Plan key lifecycle carefully.
+
+**Issue 4: Performance impact**
+
+```
+Encryption adds CPU overhead
+Usually negligible (~1-5%)
+But measure for sensitive workloads
+```
+
+**Production scenarios:**
+
+1. **Customer-managed keys**: All EBS volumes encrypted with customer KMS keys. Compliance requirement met. Audit trail in CloudTrail.
+
+2. **Per-tier keys**: Production data: dedicated key. Dev: different key. Compromise of one doesn't affect other.
+
+3. **EKS secrets encryption**: Enabled KMS encryption for secrets. etcd encryption protected. Compliance.
+
+4. **Key rotation drill**: Tested key rotation in dev. Documented process. Quarterly rotation in prod.
+
+5. **Cross-region DR with keys**: Created replicated KMS keys across regions. Snapshots replicated. DR cluster could decrypt.
+
+---
+
+## 400. How do you manage database workloads in Kubernetes?
+
+Running databases in Kubernetes requires careful planning. StatefulSets, operators, and best practices.
+
+**Approaches:**
+
+**Approach 1: Operator-managed**
+
+Recommended. Use specialized operators:
+
+```yaml
+# CloudNativePG for PostgreSQL:
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: my-postgres
+spec:
+  instances: 3
+  storage:
+    size: 100Gi
+    storageClass: fast-ssd
+```
+
+Operator handles:
+- High availability
+- Failover
+- Backups
+- Upgrades
+- Monitoring
+
+**Popular operators:**
+
+- **CloudNativePG**: PostgreSQL
+- **Postgres Operator (Zalando)**
+- **MongoDB Community Operator**
+- **MongoDB Enterprise Operator**
+- **MySQL Operator**
+- **Percona XtraDB Cluster Operator**
+- **Vitess** (MySQL sharding)
+- **Strimzi**: Kafka
+- **Redis Operator**
+- **Elasticsearch Operator (ECK)**
+
+**Approach 2: Manual StatefulSet**
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              memory: 4Gi
+              cpu: 2
+            limits:
+              memory: 8Gi
+              cpu: 4
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+You manage:
+- Replication
+- Failover
+- Backups
+- Upgrades
+
+**Approach 3: Managed service**
+
+```
+AWS RDS
+Azure SQL
+GCP Cloud SQL
+```
+
+Outside cluster. Apps connect via:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  type: ExternalName
+  externalName: my-db.region.rds.amazonaws.com
+```
+
+**Approach comparison:**
+
+| Aspect | Operator | Manual | Managed |
+|--------|----------|--------|---------|
+| Setup | Easy | Hard | Easiest |
+| HA | Auto | Manual | Built-in |
+| Backups | Auto | Manual | Built-in |
+| Upgrades | Auto | Manual | Managed |
+| Cost | Cluster cost | Cluster cost | Service cost |
+| Control | Medium | Full | Limited |
+| Cloud-portable | Yes | Yes | No |
+
+**Best practices for in-cluster:**
+
+**Practice 1: Proper storage**
+
+```yaml
+# Fast block storage:
+storageClassName: fast-ssd
+
+# Adequate IOPS:
+parameters:
+  iops: "10000"
+```
+
+**Practice 2: Resource limits**
+
+```yaml
+resources:
+  requests:
+    memory: 8Gi
+    cpu: 4
+  limits:
+    memory: 16Gi
+    cpu: 8
+```
+
+Critical for performance.
+
+**Practice 3: Anti-affinity**
+
+```yaml
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: postgres
+          topologyKey: kubernetes.io/hostname
+```
+
+Replicas on different nodes.
+
+**Practice 4: PodDisruptionBudget**
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: postgres
+```
+
+Protect during voluntary disruptions.
+
+**Practice 5: Health probes**
+
+```yaml
+livenessProbe:
+  exec:
+    command: ["pg_isready", "-U", "postgres"]
+  initialDelaySeconds: 30
+  periodSeconds: 10
+
+readinessProbe:
+  exec:
+    command: ["pg_isready", "-U", "postgres"]
+  initialDelaySeconds: 5
+```
+
+**Practice 6: Backups**
+
+```yaml
+# CloudNativePG built-in:
+spec:
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://my-backups/postgres
+      s3Credentials:
+        accessKeyId:
+          name: aws-creds
+          key: ACCESS_KEY_ID
+```
+
+Or operator-specific.
+
+**Practice 7: Monitoring**
+
+```yaml
+# Prometheus exporter:
+- name: postgres-exporter
+  image: prometheuscommunity/postgres-exporter
+  env:
+    - name: DATA_SOURCE_NAME
+      value: "postgresql://..."
+```
+
+```promql
+# Key metrics:
+pg_up
+pg_database_size_bytes
+pg_stat_database_xact_commit
+pg_stat_database_blks_read
+```
+
+**Practice 8: Connection pooling**
+
+```yaml
+# PgBouncer:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+spec:
+  template:
+    spec:
+      containers:
+        - name: pgbouncer
+          image: edoburu/pgbouncer
+```
+
+Apps connect to PgBouncer, not directly. Reduces connection overhead.
+
+**Practice 9: Replication**
+
+For HA, replicas:
+
+```yaml
+# Operator manages:
+spec:
+  instances: 3
+  # 1 primary + 2 replicas
+  # Auto-failover
+```
+
+**Practice 10: Network policies**
+
+```yaml
+# Restrict access to DB:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-access
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              role: backend
+      ports:
+        - port: 5432
+```
+
+**CloudNativePG example:**
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: my-cluster
+spec:
+  instances: 3
+  
+  primaryUpdateStrategy: unsupervised
+  
+  storage:
+    size: 100Gi
+    storageClass: fast-ssd
+  
+  resources:
+    requests:
+      memory: 4Gi
+      cpu: 2
+    limits:
+      memory: 8Gi
+      cpu: 4
+  
+  monitoring:
+    enablePodMonitor: true
+  
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://my-backups
+      s3Credentials:
+        accessKeyId:
+          name: aws-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: aws-creds
+          key: SECRET_ACCESS_KEY
+    retentionPolicy: "30d"
+  
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+```
+
+**Disaster recovery:**
+
+```yaml
+# Cross-cluster recovery:
+spec:
+  bootstrap:
+    recovery:
+      backup:
+        name: original-cluster-backup
+```
+
+Restore from backup to new cluster.
+
+**Migration to K8s:**
+
+```
+1. Set up new in-K8s database
+2. Set up replication from old to new
+3. Verify replication healthy
+4. Cutover (during maintenance window)
+5. Apps connect to K8s database
+6. Decommission old
+```
+
+Database-specific (PostgreSQL logical, MySQL replication).
+
+**Performance considerations:**
+
+**Tuning:**
+
+```yaml
+# PostgreSQL parameters:
+spec:
+  postgresql:
+    parameters:
+      shared_buffers: "2GB"
+      effective_cache_size: "6GB"
+      work_mem: "16MB"
+      maintenance_work_mem: "256MB"
+      max_connections: "200"
+      checkpoint_completion_target: "0.9"
+      wal_buffers: "16MB"
+      default_statistics_target: "100"
+```
+
+**Monitoring queries:**
+
+```promql
+# Slow queries:
+pg_stat_statements_total_exec_time / pg_stat_statements_calls
+
+# Cache hit ratio:
+sum(pg_stat_database_blks_hit) / (sum(pg_stat_database_blks_hit) + sum(pg_stat_database_blks_read))
+
+# Connections:
+pg_stat_database_numbackends
+```
+
+**Common issues:**
+
+**Issue 1: Slow performance**
+
+Causes:
+- Insufficient resources
+- Slow storage
+- Misconfigured database
+- Cross-AZ traffic
+
+Fix: tune resources, storage, config.
+
+**Issue 2: Out of memory**
+
+```
+OOMKilled
+```
+
+Increase memory limits or reduce shared_buffers.
+
+**Issue 3: Disk full**
+
+```
+PG can't write
+```
+
+Expand PVC or clean up.
+
+**Issue 4: Replication lag**
+
+```
+Replicas behind primary
+```
+
+Causes: slow replicas, network, high write rate.
+
+**Issue 5: Connection exhaustion**
+
+```
+FATAL: too many connections
+```
+
+Use connection pooling (PgBouncer).
+
+**Production scenarios:**
+
+1. **CloudNativePG production**: PostgreSQL via operator. 3 replicas, automatic failover, continuous backups to S3. Zero manual operations.
+
+2. **Migration to K8s**: Migrated from RDS to in-cluster PostgreSQL. Logical replication. 30min downtime cutover.
+
+3. **Stayed with RDS**: Initially planned in-K8s. Realized operational cost. Stayed with RDS. Less control but less work.
+
+4. **MongoDB operator**: MongoDB Community Operator. Replica set with 3 nodes. Backups to S3. Survived multiple node failures.
+
+5. **Performance tuning**: Slow queries. Added monitoring. Identified missing indexes. Tuned PostgreSQL parameters. Performance improved 5x.
+
