@@ -88673,3 +88673,15047 @@ Use connection pooling (PgBouncer).
 
 5. **Performance tuning**: Slow queries. Added monitoring. Identified missing indexes. Tuned PostgreSQL parameters. Performance improved 5x.
 
+# Service Mesh (401-420)
+
+## 401. What is a service mesh?
+
+A service mesh is a dedicated infrastructure layer that handles service-to-service communication. It provides networking, security, and observability features without requiring application code changes.
+
+**Problem service mesh solves:**
+
+In microservices, every service needs:
+- Load balancing
+- Service discovery
+- Retries
+- Timeouts
+- Circuit breaking
+- TLS encryption
+- Authentication
+- Authorization
+- Metrics
+- Distributed tracing
+- Logging
+
+**Without service mesh:**
+
+```
+Every app implements these (libraries):
+- Hystrix (circuit breakers)
+- Eureka (discovery)
+- Spring Cloud
+- Different libraries per language
+- Inconsistent implementations
+```
+
+Code duplication, polyglot issues, upgrade challenges.
+
+**With service mesh:**
+
+```
+Infrastructure handles it:
+- Sidecar proxy intercepts traffic
+- Implements features uniformly
+- App code unchanged
+- Language-agnostic
+```
+
+**Architecture:**
+
+```
+Application pods (with sidecar proxy)
+       ↓
+Sidecar proxies (Envoy, Linkerd2-proxy, etc.)
+       ↓ (intercept all traffic)
+Control plane (Istiod, Linkerd controller)
+       ↓ (configures sidecars)
+```
+
+**Two planes:**
+
+**Data plane:**
+- Sidecar proxies
+- Actually handles traffic
+- One per pod (typically)
+
+**Control plane:**
+- Manages configuration
+- Distributes policies
+- Provides APIs
+- Aggregates telemetry
+
+**Capabilities:**
+
+**Capability 1: Traffic management**
+
+- Load balancing (multiple algorithms)
+- Service discovery
+- Traffic splitting (canary, A/B)
+- Routing rules (by header, weight, etc.)
+- Retries
+- Timeouts
+- Circuit breaking
+- Fault injection
+
+**Capability 2: Security**
+
+- mTLS (mutual TLS) between services
+- Workload identity
+- Authentication
+- Authorization policies
+- Encryption in transit
+
+**Capability 3: Observability**
+
+- Metrics (RED: rate, errors, duration)
+- Distributed tracing
+- Access logs
+- Service dependency maps
+
+**Capability 4: Reliability**
+
+- Automatic retries
+- Outlier detection
+- Health checks
+- Failover
+
+**Major service meshes:**
+
+**Istio:**
+- Most feature-rich
+- Envoy-based
+- Larger footprint
+- Steeper learning curve
+
+**Linkerd:**
+- Simpler, lighter
+- Custom Rust proxy
+- Easier operations
+- Less feature-rich
+
+**Consul:**
+- HashiCorp
+- Multi-platform (not just K8s)
+- Integrated with Consul service discovery
+
+**Cilium Service Mesh:**
+- eBPF-based
+- No sidecars (newer)
+- Performance focus
+
+**Open Service Mesh (OSM):**
+- Microsoft-backed
+- Simpler than Istio
+- SMI-compliant
+
+**Kuma:**
+- Universal (K8s + VMs)
+- Envoy-based
+- Multi-zone built-in
+
+**When to use:**
+
+**Use service mesh when:**
+
+- Many microservices (10+)
+- Need consistent security (mTLS)
+- Want detailed observability
+- Multi-cluster requirements
+- Compliance requires encryption
+- Polyglot architecture
+
+**Don't use when:**
+
+- Few services (<10)
+- Performance critical (every ms counts)
+- Team can't operate complexity
+- Don't need its features
+
+**Trade-offs:**
+
+**Pros:**
+
+- Consistent infrastructure features
+- App code simplification
+- Strong security defaults
+- Rich observability
+- Policy-driven control
+
+**Cons:**
+
+- Operational complexity
+- Resource overhead (sidecars)
+- Latency (proxy hops)
+- Learning curve
+- Another moving part
+
+**Resource overhead:**
+
+```
+Sidecar per pod:
+- Memory: 50-200MB
+- CPU: 0.1-0.5 cores
+- Latency: 1-3ms per hop
+```
+
+For 100 pods: significant cluster overhead.
+
+**Alternatives:**
+
+**API Gateway:**
+
+```
+North-south traffic (external)
+Doesn't handle internal
+```
+
+Different scope.
+
+**SDK approach:**
+
+```
+Libraries in apps:
+- Spring Cloud
+- gRPC built-ins
+- Custom code
+```
+
+Polyglot issue.
+
+**Newer approaches:**
+
+**Sidecarless meshes:**
+
+- Cilium (eBPF)
+- Istio Ambient Mode
+
+Reduce sidecar overhead.
+
+**Production scenarios:**
+
+1. **mTLS for compliance**: SOC 2 required encrypted internal traffic. Adopted Istio. Strict mTLS. Compliance achieved.
+
+2. **Observability gold**: Couldn't trace service dependencies. Linkerd added. Auto-instrumentation. Service map visualized.
+
+3. **Canary deployments**: Manual canary releases risky. Istio VirtualService for traffic splitting. Gradual rollouts safe.
+
+4. **Linkerd for simplicity**: Tried Istio, too complex. Migrated to Linkerd. mTLS automatic. Simpler ops.
+
+5. **No mesh decision**: Small startup, 5 services. Mesh overhead not worth it. Used direct service calls. Plan to add if grow.
+
+---
+
+## 402. Explain Istio architecture
+
+Istio is a comprehensive service mesh. Understanding architecture helps with deployment and troubleshooting.
+
+**High-level:**
+
+```
+┌─────────────────────────────────────────┐
+│         Control Plane (istiod)          │
+│   - Configuration                       │
+│   - Certificate management              │
+│   - Discovery                           │
+└──────────────────┬──────────────────────┘
+                   ↓ (xDS APIs)
+┌─────────────────────────────────────────┐
+│       Data Plane (Envoy sidecars)       │
+│   - Each pod has sidecar                │
+│   - All traffic via sidecar             │
+└─────────────────────────────────────────┘
+```
+
+**Istiod (control plane):**
+
+Single binary, combines:
+
+**Pilot:**
+- Service discovery
+- Configuration distribution
+- xDS APIs for sidecars
+
+**Citadel:**
+- Certificate authority
+- Issues workload certificates
+- Mounts certs in pods
+
+**Galley:**
+- Configuration validation
+- Webhooks for admission
+
+**Single deployment:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: istiod
+  namespace: istio-system
+spec:
+  replicas: 3
+```
+
+**Data plane (Envoy sidecars):**
+
+Per-pod Envoy proxy:
+
+```yaml
+spec:
+  containers:
+    - name: app
+      image: my-app
+    - name: istio-proxy   # Auto-injected
+      image: docker.io/istio/proxyv2:1.20.0
+```
+
+**Architecture flow:**
+
+```
+1. App pod created with istio-proxy sidecar
+2. iptables rules redirect traffic through Envoy
+3. Envoy connects to istiod (xDS)
+4. Istiod sends configuration
+5. Envoy applies config
+6. Envoy handles all traffic
+```
+
+**iptables redirection:**
+
+Init container sets up rules:
+
+```
+Outbound traffic from app:
+  → iptables → Envoy (port 15001)
+  
+Inbound traffic to app:
+  → iptables → Envoy (port 15006)
+  
+DNS:
+  → unchanged
+```
+
+**xDS APIs:**
+
+Envoy fetches config from istiod:
+
+- **LDS**: Listeners (ports to listen on)
+- **CDS**: Clusters (upstream services)
+- **EDS**: Endpoints (specific instances)
+- **RDS**: Routes (traffic rules)
+- **SDS**: Secrets (certificates)
+
+Dynamic config without restarts.
+
+**Resources:**
+
+**VirtualService:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: my-app
+spec:
+  hosts:
+    - my-app
+  http:
+    - route:
+        - destination:
+            host: my-app
+            subset: v1
+          weight: 90
+        - destination:
+            host: my-app
+            subset: v2
+          weight: 10
+```
+
+Defines routing rules.
+
+**DestinationRule:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: my-app
+spec:
+  host: my-app
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+    outlierDetection:
+      consecutive5xxErrors: 5
+```
+
+Policies for upstream services.
+
+**Gateway:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 443
+        protocol: HTTPS
+      hosts:
+        - example.com
+      tls:
+        mode: SIMPLE
+        credentialName: tls-cert
+```
+
+Edge proxy for ingress.
+
+**ServiceEntry:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: external-api
+spec:
+  hosts:
+    - api.external.com
+  ports:
+    - number: 443
+      name: https
+      protocol: HTTPS
+```
+
+External services in mesh.
+
+**PeerAuthentication:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+mTLS requirements.
+
+**AuthorizationPolicy:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: api-access
+spec:
+  selector:
+    matchLabels:
+      app: api
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/web"]
+```
+
+L7 authorization.
+
+**Istio gateways:**
+
+**Ingress gateway:**
+
+```
+External traffic → Ingress Gateway → Mesh services
+```
+
+Envoy-based gateway at edge.
+
+**Egress gateway:**
+
+```
+Mesh services → Egress Gateway → External services
+```
+
+Optional. Controls outbound traffic.
+
+**Configuration flow:**
+
+```
+1. User creates VirtualService
+2. Webhook validates
+3. Stored in K8s API
+4. Istiod watches, picks up
+5. Istiod converts to Envoy config
+6. Distributes via xDS
+7. Envoy sidecars apply
+```
+
+**Certificate management:**
+
+```
+1. Istiod has root CA
+2. Pod sidecar requests cert (via xDS SDS)
+3. Istiod signs cert (workload identity)
+4. Cert in Envoy memory
+5. Used for mTLS
+6. Auto-rotated (24h default lifetime)
+```
+
+**Identity:**
+
+```
+SPIFFE format:
+spiffe://cluster.local/ns/<namespace>/sa/<service-account>
+
+Example:
+spiffe://cluster.local/ns/production/sa/payment-api
+```
+
+Cryptographic workload identity.
+
+**Telemetry:**
+
+```
+Envoy → metrics → Prometheus
+Envoy → traces → Jaeger/Zipkin
+Envoy → logs → stdout (or specified)
+```
+
+Auto-instrumented.
+
+**Components ecosystem:**
+
+```
+Istio control plane: istiod
+Istio gateways: ingress, egress
+Add-ons:
+- Kiali (visualization)
+- Jaeger (tracing)
+- Prometheus (metrics)
+- Grafana (dashboards)
+```
+
+**Resource overhead:**
+
+```
+Istiod: 500MB-2GB memory
+Envoy sidecars: 50-200MB per pod
+```
+
+For 100 pods: 5-20GB overhead.
+
+**Ambient mode (newer):**
+
+```
+No per-pod sidecars
+Per-node proxies (ztunnel)
+Optional waypoint proxies for L7
+```
+
+Reduces overhead.
+
+**Production scenarios:**
+
+1. **Production Istio**: 50-microservice cluster. Istio for mTLS, observability, traffic management. Operational team learned over months.
+
+2. **Istiod HA**: Single istiod was SPOF. Scaled to 3 replicas. PodDisruptionBudget. Survived node failures.
+
+3. **Sidecar resource tuning**: Default sidecar limits 200MB. Some apps with high traffic needed 500MB. Tuned per pod.
+
+4. **Multi-tenant**: Multiple teams in cluster. Per-namespace Istio configurations. Each team managed own routing.
+
+5. **Ambient mode evaluation**: Sidecar overhead too high. Evaluating Istio Ambient mode. Promising results in tests.
+
+---
+
+## 403. Difference between Istio and Linkerd
+
+Two major service mesh implementations with different philosophies and trade-offs.
+
+**Architecture:**
+
+**Istio:**
+
+```
+Control plane: istiod (Go)
+Data plane: Envoy (C++)
+Configuration: Kubernetes CRDs
+```
+
+**Linkerd:**
+
+```
+Control plane: Multiple controllers (Go)
+Data plane: linkerd2-proxy (Rust)
+Configuration: Kubernetes annotations + Linkerd CRDs
+```
+
+**Design philosophy:**
+
+**Istio:**
+- Feature-rich
+- Configurable
+- Powerful
+- Complex
+
+**Linkerd:**
+- Simple
+- Opinionated
+- Lightweight
+- Less customizable
+
+**Proxy comparison:**
+
+**Envoy (Istio):**
+
+```
+Written in C++
+~50MB memory per sidecar
+Many features
+Battle-tested at scale
+```
+
+**Linkerd2-proxy:**
+
+```
+Written in Rust
+~10-20MB memory per sidecar
+Smaller feature set
+Memory-safe by design
+Lower latency
+```
+
+**Performance:**
+
+```
+Linkerd2-proxy: ~0.5ms latency overhead
+Envoy: ~1-2ms latency overhead
+
+Linkerd: lower CPU per request
+Envoy: more features, more overhead
+```
+
+Linkerd typically more efficient.
+
+**Feature comparison:**
+
+| Feature | Istio | Linkerd |
+|---------|-------|---------|
+| mTLS | Yes (configurable) | Yes (default) |
+| Traffic splitting | Yes | Yes |
+| Retries | Yes | Yes (limited) |
+| Timeouts | Yes | Yes |
+| Circuit breaking | Yes | Limited |
+| Rate limiting | Yes | No (built-in) |
+| L7 authorization | Yes | Yes |
+| JWT validation | Yes | No |
+| Multi-cluster | Yes | Yes |
+| External authorization | Yes | Limited |
+| WASM extensions | Yes | No |
+
+**Istio more features. Linkerd more focused.**
+
+**Configuration:**
+
+**Istio:**
+
+```yaml
+# Many CRDs:
+- VirtualService
+- DestinationRule
+- Gateway
+- ServiceEntry
+- PeerAuthentication
+- AuthorizationPolicy
+- Sidecar
+- WorkloadEntry
+- EnvoyFilter
+```
+
+**Linkerd:**
+
+```yaml
+# Fewer CRDs:
+- Server
+- ServerAuthorization
+- ServiceProfile
+- TrafficSplit
+- HTTPRoute (Gateway API)
+```
+
+Less to learn with Linkerd.
+
+**mTLS:**
+
+**Istio:**
+
+```yaml
+# Configurable per namespace/workload:
+spec:
+  mtls:
+    mode: STRICT
+```
+
+Modes: DISABLE, PERMISSIVE, STRICT.
+
+**Linkerd:**
+
+```
+mTLS enabled by default for all meshed workloads
+No configuration needed
+```
+
+Simpler, secure by default.
+
+**Installation:**
+
+**Istio:**
+
+```bash
+istioctl install --set profile=default
+```
+
+Multiple profiles. Configurable.
+
+**Linkerd:**
+
+```bash
+linkerd install | kubectl apply -f -
+linkerd check
+```
+
+Simple, validates installation.
+
+**Resource overhead:**
+
+**Istio:**
+
+```
+Control plane:
+- istiod: 500MB-2GB
+
+Data plane (per pod):
+- Envoy: 50-200MB memory, 0.1-0.5 CPU
+```
+
+**Linkerd:**
+
+```
+Control plane:
+- Linkerd controllers: 200-500MB total
+
+Data plane (per pod):
+- linkerd2-proxy: 10-50MB memory, 0.05-0.2 CPU
+```
+
+Linkerd typically 50-70% less overhead.
+
+**Observability:**
+
+**Istio:**
+
+```
+Metrics: Prometheus
+Tracing: Jaeger, Zipkin
+Visualization: Kiali
+
+Rich auto-generated metrics
+```
+
+**Linkerd:**
+
+```
+Built-in metrics (RED)
+Tracing: optional, via OpenTelemetry
+UI: Linkerd Viz (separate)
+
+Simpler but covers basics
+```
+
+**Multi-cluster:**
+
+**Istio:**
+
+```
+Multiple modes:
+- Single mesh (primary-remote)
+- Multi-primary
+- Replicated control plane
+```
+
+Complex but flexible.
+
+**Linkerd:**
+
+```
+Multi-cluster extension
+Service mirroring
+Gateway-based
+```
+
+Simpler, fewer options.
+
+**Extensibility:**
+
+**Istio:**
+
+```
+EnvoyFilter (raw Envoy config)
+WASM extensions
+External authorization
+Rate limit service
+```
+
+Highly extensible.
+
+**Linkerd:**
+
+```
+ServiceProfile for HTTP routes
+Limited extension points
+```
+
+Less flexible.
+
+**Learning curve:**
+
+**Istio:**
+
+```
+Steep
+Many concepts
+Many CRDs
+Debugging complex
+Books needed
+```
+
+**Linkerd:**
+
+```
+Gentle
+Fewer concepts
+Good defaults
+Easier to debug
+```
+
+**Cost (operational):**
+
+**Istio:**
+
+```
+More engineering time
+More tuning
+More documentation needed
+Hire experienced engineers
+```
+
+**Linkerd:**
+
+```
+Less operational overhead
+Faster to adopt
+Junior engineers can manage
+```
+
+**When to choose Istio:**
+
+- Need extensive features
+- Have Istio expertise
+- Complex routing requirements
+- WASM extensions needed
+- Rich auth needs (JWT, OAuth)
+- Multi-cluster complex
+- Multi-mesh federation
+
+**When to choose Linkerd:**
+
+- Want simplicity
+- Performance critical
+- Smaller team
+- Just need mTLS + observability
+- Faster adoption desired
+- Kubernetes-native preference
+
+**Side-by-side:**
+
+| Aspect | Istio | Linkerd |
+|--------|-------|---------|
+| Complexity | High | Low |
+| Features | Many | Fewer (focused) |
+| Performance | Good | Better |
+| Memory per pod | 50-200MB | 10-50MB |
+| Learning curve | Steep | Gentle |
+| mTLS default | Configurable | Always on |
+| Multi-cluster | Complex | Simpler |
+| Community | Large | Growing |
+| Maintained by | Google, IBM, Red Hat | Buoyant |
+
+**Migration:**
+
+Both → other requires:
+- Remove old mesh
+- Install new
+- Update configurations (different CRDs)
+- Test thoroughly
+
+Not trivial. Choose carefully upfront.
+
+**Production scenarios:**
+
+1. **Istio for enterprise**: Large enterprise, complex requirements. Istio chosen for feature richness. Operational team of 3 engineers.
+
+2. **Linkerd for startup**: Startup with 30 services. Linkerd for simplicity. Single engineer manages.
+
+3. **Migration to Linkerd**: Tried Istio, too complex. Migrated to Linkerd. 80% less operational overhead. Met needs.
+
+4. **Performance critical**: Latency-sensitive app. Tested both. Linkerd added 0.5ms vs Istio's 2ms. Chose Linkerd.
+
+5. **Features needed Istio**: Wanted WASM extensions, rich JWT auth. Linkerd insufficient. Stayed with Istio despite complexity.
+
+---
+
+## 404. Explain Envoy sidecar functionality
+
+Envoy is the sidecar proxy in Istio. Each pod has one, intercepting all traffic. Understanding its functionality is key.
+
+**Role:**
+
+```
+Application
+   ↕ (loopback)
+Envoy sidecar (intercepts all traffic)
+   ↕ (network)
+Other services
+```
+
+Envoy handles:
+- Outbound app traffic
+- Inbound traffic to app
+- Service discovery
+- Load balancing
+- Security (mTLS)
+- Observability
+
+**Container in pod:**
+
+```yaml
+spec:
+  containers:
+    - name: app
+      image: my-app
+    - name: istio-proxy
+      image: docker.io/istio/proxyv2:1.20.0
+      ports:
+        - containerPort: 15090   # Prometheus
+        - containerPort: 15021   # Health
+        - containerPort: 15001   # Outbound
+        - containerPort: 15006   # Inbound
+        - containerPort: 15008   # HBONE (ambient)
+```
+
+**Initialization:**
+
+```yaml
+initContainers:
+  - name: istio-init
+    image: docker.io/istio/proxyv2:1.20.0
+    command: ['/usr/local/bin/istio-iptables', ...]
+```
+
+Init container sets up iptables rules:
+
+```
+Outbound traffic from app:
+  iptables redirect to port 15001 (Envoy outbound)
+
+Inbound traffic to app:
+  iptables redirect to port 15006 (Envoy inbound)
+
+Health checks, app self-loopback:
+  excluded from interception
+```
+
+**Traffic flow:**
+
+**Outbound:**
+
+```
+App makes request to backend-service:8080
+       ↓
+iptables redirects to 127.0.0.1:15001
+       ↓
+Envoy receives
+       ↓
+Envoy looks up backend-service
+       ↓
+Selects endpoint (load balancing)
+       ↓
+Envoy establishes mTLS to backend's Envoy
+       ↓
+Sends request
+```
+
+**Inbound:**
+
+```
+External request to pod IP:8080
+       ↓
+iptables redirects to 127.0.0.1:15006
+       ↓
+Envoy receives
+       ↓
+Envoy validates mTLS
+       ↓
+Envoy applies AuthorizationPolicy
+       ↓
+Envoy forwards to app via 127.0.0.1:8080
+```
+
+App receives request as if direct.
+
+**xDS configuration:**
+
+Envoy fetches config from istiod:
+
+```yaml
+# Envoy bootstrap config:
+dynamic_resources:
+  ads_config:
+    transport_api_version: V3
+    api_type: GRPC
+    grpc_services:
+      - envoy_grpc:
+          cluster_name: xds-grpc
+```
+
+xDS = combined LDS/CDS/EDS/RDS/SDS.
+
+**Listeners:**
+
+Envoy listens on:
+
+```
+15001: outbound (from app)
+15006: inbound (to app)
+15090: Prometheus metrics
+15021: health check
+```
+
+Plus dynamic listeners for inbound traffic.
+
+**Filter chains:**
+
+```
+Incoming connection
+       ↓
+Network filters (L4):
+- TLS inspection
+- TLS termination (mTLS)
+       ↓
+HTTP Connection Manager (if HTTP)
+       ↓
+HTTP filters (L7):
+- JWT auth
+- RBAC (AuthorizationPolicy)
+- Rate limiting
+- Routing
+       ↓
+Cluster (upstream service)
+```
+
+**Service discovery:**
+
+```
+1. K8s creates pods
+2. Istiod sees them via K8s API
+3. Sends EDS update to Envoy
+4. Envoy updates cluster endpoints
+5. New requests use new endpoints
+```
+
+Dynamic, no restart needed.
+
+**Load balancing:**
+
+```yaml
+# DestinationRule:
+spec:
+  trafficPolicy:
+    loadBalancer:
+      simple: ROUND_ROBIN   # Or LEAST_REQUEST, RANDOM, etc.
+```
+
+Envoy distributes requests per policy.
+
+**Connection pooling:**
+
+```yaml
+trafficPolicy:
+  connectionPool:
+    tcp:
+      maxConnections: 100
+    http:
+      http2MaxRequests: 1000
+      maxRequestsPerConnection: 100
+```
+
+Envoy reuses connections.
+
+**Retries:**
+
+```yaml
+# VirtualService:
+spec:
+  http:
+    - route:
+        - destination:
+            host: my-service
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+        retryOn: 5xx,reset,connect-failure
+```
+
+Envoy retries failed requests.
+
+**Timeouts:**
+
+```yaml
+spec:
+  http:
+    - route:
+        - destination:
+            host: my-service
+      timeout: 10s
+```
+
+Request timeout.
+
+**Circuit breakers:**
+
+```yaml
+trafficPolicy:
+  connectionPool:
+    tcp:
+      maxConnections: 100
+  outlierDetection:
+    consecutive5xxErrors: 5
+    interval: 30s
+    baseEjectionTime: 30s
+```
+
+Eject unhealthy endpoints.
+
+**Observability:**
+
+**Metrics:**
+
+```bash
+# Envoy stats endpoint:
+curl http://localhost:15000/stats
+```
+
+Many metrics: connections, requests, errors, latency.
+
+Exposed to Prometheus at /metrics on port 15090.
+
+**Access logs:**
+
+```yaml
+# Istio MeshConfig:
+spec:
+  accessLogFile: /dev/stdout
+  accessLogFormat: |
+    [%START_TIME%] "%REQ(:METHOD)% %REQ(:PATH)% %PROTOCOL%" %RESPONSE_CODE%
+```
+
+**Tracing:**
+
+```yaml
+spec:
+  enableTracing: true
+  defaultProviders:
+    tracing:
+      - jaeger
+```
+
+Envoy adds trace headers, sends spans.
+
+**Admin interface:**
+
+```bash
+# Envoy admin port (15000):
+kubectl port-forward my-pod 15000:15000 -c istio-proxy
+curl http://localhost:15000/
+```
+
+Endpoints:
+- `/clusters`: cluster status
+- `/listeners`: listener config
+- `/config_dump`: full config
+- `/stats`: metrics
+- `/runtime`: runtime overrides
+
+**Common operations:**
+
+**View clusters:**
+
+```bash
+istioctl proxy-config cluster my-pod
+```
+
+**View listeners:**
+
+```bash
+istioctl proxy-config listener my-pod
+```
+
+**View routes:**
+
+```bash
+istioctl proxy-config route my-pod
+```
+
+**View endpoints:**
+
+```bash
+istioctl proxy-config endpoint my-pod
+```
+
+**View certificates:**
+
+```bash
+istioctl proxy-config secret my-pod
+```
+
+**Debugging:**
+
+**Logs:**
+
+```bash
+kubectl logs my-pod -c istio-proxy
+```
+
+**Increase log level:**
+
+```bash
+istioctl proxy-config log my-pod --level debug
+```
+
+**Config dump:**
+
+```bash
+kubectl exec my-pod -c istio-proxy -- curl localhost:15000/config_dump > config.json
+```
+
+**Resource usage:**
+
+```
+Default limits:
+- CPU: 0.1 (request), 2 (limit)
+- Memory: 128MB (request), 1Gi (limit)
+```
+
+Tunable per pod:
+
+```yaml
+metadata:
+  annotations:
+    sidecar.istio.io/proxyCPU: "100m"
+    sidecar.istio.io/proxyMemory: "256Mi"
+```
+
+**Production scenarios:**
+
+1. **Config debugging**: Routing issue. `istioctl proxy-config route my-pod` showed missing destination. VirtualService misconfigured. Fixed.
+
+2. **Performance tuning**: High-traffic pod, Envoy hit CPU limit. Increased to 1 CPU. Performance restored.
+
+3. **Connection issues**: 503 errors from one pod. Envoy logs showed upstream timeout. Increased timeout. Resolved.
+
+4. **mTLS verification**: Suspected mTLS issue. Checked `proxy-config secret`. Cert present, valid. Different issue.
+
+5. **Outlier detection**: Bad pod returning 5xx. Envoy ejected it temporarily. Other instances handled traffic. Self-healing.
+
+---
+
+## 405. How does sidecar injection work?
+
+Sidecar injection automatically adds Envoy sidecar to pods. Two main mechanisms: webhook (automatic) and manual.
+
+**Automatic injection:**
+
+**Setup:**
+
+```yaml
+# Label namespace:
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: my-app
+  labels:
+    istio-injection: enabled
+```
+
+Pods in this namespace get sidecar.
+
+**Mechanism:**
+
+```
+1. User creates pod
+2. K8s API receives
+3. MutatingWebhook (istio-sidecar-injector) called
+4. Webhook adds sidecar container
+5. Modified pod stored
+6. Scheduled, runs with sidecar
+```
+
+**MutatingWebhook config:**
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: istio-sidecar-injector
+webhooks:
+  - name: sidecar-injector.istio.io
+    namespaceSelector:
+      matchLabels:
+        istio-injection: enabled
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        operations: ["CREATE"]
+```
+
+**Per-pod control:**
+
+```yaml
+# Disable for specific pod:
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  # ...
+```
+
+Or enable in non-labeled namespace:
+
+```yaml
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "true"
+```
+
+**What gets injected:**
+
+```yaml
+spec:
+  initContainers:
+    - name: istio-init   # iptables setup
+      image: docker.io/istio/proxyv2:1.20.0
+      args: [...]
+  containers:
+    - name: app
+      # User's container
+    - name: istio-proxy   # The sidecar
+      image: docker.io/istio/proxyv2:1.20.0
+      args:
+        - proxy
+        - sidecar
+      env:
+        - name: ISTIO_META_WORKLOAD_NAME
+          value: my-app
+        # Many env vars
+      volumeMounts:
+        - name: istio-data
+          mountPath: /var/lib/istio/data
+        - name: istio-envoy
+          mountPath: /etc/istio/proxy
+        # Token, certs, etc.
+  volumes:
+    - name: istio-envoy
+      emptyDir:
+        medium: Memory
+    - name: istio-data
+      emptyDir: {}
+```
+
+**Manual injection:**
+
+For non-webhook clusters or testing:
+
+```bash
+istioctl kube-inject -f deployment.yaml | kubectl apply -f -
+```
+
+Or:
+
+```bash
+istioctl kube-inject -f deployment.yaml > deployment-injected.yaml
+kubectl apply -f deployment-injected.yaml
+```
+
+**Injection template:**
+
+```bash
+# View current template:
+kubectl -n istio-system get configmap istio-sidecar-injector -o jsonpath='{.data.config}'
+```
+
+Template determines what gets injected.
+
+**Customization:**
+
+**Per-pod annotations:**
+
+```yaml
+metadata:
+  annotations:
+    sidecar.istio.io/proxyCPU: "200m"
+    sidecar.istio.io/proxyMemory: "512Mi"
+    sidecar.istio.io/logLevel: debug
+    sidecar.istio.io/interceptionMode: REDIRECT   # Or TPROXY
+    traffic.sidecar.istio.io/excludeInboundPorts: "8080"
+    traffic.sidecar.istio.io/includeOutboundIPRanges: "10.0.0.0/8"
+```
+
+**Common annotations:**
+
+```yaml
+# Resources:
+sidecar.istio.io/proxyCPU: "100m"
+sidecar.istio.io/proxyMemory: "128Mi"
+sidecar.istio.io/proxyCPULimit: "2"
+sidecar.istio.io/proxyMemoryLimit: "1024Mi"
+
+# Network:
+traffic.sidecar.istio.io/excludeInboundPorts: "8080"
+traffic.sidecar.istio.io/excludeOutboundPorts: "5432"
+traffic.sidecar.istio.io/excludeOutboundIPRanges: "10.0.0.0/8"
+
+# Logging:
+sidecar.istio.io/logLevel: debug
+
+# Status:
+status.sidecar.istio.io/port: "15020"
+```
+
+**Verifying injection:**
+
+```bash
+# Check namespace label:
+kubectl get namespace my-app --show-labels
+
+# Check pod has sidecar:
+kubectl get pod my-pod -o jsonpath='{.spec.containers[*].name}'
+# Should show: app istio-proxy
+```
+
+**Failure modes:**
+
+**Issue 1: Namespace not labeled**
+
+```bash
+# Verify:
+kubectl get namespace my-app -o yaml | grep istio-injection
+```
+
+If missing: label it.
+
+**Issue 2: Webhook not responding**
+
+```bash
+# Check webhook:
+kubectl get mutatingwebhookconfiguration istio-sidecar-injector
+
+# Check istiod:
+kubectl get pods -n istio-system -l app=istiod
+```
+
+**Issue 3: Pod-level exclusion**
+
+```yaml
+# Pod has annotation:
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "false"
+```
+
+Even with labeled namespace, this pod skipped.
+
+**Issue 4: kube-system namespace**
+
+System namespaces typically excluded:
+
+```yaml
+namespaceSelector:
+  matchExpressions:
+    - key: name
+      operator: NotIn
+      values: [kube-system, kube-public]
+```
+
+**Issue 5: Webhook timeout**
+
+Webhook adds latency. If istiod overloaded, pods stuck creating.
+
+**Sidecar resource configuration:**
+
+```yaml
+# Globally via IstioOperator:
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  values:
+    global:
+      proxy:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 2
+            memory: 1Gi
+```
+
+**Sidecar resource (custom):**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: default
+  namespace: my-app
+spec:
+  egress:
+    - hosts:
+        - "./*"
+        - "istio-system/*"
+```
+
+Limits what sidecar knows about. Reduces resource usage.
+
+**Native vs CNI plugin:**
+
+**Default (iptables):**
+
+```
+Init container runs as privileged
+Sets up iptables rules
+```
+
+Requires init container privileges.
+
+**CNI plugin:**
+
+```yaml
+# Enable Istio CNI:
+spec:
+  components:
+    cni:
+      enabled: true
+```
+
+```
+CNI plugin sets up iptables (not init container)
+Pods don't need elevated privileges
+```
+
+Better security.
+
+**Upgrade considerations:**
+
+When upgrading Istio:
+
+```
+1. New istiod version
+2. Webhook config updated
+3. New pods get new sidecar version
+4. Existing pods still have old sidecar
+
+To update existing:
+- Restart pods (rolling restart)
+- New pods get new sidecar
+```
+
+```bash
+# Rolling restart:
+kubectl rollout restart deployment/my-app
+```
+
+**Production scenarios:**
+
+1. **Namespace-level injection**: Labeled all production namespaces. All new pods automatically got sidecars. No per-pod config.
+
+2. **Excluded specific pod**: One pod was high-performance, sidecar overhead unacceptable. Added `inject: "false"`. Outside mesh.
+
+3. **Resource tuning**: Some sidecars OOMKilled. Added per-pod annotation for more memory. Resolved.
+
+4. **CNI plugin adoption**: Security required no privileged init. Migrated to Istio CNI. Cleaner security posture.
+
+5. **Sidecar resource**: Sidecars knew about all services (overhead). Added Sidecar resource per namespace. Reduced memory 60%.
+
+---
+
+## 406. Explain mTLS in Istio
+
+Mutual TLS (mTLS) provides encryption and identity verification between services. Istio automates mTLS for the mesh.
+
+**What is mTLS:**
+
+**Regular TLS:**
+
+```
+Client connects to server
+Server presents certificate
+Client verifies server identity
+Encrypted channel
+```
+
+**Mutual TLS:**
+
+```
+Client connects to server
+Server presents certificate (server verifies)
+Client presents certificate (client verifies)
+Both parties authenticated
+Encrypted channel
+```
+
+**Benefits:**
+
+- Encryption in transit
+- Workload identity
+- Authentication for all services
+- Cryptographic proof of identity
+
+**Istio implementation:**
+
+```
+Pod A (sidecar with cert for SA-A)
+       ↓
+Wants to call Pod B
+       ↓
+Sidecar A initiates TLS to Sidecar B
+       ↓
+Both present certs (mutual)
+       ↓
+Both verify against Istio CA
+       ↓
+Encrypted channel established
+       ↓
+App traffic flows
+```
+
+App is unaware. mTLS automatic.
+
+**Certificate flow:**
+
+```
+1. Pod created with ServiceAccount
+2. Sidecar starts
+3. Requests certificate from istiod
+4. Istiod (Citadel) signs cert
+   - Subject: spiffe://cluster.local/ns/<ns>/sa/<sa>
+   - Valid: 24 hours
+5. Cert stored in sidecar memory
+6. Auto-renewed before expiry
+```
+
+**Identity format (SPIFFE):**
+
+```
+spiffe://cluster.local/ns/production/sa/payment-api
+```
+
+- Trust domain: `cluster.local`
+- Namespace: `production`
+- Service account: `payment-api`
+
+Used in mTLS verification and AuthorizationPolicies.
+
+**Configuration:**
+
+**Mesh-wide PeerAuthentication:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+```
+
+Applies to entire mesh.
+
+**Namespace-level:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT
+```
+
+All workloads in namespace.
+
+**Workload-level:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: api-mtls
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: api
+  mtls:
+    mode: STRICT
+```
+
+Specific workloads.
+
+**Modes:**
+
+**STRICT:**
+
+```
+Only mTLS allowed
+Plain traffic rejected
+```
+
+Most secure.
+
+**PERMISSIVE (default):**
+
+```
+Both mTLS and plain accepted
+Transition mode
+```
+
+For gradual rollout.
+
+**DISABLE:**
+
+```
+No mTLS
+Plain traffic only
+```
+
+For specific exclusions.
+
+**Port-level:**
+
+```yaml
+spec:
+  selector:
+    matchLabels:
+      app: my-app
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    8080:
+      mode: PERMISSIVE   # This port permissive
+```
+
+Different per port.
+
+**Migration path:**
+
+```
+Step 1: Install Istio
+       ↓
+Step 2: PERMISSIVE mode (default)
+       Apps work, mTLS gradually adopted
+       ↓
+Step 3: Verify traffic is mTLS:
+       Check metric: istio_requests_total{security_policy="mutual_tls"}
+       Should approach 100%
+       ↓
+Step 4: STRICT mode
+       Plain traffic rejected
+```
+
+Don't go STRICT immediately - breaks non-mesh traffic.
+
+**Verification:**
+
+**mTLS coverage:**
+
+```promql
+# % of requests with mTLS:
+sum(rate(istio_requests_total{security_policy="mutual_tls"}[5m]))
+/
+sum(rate(istio_requests_total[5m]))
+```
+
+Should be ~100% in STRICT mode.
+
+**Inspect certificates:**
+
+```bash
+# View cert in sidecar:
+istioctl proxy-config secret my-pod
+```
+
+Shows current certificates.
+
+**Verify identity:**
+
+```bash
+# Check actual identity:
+istioctl experimental authz check my-pod
+```
+
+**Origin authentication (JWT):**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: jwt-auth
+spec:
+  selector:
+    matchLabels:
+      app: api
+  jwtRules:
+    - issuer: "https://auth.example.com"
+      jwksUri: "https://auth.example.com/.well-known/jwks.json"
+```
+
+JWT validation in addition to mTLS. End-user identity.
+
+**Combined with AuthorizationPolicy:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: api-access
+spec:
+  selector:
+    matchLabels:
+      app: api
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/web"]
+      to:
+        - operation:
+            methods: ["GET"]
+```
+
+mTLS identity used for authorization decisions.
+
+**Certificate management:**
+
+**Default:**
+- Istio CA (built-in)
+- 24-hour cert lifetime
+- Auto-renewal at 80% of lifetime
+
+**Custom CA:**
+
+```yaml
+spec:
+  values:
+    global:
+      caAddress: my-ca:8060
+```
+
+For corporate PKI integration.
+
+**External CA (cert-manager):**
+
+```yaml
+# Use cert-manager issued certs for Istio
+```
+
+**Cross-mesh trust:**
+
+For multi-cluster:
+
+```yaml
+# Shared trust domain
+trustDomain: my-cluster.local
+
+# Cross-cluster: import each other's root certs
+```
+
+Both clusters trust each other.
+
+**Common issues:**
+
+**Issue 1: STRICT breaks non-mesh traffic**
+
+Non-meshed workloads can't connect.
+
+Fix:
+- Add to mesh
+- Use PERMISSIVE for transition
+- DestinationRule with TLS settings
+
+**Issue 2: Cert verification failures**
+
+```
+Certificate not yet valid
+or
+Certificate has expired
+```
+
+Clock skew. Sync clocks (NTP).
+
+**Issue 3: External traffic**
+
+External services not in mesh:
+
+```yaml
+# DestinationRule for external:
+spec:
+  host: external-service.com
+  trafficPolicy:
+    tls:
+      mode: SIMPLE   # Use regular TLS to external
+```
+
+**Issue 4: Headless services**
+
+Some headless service patterns don't work well with mTLS:
+
+```yaml
+# Need DestinationRule:
+spec:
+  host: headless-service
+  trafficPolicy:
+    tls:
+      mode: DISABLE
+```
+
+**Issue 5: Sidecar to non-sidecar**
+
+```
+Pod with sidecar → Pod without sidecar
+mTLS expected by sender, not supported by receiver
+Fails in STRICT
+```
+
+Fix: include receiver in mesh, or use PERMISSIVE.
+
+**Monitoring:**
+
+```promql
+# Authentication failures:
+sum(rate(istio_requests_total{response_code="403"}[5m]))
+
+# mTLS coverage:
+sum(rate(istio_requests_total{security_policy="mutual_tls"}[5m]))
+/
+sum(rate(istio_requests_total[5m]))
+```
+
+**Production scenarios:**
+
+1. **Compliance via STRICT mTLS**: SOC 2 required encrypted internal traffic. STRICT mode. All in-mesh traffic mTLS. Compliance achieved.
+
+2. **PERMISSIVE migration**: Adopted Istio. PERMISSIVE mode. Gradual adoption. Once 99%+ mTLS, switched to STRICT.
+
+3. **Cert rotation drill**: Tested cert rotation. All sidecars rotated certs without disruption. Confidence in mechanism.
+
+4. **Cross-cluster mTLS**: Multi-cluster mesh. Same trust domain. Pods in cluster A authenticated with mTLS to cluster B.
+
+5. **JWT + mTLS**: API needed user identity. mTLS for service identity, JWT for user identity. Both validated. Strong auth.
+
+---
+
+## 407. How do you implement traffic splitting?
+
+Traffic splitting routes requests across multiple service versions. Critical for canary deployments, A/B testing.
+
+**Use cases:**
+
+- Canary deployments (gradual rollout)
+- A/B testing (compare versions)
+- Blue-green deployments
+- Traffic mirroring (shadow testing)
+- Geographic routing
+
+**Istio implementation:**
+
+**Step 1: Define subsets**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: my-app
+spec:
+  host: my-app
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+```
+
+Defines named groups of pods based on labels.
+
+**Step 2: Deploy versions**
+
+```yaml
+# v1 Deployment:
+metadata:
+  name: my-app-v1
+  labels:
+    app: my-app
+    version: v1   # Matches subset
+spec:
+  replicas: 9
+
+# v2 Deployment:
+metadata:
+  name: my-app-v2
+  labels:
+    app: my-app
+    version: v2
+spec:
+  replicas: 1
+```
+
+**Step 3: Split traffic**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: my-app
+spec:
+  hosts:
+    - my-app
+  http:
+    - route:
+        - destination:
+            host: my-app
+            subset: v1
+          weight: 90
+        - destination:
+            host: my-app
+            subset: v2
+          weight: 10
+```
+
+90% to v1, 10% to v2.
+
+**Verify:**
+
+```bash
+# Make requests:
+for i in {1..100}; do
+  kubectl exec test-pod -- curl -s http://my-app | grep version
+done
+
+# Should see ~90 v1, ~10 v2
+```
+
+**Gradual canary:**
+
+```yaml
+# Day 1: 5%
+weight: 95 / 5
+
+# Day 2: 25%
+weight: 75 / 25
+
+# Day 3: 50%
+weight: 50 / 50
+
+# Day 4: 100%
+weight: 0 / 100
+```
+
+Increase v2 weight over time.
+
+**Automated canary (Flagger):**
+
+```yaml
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: my-app
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  service:
+    port: 80
+  analysis:
+    interval: 1m
+    threshold: 5
+    maxWeight: 50
+    stepWeight: 10
+    metrics:
+      - name: request-success-rate
+        thresholdRange:
+          min: 99
+        interval: 1m
+```
+
+Flagger:
+1. Deploys new version
+2. Gradually shifts traffic
+3. Monitors metrics
+4. Continues if healthy
+5. Auto-rollback if metrics degrade
+
+**Header-based routing:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+spec:
+  hosts:
+    - my-app
+  http:
+    - match:
+        - headers:
+            x-canary-user:
+              exact: "true"
+      route:
+        - destination:
+            host: my-app
+            subset: v2
+    - route:
+        - destination:
+            host: my-app
+            subset: v1
+```
+
+Specific users (with header) → v2.
+Others → v1.
+
+**Use case:** internal users test v2 first.
+
+**Cookie-based:**
+
+```yaml
+match:
+  - headers:
+      cookie:
+        regex: ".*canary=true.*"
+```
+
+**User percentage:**
+
+```yaml
+# Header-based for specific users:
+match:
+  - headers:
+      user-id:
+        regex: ".*[0-9]$"   # IDs ending in specific digit
+```
+
+Approximate user-based split.
+
+**Mirroring (shadow traffic):**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+spec:
+  hosts:
+    - my-app
+  http:
+    - route:
+        - destination:
+            host: my-app
+            subset: v1
+      mirror:
+        host: my-app
+        subset: v2
+      mirrorPercentage:
+        value: 100
+```
+
+100% to v1 (live).
+100% mirrored to v2 (shadow).
+
+v2 receives copy but response ignored. Test without user impact.
+
+**Geographic routing:**
+
+```yaml
+match:
+  - headers:
+      x-country:
+        exact: "US"
+  route:
+    - destination:
+        host: my-app
+        subset: us-version
+```
+
+Different versions per region.
+
+**Combination:**
+
+```yaml
+http:
+  # Internal users always v2:
+  - match:
+      - headers:
+          x-internal-user:
+            exact: "true"
+    route:
+      - destination:
+          host: my-app
+          subset: v2
+  # Beta cookie → v2:
+  - match:
+      - headers:
+          cookie:
+            regex: ".*beta=true.*"
+    route:
+      - destination:
+          host: my-app
+          subset: v2
+  # 10% of others:
+  - route:
+      - destination:
+          host: my-app
+          subset: v1
+        weight: 90
+      - destination:
+          host: my-app
+          subset: v2
+        weight: 10
+```
+
+Multi-criteria routing.
+
+**Linkerd traffic splitting:**
+
+```yaml
+apiVersion: split.smi-spec.io/v1alpha1
+kind: TrafficSplit
+metadata:
+  name: my-app
+spec:
+  service: my-app
+  backends:
+    - service: my-app-v1
+      weight: 900
+    - service: my-app-v2
+      weight: 100
+```
+
+SMI spec, similar concept.
+
+**Monitoring traffic split:**
+
+```promql
+# Traffic by version:
+sum by (destination_version) (
+  rate(istio_requests_total{destination_app="my-app"}[5m])
+)
+```
+
+Visualize in Grafana.
+
+**Rolling back:**
+
+```yaml
+# Quick rollback:
+http:
+  - route:
+      - destination:
+          host: my-app
+          subset: v1
+        weight: 100   # All back to v1
+```
+
+Apply change, traffic shifts immediately.
+
+**Best practices:**
+
+**Practice 1: Start small**
+
+```
+First canary: 1-5% traffic
+Gradual increase based on health
+```
+
+**Practice 2: Monitor closely**
+
+```promql
+# Error rate by version:
+sum by (destination_version) (
+  rate(istio_requests_total{response_code=~"5.."}[5m])
+)
+/
+sum by (destination_version) (
+  rate(istio_requests_total[5m])
+)
+```
+
+Alert on regressions.
+
+**Practice 3: Define rollback criteria**
+
+```
+If v2 error rate > 1.5x v1:
+  Rollback
+If v2 latency > 1.5x v1:
+  Rollback
+```
+
+Automate with Flagger.
+
+**Practice 4: Test in staging first**
+
+Don't canary in production without testing canary in staging.
+
+**Practice 5: Document**
+
+```
+What's being tested
+Success criteria
+Rollback plan
+Timeline
+```
+
+**Common pitfalls:**
+
+**Pitfall 1: Insufficient replicas**
+
+```
+Only 1 pod of v2
+Can't handle even 10% traffic
+```
+
+Scale v2 before increasing weight.
+
+**Pitfall 2: Database compatibility**
+
+```
+v1 and v2 share database
+Schema must be compatible
+```
+
+**Pitfall 3: Session affinity**
+
+```
+User on v2 → request to v1 (different pod)
+Session lost
+```
+
+Sticky sessions or stateless apps.
+
+**Pitfall 4: Forgetting rollback**
+
+```
+Canary at 50% for weeks
+Forgot to complete or rollback
+```
+
+Set deadlines, automate.
+
+**Production scenarios:**
+
+1. **Gradual canary**: 5% → 25% → 50% → 100% over 4 days. Monitored error rate. v2 healthy. Successful.
+
+2. **Header-based for QA**: QA team's requests routed to v2 (via header). Production users still on v1. Tested in prod safely.
+
+3. **Flagger automated**: Configured Flagger. Canary automatic. Auto-rollback on errors. Hands-off deployments.
+
+4. **Shadow testing**: Mirrored prod traffic to new version. Identified performance issue without user impact. Fixed before promoting.
+
+5. **Quick rollback**: Canary showed errors. Updated VirtualService weight to 100% v1. Recovered in 30 seconds.
+
+---
+
+## 408. Explain circuit breaking
+
+Circuit breakers prevent cascade failures. When a service is unhealthy, stop sending traffic to it until it recovers.
+
+**Problem:**
+
+```
+Service A → Service B → Service C
+                          (slow/failing)
+
+Service B threads blocked waiting for C
+Service B becomes unresponsive
+Service A can't reach B
+Cascade failure!
+```
+
+**Solution:**
+
+```
+Circuit breaker on B → C
+B detects C unhealthy
+Opens circuit (stops requests to C)
+B returns error immediately (or fallback)
+B remains responsive
+C recovers
+Circuit closes (allows traffic again)
+```
+
+**Circuit states:**
+
+**Closed:**
+
+```
+Normal operation
+Requests flow through
+Track failures
+```
+
+**Open:**
+
+```
+Failures exceeded threshold
+Reject all requests immediately
+No traffic to failing service
+After timeout, try again
+```
+
+**Half-Open:**
+
+```
+After timeout in Open state
+Allow limited requests
+If succeed: Closed
+If fail: Open again
+```
+
+**Istio implementation:**
+
+**Outlier detection:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: my-service
+spec:
+  host: my-service
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 5      # 5 consecutive 5xx
+      interval: 30s                # Check every 30s
+      baseEjectionTime: 30s        # Eject for 30s
+      maxEjectionPercent: 50       # Max 50% of endpoints ejected
+      minHealthPercent: 30         # Keep at least 30% healthy
+```
+
+**Behavior:**
+
+```
+1. Backend pod returns 5 consecutive 5xx
+2. Envoy marks unhealthy
+3. Removes from load balancing
+4. After 30s, re-add (half-open)
+5. If still failing, eject longer
+```
+
+**Connection pool limits:**
+
+```yaml
+spec:
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100         # Max TCP connections
+        connectTimeout: 5s          # Connection timeout
+      http:
+        http2MaxRequests: 1000      # Max parallel requests
+        maxRequestsPerConnection: 100
+        maxRetries: 3
+```
+
+Limits prevent overwhelming backend.
+
+**Behavior:**
+
+```
+Pool full + new request:
+- Wait
+- Or fail fast
+```
+
+**Combined config:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: my-service
+spec:
+  host: my-service
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 5s
+      http:
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 100
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+```
+
+**Tuning:**
+
+**Sensitive (early protection):**
+
+```yaml
+outlierDetection:
+  consecutive5xxErrors: 3
+  consecutiveGatewayErrors: 3   # Also includes timeouts
+  interval: 10s
+  baseEjectionTime: 30s
+```
+
+Fast detection.
+
+**Tolerant (more forgiving):**
+
+```yaml
+outlierDetection:
+  consecutive5xxErrors: 10
+  interval: 60s
+  baseEjectionTime: 60s
+```
+
+Slower to eject.
+
+**Per-port:**
+
+```yaml
+spec:
+  trafficPolicy:
+    portLevelSettings:
+      - port:
+          number: 8080
+        connectionPool:
+          tcp:
+            maxConnections: 100
+      - port:
+          number: 9090
+        connectionPool:
+          tcp:
+            maxConnections: 50
+```
+
+Different limits per port.
+
+**Subset-specific:**
+
+```yaml
+spec:
+  host: my-service
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+      trafficPolicy:
+        connectionPool:
+          tcp:
+            maxConnections: 100
+    - name: v2
+      labels:
+        version: v2
+      trafficPolicy:
+        connectionPool:
+          tcp:
+            maxConnections: 50   # Less for new version
+```
+
+**Monitoring:**
+
+```promql
+# Outlier ejection events:
+envoy_cluster_outlier_detection_ejections_active
+
+# Active ejections:
+envoy_cluster_outlier_detection_ejections_total
+
+# Pool overflows:
+envoy_cluster_upstream_cx_overflow
+```
+
+**Application-level fallbacks:**
+
+When circuit open, app gets error. Handle gracefully:
+
+```python
+try:
+    result = call_service()
+except CircuitOpenError:
+    result = cached_value or default_response
+```
+
+Don't propagate failure. Degrade gracefully.
+
+**Linkerd circuit breaking:**
+
+```yaml
+# ServiceProfile:
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+spec:
+  routes:
+    - condition:
+        method: GET
+        pathRegex: /api/.*
+      timeout: 10s
+      isRetryable: true
+```
+
+Linkerd has simpler circuit breaking than Istio.
+
+**When to use:**
+
+**Use circuit breaking for:**
+
+- Upstream services that can fail
+- External APIs (third-party)
+- Database connections
+- Services with variable load
+
+**Skip when:**
+
+- Stateless apps with idempotent operations
+- Requests that must complete
+- Internal calls within mesh (mesh handles)
+
+**Best practices:**
+
+**Practice 1: Reasonable thresholds**
+
+```yaml
+# Don't be too sensitive:
+consecutive5xxErrors: 5   # Not 1-2
+```
+
+Brief glitches shouldn't trip circuit.
+
+**Practice 2: Combined with retries**
+
+```yaml
+# VirtualService:
+http:
+  - retries:
+      attempts: 3
+      retryOn: 5xx,reset
+```
+
+Plus circuit breaker. Retries handle transient. Circuit handles persistent.
+
+**Practice 3: Connection pool tuning**
+
+```
+Initial: defaults
+Monitor: pool exhaustion?
+Tune: increase if needed
+```
+
+**Practice 4: Test in staging**
+
+Simulate failures:
+- Kill backend pods
+- Verify circuit opens
+- Verify fallback works
+
+**Practice 5: Application fallbacks**
+
+```python
+# Handle circuit-open errors:
+def get_user(user_id):
+    try:
+        return user_service.get(user_id)
+    except UnavailableError:
+        return get_user_from_cache(user_id)
+```
+
+**Common issues:**
+
+**Issue 1: Too sensitive**
+
+Circuit opens frequently for minor blips.
+
+Fix: increase thresholds.
+
+**Issue 2: Slow recovery**
+
+Circuit stays open too long.
+
+Fix: reduce baseEjectionTime.
+
+**Issue 3: All endpoints ejected**
+
+```yaml
+maxEjectionPercent: 100
+```
+
+All ejected = service unavailable.
+
+Fix: limit to 50-70%.
+
+**Issue 4: No fallback**
+
+App returns errors to users when circuit open.
+
+Fix: implement fallbacks.
+
+**Production scenarios:**
+
+1. **Cascade prevention**: Service B depended on Service C. C had outage. Circuit breaker on B → C opened. B continued serving other functionality. No cascade.
+
+2. **External API circuit**: Third-party API flaky. Circuit breaker around it. Apps used cached fallback when open. User experience preserved.
+
+3. **Pool exhaustion**: Default pool too small. Pods showing "no_healthy_upstream". Increased maxConnections. Resolved.
+
+4. **Tuning iteration**: Initial circuit too sensitive. Opened on minor blips. Increased threshold from 3 to 7 consecutive errors. Stopped false positives.
+
+5. **DB circuit**: Database had brief contention. Circuit opened, no requests for 30s. DB recovered. Circuit closed. Service self-healed.
+
+---
+
+## 409. How do you implement retries and timeouts?
+
+Retries and timeouts handle transient failures gracefully. Service mesh provides built-in support.
+
+**Concepts:**
+
+**Timeout:**
+
+```
+Max time to wait for response
+Exceeded: request fails
+```
+
+**Retry:**
+
+```
+On failure: try again
+Multiple attempts before giving up
+```
+
+**Both critical:**
+- Timeout: don't wait forever
+- Retry: handle transient issues
+
+**Istio implementation:**
+
+**Timeouts:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: my-service
+spec:
+  hosts:
+    - my-service
+  http:
+    - route:
+        - destination:
+            host: my-service
+      timeout: 10s
+```
+
+10 seconds total. Beyond: request fails.
+
+**Retries:**
+
+```yaml
+spec:
+  http:
+    - route:
+        - destination:
+            host: my-service
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+        retryOn: 5xx,reset,connect-failure,refused-stream
+        retryRemoteLocalities: true
+```
+
+**Parameters:**
+
+**attempts:**
+
+```
+attempts: 3
+Total tries (including original): 3
+1 original + 2 retries
+```
+
+**perTryTimeout:**
+
+```
+perTryTimeout: 2s
+Each attempt times out after 2s
+```
+
+**retryOn:**
+
+What to retry on:
+
+```
+5xx: 5xx responses
+reset: connection reset
+connect-failure: can't connect
+refused-stream: HTTP/2 stream refused
+retriable-4xx: specific 4xx (e.g., 409)
+gateway-error: 502, 503, 504
+```
+
+**Combination:**
+
+```yaml
+spec:
+  http:
+    - route:
+        - destination:
+            host: my-service
+      timeout: 10s                    # Overall
+      retries:
+        attempts: 3
+        perTryTimeout: 3s             # Per attempt
+        retryOn: 5xx,reset
+```
+
+Total time budget: 10s. 3 attempts of up to 3s each.
+
+**Default behavior:**
+
+Istio defaults:
+- 2 retries on connect-failure, refused-stream, 5xx
+- No timeout (be careful!)
+
+**Best to explicitly set both.**
+
+**Retry backoff:**
+
+Istio uses exponential backoff by default. No direct config in VirtualService, but Envoy uses smart timing.
+
+**Conditional retries:**
+
+**Idempotent operations:**
+
+```
+GET: safe to retry
+PUT (with same data): safe
+DELETE (idempotent): safe
+POST: not always safe (might create duplicate)
+```
+
+Be careful with POST retries:
+
+```yaml
+# Don't retry POST:
+match:
+  - method:
+      exact: POST
+route:
+  - destination:
+      host: my-service
+# No retries
+```
+
+Or apply per-route logic.
+
+**Linkerd retries:**
+
+```yaml
+# ServiceProfile:
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: my-service.default.svc.cluster.local
+spec:
+  routes:
+    - condition:
+        method: GET
+        pathRegex: /api/users/[^/]*
+      isRetryable: true
+      timeout: 10s
+```
+
+Per-route configuration.
+
+**Linkerd retry budget:**
+
+```yaml
+spec:
+  retryBudget:
+    retryRatio: 0.2
+    minRetriesPerSecond: 10
+    ttl: 10s
+```
+
+Limit retry rate to prevent overwhelming.
+
+**Idempotency considerations:**
+
+**Idempotent:**
+
+```python
+# Safe to retry:
+def get_user(id): ...
+def set_value(key, value): ...   # Same result on retry
+def delete_user(id): ...
+```
+
+**Non-idempotent:**
+
+```python
+# NOT safe to retry blindly:
+def create_order(): ...  # Could create duplicate
+def increment_counter(): ...  # Could double-count
+def send_email(): ...   # Could send twice
+```
+
+For non-idempotent, use idempotency keys:
+
+```python
+def create_order(idempotency_key):
+    # If key already used, return same response
+```
+
+**Application-level retries:**
+
+```python
+# In app code:
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10)
+)
+def call_service():
+    return requests.get(url, timeout=5)
+```
+
+**Mesh + app retries:**
+
+If both configured:
+- Total retries multiply
+- 3 (mesh) × 3 (app) = 9 attempts
+
+Usually want one or the other.
+
+**Recommendation:**
+- Mesh retries: simple, network-level
+- App retries: complex logic, business rules
+
+**Common patterns:**
+
+**Pattern 1: Conservative**
+
+```yaml
+attempts: 2
+perTryTimeout: 5s
+retryOn: 5xx,reset,connect-failure
+```
+
+Few retries, generous timeout.
+
+**Pattern 2: Aggressive**
+
+```yaml
+attempts: 5
+perTryTimeout: 1s
+retryOn: 5xx,reset
+```
+
+Many quick retries.
+
+**Pattern 3: Slow services**
+
+```yaml
+attempts: 2
+perTryTimeout: 30s
+```
+
+For slow backends.
+
+**Monitoring:**
+
+```promql
+# Retries:
+sum(rate(istio_request_duration_milliseconds_count{retry_count!="0"}[5m]))
+
+# Timeouts:
+sum(rate(istio_requests_total{response_flags="UT"}[5m]))   # UT = upstream timeout
+```
+
+Track to identify issues.
+
+**Tuning:**
+
+**Too few retries:**
+
+```
+Service shows transient errors to users
+```
+
+Increase retries, especially for known-flaky services.
+
+**Too many retries:**
+
+```
+Backend overloaded by retries during issues
+```
+
+Reduce retries or use retry budget.
+
+**Timeout too short:**
+
+```
+Legitimate slow requests fail
+```
+
+Increase timeout.
+
+**Timeout too long:**
+
+```
+Hung requests don't fail
+Resources tied up
+```
+
+Decrease timeout.
+
+**Per-route configuration:**
+
+```yaml
+spec:
+  http:
+    # Critical fast path:
+    - match:
+        - uri:
+            prefix: /api/critical
+      route:
+        - destination:
+            host: my-service
+      timeout: 5s
+      retries:
+        attempts: 5
+        perTryTimeout: 1s
+    # Slow batch endpoint:
+    - match:
+        - uri:
+            prefix: /api/batch
+      route:
+        - destination:
+            host: my-service
+      timeout: 300s
+      retries:
+        attempts: 1
+```
+
+Different policies for different routes.
+
+**Cascading retries problem:**
+
+```
+Client → A → B → C
+
+C slow, B retries
+A retries B (now even slower from B's retries)
+Client retries A (compound)
+
+Cascading retry storm
+```
+
+Solutions:
+- Don't retry in middle layers
+- Use retry budgets
+- Add jitter
+- Total retry budget across layers
+
+**Best practices:**
+
+1. **Always set timeout**: never wait forever
+2. **Few retries**: 2-3, not 10
+3. **Per-try timeout**: avoid endless attempts
+4. **Don't retry POST**: unless idempotent
+5. **Monitor**: track retry rates
+6. **Test**: simulate failures
+7. **Application fallbacks**: when retries exhausted
+8. **Don't compound**: one layer retries
+
+**Common issues:**
+
+**Issue 1: No timeout configured**
+
+Default no timeout. Requests can hang forever.
+
+Fix: explicit timeout.
+
+**Issue 2: POST retried, duplicates**
+
+Critical issue.
+
+Fix: idempotency keys, no POST retry, or careful retry conditions.
+
+**Issue 3: Retry storms**
+
+Cascading retries overwhelm backend.
+
+Fix: retry budgets, exponential backoff.
+
+**Issue 4: Slow propagation**
+
+App config takes time to propagate.
+
+Fix: monitor config push latency.
+
+**Production scenarios:**
+
+1. **Transient errors gone**: Service had ~1% transient errors. Added 2 retries. Errors dropped to 0.001% from user perspective.
+
+2. **Timeout discovery**: No timeout, requests hung indefinitely. Set 30s timeout. Hung requests failed appropriately.
+
+3. **Retry storm**: Backend issue. Heavy retries made it worse. Implemented retry budget. Limited compounding.
+
+4. **POST issue**: Retry on POST created duplicate orders. Added idempotency keys to API. Safe retries.
+
+5. **Per-route tuning**: Different endpoints had different needs. Configured per-route timeouts and retries. Optimized for each use case.
+
+---
+
+## 410. Explain rate limiting in service mesh
+
+Rate limiting prevents abuse and protects services from overload. Service mesh can enforce at various levels.
+
+**Why rate limit:**
+
+- Prevent abuse (DDoS, brute force)
+- Protect backend services from overload
+- Fair resource allocation across users
+- Compliance with API contracts
+- Cost control (rate-limit expensive operations)
+
+**Types:**
+
+**Local rate limiting:**
+
+```
+Per pod (Envoy sidecar)
+Each pod tracks own counter
+Independent
+Fast
+Distributed but inconsistent
+```
+
+**Global rate limiting:**
+
+```
+External rate limit service
+All pods check service
+Consistent across cluster
+Slower (network call)
+Coordinated
+```
+
+**Istio local rate limiting:**
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: filter-local-ratelimit
+spec:
+  workloadSelector:
+    labels:
+      app: my-service
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_INBOUND
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.local_ratelimit
+          typed_config:
+            "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+            type_url: type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+            value:
+              stat_prefix: http_local_rate_limiter
+              token_bucket:
+                max_tokens: 100
+                tokens_per_fill: 100
+                fill_interval: 60s
+```
+
+100 requests per minute per pod.
+
+**Global rate limiting:**
+
+Need external rate limit service:
+
+```yaml
+# Ratelimit service deployment:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ratelimit
+spec:
+  template:
+    spec:
+      containers:
+        - name: ratelimit
+          image: envoyproxy/ratelimit:latest
+          env:
+            - name: USE_STATSD
+              value: "false"
+            - name: LOG_LEVEL
+              value: info
+            - name: REDIS_URL
+              value: redis:6379
+```
+
+**Rate limit config:**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ratelimit-config
+data:
+  config.yaml: |
+    domain: my-domain
+    descriptors:
+      - key: generic_key
+        value: my-route
+        rate_limit:
+          unit: minute
+          requests_per_unit: 100
+      - key: header_match
+        value: production
+        rate_limit:
+          unit: second
+          requests_per_unit: 10
+```
+
+**EnvoyFilter to use external rate limit:**
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: filter-ratelimit
+spec:
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ratelimit
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+            domain: my-domain
+            failure_mode_deny: false
+            rate_limit_service:
+              grpc_service:
+                envoy_grpc:
+                  cluster_name: rate_limit_service
+              transport_api_version: V3
+```
+
+**Patterns:**
+
+**Pattern 1: Per-IP**
+
+```yaml
+# Rate limit by source IP:
+descriptors:
+  - key: remote_address
+    rate_limit:
+      unit: minute
+      requests_per_unit: 60
+```
+
+60 requests/minute per IP.
+
+**Pattern 2: Per-user**
+
+```yaml
+# By header (e.g., user_id):
+descriptors:
+  - key: header_match
+    value: user
+    rate_limit:
+      unit: minute
+      requests_per_unit: 1000
+```
+
+**Pattern 3: Per-endpoint**
+
+```yaml
+# Different limits for different endpoints:
+descriptors:
+  - key: generic_key
+    value: api_login
+    rate_limit:
+      unit: minute
+      requests_per_unit: 10   # Strict for login
+  - key: generic_key
+    value: api_search
+    rate_limit:
+      unit: minute
+      requests_per_unit: 100   # More lenient
+```
+
+**Pattern 4: Tiered**
+
+```yaml
+# Different limits per tier:
+descriptors:
+  - key: tier
+    value: free
+    rate_limit:
+      unit: hour
+      requests_per_unit: 100
+  - key: tier
+    value: paid
+    rate_limit:
+      unit: hour
+      requests_per_unit: 10000
+```
+
+User tier in header.
+
+**Token bucket algorithm:**
+
+```
+Bucket capacity: 100 tokens
+Refill rate: 10 tokens/second
+Each request: 1 token
+
+If tokens available: request allowed, token used
+If empty: request denied
+
+Burst: up to 100 immediately
+Sustained: 10/second
+```
+
+**Sliding window:**
+
+Alternative algorithm. More precise but more memory.
+
+**Response:**
+
+When rate limited:
+
+```http
+HTTP/1.1 429 Too Many Requests
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1234567890
+Retry-After: 30
+```
+
+App should respect Retry-After.
+
+**Application-level (alternative):**
+
+Some apps implement rate limiting directly:
+
+```python
+from flask_limiter import Limiter
+
+limiter = Limiter(
+    app,
+    default_limits=["100 per minute", "1000 per hour"]
+)
+
+@app.route('/api/expensive')
+@limiter.limit("10 per minute")
+def expensive():
+    pass
+```
+
+vs mesh-level:
+- App: business logic, complex rules
+- Mesh: simple rules, infrastructure-level
+
+Both can coexist.
+
+**Multi-dimensional:**
+
+```yaml
+# Combine factors:
+descriptors:
+  - key: tier
+    value: free
+    descriptors:
+      - key: endpoint
+        value: search
+        rate_limit:
+          unit: minute
+          requests_per_unit: 10
+```
+
+Free tier on /search: 10/minute.
+
+**Best practices:**
+
+1. **Local for simple**: faster, no coordination
+2. **Global for complex**: shared state needed
+3. **Test under load**: verify limits work
+4. **Monitor**: track rate-limited requests
+5. **Communicate limits**: API documentation
+6. **Headers**: return X-RateLimit headers
+7. **Graceful degradation**: app handles 429
+
+**Common rate limits:**
+
+```
+Anonymous: 60/minute
+Free tier: 1000/hour
+Paid: 10000/hour
+Enterprise: 100k/hour
+
+Login attempts: 5/minute per IP
+Sensitive ops: 10/hour per user
+```
+
+**Monitoring:**
+
+```promql
+# Rate-limited requests:
+sum(rate(envoy_local_rate_limit_blocked_total[5m]))
+
+# Or for global:
+sum(rate(ratelimit_service_total_hits[5m]))
+```
+
+Alert if too many denied:
+
+```yaml
+- alert: HighRateLimitDenials
+  expr: rate(envoy_local_rate_limit_blocked_total[5m]) > 100
+```
+
+**Production scenarios:**
+
+1. **API rate limiting**: Public API. Per-API-key limits. Free vs paid tiers. Implemented via global rate limit service.
+
+2. **Login protection**: Brute force attempts. Rate limit 5/minute per IP on login. Effective protection.
+
+3. **Backend protection**: Backend overwhelmed. Added rate limit at Ingress. 1000 req/sec total. Backend stable.
+
+4. **Burst handling**: Token bucket allowed bursts but limited sustained. Real users (bursts) OK. Bots (sustained) limited.
+
+5. **Cost control**: Expensive ML inference. Per-user rate limit. Prevented runaway costs.
+
+---
+
+## 411. How do you monitor service mesh traffic?
+
+Service mesh generates rich telemetry. Effective monitoring uses these signals.
+
+**Three pillars:**
+
+**Metrics:** numerical measurements over time
+**Logs:** event records
+**Traces:** request flows across services
+
+All auto-generated by mesh sidecars.
+
+**Istio metrics:**
+
+Auto-generated for every service-to-service call:
+
+```promql
+# Request rate:
+sum by (destination_service) (rate(istio_requests_total[5m]))
+
+# Error rate:
+sum(rate(istio_requests_total{response_code=~"5.."}[5m]))
+/
+sum(rate(istio_requests_total[5m]))
+
+# P99 latency:
+histogram_quantile(0.99,
+  sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le, destination_service)
+)
+```
+
+**RED metrics built-in:**
+
+- **Rate**: `istio_requests_total`
+- **Errors**: `istio_requests_total{response_code=~"5.."}`
+- **Duration**: `istio_request_duration_milliseconds`
+
+**Detailed metric:**
+
+```promql
+istio_requests_total{
+  source_workload="frontend",
+  source_workload_namespace="production",
+  destination_service_name="backend",
+  destination_service_namespace="production",
+  request_protocol="http",
+  response_code="200",
+  response_flags="-",
+  security_policy="mutual_tls"
+}
+```
+
+Rich labels enable many queries.
+
+**Linkerd metrics:**
+
+```promql
+# Success rate:
+sum(rate(response_total{classification="success"}[5m]))
+/
+sum(rate(response_total[5m]))
+
+# Latency:
+histogram_quantile(0.99, sum(rate(response_latency_ms_bucket[5m])) by (le))
+
+# Per-route:
+sum by (rt_route) (rate(route_response_total[5m]))
+```
+
+**Pre-built dashboards:**
+
+**Istio (Kiali, Grafana):**
+
+```
+Mesh dashboard: cluster overview
+Service dashboard: per-service RED
+Workload dashboard: per-deployment
+Performance dashboard: latency analysis
+```
+
+**Linkerd (Linkerd Viz):**
+
+```
+Top: live traffic view
+Tap: request inspection
+Stat: aggregated stats
+Routes: per-route metrics
+```
+
+**Common queries:**
+
+**Top services by traffic:**
+
+```promql
+topk(10, sum by (destination_service) (
+  rate(istio_requests_total[5m])
+))
+```
+
+**Top error sources:**
+
+```promql
+topk(10, sum by (source_workload, destination_service) (
+  rate(istio_requests_total{response_code=~"5.."}[5m])
+))
+```
+
+**Latency by service:**
+
+```promql
+sum by (destination_service) (
+  histogram_quantile(0.99,
+    rate(istio_request_duration_milliseconds_bucket[5m])
+  )
+)
+```
+
+**Cross-namespace traffic:**
+
+```promql
+sum by (source_workload_namespace, destination_workload_namespace) (
+  rate(istio_requests_total[5m])
+)
+```
+
+Identify unexpected cross-namespace.
+
+**mTLS coverage:**
+
+```promql
+sum(rate(istio_requests_total{security_policy="mutual_tls"}[5m]))
+/
+sum(rate(istio_requests_total[5m]))
+```
+
+Should be ~100% in STRICT mode.
+
+**Service dependency map:**
+
+Auto-generated from metrics:
+
+```
+Frontend → API Gateway → Auth Service
+                      → User Service → Database
+                      → Payment Service → Stripe (external)
+```
+
+Tools:
+- Kiali (Istio)
+- Linkerd Viz
+- Custom built from metrics
+
+**Tracing:**
+
+Mesh auto-generates spans:
+
+```yaml
+# Istio enables:
+spec:
+  meshConfig:
+    enableTracing: true
+    defaultProviders:
+      tracing:
+        - jaeger
+```
+
+Each request:
+- Sidecar adds trace headers
+- Generates span
+- Sends to tracing backend
+
+**Trace data:**
+
+```
+Service A (Envoy span) → Service B (Envoy span) → Service C (Envoy span)
+```
+
+Auto-generated. App spans (if instrumented) appear as children.
+
+**Sampling:**
+
+```yaml
+# Sample 1% of traces:
+spec:
+  meshConfig:
+    extensionProviders:
+      - name: jaeger
+        zipkin:
+          service: zipkin.istio-system
+          port: 9411
+```
+
+For high-traffic: tail sampling.
+
+**Access logs:**
+
+```yaml
+spec:
+  meshConfig:
+    accessLogFile: /dev/stdout
+    accessLogFormat: |
+      [%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%" 
+      %RESPONSE_CODE% %RESPONSE_FLAGS%
+      "%REQ(X-FORWARDED-FOR)%" "%REQ(USER-AGENT)%"
+```
+
+Per-request logs. High volume.
+
+**SLO monitoring:**
+
+```yaml
+# Define SLO via mesh metrics:
+availability_sli: |
+  sum(rate(istio_requests_total{response_code!~"5.."}[5m]))
+  /
+  sum(rate(istio_requests_total[5m]))
+
+# Should be >99.9%
+```
+
+**Alerts:**
+
+```yaml
+- alert: ServiceHighErrorRate
+  expr: |
+    sum by (destination_service) (
+      rate(istio_requests_total{response_code=~"5.."}[5m])
+    )
+    /
+    sum by (destination_service) (
+      rate(istio_requests_total[5m])
+    )
+    > 0.05
+  for: 10m
+
+- alert: ServiceHighLatency
+  expr: |
+    histogram_quantile(0.99,
+      sum by (le, destination_service) (
+        rate(istio_request_duration_milliseconds_bucket[5m])
+      )
+    ) > 1000
+  for: 10m
+```
+
+**Kiali features:**
+
+```yaml
+# Install Kiali:
+istioctl install --set values.kiali.enabled=true
+```
+
+Capabilities:
+- Service graph visualization
+- Traffic flow animation
+- Configuration validation
+- Error and warning indicators
+- Drill-down to traces
+
+**Distributed tracing query:**
+
+In Jaeger:
+
+```
+Service: payment-service
+Operation: POST /api/charge
+Min Duration: 1s
+Time range: last 1 hour
+```
+
+Find slow requests, see full trace.
+
+**Performance overhead:**
+
+Mesh observability adds:
+- CPU: ~5% per sidecar
+- Network: telemetry data
+- Storage: metrics, traces, logs
+
+Tune sampling appropriately.
+
+**Best practices:**
+
+1. **Use built-in dashboards**: pre-configured well
+2. **Service-level SLOs**: from mesh metrics
+3. **Watch sidecar overhead**: ensure not impacting workload
+4. **Verify mTLS coverage**: should be 100% in STRICT
+5. **Trace strategically**: tail sampling for important
+6. **Access logs sparingly**: volume can overwhelm
+7. **Combine signals**: metrics + traces + logs
+
+**Production scenarios:**
+
+1. **RED for free**: Apps had minimal instrumentation. Mesh provided complete RED metrics. Standardized dashboards across services.
+
+2. **Service graph reveals**: Kiali showed unexpected service calls. Service A called Service B which app team didn't know about. Investigated.
+
+3. **mTLS verification**: Migration to STRICT mode. Watched mtls coverage metric. Caught service not yet meshed. Fixed.
+
+4. **Sidecar overhead**: Some sidecars used more memory than apps. Tuned Envoy buffer sizes. Reduced memory 50%.
+
+5. **Mesh-based SLOs**: Built SLOs from mesh metrics. Same SLI across all services. Consistent reliability tracking.
+
+---
+
+## 412. Explain service mesh observability
+
+Service mesh observability provides deep visibility into service-to-service communication without application instrumentation.
+
+**Three pillars unified:**
+
+```
+Metrics: aggregate behavior
+       ↓
+Traces: individual request flows
+       ↓
+Logs: event records
+```
+
+All correlated via trace IDs.
+
+**Automatic instrumentation:**
+
+Mesh provides without code changes:
+
+```
+- Request rate (per service, per route, per source/destination)
+- Error rate (HTTP 5xx, gRPC errors)
+- Latency (P50, P95, P99 distributions)
+- Request size, response size
+- Connection counts
+- TLS metrics
+- Retry, timeout metrics
+```
+
+**Why service mesh observability:**
+
+**Before:**
+
+```
+Each app instruments differently
+Inconsistent metrics
+Different languages, different libraries
+Hard to compare services
+```
+
+**After:**
+
+```
+Uniform instrumentation (sidecar)
+Same metrics for all
+Consistent across polyglot
+Easy comparison
+```
+
+**Metrics:**
+
+**Service-level:**
+
+```promql
+# Service health:
+sum by (destination_service) (
+  rate(istio_requests_total[5m])
+)
+
+# Service errors:
+sum by (destination_service) (
+  rate(istio_requests_total{response_code=~"5.."}[5m])
+)
+
+# Service latency:
+histogram_quantile(0.99,
+  sum by (le, destination_service) (
+    rate(istio_request_duration_milliseconds_bucket[5m])
+  )
+)
+```
+
+**Workload-level:**
+
+```promql
+# Per source workload:
+sum by (source_workload, destination_service) (
+  rate(istio_requests_total[5m])
+)
+```
+
+Who's calling whom.
+
+**Pod-level:**
+
+```promql
+# Per pod:
+sum by (pod, destination_service) (
+  rate(istio_requests_total[5m])
+)
+```
+
+**Tracing:**
+
+**Auto-generated spans:**
+
+Every service-to-service call generates spans:
+
+```
+Trace:
+├── frontend (envoy span)
+│   └── api-gateway (envoy span)
+│       ├── auth-service (envoy span)
+│       └── user-service (envoy span)
+│           └── database (envoy span)
+```
+
+**Trace context:**
+
+```
+Request enters mesh:
+- Trace ID generated
+- Span IDs created
+- Headers propagated
+
+Each subsequent hop:
+- New span (child of previous)
+- Same trace ID
+- Headers passed
+```
+
+**Context propagation:**
+
+```
+Headers (W3C Trace Context):
+- traceparent: trace and span IDs
+- tracestate: vendor info
+```
+
+**Sampling:**
+
+```yaml
+# Istio sampling:
+spec:
+  meshConfig:
+    defaultConfig:
+      tracing:
+        sampling: 1.0   # 100% (high traffic: lower)
+```
+
+**Tail-based sampling:**
+
+```yaml
+# OpenTelemetry Collector:
+processors:
+  tail_sampling:
+    policies:
+      - name: errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: slow
+        type: latency
+        latency: {threshold_ms: 1000}
+      - name: probabilistic
+        type: probabilistic
+        probabilistic: {sampling_percentage: 1}
+```
+
+Keep errors + slow + 1% sample.
+
+**Access logs:**
+
+```yaml
+spec:
+  meshConfig:
+    accessLogFile: /dev/stdout
+    accessLogFormat: |
+      [%START_TIME%]
+      "%REQ(:METHOD)% %REQ(:PATH)% %PROTOCOL%"
+      %RESPONSE_CODE%
+      "%REQ(X-FORWARDED-FOR)%"
+      "%REQ(USER-AGENT)%"
+      %DURATION%
+```
+
+Per-request log.
+
+Volume can be huge:
+
+```
+1000 RPS × 86400s/day = 86M logs/day
+```
+
+Filter or sample.
+
+**Visualization:**
+
+**Kiali (Istio):**
+
+```yaml
+helm install kiali kiali/kiali-server
+```
+
+Features:
+- Service map
+- Traffic flow
+- Configuration validation
+- Health overview
+
+**Linkerd Viz:**
+
+```bash
+linkerd viz install | kubectl apply -f -
+```
+
+Features:
+- Top: live traffic
+- Tap: request inspection
+- Stat: stats per route
+
+**Grafana:**
+
+Pre-built dashboards:
+- Mesh dashboard
+- Service dashboard
+- Workload dashboard
+
+```yaml
+# Import:
+# Istio: https://grafana.com/grafana/dashboards/7639
+```
+
+**Custom dashboards:**
+
+```promql
+# Top error sources:
+topk(10, sum by (source_workload, destination_service) (
+  rate(istio_requests_total{response_code=~"5.."}[5m])
+))
+
+# Slowest services:
+topk(10,
+  histogram_quantile(0.99,
+    sum by (le, destination_service) (
+      rate(istio_request_duration_milliseconds_bucket[5m])
+    )
+  )
+)
+```
+
+**Correlation:**
+
+**Metrics → Traces:**
+
+```
+Spike in errors at 10:30
+       ↓
+Find traces with errors at that time
+       ↓
+Specific trace shows root cause
+```
+
+**Traces → Logs:**
+
+```
+Slow trace
+       ↓
+Get trace_id
+       ↓
+Search logs for trace_id
+       ↓
+See app-level details
+```
+
+**Logs → Metrics:**
+
+```
+Error pattern in logs
+       ↓
+Query metric over time
+       ↓
+Verify frequency, correlations
+```
+
+**Use cases:**
+
+**Use case 1: Performance debugging**
+
+```
+P99 latency high
+       ↓
+Mesh metrics: which service?
+       ↓
+Traces: which span slow?
+       ↓
+App logs: why slow?
+```
+
+Top-down debugging.
+
+**Use case 2: Error investigation**
+
+```
+Error rate spike
+       ↓
+Mesh: source and destination
+       ↓
+Trace: full request flow
+       ↓
+Identify failing component
+```
+
+**Use case 3: Capacity planning**
+
+```
+Service traffic growing
+       ↓
+Mesh metrics over time
+       ↓
+Identify trends
+       ↓
+Scale proactively
+```
+
+**Use case 4: Compliance audit**
+
+```
+"Who accessed customer data?"
+       ↓
+Access logs (with user identity)
+       ↓
+Detailed audit trail
+```
+
+**Use case 5: Service dependency mapping**
+
+```
+"What does service X depend on?"
+       ↓
+Mesh service map
+       ↓
+Complete dependency view
+```
+
+**Resource considerations:**
+
+```
+Sidecar CPU/memory: 0.1-0.5 CPU, 100-200MB
+Mesh telemetry: 5-10% CPU overhead
+Tracing storage: significant
+Log storage: huge if not filtered
+```
+
+Plan infrastructure.
+
+**Cost optimization:**
+
+```
+- Reduce trace sampling (use tail-based)
+- Filter access logs (drop healthy requests)
+- Aggregate metrics (drop high-cardinality labels)
+- Tier log storage (hot/cold)
+```
+
+**Best practices:**
+
+1. **Start with built-in dashboards**: don't rebuild from scratch
+2. **SLOs from mesh metrics**: consistent definition
+3. **Tail sampling**: keep important traces
+4. **Correlate signals**: metrics + traces + logs
+5. **Service dependency map**: regular review
+6. **Alert appropriately**: avoid fatigue
+7. **Visualize for stakeholders**: dashboards for various audiences
+
+**Production scenarios:**
+
+1. **Cross-service debugging**: Bug spanned 5 services. Mesh trace showed exact flow. Resolved in minutes vs hours without mesh.
+
+2. **Service map insights**: Kiali revealed circular dependencies. Refactored services. Better architecture.
+
+3. **mTLS verification**: Compliance audit. Demonstrated mTLS coverage via metrics. 99.95% of internal traffic encrypted.
+
+4. **Auto-discovered dependencies**: New engineer joined. Used Kiali to understand architecture. Onboarding faster.
+
+5. **Performance regression caught**: Deploy caused latency spike. Mesh metrics alerted within minutes. Quick rollback.
+
+---
+
+## 413. How do you debug sidecar injection failures?
+
+Sidecar injection failures prevent mesh participation. Systematic debugging required.
+
+**Symptoms:**
+
+```
+Pod started but no sidecar
+Pod has only app container
+Mesh features don't work
+```
+
+**Step 1: Verify namespace label**
+
+```bash
+kubectl get namespace my-app --show-labels
+
+# Should show: istio-injection=enabled
+```
+
+If missing:
+
+```bash
+kubectl label namespace my-app istio-injection=enabled
+```
+
+**Step 2: Check pod annotations**
+
+```bash
+kubectl get pod my-pod -o yaml | grep -A 5 annotations
+
+# Look for:
+# sidecar.istio.io/inject: "false"
+```
+
+If "false", remove or change to "true".
+
+**Step 3: Check webhook**
+
+```bash
+# Webhook configuration:
+kubectl get mutatingwebhookconfiguration istio-sidecar-injector
+
+# Detailed:
+kubectl get mutatingwebhookconfiguration istio-sidecar-injector -o yaml
+```
+
+Look for:
+- Namespace selector
+- Failure policy
+- Target service
+
+**Step 4: Check istiod**
+
+```bash
+# istiod pods running?
+kubectl get pods -n istio-system -l app=istiod
+
+# Logs:
+kubectl logs -n istio-system -l app=istiod
+```
+
+If istiod down, webhook can't be called.
+
+**Step 5: Webhook service**
+
+```bash
+# Service exists?
+kubectl get svc -n istio-system istiod
+
+# Endpoints?
+kubectl get endpoints -n istio-system istiod
+```
+
+If no endpoints: istiod pod not selected or not ready.
+
+**Step 6: Test webhook**
+
+```bash
+# Create test pod in labeled namespace:
+kubectl run test-pod --image=nginx -n my-app
+
+# Check if sidecar injected:
+kubectl get pod test-pod -o jsonpath='{.spec.containers[*].name}'
+```
+
+Should show: nginx istio-proxy.
+
+If only "nginx": injection failed.
+
+**Common causes:**
+
+**Cause 1: Namespace not labeled**
+
+Most common. Fix with label.
+
+**Cause 2: Pod annotation disables**
+
+```yaml
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "false"
+```
+
+Remove or set to "true".
+
+**Cause 3: Excluded namespace**
+
+System namespaces typically excluded:
+
+```yaml
+namespaceSelector:
+  matchExpressions:
+    - key: name
+      operator: NotIn
+      values:
+        - kube-system
+        - kube-public
+        - istio-system
+```
+
+**Cause 4: istiod down**
+
+```bash
+kubectl get pods -n istio-system -l app=istiod
+# Should show Running
+
+kubectl describe pod -n istio-system <istiod-pod>
+# Look for issues
+```
+
+**Cause 5: Webhook misconfiguration**
+
+```bash
+# Verify webhook configuration:
+kubectl get mutatingwebhookconfiguration istio-sidecar-injector -o yaml
+
+# Common issues:
+# - Wrong service reference
+# - CA bundle expired
+# - Failure policy set wrong
+```
+
+**Cause 6: Network policy blocking**
+
+NetworkPolicy might prevent webhook → API server:
+
+```bash
+kubectl get networkpolicies -n istio-system
+```
+
+**Cause 7: Resource constraints**
+
+Pod creation fails before webhook called:
+
+```bash
+kubectl describe pod my-pod
+# Look at events
+```
+
+**Cause 8: Already injected during pod definition**
+
+```yaml
+# Manually injected via istioctl kube-inject:
+# Don't combine with auto-injection
+```
+
+**Cause 9: Init container issue**
+
+Sidecar injection adds init container. If init fails:
+
+```bash
+kubectl describe pod my-pod
+# Look at init container status
+
+kubectl logs my-pod -c istio-init
+```
+
+Common: needs CAP_NET_ADMIN.
+
+**Cause 10: Wrong injection template**
+
+```bash
+# Check template version:
+kubectl get configmap -n istio-system istio-sidecar-injector -o yaml
+```
+
+Mismatched versions cause issues.
+
+**Debugging steps:**
+
+**Verbose debugging:**
+
+```bash
+# Increase webhook log level:
+# Webhook logs in istiod logs
+
+kubectl logs -n istio-system -l app=istiod --tail=100
+```
+
+Look for injection attempts.
+
+**Webhook calls:**
+
+```bash
+# Check API server logs (if accessible):
+# Look for webhook call results
+```
+
+Hard to access in managed K8s.
+
+**Manual injection test:**
+
+```bash
+istioctl kube-inject -f my-pod.yaml
+```
+
+If this produces sidecar config: injection logic works.
+
+**Webhook validation:**
+
+```bash
+istioctl analyze
+```
+
+Comprehensive analysis tool. Identifies common issues.
+
+**Specific scenarios:**
+
+**Scenario 1: New namespace, no injection**
+
+```bash
+# Add label:
+kubectl label namespace my-app istio-injection=enabled
+
+# Recreate pods (existing pods don't get sidecar):
+kubectl rollout restart deployment -n my-app
+```
+
+**Scenario 2: Pod in non-labeled namespace**
+
+```yaml
+# Per-pod opt-in:
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "true"
+```
+
+**Scenario 3: Some pods inject, others don't**
+
+```bash
+# Compare pod specs:
+kubectl get pod injected-pod -o yaml > inject.yaml
+kubectl get pod not-injected-pod -o yaml > noinject.yaml
+diff inject.yaml noinject.yaml
+```
+
+Look for differences (annotations, labels).
+
+**Scenario 4: After Istio upgrade**
+
+```bash
+# Restart deployments to get new sidecar version:
+kubectl rollout restart deployment -n my-app
+```
+
+**Scenario 5: Failure policy**
+
+```yaml
+# Webhook config:
+failurePolicy: Fail   # Pod creation fails if webhook unreachable
+# Or:
+failurePolicy: Ignore   # Pod created without sidecar if webhook fails
+```
+
+Different behaviors.
+
+**Best practices:**
+
+1. **Test in dev namespace**: verify before production
+2. **istiod HA**: avoid single point of failure
+3. **Monitor injection rate**: alert if drops
+4. **Document**: which namespaces should have injection
+5. **Automate**: avoid manual injection
+6. **Use Sidecar resource**: limit scope when needed
+
+**Monitoring:**
+
+```promql
+# Pods without sidecar that should have one:
+# Custom metric: requires comparison of labels and pod spec
+```
+
+Create alert.
+
+**Common error messages:**
+
+```
+"admission webhook 'sidecar-injector.istio.io' denied the request"
+- Webhook called but rejected
+
+"Internal error occurred: failed calling webhook"
+- Webhook unreachable
+
+"x509: certificate signed by unknown authority"
+- CA bundle issue
+```
+
+Each requires specific fix.
+
+**Recovery:**
+
+```bash
+# If webhook completely broken:
+kubectl delete mutatingwebhookconfiguration istio-sidecar-injector
+
+# Reinstall:
+istioctl install
+```
+
+Drastic, only if needed.
+
+**Production scenarios:**
+
+1. **Namespace label missed**: New namespace, deployment without sidecars. Added label. Restarted deployments. Worked.
+
+2. **istiod outage**: istiod down. Pod creation succeeded (failure policy Ignore). Apps without sidecars. Fixed istiod, restarted pods.
+
+3. **Network policy issue**: NetworkPolicy blocked webhook. Identified via istiod logs (couldn't be called). Added allow rule.
+
+4. **CA bundle expired**: After cluster restore. CA bundle in webhook config invalid. Re-ran istioctl install.
+
+5. **Mixed injection**: Some pods injected, others not. Differences in annotations. Standardized via GitOps. Consistent.
+
+---
+
+## 414. Explain canary deployment using Istio
+
+Canary deployments gradually shift traffic to new versions. Istio enables sophisticated canary strategies.
+
+**Basic concept:**
+
+```
+Production: v1 (100% traffic)
+       ↓
+Deploy: v2 (0% traffic)
+       ↓
+Shift: v1 90%, v2 10%
+       ↓
+Monitor v2
+       ↓
+If healthy: shift more
+If unhealthy: rollback
+       ↓
+Eventually: v2 100%, v1 retired
+```
+
+**Setup:**
+
+**Step 1: Deploy v1 and v2**
+
+```yaml
+# v1:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app-v1
+  labels:
+    app: my-app
+    version: v1
+spec:
+  replicas: 9
+  selector:
+    matchLabels:
+      app: my-app
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: my-app
+        version: v1
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:v1
+
+---
+
+# v2:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app-v2
+  labels:
+    app: my-app
+    version: v2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-app
+      version: v2
+  template:
+    metadata:
+      labels:
+        app: my-app
+        version: v2
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:v2
+```
+
+**Step 2: Service selects both**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+spec:
+  selector:
+    app: my-app   # No version selector
+  ports:
+    - port: 80
+```
+
+**Step 3: DestinationRule subsets**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: my-app
+spec:
+  host: my-app
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+```
+
+**Step 4: VirtualService for split**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: my-app
+spec:
+  hosts:
+    - my-app
+  http:
+    - route:
+        - destination:
+            host: my-app
+            subset: v1
+          weight: 90
+        - destination:
+            host: my-app
+            subset: v2
+          weight: 10
+```
+
+**Progressive rollout:**
+
+```yaml
+# Stage 1: 5%:
+- destination: v2
+  weight: 5
+- destination: v1
+  weight: 95
+
+# Stage 2: 25%
+- destination: v2
+  weight: 25
+- destination: v1
+  weight: 75
+
+# Stage 3: 50%
+- destination: v2
+  weight: 50
+- destination: v1
+  weight: 50
+
+# Stage 4: 100%
+- destination: v2
+  weight: 100
+```
+
+Apply each stage, monitor, proceed if healthy.
+
+**Targeted canary:**
+
+**Internal users first:**
+
+```yaml
+http:
+  - match:
+      - headers:
+          x-internal-user:
+            exact: "true"
+    route:
+      - destination:
+          host: my-app
+          subset: v2
+  - route:
+      - destination:
+          host: my-app
+          subset: v1
+```
+
+Internal users → v2 (test in prod safely).
+External users → v1.
+
+**Specific cohort:**
+
+```yaml
+match:
+  - headers:
+      user-id:
+        regex: ".*[0-9]$"   # Specific users
+```
+
+**Geographic:**
+
+```yaml
+match:
+  - headers:
+      x-country:
+        exact: "US"
+```
+
+**Combined:**
+
+```yaml
+http:
+  # Always-on v2 for internal:
+  - match:
+      - headers:
+          x-internal:
+            exact: "true"
+    route:
+      - destination:
+          host: my-app
+          subset: v2
+  # 10% for others:
+  - route:
+      - destination:
+          host: my-app
+          subset: v1
+        weight: 90
+      - destination:
+          host: my-app
+          subset: v2
+        weight: 10
+```
+
+**Monitoring canary:**
+
+```promql
+# Per-version metrics:
+
+# Error rate v2 vs v1:
+sum(rate(istio_requests_total{destination_subset="v2", response_code=~"5.."}[5m]))
+/
+sum(rate(istio_requests_total{destination_subset="v2"}[5m]))
+
+# Latency v2 vs v1:
+histogram_quantile(0.99,
+  rate(istio_request_duration_milliseconds_bucket{destination_subset="v2"}[5m])
+)
+```
+
+Compare to v1. If v2 worse: rollback.
+
+**Automated canary (Flagger):**
+
+```yaml
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: my-app
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  service:
+    port: 80
+  analysis:
+    interval: 1m
+    threshold: 5
+    maxWeight: 50
+    stepWeight: 10
+    metrics:
+      - name: request-success-rate
+        thresholdRange:
+          min: 99
+        interval: 1m
+      - name: request-duration
+        thresholdRange:
+          max: 500
+        interval: 1m
+    webhooks:
+      - name: load-test
+        url: http://flagger-loadtester.test/
+```
+
+Flagger:
+1. Detects new version
+2. Gradually shifts traffic
+3. Runs analysis
+4. Auto-rollback or promote
+
+**Rollback:**
+
+**Manual:**
+
+```yaml
+# Quickly back to 100% v1:
+http:
+  - route:
+      - destination:
+          host: my-app
+          subset: v1
+        weight: 100
+```
+
+Apply, traffic shifts immediately.
+
+**Automated (Flagger):**
+
+If metrics fail:
+```
+Flagger detects failure
+Reverts traffic to v1
+Alerts team
+```
+
+**Best practices:**
+
+**Practice 1: Test in staging**
+
+Before production canary, full deployment to staging. Verify functionality.
+
+**Practice 2: Start small**
+
+```
+1-5% initial
+Increase only after monitoring
+```
+
+**Practice 3: Define success criteria**
+
+```
+- Error rate < 1%
+- P99 latency < 500ms
+- No customer complaints
+```
+
+**Practice 4: Backward compatibility**
+
+```
+v2 must work with:
+- Same database schema (or migrated)
+- Existing clients
+- Other services' APIs
+```
+
+**Practice 5: Set deadlines**
+
+```
+Canary at 50% for max 24 hours
+Then either promote or rollback
+Don't leave indefinitely
+```
+
+**Practice 6: Test rollback**
+
+```
+Verify rollback procedure works
+Practice in staging
+```
+
+**Common issues:**
+
+**Issue 1: Database compatibility**
+
+```
+v1 and v2 share DB
+Schema changes break v1 or v2
+```
+
+Solutions:
+- Schema migration before v2 deploy
+- Schema versioning
+- Two-phase migrations
+
+**Issue 2: Session affinity**
+
+```
+User on v2, request to v1 (different pod)
+Session lost
+```
+
+Sticky sessions or stateless design.
+
+**Issue 3: Cascading effects**
+
+```
+v2 has subtle bug
+Downstream services affected
+```
+
+Monitor downstream too.
+
+**Issue 4: Insufficient v2 replicas**
+
+```
+v2: 1 replica
+Traffic to v2: 50%
+Overloaded
+```
+
+Scale v2 before increasing weight.
+
+**Issue 5: Long-running connections**
+
+```
+Existing connections still on v1
+New connections on v2 (per traffic split)
+Not pure split
+```
+
+Connection-level vs request-level routing.
+
+**Production scenarios:**
+
+1. **Gradual canary**: 5% → 25% → 50% → 100% over 4 days. Each stage monitored. v2 healthy. Successful.
+
+2. **Flagger automated**: Configured Flagger. Canary fully automatic. Caught regression at 20%. Auto-rollback. Engineer notified.
+
+3. **Internal users first**: Beta header for internal team. Tested v2 in production. Caught UI issue before customers.
+
+4. **Quick rollback**: Canary at 30%. Error spike detected. Updated VirtualService weight to 100% v1. Recovered in 30 seconds.
+
+5. **Database migration**: v2 needed schema change. Two-phase: add column (compatible) → deploy v2 → remove old column. No issues.
+
+---
+
+## 415. How do you secure service-to-service communication?
+
+Securing east-west traffic requires multiple layers of defense. Service mesh provides foundation.
+
+**Defense layers:**
+
+**Layer 1: Network policies**
+
+L3/L4 isolation:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - port: 8080
+```
+
+Restricts who can talk to whom.
+
+**Layer 2: mTLS**
+
+Encryption + authentication:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+All in-mesh traffic mTLS.
+
+**Layer 3: Authorization policies**
+
+L7 access control:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: backend-access
+spec:
+  selector:
+    matchLabels:
+      app: backend
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/frontend"]
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            paths: ["/api/v1/*"]
+```
+
+Service-level authorization.
+
+**Layer 4: Application authentication**
+
+App-level auth:
+
+```python
+# JWT validation:
+@app.route('/api')
+@require_jwt
+def api():
+    user = request.user
+    # ...
+```
+
+Defense in depth.
+
+**Layer 5: Network encryption (CNI)**
+
+CNI-level encryption:
+
+```yaml
+# Cilium WireGuard:
+spec:
+  encryption:
+    enabled: true
+    type: wireguard
+```
+
+All pod-to-pod encrypted.
+
+**mTLS deep dive:**
+
+**Configuration levels:**
+
+```yaml
+# Mesh-wide:
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+
+# Namespace:
+spec:
+  mtls:
+    mode: STRICT
+metadata:
+  namespace: production
+
+# Workload:
+spec:
+  selector:
+    matchLabels:
+      app: api
+  mtls:
+    mode: STRICT
+```
+
+**Identity:**
+
+Each workload gets cryptographic identity:
+
+```
+spiffe://cluster.local/ns/production/sa/payment-api
+```
+
+Used for:
+- mTLS handshake
+- Authorization decisions
+- Audit logs
+
+**Verification:**
+
+```promql
+# mTLS coverage:
+sum(rate(istio_requests_total{security_policy="mutual_tls"}[5m]))
+/
+sum(rate(istio_requests_total[5m]))
+```
+
+Should be ~100% in STRICT mode.
+
+**Authorization policies:**
+
+**Allow specific workloads:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: api-access
+spec:
+  selector:
+    matchLabels:
+      app: api
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/web"]
+            namespaces: ["production"]
+```
+
+Only specific SAs.
+
+**Deny by default:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: production
+spec:
+  {}
+```
+
+Default deny. Then allow explicit.
+
+**Path-based:**
+
+```yaml
+rules:
+  - to:
+      - operation:
+          paths: ["/admin/*"]
+          methods: ["GET", "POST"]
+    from:
+      - source:
+          principals: ["cluster.local/ns/admin/sa/admin-service"]
+```
+
+Granular per endpoint.
+
+**JWT-based:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: jwt
+spec:
+  selector:
+    matchLabels:
+      app: api
+  jwtRules:
+    - issuer: "https://auth.example.com"
+      jwksUri: "https://auth.example.com/.well-known/jwks.json"
+
+---
+
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+spec:
+  rules:
+    - from:
+        - source:
+            requestPrincipals: ["https://auth.example.com/*"]
+```
+
+JWT validated, user identity available.
+
+**Service mesh + Network Policy:**
+
+```yaml
+# NetworkPolicy: L3/L4 (IP-based):
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web
+
+# AuthorizationPolicy: L7 (identity-based):
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+spec:
+  selector:
+    matchLabels:
+      app: api
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/web/sa/web"]
+```
+
+Both for defense in depth.
+
+**Egress control:**
+
+```yaml
+# Restrict outbound:
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: default
+spec:
+  egress:
+    - hosts:
+        - "./*"
+        - "istio-system/*"
+```
+
+Sidecar only knows allowed hosts.
+
+**External services:**
+
+```yaml
+# Explicit ServiceEntry for allowed external:
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+spec:
+  hosts:
+    - api.external.com
+  ports:
+    - number: 443
+      protocol: HTTPS
+```
+
+Block unknown external (with proper egress policy).
+
+**Compliance considerations:**
+
+**SOC 2:**
+- Audit logs of access
+- Authentication required
+- Encryption in transit
+
+**PCI-DSS:**
+- Encryption (strong)
+- Access control
+- Audit trails
+
+**HIPAA:**
+- Encryption in transit (mTLS)
+- Access controls
+- Audit logs
+
+**Zero-trust:**
+
+```
+Never trust based on network location
+Authenticate every connection
+Authorize every request
+Encrypt everything
+Audit everything
+```
+
+Service mesh enables this model.
+
+**Implementation:**
+
+```
+Layer 1: Workload identity (SA)
+Layer 2: mTLS for transport
+Layer 3: AuthorizationPolicies
+Layer 4: JWT for users
+Layer 5: NetworkPolicy
+Layer 6: Audit logs
+```
+
+**Monitoring:**
+
+```promql
+# Authentication failures:
+sum(rate(istio_requests_total{response_code="403"}[5m]))
+
+# Authorization failures:
+sum(rate(istio_requests_total{response_code="403", response_flags="UAEX"}[5m]))
+
+# mTLS coverage:
+sum(rate(istio_requests_total{security_policy="mutual_tls"}[5m]))
+/
+sum(rate(istio_requests_total[5m]))
+```
+
+**Alerts:**
+
+```yaml
+- alert: mTLSCoverageLow
+  expr: |
+    sum(rate(istio_requests_total{security_policy="mutual_tls"}[5m]))
+    /
+    sum(rate(istio_requests_total[5m]))
+    < 0.99
+  for: 10m
+
+- alert: HighAuthDenials
+  expr: |
+    sum(rate(istio_requests_total{response_code="403"}[5m])) > 100
+  for: 5m
+```
+
+**Production scenarios:**
+
+1. **STRICT mTLS migration**: Started PERMISSIVE. Monitored coverage. Once 99.9%+ mTLS, switched STRICT. Defense in depth.
+
+2. **Default deny**: Implemented namespace default-deny AuthorizationPolicy. Explicit allows. Reduced attack surface.
+
+3. **JWT for users + mTLS for services**: Two-factor identity. Service authenticated via mTLS, user via JWT. Comprehensive auth.
+
+4. **Compromised pod limited**: App vulnerability led to RCE. mTLS prevented lateral movement (no valid cert for other services). Damage limited.
+
+5. **Compliance audit passed**: Demonstrated mTLS coverage, AuthorizationPolicies, audit logs. SOC 2 audit smooth.
+
+---
+
+## 416. Explain multi-cluster service mesh
+
+Multi-cluster mesh extends mesh capabilities across multiple Kubernetes clusters. Critical for multi-region, DR, and federated deployments.
+
+**Why multi-cluster:**
+
+- Geographic distribution
+- Disaster recovery
+- Tenant isolation
+- Scale beyond single cluster
+- Compliance (data sovereignty)
+
+**Mesh challenges across clusters:**
+
+```
+Cluster A: pod CIDR 10.244.0.0/16
+Cluster B: pod CIDR 10.245.0.0/16
+
+Issues:
+- Pod-to-pod connectivity
+- Service discovery
+- mTLS across clusters
+- Identity federation
+- Failover
+```
+
+**Istio multi-cluster models:**
+
+**Model 1: Single mesh, primary-remote**
+
+```
+Cluster A: full control plane (primary)
+Cluster B: remote (uses A's control plane)
+```
+
+Single mesh spans both.
+
+**Model 2: Multi-primary**
+
+```
+Cluster A: own control plane
+Cluster B: own control plane
+Both peered, share identity
+```
+
+More autonomous.
+
+**Model 3: Multi-network**
+
+```
+Different networks (different VPCs)
+Connected via gateways
+```
+
+**Multi-cluster setup:**
+
+**Requirements:**
+
+```
+1. Non-overlapping CIDRs (or proper routing)
+2. Network connectivity between clusters
+3. Same root CA (or trusted CAs)
+4. DNS resolution between clusters
+```
+
+**Single mesh, multi-network:**
+
+```yaml
+# Cluster A install:
+istioctl install -f cluster-a.yaml
+
+# cluster-a.yaml:
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  values:
+    global:
+      meshID: mesh1
+      multiCluster:
+        clusterName: cluster-a
+      network: network-a
+```
+
+```yaml
+# Cluster B install:
+spec:
+  values:
+    global:
+      meshID: mesh1
+      multiCluster:
+        clusterName: cluster-b
+      network: network-b
+```
+
+Same meshID, different clusters/networks.
+
+**Cross-cluster gateway:**
+
+```yaml
+# Each cluster has gateway:
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: cross-network-gateway
+spec:
+  selector:
+    istio: eastwestgateway
+  servers:
+    - port:
+        number: 15443
+        name: tls
+        protocol: TLS
+      tls:
+        mode: AUTO_PASSTHROUGH
+      hosts:
+        - "*.local"
+```
+
+Gateways enable cross-cluster.
+
+**Service discovery:**
+
+```
+1. Service in Cluster A
+2. ServiceEntry created in Cluster B (auto via Istio multi-cluster)
+3. Cluster B knows about Cluster A's services
+4. Apps can call cross-cluster services
+```
+
+**Identity:**
+
+```yaml
+# Shared root CA:
+# Both clusters use certs signed by same CA
+# Identities format: spiffe://my-mesh.local/...
+```
+
+mTLS works across clusters.
+
+**Linkerd multi-cluster:**
+
+```bash
+# Install on both clusters:
+linkerd install | kubectl apply -f -
+
+# Multi-cluster extension:
+linkerd multicluster install | kubectl apply -f -
+
+# Link clusters:
+linkerd multicluster link --cluster-name cluster-a | kubectl apply -f -
+```
+
+**Service mirroring:**
+
+```yaml
+# In cluster A, service x exists
+# Mirror to cluster B:
+linkerd --context=cluster-b multicluster install
+linkerd --context=cluster-a multicluster link --cluster-name=remote
+```
+
+In cluster B, services appear as:
+```
+my-service-cluster-a
+```
+
+Access via mirrored service.
+
+**Cilium Cluster Mesh:**
+
+```bash
+# Enable:
+cilium clustermesh enable --context cluster-a
+cilium clustermesh enable --context cluster-b
+cilium clustermesh connect --context cluster-a --destination-context cluster-b
+```
+
+**Global services:**
+
+```yaml
+# Service in cluster A:
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  annotations:
+    service.cilium.io/global: "true"
+spec:
+  selector:
+    app: my-app
+```
+
+Service spans clusters. Pods from both available.
+
+**Use cases:**
+
+**Use case 1: Active-passive DR**
+
+```
+Primary: Cluster A (US-East)
+DR: Cluster B (US-West)
+Failover: traffic shifts to B
+```
+
+**Use case 2: Active-active geographic**
+
+```
+Cluster A: serves US users
+Cluster B: serves EU users
+Global load balancer routes
+```
+
+**Use case 3: Burst capacity**
+
+```
+Primary cluster: normal load
+Secondary: traffic spikes
+Auto-scale across
+```
+
+**Use case 4: Tenant isolation**
+
+```
+Each tenant: own cluster
+Shared services in central cluster
+Cross-cluster mesh for shared
+```
+
+**Traffic management:**
+
+**Failover:**
+
+```yaml
+# VirtualService with multiple destinations:
+spec:
+  http:
+    - route:
+        - destination:
+            host: my-service.namespace.svc.cluster.local
+        # Failover to remote
+```
+
+If local unavailable, route to remote cluster.
+
+**Locality-based:**
+
+```yaml
+# DestinationRule:
+spec:
+  trafficPolicy:
+    loadBalancer:
+      localityLbSetting:
+        enabled: true
+        distribute:
+          - from: us-east-1/*
+            to:
+              "us-east-1/*": 80
+              "us-west-1/*": 20
+```
+
+Prefer local, failover remote.
+
+**Challenges:**
+
+**Challenge 1: Network connectivity**
+
+Clusters must reach each other:
+- Direct VPC peering
+- VPN
+- Internet (with proper firewalls)
+
+**Challenge 2: Latency**
+
+```
+Same region: 1-5ms
+Cross-region: 50-200ms
+```
+
+Affects cross-cluster calls.
+
+**Challenge 3: Data sovereignty**
+
+GDPR: EU user data must stay in EU. Mesh routing must respect.
+
+**Challenge 4: Operational complexity**
+
+Multiple control planes, multiple clusters, multiple networks. More to operate.
+
+**Challenge 5: Cost**
+
+```
+Cross-region egress: $0.02-0.10/GB
+Multi-cluster cost: significant for high traffic
+```
+
+**Monitoring across clusters:**
+
+```promql
+# Cross-cluster requests:
+sum by (source_cluster, destination_cluster) (
+  rate(istio_requests_total[5m])
+)
+
+# Cross-cluster latency:
+histogram_quantile(0.99,
+  rate(istio_request_duration_milliseconds_bucket{source_cluster!="destination_cluster"}[5m])
+)
+```
+
+**Best practices:**
+
+1. **Plan CIDRs**: non-overlapping from start
+2. **Shared root CA**: simplifies trust
+3. **Latency awareness**: avoid unnecessary cross-cluster
+4. **Locality preferences**: same-cluster first
+5. **DR drills**: test failover regularly
+6. **Cost monitoring**: track egress
+7. **Documentation**: complex setups need docs
+
+**Production scenarios:**
+
+1. **DR multi-cluster**: Production us-east-1, DR us-west-2. Istio multi-cluster. Survived us-east-1 outage. Traffic shifted.
+
+2. **Cilium for performance**: 5 clusters, needed cross-cluster service access. Cilium Cluster Mesh (eBPF). Lower overhead than Istio.
+
+3. **Linkerd for simplicity**: 2 clusters, mesh needed. Linkerd multi-cluster. Easier than Istio. Service mirroring straightforward.
+
+4. **Multi-region active-active**: Users globally. Clusters in US, EU, Asia. Locality routing. Each region served locally.
+
+5. **Operational learning**: Multi-cluster harder than expected. Started with 2, scaled to 5. Operational team grew.
+
+---
+
+## 417. How do you optimize service mesh performance?
+
+Service mesh adds overhead. Optimization minimizes impact while keeping benefits.
+
+**Overhead sources:**
+
+```
+Sidecar latency: 1-3ms per hop
+Sidecar CPU: 0.1-0.5 cores per pod
+Sidecar memory: 50-200MB per pod
+mTLS handshakes: CPU intensive
+```
+
+**Optimization strategies:**
+
+**Strategy 1: Right-size sidecars**
+
+```yaml
+# Default:
+spec:
+  values:
+    global:
+      proxy:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 2
+            memory: 1Gi
+```
+
+Tune per workload:
+
+```yaml
+# Per pod:
+metadata:
+  annotations:
+    sidecar.istio.io/proxyCPU: "50m"
+    sidecar.istio.io/proxyMemory: "64Mi"
+    sidecar.istio.io/proxyCPULimit: "500m"
+    sidecar.istio.io/proxyMemoryLimit: "256Mi"
+```
+
+Low-traffic pods need less.
+
+**Strategy 2: Sidecar resource (scope)**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: default
+  namespace: production
+spec:
+  egress:
+    - hosts:
+        - "./*"
+        - "istio-system/*"
+```
+
+Sidecar only knows local namespace + istio-system. Less config = less memory.
+
+Default: sidecar knows all services in cluster. With many services, significant memory.
+
+**Strategy 3: Disable unused features**
+
+```yaml
+# Telemetry tuning:
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  meshConfig:
+    enableTracing: false   # If not using tracing
+```
+
+**Strategy 4: Reduce telemetry cardinality**
+
+```yaml
+# Telemetry v2:
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: default
+spec:
+  metrics:
+    - providers:
+        - name: prometheus
+      overrides:
+        - match:
+            metric: REQUEST_COUNT
+          tagOverrides:
+            request_protocol:
+              operation: REMOVE
+```
+
+Remove high-cardinality labels.
+
+**Strategy 5: Limit access logs**
+
+```yaml
+# Don't log all requests:
+spec:
+  meshConfig:
+    accessLogFile: ""   # Disable
+```
+
+Or selectively:
+
+```yaml
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+spec:
+  accessLogging:
+    - providers:
+        - name: envoy
+      filter:
+        expression: "response.code >= 400"
+```
+
+Only log errors.
+
+**Strategy 6: Tail-based tracing**
+
+```yaml
+processors:
+  tail_sampling:
+    policies:
+      - name: errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: probabilistic
+        type: probabilistic
+        probabilistic: {sampling_percentage: 1}
+```
+
+Keep errors + 1% sample. Reduces storage 99%.
+
+**Strategy 7: Ambient mode (Istio)**
+
+```yaml
+# No per-pod sidecars
+# Ztunnel on each node
+# Waypoint proxies for L7 (optional)
+```
+
+Significantly less overhead per pod.
+
+**Strategy 8: eBPF-based (Cilium)**
+
+```
+Cilium Service Mesh:
+- No sidecars
+- eBPF in kernel
+- Lowest overhead
+```
+
+**Strategy 9: Selective mesh participation**
+
+```yaml
+# Only inject for pods that need it:
+metadata:
+  annotations:
+    sidecar.istio.io/inject: "false"   # Skip
+```
+
+Performance-critical pods outside mesh.
+
+**Strategy 10: HTTP/2 keepalive**
+
+```yaml
+# DestinationRule:
+spec:
+  trafficPolicy:
+    connectionPool:
+      http:
+        h2UpgradePolicy: UPGRADE
+        useClientProtocol: false
+```
+
+HTTP/2 multiplexing reduces connection overhead.
+
+**Strategy 11: Compile-time optimization (Istio)**
+
+Some Istio builds optimize for performance:
+
+```yaml
+# Reduce binary size, optimize:
+spec:
+  values:
+    global:
+      proxy:
+        image: proxyv2-distroless
+```
+
+Smaller, faster startup.
+
+**Strategy 12: Connection pooling**
+
+```yaml
+trafficPolicy:
+  connectionPool:
+    tcp:
+      maxConnections: 100
+    http:
+      http2MaxRequests: 1000
+      maxRequestsPerConnection: 100
+```
+
+Reuse connections.
+
+**Strategy 13: Outlier detection efficiency**
+
+```yaml
+outlierDetection:
+  consecutive5xxErrors: 5
+  interval: 60s   # Don't check too frequently
+```
+
+Less frequent checks = less CPU.
+
+**Strategy 14: Network optimization**
+
+Use eBPF-based CNI (Cilium) instead of iptables:
+
+```
+iptables: O(n) per rule
+eBPF: O(1) lookup
+```
+
+Significant at scale.
+
+**Strategy 15: TLS optimization**
+
+```yaml
+# Modern TLS:
+spec:
+  meshConfig:
+    defaultProviders:
+      tracing:
+      - jaeger
+# TLS 1.3 (faster handshakes)
+```
+
+**Measuring overhead:**
+
+```promql
+# Sidecar CPU:
+sum by (pod) (rate(container_cpu_usage_seconds_total{container="istio-proxy"}[5m]))
+
+# Sidecar memory:
+sum by (pod) (container_memory_working_set_bytes{container="istio-proxy"})
+
+# Compare:
+sum by (pod) (rate(container_cpu_usage_seconds_total{container!="istio-proxy"}[5m]))
+```
+
+Track overhead per workload.
+
+**Benchmarking:**
+
+```bash
+# Test with and without mesh:
+
+# Without:
+fortio load -c 10 -qps 1000 -t 60s http://service-direct
+
+# With:
+fortio load -c 10 -qps 1000 -t 60s http://service-meshed
+```
+
+Measure latency, throughput, resource usage.
+
+**Common bottlenecks:**
+
+**Bottleneck 1: Sidecar config size**
+
+Many services = large config = high memory.
+
+Fix: Sidecar resource (limit scope).
+
+**Bottleneck 2: Telemetry overhead**
+
+High cardinality metrics consume Prometheus.
+
+Fix: tune labels, drop unused.
+
+**Bottleneck 3: TLS handshakes**
+
+Many connections = many handshakes.
+
+Fix: connection pooling, HTTP/2.
+
+**Bottleneck 4: Logging volume**
+
+Access logs at high traffic = massive volume.
+
+Fix: filter, sample, or disable.
+
+**Bottleneck 5: Istiod load**
+
+Many services + sidecars = load on istiod.
+
+Fix: scale istiod, optimize config updates.
+
+**Comparison:**
+
+| Mesh | Overhead per pod | Latency |
+|------|------------------|---------|
+| Istio sidecar | 50-200MB, 0.1-0.5 CPU | 1-3ms |
+| Istio Ambient | 10-50MB (node), 0.1 CPU | 0.5-2ms |
+| Linkerd | 10-30MB, 0.05-0.2 CPU | 0.5-1ms |
+| Cilium Service Mesh | None per pod, agent on node | <0.5ms |
+
+Choose based on overhead tolerance.
+
+**Production scenarios:**
+
+1. **Sidecar resource scope**: 200 services. Default sidecars knew all. Memory 500MB each. Added Sidecar resource per namespace. Reduced to 100MB.
+
+2. **Access logs disabled**: High-traffic gateway, access logs filled storage. Disabled. Selectively re-enabled for errors only.
+
+3. **Ambient mode**: Sidecar overhead unacceptable for high-density nodes. Tested Ambient mode. 80% reduction in overhead.
+
+4. **Cilium migration**: Latency-sensitive app. Istio added 2ms. Migrated to Cilium Service Mesh. Latency under 0.5ms.
+
+5. **Tail sampling**: 100% trace sampling expensive. Implemented tail sampling. Reduced storage 95% while keeping error/slow traces.
+
+---
+
+## 418. Explain service mesh upgrade challenges
+
+Service mesh upgrades are critical infrastructure changes. Multiple components, dependencies, and risks.
+
+**Upgrade complexity:**
+
+```
+Components to upgrade:
+- Control plane (istiod, Linkerd controllers)
+- Data plane (sidecars in every pod)
+- CRDs (potentially breaking changes)
+- Add-ons (Kiali, Jaeger, Grafana)
+```
+
+Each step has risks.
+
+**Istio upgrade strategies:**
+
+**Strategy 1: In-place**
+
+```bash
+# Upgrade control plane:
+istioctl upgrade
+
+# Restart pods to update sidecars:
+kubectl rollout restart deployment -n my-namespace
+```
+
+Direct, simple. But:
+- Control plane briefly unavailable
+- Pod restart for sidecar update
+- Risk of mistakes
+
+**Strategy 2: Revisioned (canary upgrade)**
+
+```bash
+# Install new revision alongside old:
+istioctl install --revision=1-20-0
+
+# Result:
+# istiod-1-19 (old, still running)
+# istiod-1-20 (new)
+```
+
+Both control planes running. Migrate gradually.
+
+**Migrate namespaces:**
+
+```bash
+# Switch namespace to new revision:
+kubectl label namespace my-app istio.io/rev=1-20-0 istio-injection-
+
+# Restart pods:
+kubectl rollout restart deployment -n my-app
+
+# Pods now use new revision
+```
+
+Test, then migrate more namespaces.
+
+**Uninstall old:**
+
+```bash
+# Once all namespaces migrated:
+istioctl uninstall --revision=1-19-0
+```
+
+Safer than in-place. Slow but reliable.
+
+**Strategy 3: Stable revision**
+
+```yaml
+# Always use stable revision label:
+metadata:
+  labels:
+    istio.io/rev: stable
+```
+
+Maintain "stable" revision alias. Upgrade by re-aliasing.
+
+**Upgrade challenges:**
+
+**Challenge 1: API changes**
+
+```
+Istio 1.x → 2.x: breaking CRD changes
+Resource versions deprecated
+Manual updates needed
+```
+
+**Check before upgrade:**
+
+```bash
+istioctl analyze
+istioctl x precheck
+```
+
+Identifies incompatibilities.
+
+**Challenge 2: Sidecar version mismatch**
+
+```
+New control plane sends new config
+Old sidecars don't understand
+Errors
+```
+
+Solution: incremental rollout (revisioned).
+
+**Challenge 3: Pod restart requirement**
+
+```
+Sidecar version pinned at pod creation
+Must restart pod to upgrade sidecar
+```
+
+For 1000 pods: significant operation.
+
+**Strategy:**
+
+```bash
+# Rolling restart:
+kubectl rollout restart deployment -n production
+
+# PDB ensures availability
+```
+
+**Challenge 4: Add-on dependencies**
+
+```
+Istio 1.20 needs Kiali 1.75+
+Old Kiali incompatible
+Must upgrade together
+```
+
+Coordinate.
+
+**Challenge 5: Resource changes**
+
+```
+New version: more memory required
+Existing limits: OOMKilled
+```
+
+Test in staging.
+
+**Challenge 6: Configuration changes**
+
+```
+Telemetry v1 → v2: different API
+EnvoyFilters might break
+```
+
+Review release notes.
+
+**Linkerd upgrade:**
+
+```bash
+# Upgrade control plane:
+linkerd upgrade | kubectl apply -f -
+
+# Verify:
+linkerd check
+
+# Restart pods to update proxies:
+linkerd uninject /var/run/secrets/...   # If needed
+kubectl rollout restart deployment -n my-app
+```
+
+Generally simpler than Istio.
+
+**Pre-upgrade checklist:**
+
+```
+1. Read release notes
+2. Check supported K8s versions
+3. Run istioctl analyze / linkerd check
+4. Test in dev cluster
+5. Backup Istio config
+6. Plan rollback
+7. Communicate downtime (if any)
+8. Schedule maintenance window
+```
+
+**Testing:**
+
+```yaml
+# Dev cluster:
+1. Install new version
+2. Run all test cases
+3. Test critical paths
+4. Verify metrics, traces
+5. Document issues
+```
+
+**Compatibility:**
+
+**Istio version skew:**
+
+```
+Control plane: 1.20
+Sidecar: 1.19
+
+Generally supported within 2 minor versions
+But test thoroughly
+```
+
+**Kubernetes compatibility:**
+
+```
+Istio 1.20: K8s 1.25+
+Istio 1.19: K8s 1.24+
+
+Check before upgrading
+```
+
+**Rollback:**
+
+**Revisioned approach:**
+
+```bash
+# Easy rollback:
+# Old revision still installed
+# Re-label namespace back:
+kubectl label namespace my-app istio.io/rev=1-19-0 --overwrite
+
+# Restart pods:
+kubectl rollout restart deployment
+```
+
+**In-place:**
+
+```bash
+# Harder rollback:
+istioctl install --version=1.19.0
+# But existing resources may be incompatible
+```
+
+**Common issues:**
+
+**Issue 1: Old sidecar can't connect to new istiod**
+
+```
+Sidecar logs: errors connecting to control plane
+```
+
+Fix: restart pod to get new sidecar.
+
+**Issue 2: Validation errors**
+
+```
+"unsupported value for X"
+```
+
+CRD field removed in new version. Update resources.
+
+**Issue 3: Performance regression**
+
+```
+New version slower or higher memory
+```
+
+Tune resources. May need to adjust limits.
+
+**Issue 4: Missing features**
+
+```
+Used EnvoyFilter, not supported in new version
+```
+
+Refactor before upgrade.
+
+**Issue 5: Add-on incompatibility**
+
+```
+Kiali doesn't show data after Istio upgrade
+```
+
+Upgrade Kiali too.
+
+**Best practices:**
+
+1. **Use revisioned upgrades**: safer
+2. **Test in dev first**: validate
+3. **Read release notes**: every time
+4. **Plan rollback**: have escape route
+5. **Upgrade frequently**: avoid huge jumps
+6. **Monitor during upgrade**: catch issues
+7. **Coordinate with team**: not solo activity
+8. **PDB**: protect during pod restarts
+
+**Cadence:**
+
+```
+Istio: ~3 months between minor releases
+Stay 1-2 versions behind latest
+Don't lag too far behind (deprecated APIs)
+```
+
+**Production scenarios:**
+
+1. **Revisioned upgrade**: Istio 1.18 → 1.20. Used revisioned approach. Migrated namespaces gradually. Zero downtime. 2 weeks total.
+
+2. **Major version**: Istio 1.x → 2.x (hypothetical). Many breaking changes. 3-month project. Lots of testing.
+
+3. **Quick patch**: Security CVE in Istio. Upgraded same day. In-place upgrade. Tested briefly, applied. Patched.
+
+4. **EnvoyFilter regression**: Used EnvoyFilter, broke in upgrade. Refactored to Telemetry v2 API. Cleaner solution.
+
+5. **Linkerd simpler**: Linkerd upgrade quarterly. `linkerd upgrade`. Run `linkerd check`. Done in hours. Simpler than Istio.
+
+---
+
+## 419. How do you troubleshoot Envoy crashes?
+
+Envoy sidecar crashes break pod functionality. Systematic diagnosis required.
+
+**Symptoms:**
+
+```
+Pod restarting frequently
+Application can't communicate
+istio-proxy container CrashLoopBackOff
+```
+
+**Step 1: Check container status**
+
+```bash
+kubectl describe pod my-pod
+
+# Look at:
+# - istio-proxy container status
+# - Last termination reason
+# - Restart count
+```
+
+**Step 2: Check Envoy logs**
+
+```bash
+# Current logs:
+kubectl logs my-pod -c istio-proxy
+
+# Previous instance:
+kubectl logs my-pod -c istio-proxy --previous
+```
+
+Look for:
+- Stack traces
+- "OOMKilled"
+- Config errors
+- xDS errors
+
+**Step 3: Container state**
+
+```bash
+kubectl get pod my-pod -o jsonpath='{.status.containerStatuses[?(@.name=="istio-proxy")]}'
+```
+
+State details.
+
+**Common crash causes:**
+
+**Cause 1: OOMKilled**
+
+```
+Last State: Terminated
+Reason: OOMKilled
+Exit Code: 137
+```
+
+Memory limit too low.
+
+Fix:
+
+```yaml
+metadata:
+  annotations:
+    sidecar.istio.io/proxyMemoryLimit: "1Gi"
+```
+
+**Cause 2: Config error**
+
+```
+Logs show: "Invalid config"
+```
+
+EnvoyFilter or other config broken.
+
+Fix:
+
+```bash
+istioctl analyze
+# Identifies issues
+```
+
+Remove or fix bad config.
+
+**Cause 3: xDS connection failures**
+
+```
+Logs: "Unable to connect to xds-grpc"
+"transport: error while dialing"
+```
+
+Can't reach istiod.
+
+Causes:
+- istiod down
+- Network policy blocking
+- DNS issues
+
+**Diagnosis:**
+
+```bash
+# istiod running?
+kubectl get pods -n istio-system -l app=istiod
+
+# Network connectivity:
+kubectl exec my-pod -c istio-proxy -- nc -zv istiod.istio-system 15012
+```
+
+**Cause 4: Cert issues**
+
+```
+Logs: "Certificate verification failed"
+"x509: certificate has expired"
+```
+
+mTLS cert problem.
+
+```bash
+# Inspect certs:
+istioctl proxy-config secret my-pod
+```
+
+If expired: restart pod to get new cert.
+
+**Cause 5: Resource exhaustion**
+
+```
+Logs: "Resource limit reached"
+```
+
+Connection limits, fd limits.
+
+**Cause 6: Bug**
+
+Some Envoy versions have bugs. Check release notes.
+
+**Detailed log analysis:**
+
+**Look for:**
+
+```
+ERROR
+WARN
+panic:
+segfault
+SIGSEGV
+fatal
+```
+
+Common Envoy errors:
+
+```
+"Unable to bind to address" - port conflict
+"Drained" - normal shutdown
+"upstream_reset_before_response_started" - upstream issue
+"upstream_max_stream_duration_reached" - timeout
+```
+
+**Diagnostic commands:**
+
+**Config dump:**
+
+```bash
+kubectl exec my-pod -c istio-proxy -- curl -s localhost:15000/config_dump > config.json
+```
+
+Full Envoy config. Inspect.
+
+**Stats:**
+
+```bash
+kubectl exec my-pod -c istio-proxy -- curl -s localhost:15000/stats
+```
+
+All Envoy metrics.
+
+**Clusters:**
+
+```bash
+kubectl exec my-pod -c istio-proxy -- curl -s localhost:15000/clusters
+```
+
+Cluster status, health.
+
+**Listeners:**
+
+```bash
+istioctl proxy-config listener my-pod
+```
+
+**Routes:**
+
+```bash
+istioctl proxy-config route my-pod
+```
+
+**Endpoints:**
+
+```bash
+istioctl proxy-config endpoint my-pod
+```
+
+**Comparison with healthy pod:**
+
+```bash
+# Get configs from both:
+istioctl proxy-config cluster my-pod > problem.txt
+istioctl proxy-config cluster healthy-pod > healthy.txt
+diff problem.txt healthy.txt
+```
+
+**Resource limits:**
+
+```yaml
+# Check current:
+kubectl get pod my-pod -o jsonpath='{.spec.containers[?(@.name=="istio-proxy")].resources}'
+
+# Increase if needed:
+metadata:
+  annotations:
+    sidecar.istio.io/proxyCPULimit: "2"
+    sidecar.istio.io/proxyMemoryLimit: "1Gi"
+```
+
+**Common scenarios:**
+
+**Scenario 1: After Istio upgrade**
+
+```
+Sidecar crashes after upgrade
+```
+
+Causes:
+- Incompatible config
+- Version skew
+- Resource changes needed
+
+Fix:
+- Restart pods (get new sidecar)
+- Update configs
+- Adjust resources
+
+**Scenario 2: After deploy**
+
+```
+Application change breaks sidecar
+```
+
+Causes:
+- App listening on wrong port
+- App health check fails
+- Volume mount conflicts
+
+**Scenario 3: Heavy traffic**
+
+```
+Sidecar crashes under load
+```
+
+Causes:
+- Resource limits hit
+- Connection limits
+- Buffer overflows
+
+Fix: increase resources, tune connection pools.
+
+**Scenario 4: Random crashes**
+
+```
+Sidecar crashes intermittently
+```
+
+Possibly:
+- Memory leak
+- Bug in version
+- Specific request pattern
+
+Investigate, possibly upgrade.
+
+**Scenario 5: Specific endpoints**
+
+```
+Sidecar OK most time, crashes on specific calls
+```
+
+Possibly:
+- EnvoyFilter bug
+- Specific protocol issue
+
+Reproduce, debug.
+
+**Debugging tools:**
+
+**istioctl proxy-status:**
+
+```bash
+istioctl proxy-status
+```
+
+Shows sync status of all sidecars. If "STALE" or "NOT SENT": config issue.
+
+**istioctl analyze:**
+
+```bash
+istioctl analyze -n my-app
+```
+
+Identifies configuration issues.
+
+**Envoy admin endpoints:**
+
+```bash
+# Many useful endpoints:
+kubectl port-forward my-pod 15000:15000 -c istio-proxy
+curl http://localhost:15000/
+
+# Endpoints:
+# /clusters
+# /listeners
+# /routes
+# /stats
+# /config_dump
+# /server_info
+```
+
+**Increase log level:**
+
+```bash
+istioctl proxy-config log my-pod --level debug
+```
+
+More verbose logs. Disable after debugging.
+
+**Recovery actions:**
+
+**Action 1: Restart pod**
+
+```bash
+kubectl delete pod my-pod
+```
+
+Often resolves transient issues.
+
+**Action 2: Rollout restart**
+
+```bash
+kubectl rollout restart deployment my-app
+```
+
+For multiple pods.
+
+**Action 3: Remove problematic config**
+
+```bash
+# Remove EnvoyFilter:
+kubectl delete envoyfilter bad-filter
+```
+
+**Action 4: Adjust resources**
+
+```yaml
+metadata:
+  annotations:
+    sidecar.istio.io/proxyMemoryLimit: "2Gi"
+```
+
+**Action 5: Upgrade**
+
+```bash
+istioctl upgrade
+```
+
+If bug fixed in newer version.
+
+**Prevention:**
+
+1. **Adequate resources**: don't run too lean
+2. **Test configs**: in dev before prod
+3. **Monitor**: alert on crashes
+4. **Stay current**: bug fixes in updates
+5. **Validation**: istioctl analyze regularly
+
+**Production scenarios:**
+
+1. **OOMKilled fix**: High-traffic pod, sidecar OOMKilled. Default 1Gi limit. Increased to 2Gi for this workload. Stable.
+
+2. **EnvoyFilter bug**: Custom EnvoyFilter caused crashes. Identified via logs. Fixed config. Resolved.
+
+3. **xDS issue**: All sidecars crashing simultaneously. istiod down. Restarted istiod. Sidecars recovered.
+
+4. **Cert expiry**: Sidecars crashed at 24h mark. Cert renewal failed (DNS issue). Fixed DNS. Sidecars healthy.
+
+5. **Upgrade regression**: Istio 1.x upgrade caused crashes. Specific bug. Downgraded. Waited for patch.
+
+---
+
+## 420. Explain egress traffic control
+
+Egress traffic is outbound traffic from cluster to external services. Controlling provides security, compliance, observability.
+
+**Default behavior:**
+
+```
+Pods can reach external services freely (typically)
+No restrictions on what they call
+Security and compliance issues
+```
+
+**Why control egress:**
+
+- **Security**: prevent data exfiltration
+- **Compliance**: only approved external services
+- **Observability**: track external calls
+- **Cost**: identify expensive external calls
+- **Reliability**: control timeouts, retries
+
+**Istio egress patterns:**
+
+**Pattern 1: Direct (no control)**
+
+```yaml
+# Default:
+spec:
+  meshConfig:
+    outboundTrafficPolicy:
+      mode: ALLOW_ANY
+```
+
+Anything goes. Not recommended for production.
+
+**Pattern 2: Registry only**
+
+```yaml
+spec:
+  meshConfig:
+    outboundTrafficPolicy:
+      mode: REGISTRY_ONLY
+```
+
+Only services in registry (ServiceEntry or in-mesh) reachable. Unknown blocked.
+
+**Approach 1: ServiceEntry for allowed external**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: external-api
+spec:
+  hosts:
+    - api.external.com
+  ports:
+    - number: 443
+      name: https
+      protocol: HTTPS
+  resolution: DNS
+```
+
+ServiceEntry tells mesh about external service. Allowed.
+
+**Apps now have visibility:**
+- Traffic to api.external.com goes through Envoy
+- Metrics, traces generated
+- Policies applied
+
+**Approach 2: Egress gateway**
+
+Centralized egress point:
+
+```yaml
+# Egress gateway deployment:
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  components:
+    egressGateways:
+      - name: istio-egressgateway
+        enabled: true
+
+# Route through egress gateway:
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: external-api-via-egress
+spec:
+  hosts:
+    - api.external.com
+  gateways:
+    - istio-egressgateway
+    - mesh
+  http:
+    - match:
+        - gateways:
+            - mesh
+          port: 443
+      route:
+        - destination:
+            host: istio-egressgateway.istio-system.svc.cluster.local
+            port:
+              number: 443
+    - match:
+        - gateways:
+            - istio-egressgateway
+          port: 443
+      route:
+        - destination:
+            host: api.external.com
+            port:
+              number: 443
+```
+
+All external traffic flows through egress gateway:
+
+```
+Pod → sidecar → egress gateway → external service
+```
+
+Benefits:
+- Single point of egress
+- Easier policy enforcement
+- Single point for logging
+- Network egress control
+
+**TLS origination at egress:**
+
+```yaml
+# App sends HTTP, egress gateway upgrades to HTTPS:
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+spec:
+  host: api.external.com
+  trafficPolicy:
+    portLevelSettings:
+      - port:
+          number: 443
+        tls:
+          mode: SIMPLE
+          sni: api.external.com
+```
+
+Useful when:
+- Apps don't have TLS
+- Centralized cert management
+- Outbound mTLS to external
+
+**Approach 3: NetworkPolicy egress**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  egress:
+    # Allow DNS:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+    # Allow specific external:
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.0/24   # External service IP
+      ports:
+        - port: 443
+```
+
+Network-level egress restrictions.
+
+**Approach 4: Sidecar resource**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: default
+  namespace: my-app
+spec:
+  egress:
+    - hosts:
+        - "./*"
+        - "istio-system/*"
+        - "ext-services/*"
+```
+
+Limits what sidecar knows about. Performance + security.
+
+**Combining:**
+
+```
+Layer 1: NetworkPolicy (L3/L4 egress)
+Layer 2: Sidecar resource (visible services)
+Layer 3: ServiceEntry (external definitions)
+Layer 4: Egress gateway (controlled point)
+Layer 5: TLS origination (security)
+```
+
+Defense in depth.
+
+**Authorization for external:**
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: external-access
+  namespace: istio-system
+spec:
+  selector:
+    matchLabels:
+      istio: egressgateway
+  rules:
+    - from:
+        - source:
+            namespaces: ["production"]
+      to:
+        - operation:
+            hosts: ["api.external.com"]
+```
+
+Only production namespace can call api.external.com.
+
+**Monitoring egress:**
+
+```promql
+# External calls by destination:
+sum by (destination_service) (
+  rate(istio_requests_total{destination_service_namespace="default"}[5m])
+)
+
+# Through egress gateway:
+sum by (destination_service) (
+  rate(istio_requests_total{source_workload="istio-egressgateway"}[5m])
+)
+```
+
+Visibility into external dependencies.
+
+**Cost monitoring:**
+
+External calls often cost money (egress bandwidth, third-party APIs):
+
+```promql
+# Estimate egress data:
+sum by (destination_service) (
+  rate(istio_request_bytes_sum[5m])
+)
+```
+
+Identify expensive callers.
+
+**Audit logging:**
+
+```yaml
+spec:
+  meshConfig:
+    accessLogFile: /dev/stdout
+```
+
+Log all egress through gateway.
+
+**External service patterns:**
+
+**Static IP:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: external-db
+spec:
+  hosts:
+    - db.external.com
+  addresses:
+    - 203.0.113.10
+  ports:
+    - number: 5432
+      protocol: TCP
+  resolution: STATIC
+  endpoints:
+    - address: 203.0.113.10
+```
+
+**DNS:**
+
+```yaml
+spec:
+  resolution: DNS   # Resolves via DNS
+```
+
+**None:**
+
+```yaml
+spec:
+  resolution: NONE   # Don't resolve, pass through
+```
+
+**Common scenarios:**
+
+**Scenario 1: Compliance requirement**
+
+```
+"Only approved external services allowed"
+```
+
+Solution:
+- REGISTRY_ONLY policy
+- Explicit ServiceEntry per approved service
+- Audit logs of all external calls
+
+**Scenario 2: Cost control**
+
+```
+Excessive egress costs
+```
+
+Solution:
+- Monitor via mesh metrics
+- Identify top egress
+- Cache, optimize, or reduce
+
+**Scenario 3: Security incident**
+
+```
+Compromised pod making external calls
+```
+
+Solution:
+- NetworkPolicy default-deny egress
+- Service mesh egress gateway logs all
+- Alert on unusual external traffic
+
+**Scenario 4: Third-party API**
+
+```
+API requires specific TLS settings
+```
+
+Solution:
+- Egress gateway terminates and re-encrypts
+- Centralized cert management
+- Apps don't manage TLS
+
+**Scenario 5: Migration**
+
+```
+On-prem service migrating to cloud
+```
+
+Solution:
+- ServiceEntry pointing to on-prem
+- Apps unaware of location
+- Update ServiceEntry when migrated
+
+**Best practices:**
+
+1. **REGISTRY_ONLY in production**: explicit allowlist
+2. **Egress gateway for control**: centralized policy
+3. **Monitor external calls**: visibility
+4. **NetworkPolicy + mesh**: defense in depth
+5. **TLS for all external**: encrypt in transit
+6. **Audit logs**: compliance, forensics
+7. **Document external dependencies**: inventory
+
+**Common issues:**
+
+**Issue 1: Forgotten external service**
+
+```
+App calls external, blocked by REGISTRY_ONLY
+```
+
+Add ServiceEntry.
+
+**Issue 2: DNS resolution**
+
+```
+External hostname can't resolve
+```
+
+Check ServiceEntry DNS resolution.
+
+**Issue 3: TLS issues**
+
+```
+Cert errors to external
+```
+
+Configure TLS in DestinationRule.
+
+**Issue 4: Egress gateway bottleneck**
+
+```
+All traffic through single gateway
+Performance issue
+```
+
+Scale gateway replicas.
+
+**Production scenarios:**
+
+1. **REGISTRY_ONLY for compliance**: PCI-DSS required egress control. Implemented REGISTRY_ONLY. ServiceEntry for each approved external. Audit logs comprehensive.
+
+2. **Egress gateway**: Centralized egress. Single point for TLS, logging, policy. Simplified security.
+
+3. **External API monitoring**: Tracked external API calls via mesh metrics. Identified expensive API. Cached responses. Cost dropped.
+
+4. **Compromise contained**: Pod compromised. NetworkPolicy denied egress to most. Egress gateway logged attempts. Limited damage.
+
+5. **Migration smooth**: On-prem to cloud migration. ServiceEntry abstraction. Updated when migrated. Apps unchanged.
+
+# Incident Management & SRE Scenarios (421-440)
+
+## 421. Describe a major Kubernetes production outage you handled
+
+Walking through a real-world incident illustrates incident response principles in action.
+
+**Scenario: etcd disk full causing cluster-wide outage**
+
+**Timeline:**
+
+```
+T+0:00: PagerDuty alert: "Multiple API errors"
+T+0:02: On-call engineer acknowledges
+T+0:03: Open incident channel #incident-2024-12-15
+T+0:05: Initial triage begins
+```
+
+**Initial assessment:**
+
+```bash
+# Check cluster:
+kubectl get nodes
+# Error: Unable to connect to the server: context deadline exceeded
+
+kubectl get pods -A
+# Same error
+```
+
+API server unreachable. Critical.
+
+**Investigation:**
+
+```
+T+0:08: Engineer SSH to control plane node
+T+0:10: Check API server status
+```
+
+```bash
+# On master:
+systemctl status kube-apiserver
+# Active but logs show errors
+
+journalctl -u kube-apiserver -n 100
+# Errors: "etcdserver: mvcc: database space exceeded"
+```
+
+**Diagnosis:**
+
+```
+T+0:12: etcd database full
+T+0:14: Verify with etcdctl:
+```
+
+```bash
+ETCDCTL_API=3 etcdctl \
+  --endpoints=https://localhost:2379 \
+  --cacert=/etc/etcd/ca.crt \
+  --cert=/etc/etcd/server.crt \
+  --key=/etc/etcd/server.key \
+  endpoint status
+
+# Output shows: dbSize: 8.0 GB (quota: 8.0 GB)
+```
+
+etcd at quota limit. Read-only mode.
+
+**Mitigation:**
+
+```
+T+0:16: Form mitigation plan
+T+0:18: Begin compaction
+```
+
+```bash
+# Get current revision:
+ETCDCTL_API=3 etcdctl endpoint status --write-out=json | jq -r '.[0].Status.header.revision'
+# 12345678
+
+# Compact:
+ETCDCTL_API=3 etcdctl compact 12345678
+
+# Defragment:
+ETCDCTL_API=3 etcdctl defrag --endpoints=https://localhost:2379
+
+# Check size:
+ETCDCTL_API=3 etcdctl endpoint status
+# dbSize: 4.0 GB (much better)
+```
+
+**Resolution:**
+
+```
+T+0:25: etcd healthy
+T+0:26: API server responding
+T+0:28: kubectl works again
+T+0:30: All pods checked, healthy
+T+0:35: Monitoring confirms recovery
+```
+
+**Total time: 35 minutes (SEV-1)**
+
+**Communications:**
+
+```
+T+0:05: Internal incident channel
+T+0:10: Status page updated: "Investigating API server issues"
+T+0:18: Status page: "Identified, working on fix"
+T+0:30: Status page: "Resolved, monitoring"
+T+1:00: All-clear, post-mortem scheduled
+```
+
+**Postmortem findings:**
+
+**Root cause:**
+
+```
+etcd quota 8GB default
+Cluster had many controller-generated resources
+Quota reached, etcd went read-only
+No alert before threshold
+```
+
+**Action items:**
+
+1. **Increase etcd quota:**
+```yaml
+--quota-backend-bytes=16Gi
+```
+
+2. **Add monitoring:**
+```yaml
+- alert: EtcdDatabaseFull
+  expr: |
+    etcd_mvcc_db_total_size_in_bytes 
+    / etcd_server_quota_backend_bytes > 0.7
+  for: 10m
+```
+
+3. **Enable auto-compaction:**
+```yaml
+--auto-compaction-mode=periodic
+--auto-compaction-retention=1h
+```
+
+4. **Scheduled defrag:**
+```bash
+# Cron monthly:
+etcdctl defrag --cluster
+```
+
+5. **Capacity planning:**
+- Document resource growth patterns
+- Quarterly etcd capacity review
+
+**Lessons learned:**
+
+```
+What went well:
+- Quick acknowledgment
+- Effective triage
+- Clear communication
+
+What didn't:
+- No early warning (alert at 70% would have caught)
+- No documented procedure for etcd issues
+- Compaction took time (could be faster)
+
+Improvements:
+- Better monitoring
+- Runbook for etcd incidents
+- Automated compaction
+```
+
+**Other common outage scenarios:**
+
+**Scenario: Cascading failure from one service**
+
+```
+Service A slow → Service B threads blocked
+→ Service B unresponsive → Service C errors
+→ Service D errors (depends on C)
+→ Frontend errors → Users affected
+```
+
+Resolution:
+- Identify root (Service A)
+- Restart or rollback A
+- Circuit breakers prevent future cascades
+
+**Scenario: Image registry outage**
+
+```
+External registry down
+New pods can't pull images
+Restarted pods stuck ImagePullBackOff
+```
+
+Resolution:
+- Use locally cached images (pre-pull)
+- Image pull credentials secret
+- Mirror critical images internally
+
+**Scenario: DNS failure**
+
+```
+CoreDNS pods crashing
+All apps lose service discovery
+Cascading errors
+```
+
+Resolution:
+- Scale CoreDNS
+- Investigate root cause (memory, config)
+- Fix CoreDNS
+- Verify recovery
+
+**Scenario: Certificate expiry**
+
+```
+kubelet client cert expired
+Nodes go NotReady
+Workloads disrupted
+```
+
+Resolution:
+- Renew certs
+- Restart kubelet
+- Investigate cert rotation failure
+
+**Scenario: Node disk pressure**
+
+```
+Node fills up (logs, images)
+Kubelet evicts pods
+Cascading evictions
+```
+
+Resolution:
+- Clear space (image garbage collection)
+- Increase node disk
+- Improve image cleanup
+- Limit ephemeral storage
+
+**Production lessons:**
+
+1. **Have runbooks**: for common scenarios
+2. **Test runbooks**: simulated incidents
+3. **Monitor everything**: proactive alerts
+4. **Document recovery**: post-incident
+5. **Practice**: chaos engineering, game days
+6. **Learn**: blameless post-mortems
+7. **Improve**: implement action items
+
+---
+
+## 422. How do you conduct root cause analysis?
+
+Root cause analysis (RCA) identifies the underlying cause of incidents to prevent recurrence.
+
+**Goals:**
+
+- Identify root cause (not just symptom)
+- Understand contributing factors
+- Generate actionable preventions
+- Learn organizationally
+- Avoid blame
+
+**Methodology:**
+
+**5 Whys technique:**
+
+```
+Problem: API returning 500 errors
+
+Why 1: Database connection pool exhausted
+Why 2: Application not releasing connections
+Why 3: New code path missing connection.close()
+Why 4: Code review didn't catch
+Why 5: No automated check for connection cleanup
+
+Root cause: lack of automated connection lifecycle check
+Fix: linting rule for connection cleanup
+```
+
+Keep asking why until you reach systemic cause.
+
+**Fishbone diagram:**
+
+```
+Problem: outage
+├── People: training, on-call experience
+├── Process: change management, testing
+├── Tools: monitoring, deployment
+├── Environment: infrastructure, dependencies
+└── Methods: design, architecture
+```
+
+Multi-dimensional analysis.
+
+**Timeline reconstruction:**
+
+```
+T-7d: Code change merged
+T-1d: Deploy to staging
+T-1h: Deploy to production
+T+0:  First alert
+T+5m: Engineer acks
+T+12m: Identified
+T+25m: Mitigated
+T+45m: Verified
+T+1h: Post-mortem started
+```
+
+Build comprehensive timeline.
+
+**Information sources:**
+
+**Logs:**
+
+```bash
+# Application logs:
+kubectl logs my-pod --since=2h
+
+# Kubernetes events:
+kubectl get events --sort-by='.lastTimestamp' --all-namespaces
+
+# Audit logs:
+# In K8s audit log file
+```
+
+**Metrics:**
+
+```promql
+# Error rate over time:
+rate(http_requests_total{status=~"5.."}[5m])
+
+# Resource usage:
+container_memory_working_set_bytes
+container_cpu_usage_seconds_total
+```
+
+**Traces:**
+
+```
+Distributed traces showing request path
+Identify slow/failing services
+```
+
+**Deployment history:**
+
+```bash
+# Recent deploys:
+kubectl rollout history deployment my-app
+
+# Helm releases:
+helm history my-release
+```
+
+**Investigation process:**
+
+**Step 1: Define problem**
+
+```
+Clear, specific problem statement:
+"API endpoint /users returning 500 errors at 15% rate"
+
+Not:
+"Service is broken"
+```
+
+**Step 2: Gather data**
+
+```
+- What metrics changed?
+- What logs show?
+- What changed recently?
+- What's normal vs current?
+```
+
+**Step 3: Form hypotheses**
+
+```
+Possible causes:
+1. Recent code deploy
+2. Database issue
+3. Infrastructure change
+4. Increased load
+5. External dependency
+```
+
+**Step 4: Test hypotheses**
+
+```
+For each hypothesis:
+- What evidence supports?
+- What evidence refutes?
+- How to verify?
+```
+
+**Step 5: Verify root cause**
+
+```
+Reproduce in test environment
+Confirm fix prevents issue
+Verify other paths not affected
+```
+
+**Common pitfalls:**
+
+**Pitfall 1: Stop at proximate cause**
+
+```
+Bad: "pod crashed" (proximate)
+Good: "configuration error in deploy pipeline allowed bad image" (root)
+```
+
+**Pitfall 2: Blame individual**
+
+```
+Bad: "Engineer X made mistake"
+Good: "Process didn't catch error before production"
+```
+
+**Pitfall 3: Single cause**
+
+```
+Often multiple contributing factors:
+- Code bug
+- Insufficient testing
+- Inadequate monitoring
+- Slow detection
+- Manual recovery
+```
+
+Acknowledge all.
+
+**Pitfall 4: Confirmation bias**
+
+```
+Looking for evidence that supports hypothesis
+Ignoring counter-evidence
+```
+
+Be systematic.
+
+**Pitfall 5: Hindsight bias**
+
+```
+"It's obvious now"
+But wasn't at the time
+```
+
+Consider what was known when.
+
+**Categories of root causes:**
+
+**Technical:**
+
+```
+- Code bugs
+- Configuration errors
+- Infrastructure issues
+- Dependency failures
+- Capacity issues
+```
+
+**Process:**
+
+```
+- Inadequate testing
+- Insufficient review
+- Poor change management
+- Lack of runbooks
+- Missing monitoring
+```
+
+**People:**
+
+```
+- Insufficient training
+- Communication gaps
+- Burnout
+- Knowledge silos
+```
+
+**Organizational:**
+
+```
+- Underinvestment in reliability
+- Priorities misaligned
+- Insufficient staffing
+- Poor culture (blame)
+```
+
+Often combination.
+
+**Documentation:**
+
+**Post-mortem template:**
+
+```markdown
+# Post-Mortem: [Incident Title]
+
+## Summary
+Brief overview of incident.
+
+## Impact
+- Duration:
+- Users affected:
+- Revenue impact:
+- SLA breach?
+
+## Timeline
+Chronological events with timestamps.
+
+## Root Cause
+Detailed technical explanation.
+
+## Contributing Factors
+- Factor 1
+- Factor 2
+
+## What Went Well
+- Detection time
+- Response coordination
+
+## What Didn't Go Well
+- Slow detection
+- Missing runbook
+
+## Action Items
+| Action | Owner | Due | Status |
+|--------|-------|-----|--------|
+| Add alert | Alice | Jan 20 | Open |
+| Update runbook | Bob | Jan 25 | Open |
+```
+
+**Tools:**
+
+**Slack channel:**
+
+Dedicated #incident-X channel:
+- Real-time discussion
+- Timeline naturally created
+- Searchable later
+
+**Tools for investigation:**
+
+- **Datadog**: traces, logs, metrics together
+- **Grafana**: visualizations
+- **Splunk**: log analysis
+- **Jaeger**: trace inspection
+- **kubectl**: cluster state
+
+**Incident management:**
+
+- **PagerDuty**: incident tracking
+- **Opsgenie**: alerting
+- **Incident.io**: full incident management
+- **Statuspage**: external communication
+
+**RCA techniques:**
+
+**Hypothesis-driven:**
+
+```
+1. List possible causes
+2. Rank by likelihood
+3. Investigate top hypothesis
+4. Move to next if not confirmed
+5. Continue until found
+```
+
+**Binary search (when reproducible):**
+
+```
+Last working state: T-24h
+Current broken state: T+0
+
+Test at T-12h: still broken
+Test at T-18h: working
+Test at T-15h: broken
+Narrow down to T-16h
+Investigate changes in that window
+```
+
+**Differential analysis:**
+
+```
+Working pods vs broken pods:
+- Same image?
+- Same config?
+- Same node?
+- Same time?
+
+Differences = likely cause
+```
+
+**Best practices:**
+
+1. **Be systematic**: not random
+2. **Document as you go**: timeline
+3. **Hypothesis-driven**: test specific theories
+4. **Blameless**: focus on systems
+5. **Multiple causes OK**: rarely just one
+6. **Verify root cause**: reproduce if possible
+7. **Actionable outcomes**: not just "be more careful"
+8. **Time-bounded**: don't drag on forever
+
+**Production scenarios:**
+
+1. **5 Whys revealed process issue**: Bug deployed. 5 Whys found: insufficient review, no automated checks, no tests. Process improvements.
+
+2. **Timeline reconstruction**: Multi-hour outage. Detailed timeline showed delays. Identified bottlenecks. Improved processes.
+
+3. **Multiple causes**: Outage had 4 contributing factors. All needed to occur. Each individually wouldn't have caused. Implemented prevention for each.
+
+4. **Blameless culture**: Engineer made mistake. RCA focused on tooling that allowed it. Added safeguards. Engineer stayed engaged.
+
+5. **Action items tracked**: 12 action items from one RCA. Tracked monthly. 90% completed within 60 days. Real improvements.
+
+---
+
+## 423. Explain incident severity classification
+
+Severity classification drives response urgency and resources. Consistent classification improves outcomes.
+
+**Common severity levels:**
+
+**SEV-1 (Critical):**
+
+```
+Definition:
+- Complete service outage
+- Major customer impact
+- Significant revenue loss
+- Data loss/integrity
+- Security breach
+
+Response:
+- All hands
+- Incident commander assigned
+- Page everyone needed
+- Status page update
+- Customer communication
+- Continuous work until resolved
+```
+
+**SEV-2 (High):**
+
+```
+Definition:
+- Major degradation
+- Many customers affected
+- Significant feature unavailable
+- SLA risk
+
+Response:
+- Multiple engineers
+- Quick response
+- Status page if customer-facing
+- Targeted communication
+```
+
+**SEV-3 (Medium):**
+
+```
+Definition:
+- Moderate impact
+- Some customers affected
+- Workaround available
+- Non-critical feature
+
+Response:
+- Working hours
+- Assigned engineer
+- Internal tracking
+- Routine fix
+```
+
+**SEV-4 (Low):**
+
+```
+Definition:
+- Minor impact
+- Few customers
+- Cosmetic issues
+- Non-urgent
+
+Response:
+- Backlog
+- Normal sprint work
+- No urgency
+```
+
+**Examples by category:**
+
+**Availability:**
+
+```
+SEV-1: 100% of users can't access app
+SEV-2: 25% of users affected
+SEV-3: 5% of users affected
+SEV-4: Single user issue
+```
+
+**Performance:**
+
+```
+SEV-1: P99 latency >10s (apps timing out)
+SEV-2: P99 latency >2s (degraded)
+SEV-3: P99 latency >500ms (slow)
+SEV-4: Minor latency increase
+```
+
+**Data:**
+
+```
+SEV-1: Data loss occurring
+SEV-2: Inconsistent data
+SEV-3: Minor data quality issue
+SEV-4: Cosmetic display issue
+```
+
+**Security:**
+
+```
+SEV-1: Active breach, data exfiltration
+SEV-2: Vulnerability with active exploitation
+SEV-3: Vulnerability identified, not exploited
+SEV-4: Minor security finding
+```
+
+**Classification process:**
+
+**At alert time:**
+
+```
+1. Acknowledge alert
+2. Quick assessment:
+   - User impact?
+   - Revenue impact?
+   - Data risk?
+3. Assign severity
+4. Trigger appropriate response
+```
+
+**Reassess as incident progresses:**
+
+```
+Initial: SEV-2 (degradation)
+Investigation reveals: data loss
+Upgrade to: SEV-1
+```
+
+Severity can change.
+
+**Decision matrix:**
+
+```
+| Impact | Scope | Severity |
+|--------|-------|----------|
+| Complete outage | All users | SEV-1 |
+| Major degradation | Many users | SEV-2 |
+| Minor issue | Some users | SEV-3 |
+| Cosmetic | Few users | SEV-4 |
+```
+
+**Specific factors:**
+
+**User-facing impact:**
+
+```
+Users completely unable to use product: SEV-1
+Specific feature broken: SEV-2 or 3
+Slight degradation: SEV-3 or 4
+```
+
+**Revenue impact:**
+
+```
+Active revenue loss: SEV-1
+Risk of revenue loss: SEV-2
+Indirect impact: SEV-3
+```
+
+**Compliance/security:**
+
+```
+Active breach: SEV-1
+Known vulnerability exploited: SEV-1
+Compliance violation: SEV-1 or 2
+Security finding: SEV-3
+```
+
+**Time of day considerations:**
+
+```
+SEV-2 at 3am same as 3pm
+SEV-3 at 3am: probably wait until business hours
+```
+
+Severity drives response timing.
+
+**Response per severity:**
+
+**SEV-1 response:**
+
+```
+T+0: Alert
+T+2m: Acknowledged
+T+5m: IC assigned
+T+5m: Incident channel created
+T+10m: Status page updated
+T+15m: Customer support notified
+T+20m: External communication if needed
+Ongoing: 15-30 min updates
+Until: Fully resolved
+```
+
+**SEV-2 response:**
+
+```
+T+0: Alert
+T+5m: Acknowledged
+T+15m: Investigation begins
+T+30m: Status page if customer-facing
+Updates: 30-60 min
+```
+
+**SEV-3 response:**
+
+```
+T+0: Alert (during business hours)
+T+30m: Acknowledged
+Same day: Investigation and fix
+```
+
+**SEV-4 response:**
+
+```
+Backlog
+Routine triage
+Sprint planning
+```
+
+**Communication per severity:**
+
+**SEV-1:**
+
+```
+Internal:
+- War room (Slack or call)
+- 15-min updates
+- Leadership informed
+- Customer success informed
+
+External:
+- Status page
+- Customer email (if significant)
+- Twitter/social
+- Press if major
+```
+
+**SEV-2:**
+
+```
+Internal:
+- Incident channel
+- 30-60 min updates
+
+External:
+- Status page if customer-impact
+- Affected customers if known
+```
+
+**SEV-3:**
+
+```
+Internal:
+- Working channel
+- End-of-day update
+
+External:
+- Usually none
+```
+
+**SEV-4:**
+
+```
+Internal:
+- Standard ticket
+- No special communication
+
+External:
+- None
+```
+
+**Post-mortem requirements:**
+
+```
+SEV-1: Required, formal, 1-2 weeks
+SEV-2: Required, formal, 2-3 weeks
+SEV-3: Recommended, may be brief
+SEV-4: Optional
+```
+
+**Tracking and metrics:**
+
+```promql
+# Incidents per month by severity:
+count by (severity) (incident_total)
+
+# MTTR by severity:
+avg by (severity) (incident_duration_seconds)
+
+# Time of day:
+histogram_quantile(0.5, incident_start_time)
+```
+
+Identify patterns.
+
+**Classification mistakes:**
+
+**Over-classification:**
+
+```
+Calling SEV-3 a SEV-1
+Wakes people unnecessarily
+Burnout
+```
+
+**Under-classification:**
+
+```
+SEV-1 treated as SEV-3
+Slow response
+Customer impact worse
+```
+
+Train consistently.
+
+**Tools:**
+
+**PagerDuty:**
+
+```
+Configurable urgencies
+Different policies per severity
+Escalation rules
+```
+
+**Opsgenie:**
+
+```
+Priority levels (P1-P5)
+Routing by priority
+```
+
+**Custom:**
+
+```
+Define in runbooks
+Train team
+Tools enforce
+```
+
+**Severity escalation:**
+
+```
+T+0: SEV-2 detected
+T+30m: Customer escalations
+T+45m: Realized impact larger
+T+60m: Upgrade to SEV-1
+T+60m: Page additional people
+```
+
+Don't hesitate to escalate.
+
+**Severity de-escalation:**
+
+```
+SEV-1 declared, investigation
+Found to be limited scope
+De-escalate to SEV-2
+Continue work, less urgency
+```
+
+Communicate change clearly.
+
+**Best practices:**
+
+1. **Define clearly**: documented criteria
+2. **Train team**: consistent classification
+3. **Err on high side**: better over- than under-respond
+4. **Reassess**: severity may change
+5. **Track metrics**: identify trends
+6. **Time-bound responses**: SEV-1 should be quick
+7. **Document in runbooks**: decision guide
+
+**Production scenarios:**
+
+1. **Clear definitions**: Documented severity levels with examples. Team consistent. Right responses every time.
+
+2. **Escalation**: Started as SEV-2. Realized customer impact. Upgraded to SEV-1. Right resources mobilized.
+
+3. **Tool integration**: PagerDuty different urgency per severity. SEV-1 phone + SMS, SEV-3 just app. Less burnout.
+
+4. **Metrics tracking**: Tracked SEV-1 count monthly. Identified increase. Investigation found pattern. Improved.
+
+5. **Post-mortem culture**: All SEV-1 and SEV-2 had post-mortems. Learning continuous. SEV-3 less formal but documented.
+
+---
+
+## 424. How do you reduce MTTR?
+
+MTTR (Mean Time to Recover/Resolve) measures how quickly incidents are resolved. Lower MTTR = better reliability.
+
+**MTTR components:**
+
+```
+Time to detect (TTD)
+       ↓
+Time to acknowledge
+       ↓
+Time to investigate
+       ↓
+Time to identify root cause
+       ↓
+Time to mitigate
+       ↓
+Time to verify
+```
+
+Optimize each component.
+
+**Strategy 1: Reduce TTD (detection time)**
+
+**Better monitoring:**
+
+```yaml
+# SLO-based alerts (proactive):
+- alert: ErrorBudgetBurn
+  expr: |
+    (1 - sli) > (14 * (1 - slo))
+  for: 5m
+```
+
+Alert before customers notice.
+
+**Synthetic monitoring:**
+
+```yaml
+# Continuous checks:
+schedule: every 1m
+test: critical user journey
+```
+
+Catch issues immediately.
+
+**Comprehensive coverage:**
+
+```
+RED metrics (every service)
+USE metrics (every node)
+SLOs (key services)
+Black-box probes (external)
+```
+
+**Strategy 2: Reduce acknowledgment time**
+
+**Effective paging:**
+
+```yaml
+# PagerDuty:
+- escalation_policy:
+    - level: primary
+      delay: 0   # Immediate
+    - level: secondary
+      delay: 5m
+    - level: manager
+      delay: 15m
+```
+
+Fast escalation if unanswered.
+
+**Reduce alert fatigue:**
+
+```
+Only actionable alerts page
+Bad alerts deprioritized
+Noise reduced
+```
+
+Engineers respond faster to fewer, important alerts.
+
+**Strategy 3: Reduce investigation time**
+
+**Runbooks:**
+
+```markdown
+# Runbook: High Error Rate
+
+## Symptoms
+- Alert: error rate >5%
+
+## Investigation
+1. Check dashboard: link
+2. Check recent deploys: `kubectl rollout history`
+3. Check logs: `kubectl logs ...`
+
+## Common Causes
+- Recent deploy: rollback
+- Database issue: check DB metrics
+- External dep: check upstream
+
+## Resolution Steps
+1. If recent deploy: rollback
+2. If database: check connection pool
+3. Page DBA if needed
+```
+
+Runbook = faster response.
+
+**Comprehensive dashboards:**
+
+```yaml
+# Service dashboard with:
+- RED metrics
+- Dependencies
+- Recent deploys
+- Recent changes
+- Top errors
+- Saturation
+```
+
+One place to look.
+
+**Distributed tracing:**
+
+```
+Trace shows exact path
+Identifies failing service
+Saves investigation time
+```
+
+**Strategy 4: Reduce identification time**
+
+**Correlation:**
+
+```
+Metrics ↔ Traces ↔ Logs
+
+Click metric → trace → logs
+Fast root cause
+```
+
+**ChatOps:**
+
+```bash
+# In Slack:
+/incident kubectl logs my-pod
+
+# Bot executes, returns results
+# No context switch
+```
+
+**Strategy 5: Reduce mitigation time**
+
+**Automation:**
+
+```yaml
+# Auto-rollback on bad metrics:
+spec:
+  analysis:
+    metrics:
+      - name: error-rate
+        thresholdRange:
+          max: 5
+```
+
+Flagger reverts automatically.
+
+**Quick-revert tools:**
+
+```bash
+# One command rollback:
+kubectl rollout undo deployment my-app
+
+# Or via UI tool
+```
+
+**Feature flags:**
+
+```python
+# Disable problematic feature without deploy:
+if feature_enabled("new-feature"):
+    # New code path
+else:
+    # Old code path
+```
+
+Toggle off, immediate effect.
+
+**Strategy 6: Common causes pre-solved**
+
+```
+List most common incident types:
+- Bad deploy (rollback procedure)
+- DB connection issues (restart pod, scale)
+- DNS issues (procedures)
+- Cert expiry (renew procedure)
+
+Have runbooks for each
+```
+
+Quick reference, fast action.
+
+**Strategy 7: Practice**
+
+**Game days:**
+
+```
+Quarterly:
+- Simulate incidents
+- Practice response
+- Identify weak points
+- Improve runbooks
+```
+
+**Chaos engineering:**
+
+```
+Inject failures regularly
+Team learns to respond
+Build muscle memory
+```
+
+**Strategy 8: Tooling**
+
+**Effective tools:**
+
+```
+- Quick deploy/rollback (CI/CD)
+- Fast kubectl access
+- Good monitoring
+- Easy log search
+- Incident management platform
+```
+
+**ChatOps integration:**
+
+```
+Slack bot:
+- /deploys recent
+- /logs <service>
+- /metrics <service>
+- /rollback <service>
+```
+
+Faster than CLI.
+
+**Strategy 9: Team readiness**
+
+**On-call training:**
+
+```
+New engineers shadow on-call
+Then secondary
+Then primary with senior support
+Then primary
+```
+
+Reduce learning curve.
+
+**Knowledge sharing:**
+
+```
+Post-mortems shared
+Patterns recognized
+Common issues documented
+```
+
+**Strategy 10: Architectural improvements**
+
+**Limit blast radius:**
+
+```
+Microservices
+Cellular architecture
+Bulkheads
+Circuit breakers
+```
+
+Issues don't cascade.
+
+**Graceful degradation:**
+
+```
+If feature X fails:
+- Show cached data
+- Disable feature
+- Continue with other features
+```
+
+Partial outage instead of full.
+
+**Auto-recovery:**
+
+```
+Liveness probes
+HPA
+Cluster autoscaler
+Auto-restart failed components
+```
+
+Self-healing where possible.
+
+**Measuring MTTR:**
+
+```promql
+# MTTR by severity:
+avg by (severity) (
+  incident_duration_seconds
+)
+
+# MTTR over time:
+avg_over_time(incident_duration_seconds[30d])
+```
+
+Track trends.
+
+**MTTR breakdown:**
+
+```
+Total MTTR: 60 min
+- TTD: 5 min
+- TTA: 2 min
+- Investigation: 30 min ← optimize
+- Mitigation: 15 min
+- Verification: 8 min
+
+Focus on investigation
+```
+
+Where's time spent?
+
+**Targets:**
+
+```
+SEV-1: <30 min
+SEV-2: <2 hours
+SEV-3: <8 hours
+SEV-4: <40 hours
+```
+
+Realistic targets based on severity.
+
+**Anti-patterns:**
+
+**Anti-pattern 1: Manual everything**
+
+```
+Manual diagnosis, manual fix
+Slow
+```
+
+Automate common scenarios.
+
+**Anti-pattern 2: No runbooks**
+
+```
+Engineer figures out from scratch
+Slow, inconsistent
+```
+
+Create runbooks.
+
+**Anti-pattern 3: Hero culture**
+
+```
+"Only Senior X can fix"
+Risky, slow without them
+```
+
+Spread knowledge.
+
+**Anti-pattern 4: No improvement**
+
+```
+Same incidents recurring
+No action items completed
+```
+
+Implement post-mortem actions.
+
+**Best practices:**
+
+1. **Measure**: track MTTR trends
+2. **Decompose**: where's time spent
+3. **Automate**: common scenarios
+4. **Runbooks**: for common issues
+5. **Practice**: game days, chaos
+6. **Train**: invest in on-call
+7. **Tools**: invest in good tooling
+8. **Architecture**: reduce blast radius
+9. **Learn**: from every incident
+10. **Iterate**: continuous improvement
+
+**Production scenarios:**
+
+1. **Runbook game-changer**: 3am alerts took hours. Created runbooks. Same alerts: 15 minutes. Critical improvement.
+
+2. **Automation**: Implemented auto-rollback on bad metrics. SEV-2 became non-events. Auto-recovered.
+
+3. **Practice paid off**: Game days quarterly. Real outage: team responded smoothly. Like a drill they'd done.
+
+4. **Distributed tracing**: Without traces, investigation 30+ min. With traces, found issue in 5 min.
+
+5. **MTTR improvement**: Tracked MTTR over 12 months. Reduced from 60 min to 15 min. Many small improvements compound.
+
+---
+
+## 425. Explain postmortem best practices
+
+Postmortems extract learning from incidents. Good postmortems improve systems and prevent recurrence.
+
+**Goals:**
+
+- Document what happened
+- Understand root causes
+- Identify improvements
+- Share learning
+- Prevent recurrence
+
+**Not goals:**
+
+- Blame individuals
+- Punish mistakes
+- Generate reports
+
+**Principles:**
+
+**Principle 1: Blameless**
+
+```
+Focus on systems and processes
+Not individual mistakes
+Engineers were doing best with what they had
+```
+
+Blame culture → hide mistakes → recurrence.
+
+**Principle 2: Honest**
+
+```
+Document what really happened
+Including failures, confusion
+Don't sanitize
+```
+
+Honest postmortems = real learning.
+
+**Principle 3: Specific**
+
+```
+Concrete details
+Specific times
+Actual commands
+Real metrics
+```
+
+Vague postmortems = no learning.
+
+**Principle 4: Action-oriented**
+
+```
+Specific action items
+Owners
+Deadlines
+Tracked
+```
+
+Otherwise, just paperwork.
+
+**Postmortem template:**
+
+```markdown
+# Postmortem: [Incident Title]
+
+## Summary
+2-3 sentence overview.
+
+## Impact
+- Start: 2024-12-15 14:23 UTC
+- End: 2024-12-15 15:08 UTC
+- Duration: 45 minutes
+- Users affected: ~30%
+- Revenue impact: ~$15,000
+- Severity: SEV-1
+
+## Detection
+How was it detected?
+- Alert: API error rate >5%
+- Time to detect: 3 minutes
+
+## Timeline
+| Time | Event |
+|------|-------|
+| 14:23 | First alert fires |
+| 14:25 | Engineer acknowledges |
+| 14:30 | Incident commander assigned |
+| 14:35 | Root cause hypothesis |
+| 14:50 | Mitigation deployed |
+| 15:00 | Verified recovery |
+| 15:08 | All-clear |
+
+## Root Cause
+Detailed technical explanation.
+
+The recent deploy at 14:15 introduced a bug in the connection pool logic. New code path failed to release database connections. Pool exhausted at 14:23. API began returning 500 errors when unable to acquire connection.
+
+## Contributing Factors
+1. Insufficient testing of new code path
+2. No automated check for connection cleanup
+3. Monitoring didn't catch pool exhaustion proactively
+
+## What Went Well
+- Quick detection (alerting worked)
+- Effective incident commander
+- Clear communication
+- Mitigation worked first try
+
+## What Didn't Go Well
+- Bug made it to production
+- 3 minutes to detect (could be faster)
+- Initial investigation went wrong direction
+- No runbook for this scenario
+
+## Action Items
+| Action | Owner | Due | Priority | Status |
+|--------|-------|-----|----------|--------|
+| Add connection lifecycle check in CI | Alice | Dec 22 | P0 | Open |
+| Add alert for connection pool >80% | Bob | Dec 22 | P0 | Open |
+| Update runbook for connection issues | Carol | Dec 29 | P1 | Open |
+| Improve testing coverage for DB code | Dave | Jan 5 | P2 | Open |
+
+## Supporting Information
+- Deploy diff: link
+- Alert history: link
+- Grafana dashboard during incident: link
+- Slack channel: #incident-2024-12-15
+```
+
+**Action items quality:**
+
+**Bad action items:**
+
+```
+- "Be more careful"
+- "Test better"
+- "Improve monitoring"
+```
+
+Vague, unactionable.
+
+**Good action items:**
+
+```
+- "Add Prometheus alert when DB connection pool >80% utilized (Owner: Bob, Due: Dec 22)"
+- "Add integration test verifying connections released after request (Owner: Alice, Due: Jan 5)"
+```
+
+Specific, owned, deadline.
+
+**Action item tracking:**
+
+```yaml
+# Jira tickets:
+- All postmortem actions become tickets
+- Tracked in sprints
+- Reviewed monthly
+- Completion rate measured
+```
+
+**Postmortem meeting:**
+
+**Attendees:**
+
+- Engineers involved
+- Manager
+- Anyone affected
+- Anyone who can implement actions
+
+**Agenda:**
+
+```
+1. Review timeline (5 min)
+2. Root cause discussion (15 min)
+3. What went well/didn't (10 min)
+4. Action items review (15 min)
+5. Open discussion (5 min)
+```
+
+**Facilitator role:**
+
+```
+- Keeps discussion blameless
+- Ensures everyone speaks
+- Drives toward action items
+- Time management
+```
+
+Often manager or senior engineer.
+
+**Common failure modes:**
+
+**Failure 1: No follow-through**
+
+```
+Great postmortem
+No action items completed
+Same issue recurs
+```
+
+Fix: track action items, hold accountable.
+
+**Failure 2: Blame**
+
+```
+"This is engineer X's fault"
+Engineer X disengages
+Future hiding of issues
+```
+
+Fix: blameless culture, focus on systems.
+
+**Failure 3: Surface-level**
+
+```
+"Root cause: bug"
+No deeper analysis
+```
+
+Fix: 5 Whys, deeper investigation.
+
+**Failure 4: Not shared**
+
+```
+Postmortem in private doc
+No one else learns
+```
+
+Fix: company-wide sharing, presentations.
+
+**Failure 5: Too late**
+
+```
+Postmortem 2 months later
+Details forgotten
+```
+
+Fix: within 1-2 weeks.
+
+**Sharing:**
+
+**Within team:**
+
+```
+- Postmortem meeting
+- Document shared
+- Action items in sprints
+```
+
+**Company-wide:**
+
+```
+- Postmortem digest (monthly)
+- Notable postmortems presented
+- Library of past postmortems searchable
+```
+
+**External:**
+
+For significant outages:
+
+```
+Public postmortem on company blog
+Builds trust
+Shows accountability
+```
+
+Examples:
+- Cloudflare's outage postmortems
+- AWS service incident reports
+- GitHub status incidents
+
+**Trends and patterns:**
+
+Review postmortems quarterly:
+
+```
+- Recurring root causes?
+- Common contributing factors?
+- Patterns in detection time?
+- Patterns in MTTR?
+```
+
+Identify systemic issues.
+
+**Postmortem metrics:**
+
+```
+- Number of postmortems per month
+- Action item completion rate
+- Time to publish postmortem
+- Recurring incidents
+```
+
+Track program health.
+
+**Cultural aspects:**
+
+**Encourage reporting:**
+
+```
+"Near misses" also worth reviewing
+Small incidents document
+Build learning culture
+```
+
+**Reward sharing:**
+
+```
+Recognize engineers who:
+- Lead postmortems
+- Complete action items
+- Improve systems
+```
+
+**Psychological safety:**
+
+```
+Engineers feel safe to:
+- Admit mistakes
+- Share confusion
+- Discuss failures
+```
+
+Without this: postmortems are theater.
+
+**Blameless examples:**
+
+**Blameful (bad):**
+
+```
+"Alice deployed broken code and caused outage"
+```
+
+**Blameless (good):**
+
+```
+"Code with bug was deployed to production. Our CI/CD process allowed it through without catching the issue. Multiple safeguards could have prevented this:
+- Code review didn't catch
+- Tests didn't cover this case
+- Canary deployment was at 100% (no gradual)
+- Monitoring didn't catch immediately"
+```
+
+Same incident, different framing.
+
+**Tools:**
+
+**Document templates:**
+
+```
+- Google Docs
+- Confluence
+- Notion
+- Internal wiki
+```
+
+**Incident management:**
+
+```
+- PagerDuty (with postmortem)
+- Incident.io (built-in postmortems)
+- Blameless platform
+- Custom tools
+```
+
+**Tracking:**
+
+```
+- Jira (action items)
+- GitHub issues
+- Custom dashboards
+```
+
+**Library:**
+
+```
+- All postmortems searchable
+- Tagged by type, severity
+- Linked from related runbooks
+```
+
+Build organizational memory.
+
+**Production scenarios:**
+
+1. **Action items tracked**: All postmortem actions in Jira. Monthly review. 95% completion rate. Real improvements.
+
+2. **Blameless culture**: Engineer made deploy mistake. Postmortem focused on tooling. Added safeguards. Engineer stayed engaged, became advocate for safety.
+
+3. **Pattern recognition**: Quarterly review of postmortems. Discovered 30% related to deploys. Invested in better deploy tooling. Reduced incident rate.
+
+4. **Public postmortem**: SEV-1 outage. Published public postmortem within week. Customer trust maintained. Industry recognition.
+
+5. **Wargame from postmortem**: Postmortem identified gap. Created game day exercise. Team practiced response. Better prepared for similar future incident.
+
+---
+
+## 426. How do you handle cascading failures?
+
+Cascading failures occur when one failure triggers others, multiplying impact. Containment and recovery strategies.
+
+**What causes cascading failures:**
+
+```
+Service A fails
+       ↓
+Service B (depends on A) overwhelmed by retries
+       ↓
+Service B becomes unresponsive
+       ↓
+Service C (depends on B) affected
+       ↓
+Frontend errors
+       ↓
+Users affected
+```
+
+Failures compound.
+
+**Common patterns:**
+
+**Pattern 1: Retry storm**
+
+```
+Service A returns errors
+Service B retries (configured 3 times)
+Each B replica retries
+B sends 3x normal traffic to A
+A more overwhelmed
+B times out
+B clients retry B
+Compound retry storm
+```
+
+**Pattern 2: Connection exhaustion**
+
+```
+Backend slow
+Frontend connections wait
+Frontend connection pool fills
+New requests can't connect
+Frontend appears down
+```
+
+**Pattern 3: Thread pool exhaustion**
+
+```
+External call slow
+Threads waiting
+All threads blocked
+Service can't process anything
+```
+
+**Pattern 4: Resource starvation**
+
+```
+One service uses all CPU
+Other services on node starve
+Cluster-wide impact
+```
+
+**Detection:**
+
+```
+Multiple services degrading simultaneously
+Error rates climbing across stack
+Resource usage spiking
+Health checks failing
+```
+
+**Initial response:**
+
+**Step 1: Identify root**
+
+```
+Multiple symptoms
+But typically one root cause
+Find the source
+```
+
+Look for:
+- First to fail
+- Most affected
+- Source of traffic flowing through
+
+**Step 2: Stop the bleeding**
+
+```
+Restart or fix root service
+Or:
+- Cut off problematic traffic
+- Scale up affected services
+- Disable failing feature
+```
+
+**Step 3: Recover gradually**
+
+```
+Don't restore all at once
+Could trigger cascading again
+Gradual restoration
+```
+
+**Prevention strategies:**
+
+**Strategy 1: Circuit breakers**
+
+```yaml
+# Istio:
+spec:
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+```
+
+When downstream fails, stop sending requests. Fail fast.
+
+**Strategy 2: Retry budgets**
+
+```yaml
+# Linkerd:
+spec:
+  retryBudget:
+    retryRatio: 0.2   # Max 20% retries
+    minRetriesPerSecond: 10
+    ttl: 10s
+```
+
+Limit retry rate. Prevent storms.
+
+**Strategy 3: Timeouts**
+
+```yaml
+spec:
+  http:
+    - route:
+        - destination:
+            host: backend
+      timeout: 5s
+```
+
+Don't wait forever. Free resources.
+
+**Strategy 4: Bulkheads**
+
+Isolate resources:
+
+```python
+# Different thread pools for different downstream services:
+db_pool = ThreadPool(50)
+cache_pool = ThreadPool(20)
+external_api_pool = ThreadPool(10)
+```
+
+One bottleneck doesn't starve others.
+
+**Strategy 5: Load shedding**
+
+```yaml
+# When overloaded, reject some requests:
+if cpu_usage > 0.9:
+    return 503 Service Unavailable
+```
+
+Better to fail some than all.
+
+**Strategy 6: Rate limiting**
+
+```yaml
+# Limit incoming traffic:
+spec:
+  rules:
+    - rate_limit:
+        unit: minute
+        requests_per_unit: 1000
+```
+
+Prevent overwhelming.
+
+**Strategy 7: Graceful degradation**
+
+```python
+def get_recommendations():
+    try:
+        return ml_service.recommend()
+    except:
+        return cached_popular_items   # Fallback
+```
+
+Degraded service > no service.
+
+**Strategy 8: Async / queues**
+
+```
+Front-end → queue → backend
+Front-end doesn't wait
+Backend processes at own pace
+Decouples failure modes
+```
+
+**Strategy 9: Connection pooling limits**
+
+```yaml
+trafficPolicy:
+  connectionPool:
+    tcp:
+      maxConnections: 100
+    http:
+      http2MaxRequests: 1000
+```
+
+Hard limits prevent runaway.
+
+**Strategy 10: Resource isolation**
+
+```yaml
+# Pod limits:
+resources:
+  limits:
+    cpu: 2
+    memory: 4Gi
+```
+
+One pod can't take everything.
+
+**Detection patterns:**
+
+**Pattern 1: Correlation in errors**
+
+```
+Multiple services showing errors at same time
+Likely cascading
+Find common source
+```
+
+**Pattern 2: Error rate climbing in tree**
+
+```
+Service A: 10% errors
+Service B (calls A): 8% errors (related)
+Service C (calls B): 6% errors
+```
+
+Trace dependency chain.
+
+**Pattern 3: Resource saturation**
+
+```
+Connection pools full
+Thread pools full
+CPU/memory exhausted
+```
+
+Indicates downstream issue.
+
+**Real example response:**
+
+**Scenario: Payment service slow**
+
+```
+T+0: Payment service P99 latency: 100ms → 5s
+       Database query slow
+
+T+1m: Checkout service slow (calls payment)
+       Threads waiting on payment
+
+T+2m: Frontend errors (calls checkout)
+       Timeouts
+
+T+3m: All users affected
+```
+
+**Response:**
+
+```
+T+3m: Alert: frontend error rate
+T+4m: Investigate
+T+5m: Trace shows: payment slow → checkout slow → frontend
+T+6m: Identify: database query in payment
+
+Mitigation:
+T+7m: Scale payment service (more threads)
+T+8m: Optimize database query
+T+10m: Recovery
+T+15m: All healthy
+```
+
+**Improvements added:**
+
+```yaml
+# Circuit breaker on payment:
+spec:
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 5
+
+# Timeout in checkout:
+spec:
+  http:
+    - timeout: 5s
+
+# Graceful degradation in frontend:
+# If checkout slow, show "processing" message
+```
+
+Future prevention.
+
+**Cascading failure simulation:**
+
+**Chaos engineering:**
+
+```yaml
+# Slow down payment service:
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+spec:
+  action: delay
+  selector:
+    labelSelectors:
+      app: payment
+  delay:
+    latency: "5s"
+```
+
+Test cascade prevention.
+
+**Game day exercises:**
+
+```
+Simulate dependency failure
+Practice response
+Identify weaknesses
+```
+
+**Recovery patterns:**
+
+**Pattern 1: Gradual recovery**
+
+```
+After fix:
+- 10% traffic to recovered service
+- Monitor
+- 25% traffic
+- Monitor
+- 50% traffic
+- 100% traffic
+```
+
+Avoid overwhelming.
+
+**Pattern 2: Pre-warm caches**
+
+```
+After cache failure:
+- Pre-populate cache
+- Then resume traffic
+```
+
+Cold cache might trigger cascade again.
+
+**Pattern 3: Database connection warmup**
+
+```
+After DB recovery:
+- Slow ramp of connections
+- Avoid connection storm
+```
+
+**Pattern 4: Coordinated recovery**
+
+```
+- Recover databases first
+- Then backend services
+- Then frontend
+- Top-down for write-heavy apps
+- Bottom-up for read-heavy
+```
+
+**Monitoring:**
+
+```promql
+# Cascade indicators:
+# Multiple services with high error rates:
+count(rate(http_requests_total{status=~"5.."}[5m]) > 0.05) > 3
+
+# Connection pool exhaustion:
+db_connection_pool_active / db_connection_pool_max > 0.9
+
+# Thread pool exhaustion:
+threads_busy / threads_total > 0.9
+```
+
+Alert on cascade patterns.
+
+**Best practices:**
+
+1. **Circuit breakers**: prevent storms
+2. **Timeouts everywhere**: don't wait forever
+3. **Retry budgets**: limit retries
+4. **Bulkheads**: isolate resources
+5. **Graceful degradation**: partial service
+6. **Load shedding**: when overwhelmed
+7. **Async patterns**: queues, events
+8. **Test scenarios**: chaos engineering
+9. **Monitor for cascade patterns**: early detection
+10. **Practice recovery**: game days
+
+**Production scenarios:**
+
+1. **Circuit breaker saved**: Payment slow, B's circuit breaker opened. B's other functions continued. No cascade. Customer impact minimized.
+
+2. **Retry storm**: Without retry budget. One service hiccup → 100x retry traffic → made worse. Added retry budgets. Resolved.
+
+3. **Bulkhead pattern**: Slow external API used to block all threads. Separated thread pool for external calls. External slow didn't affect main app.
+
+4. **Graceful degradation**: Recommendation engine flaky. Implemented cache fallback. Users got default recommendations during outages. No errors visible.
+
+5. **Game day caught**: Quarterly chaos exercise. Simulated DB failure. Cascade revealed. Fixed with circuit breakers. Real incident later: handled smoothly.
+
+---
+
+## 427. Explain Kubernetes chaos engineering
+
+Chaos engineering deliberately introduces failures to test system resilience and improve reliability.
+
+**Principles:**
+
+**Principle 1: Build hypothesis**
+
+```
+"Our system handles pod failures gracefully"
+"Network latency doesn't break user experience"
+"Database failover is transparent"
+```
+
+Testable hypotheses.
+
+**Principle 2: Realistic conditions**
+
+```
+Production or production-like
+Real traffic patterns
+Real configurations
+```
+
+**Principle 3: Minimize blast radius**
+
+```
+Start small
+Limit impact
+Gradual increase
+Always have abort plan
+```
+
+**Principle 4: Continuous**
+
+```
+Not one-time event
+Regular exercises
+Automated where possible
+```
+
+**Principle 5: Learn**
+
+```
+What broke?
+Why?
+How to improve?
+Implement fixes
+```
+
+**Common experiments:**
+
+**Pod failures:**
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: pod-kill
+spec:
+  action: pod-kill
+  mode: random-max-percent
+  value: "30"
+  selector:
+    namespaces:
+      - production
+    labelSelectors:
+      app: my-app
+```
+
+Kill 30% of pods. Verify auto-recovery.
+
+**Network chaos:**
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+spec:
+  action: delay
+  selector:
+    labelSelectors:
+      app: my-app
+  delay:
+    latency: "100ms"
+    jitter: "10ms"
+```
+
+Add latency. Test timeout handling.
+
+**Network partition:**
+
+```yaml
+spec:
+  action: partition
+  direction: to
+  target:
+    selector:
+      labelSelectors:
+        app: database
+```
+
+Network split. Test failover.
+
+**DNS chaos:**
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: DNSChaos
+spec:
+  action: error
+  selector:
+    labelSelectors:
+      app: my-app
+  patterns:
+    - external-api.com
+```
+
+Break DNS for specific domain. Test fallbacks.
+
+**Stress chaos:**
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+spec:
+  selector:
+    labelSelectors:
+      app: my-app
+  stressors:
+    cpu:
+      workers: 4
+      load: 80
+```
+
+CPU/memory pressure. Test resource limits.
+
+**Time chaos:**
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: TimeChaos
+spec:
+  selector:
+    labelSelectors:
+      app: my-app
+  timeOffset: "-10m"
+```
+
+Skew clock. Test time-sensitive code.
+
+**HTTP chaos:**
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: HTTPChaos
+spec:
+  selector:
+    labelSelectors:
+      app: my-app
+  mode: all
+  target: Request
+  port: 80
+  abort: true
+```
+
+Fail HTTP requests.
+
+**Tools:**
+
+**Chaos Mesh:**
+
+CNCF project. Comprehensive K8s chaos.
+
+```bash
+helm install chaos-mesh chaos-mesh/chaos-mesh
+```
+
+**Litmus:**
+
+Another CNCF chaos platform.
+
+```bash
+helm install litmus litmuschaos/litmus
+```
+
+**Chaos Monkey (Netflix):**
+
+Original. Random instance termination.
+
+**Gremlin:**
+
+Commercial. Comprehensive features.
+
+**ChaosBlade:**
+
+Alibaba's tool.
+
+**AWS Fault Injection Simulator:**
+
+AWS-managed chaos service.
+
+**Experimentation approach:**
+
+**Steady state:**
+
+```
+Define normal:
+- Latency P99 < 500ms
+- Error rate < 0.1%
+- All pods healthy
+```
+
+**Hypothesis:**
+
+```
+"During pod kill, error rate stays < 0.5%"
+```
+
+**Inject failure:**
+
+```yaml
+# Kill 1 pod
+```
+
+**Observe:**
+
+```
+Did metrics stay within bounds?
+What broke?
+What worked?
+```
+
+**Learn:**
+
+```
+Document findings
+Implement improvements
+Re-test
+```
+
+**Game days:**
+
+```
+Scheduled events:
+- Quarterly
+- Half-day exercise
+- Team participation
+
+Activities:
+- Inject various failures
+- Practice incident response
+- Identify gaps
+```
+
+Build team capability.
+
+**Examples:**
+
+**Example 1: Pod kill**
+
+```yaml
+# Kill 50% of payment service pods:
+spec:
+  action: pod-kill
+  mode: fixed-percent
+  value: "50"
+  selector:
+    labelSelectors:
+      app: payment
+```
+
+Expected:
+- Pods restart automatically
+- HPA scales if needed
+- No customer impact
+- Errors minimal
+
+If issues found: improve.
+
+**Example 2: Database failover**
+
+```yaml
+# Kill primary DB pod:
+spec:
+  action: pod-kill
+  selector:
+    labelSelectors:
+      app: postgres
+      role: primary
+```
+
+Expected:
+- Failover to replica
+- Brief blip
+- Recovery within seconds
+
+**Example 3: Slow database**
+
+```yaml
+spec:
+  action: delay
+  selector:
+    labelSelectors:
+      app: postgres
+  delay:
+    latency: "500ms"
+```
+
+Expected:
+- Timeouts in apps
+- Circuit breakers trip
+- Graceful degradation
+
+Verify resilience patterns.
+
+**Example 4: Region failure**
+
+```yaml
+# Network partition between regions:
+spec:
+  action: partition
+```
+
+Expected:
+- Failover to other region
+- DNS update
+- Continued service
+
+**Production chaos:**
+
+**Concerns:**
+
+```
+- Real users affected?
+- Business hours?
+- Approved scope?
+- Rollback ready?
+```
+
+**Approach:**
+
+```
+1. Start in dev
+2. Move to staging
+3. Carefully to production
+4. Limited blast radius
+5. Always abort plan
+```
+
+**Game day structure:**
+
+```
+Pre-game (1 week before):
+- Hypotheses defined
+- Scenarios prepared
+- Team briefed
+
+Game day (4 hours):
+- Hour 1: Setup, baseline
+- Hour 2: Run experiments
+- Hour 3: Observe, document
+- Hour 4: Debrief
+
+Post-game (1 week after):
+- Document findings
+- Action items
+- Improvements
+```
+
+**Continuous chaos:**
+
+```yaml
+# Schedule:
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+spec:
+  schedule: "0 14 * * *"   # Daily 2pm
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    selector:
+      labelSelectors:
+        app: my-app
+```
+
+Daily small failures. Continuous resilience.
+
+**Monitoring during chaos:**
+
+```promql
+# Key metrics during experiment:
+- Error rate
+- Latency
+- Saturation
+- Customer impact
+```
+
+Real-time observation.
+
+**Best practices:**
+
+1. **Start small**: gradual
+2. **Hypothesis-driven**: testable
+3. **Define abort**: emergency stop
+4. **Document**: findings and actions
+5. **Practice**: regular game days
+6. **Production carefully**: when ready
+7. **Continuous**: not one-time
+8. **Learn from failures**: improve systems
+
+**Common findings:**
+
+**Finding 1: Missing timeouts**
+
+```
+Pod kill → app waits forever for connections
+Need timeouts
+```
+
+**Finding 2: No retries**
+
+```
+Brief failure → permanent error
+Need retries
+```
+
+**Finding 3: Cascading failure**
+
+```
+One component fails → all fail
+Need circuit breakers
+```
+
+**Finding 4: Slow recovery**
+
+```
+Pod kill → 5 minutes to fully recover
+Need to investigate startup time
+```
+
+**Finding 5: Missing alerts**
+
+```
+Failure happened, no alert
+Need to add monitoring
+```
+
+**Production scenarios:**
+
+1. **Pod kill exercise**: Monthly. Found app didn't retry properly. Fixed retry logic. Resilient.
+
+2. **Database failover**: Tested quarterly. Failover took 60s initially. Tuned to 15s. Real failure happened, smooth.
+
+3. **Slow dependency**: Injected 500ms latency on external API. Found no timeouts. Added timeouts. Prevented cascade in real incident.
+
+4. **DNS chaos**: Broke DNS for external. App had no fallback. Implemented cache. Resilient now.
+
+5. **Game day culture**: Quarterly game days. Team experienced and practiced. Real incidents handled like exercises. MTTR dropped significantly.
+
+---
+
+## 428. How do you test cluster resilience?
+
+Cluster resilience testing verifies the cluster handles various failure scenarios.
+
+**Testing categories:**
+
+**Category 1: Component failures**
+
+```
+- Node failures
+- Master/etcd failures
+- Pod failures
+- Network failures
+- Storage failures
+```
+
+**Category 2: Capacity scenarios**
+
+```
+- Resource exhaustion
+- Connection limits
+- API throttling
+```
+
+**Category 3: External failures**
+
+```
+- Cloud provider issues
+- DNS failures
+- Certificate expiry
+- Image registry down
+```
+
+**Test 1: Pod resilience**
+
+```bash
+# Kill random pod:
+kubectl delete pod $(kubectl get pods -l app=my-app -o name | shuf -n 1)
+
+# Verify:
+# - New pod starts
+# - Service still available
+# - No customer impact
+```
+
+**Test 2: Node failure**
+
+```bash
+# Drain node (simulate failure):
+kubectl drain node-1 --ignore-daemonsets --delete-emptydir-data
+
+# Verify:
+# - Pods reschedule
+# - Service continues
+# - No data loss
+```
+
+Or cordon and stop node:
+
+```bash
+kubectl cordon node-1
+# Then power off node from cloud console
+```
+
+**Test 3: Multi-node failure**
+
+```bash
+# Drain multiple nodes:
+kubectl drain node-1 node-2 --ignore-daemonsets
+```
+
+Verify cluster handles bigger failure.
+
+**Test 4: Master node failure**
+
+```
+Cloud-managed: not your concern
+Self-managed: critical test
+
+Drain master, verify:
+- API still available (HA setup)
+- Workloads continue
+- New deploys work
+```
+
+**Test 5: etcd failure**
+
+```bash
+# Stop one etcd member (in HA cluster):
+systemctl stop etcd
+
+# Verify quorum maintained
+# Verify cluster operates
+# Verify recovery
+```
+
+**Test 6: Storage failure**
+
+```yaml
+# Simulate volume detach:
+# Manually detach in cloud console
+# Or use chaos tools
+
+# Verify:
+- StatefulSet survives
+- Data preserved
+- Pod can reattach
+```
+
+**Test 7: Network partition**
+
+```bash
+# Block traffic between nodes:
+# iptables on nodes to block specific IPs
+
+# Verify:
+- Cluster handles
+- Pods on isolated nodes
+- Recovery when restored
+```
+
+**Test 8: DNS failure**
+
+```yaml
+# Scale down CoreDNS:
+kubectl scale -n kube-system deployment coredns --replicas=0
+
+# Verify:
+- Apps fail gracefully (with timeouts)
+- New connections affected
+- Existing connections continue
+- Recovery when CoreDNS back
+
+kubectl scale -n kube-system deployment coredns --replicas=3
+```
+
+**Test 9: Image registry failure**
+
+```
+Block registry access (NetworkPolicy):
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+spec:
+  podSelector: {}
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+
+# New pods can't pull images
+# Existing pods continue
+# Verify pre-pull strategy
+```
+
+**Test 10: Certificate expiry**
+
+```
+Manually expire test cert
+Verify:
+- Apps handle
+- Alerting fires
+- Renewal works
+```
+
+**Test 11: API throttling**
+
+```python
+# Generate API requests:
+while true; do
+  kubectl get pods --all-namespaces > /dev/null
+done
+
+# Verify:
+- Priority and Fairness works
+- Important traffic continues
+- Throttling visible in metrics
+```
+
+**Test 12: Volume capacity**
+
+```yaml
+# Fill PVC:
+kubectl exec my-pod -- dd if=/dev/zero of=/data/fill bs=1M count=10000
+
+# Verify:
+- Out-of-space errors
+- App handles gracefully
+- Alert fires
+- Expansion works
+```
+
+**Test 13: Memory pressure**
+
+```yaml
+# Stress test:
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stress
+spec:
+  containers:
+    - name: stress
+      image: progrium/stress
+      args: ["--vm", "1", "--vm-bytes", "1G", "--vm-hang", "0"]
+```
+
+Verify:
+- Other pods unaffected (limits)
+- OOMKilled if exceeded
+- Eviction if node pressure
+
+**Test 14: HPA scaling**
+
+```bash
+# Generate load:
+hey -z 5m -c 100 http://my-app
+
+# Verify:
+- HPA scales up
+- Pods come up quickly
+- Latency stable
+- Scale down after load
+```
+
+**Test 15: Cluster autoscaling**
+
+```yaml
+# Deploy many pods that won't fit:
+spec:
+  replicas: 100
+  containers:
+    - resources:
+        requests:
+          cpu: 1
+```
+
+Verify:
+- Cluster autoscaler adds nodes
+- Pods schedule
+- Scale down after
+
+**Tools:**
+
+**Chaos Mesh:**
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Workflow
+spec:
+  entry: cluster-test
+  templates:
+    - name: cluster-test
+      templateType: Serial
+      children:
+        - kill-pods
+        - inject-latency
+        - test-recovery
+```
+
+Workflow of experiments.
+
+**Litmus:**
+
+Pre-built chaos workloads:
+
+```yaml
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+spec:
+  experiments:
+    - name: pod-delete
+    - name: pod-cpu-hog
+    - name: pod-memory-hog
+```
+
+**kube-monkey:**
+
+Kubernetes-aware chaos:
+
+```yaml
+# Opt-in via labels:
+metadata:
+  labels:
+    kube-monkey/enabled: enabled
+```
+
+**Cluster checkup:**
+
+**kube-bench:** CIS benchmark testing.
+**kubescape:** Security and compliance.
+**kubeval:** Manifest validation.
+**popeye:** Sanitize cluster.
+
+**Resilience testing approach:**
+
+**Step 1: Define expected behavior**
+
+```
+For each test:
+- What should happen?
+- What's acceptable degradation?
+- What's the recovery time?
+```
+
+**Step 2: Test in staging first**
+
+```
+- Build confidence
+- Find issues without prod risk
+- Refine procedures
+```
+
+**Step 3: Production tests carefully**
+
+```
+- Small scope
+- Off-hours
+- Abort plan
+- Monitor closely
+```
+
+**Step 4: Document findings**
+
+```
+- What worked
+- What broke
+- Action items
+```
+
+**Step 5: Implement improvements**
+
+```
+- Address findings
+- Re-test
+- Continuous improvement
+```
+
+**Cluster health checks:**
+
+```bash
+# Basic health:
+kubectl get nodes
+kubectl get pods --all-namespaces
+kubectl top nodes
+kubectl top pods
+
+# Detailed:
+kubectl get events --sort-by='.lastTimestamp'
+kubectl describe nodes
+```
+
+**Monitoring during tests:**
+
+```promql
+# Cluster health:
+sum(kube_node_status_condition{condition="Ready", status="true"}) / count(kube_node_info)
+
+# Pod health:
+sum(kube_pod_status_phase{phase="Running"}) / sum(kube_pod_info)
+
+# API server:
+up{job="apiserver"}
+
+# etcd:
+etcd_server_has_leader
+```
+
+**Best practices:**
+
+1. **Test regularly**: not one-time
+2. **Document**: tests and findings
+3. **Start small**: pod kill before node failure
+4. **Verify recovery**: not just failure
+5. **Multiple scenarios**: comprehensive coverage
+6. **Production carefully**: when ready
+7. **Automate**: continuous testing
+8. **Team practice**: game days
+
+**Production scenarios:**
+
+1. **Pod kill weekly**: Random pod kill weekly. Caught issues with startup time. Improved init logic.
+
+2. **Node drain monthly**: Drained random node. Verified PDBs respected. Workloads continued.
+
+3. **DNS failure test**: Scaled CoreDNS to 0 briefly. Apps had timeouts. Fixed retry logic.
+
+4. **Production game day**: Quarterly. Real production. Limited scope. Found issues without major incidents.
+
+5. **Continuous chaos**: Kube-monkey running constantly. Random pod kills throughout day. System always resilient.
+
+---
+
+## 429. Explain incident communication strategies
+
+Communication during incidents is critical. Clear, frequent, accurate communication improves outcomes.
+
+**Communication audiences:**
+
+**Internal:**
+
+```
+- Incident responders (real-time)
+- Engineering team
+- Leadership
+- Customer success
+- Sales
+```
+
+**External:**
+
+```
+- Customers
+- Press (for major incidents)
+- Partners
+- Public
+```
+
+Each needs different communication.
+
+**Internal channels:**
+
+**Incident channel (Slack):**
+
+```
+#incident-2024-12-15-api-outage
+
+Posts:
+- Real-time updates
+- Decisions
+- Actions taken
+- Status changes
+```
+
+Centralized communication. Search-friendly.
+
+**War room (video call):**
+
+For SEV-1:
+
+```
+Always-on video call
+Active responders join
+Faster than text for urgent
+```
+
+**Status updates:**
+
+```yaml
+# Every 15-30 minutes during SEV-1:
+"Status update at 14:30:
+- Identified root cause: DB connection pool
+- Action: deploying fix
+- ETA: 15 minutes
+- Next update: 14:45"
+```
+
+Regular cadence even if no progress.
+
+**Email summaries:**
+
+```
+End of incident:
+"SEV-1 incident resolved.
+Duration: 45 minutes.
+Impact: 30% of users affected.
+Full post-mortem to follow."
+```
+
+For broader awareness.
+
+**External communication:**
+
+**Status page:**
+
+```yaml
+# Update statuspage.io:
+- Investigating: "We're investigating reports of API errors"
+- Identified: "We've identified the cause and are working on a fix"
+- Monitoring: "Fix deployed, monitoring for stability"
+- Resolved: "Issue resolved. Post-mortem to follow"
+```
+
+Public-facing.
+
+**Customer email:**
+
+For significant incidents:
+
+```
+Subject: Service Disruption - Action Taken
+
+Dear Customer,
+
+Between 14:23 and 15:08 UTC today, our API experienced 
+elevated errors affecting approximately 30% of users.
+
+We have identified and resolved the issue. A detailed 
+post-mortem will be available within 7 days.
+
+We apologize for the disruption.
+
+[Customer Success]
+```
+
+**Social media:**
+
+For major outages:
+
+```
+Twitter:
+"We're experiencing issues with our API. 
+Engineering team is actively investigating. 
+Updates on our status page: status.example.com"
+```
+
+Public communication.
+
+**Customer support communication:**
+
+```
+Brief support team:
+"API errors ongoing. 
+Acknowledge with customers. 
+Refer to status page. 
+We'll update when resolved."
+```
+
+Support handles inbound.
+
+**Communication roles:**
+
+**Incident Commander (IC):**
+
+```
+- Drives technical response
+- Makes decisions
+- NOT communications lead (usually)
+```
+
+**Communications Lead:**
+
+```
+- Internal updates
+- Status page
+- Customer communications
+- Liaison with support
+```
+
+Separate roles for SEV-1 incidents.
+
+**Update templates:**
+
+**Initial update:**
+
+```
+"We're investigating reports of [issue].
+Time discovered: [time]
+Impact: [description]
+Status: Investigating
+Next update: [time]"
+```
+
+**Progress update:**
+
+```
+"Investigation update:
+- Identified [cause]
+- Working on [solution]
+- ETA: [time estimate]
+Status: Identified
+Next update: [time]"
+```
+
+**Resolution update:**
+
+```
+"Issue resolved at [time].
+Duration: [duration]
+Impact: [final impact]
+Action: [what was done]
+Status: Resolved
+Post-mortem: Will be available within [timeframe]"
+```
+
+**Communication principles:**
+
+**Principle 1: Frequent**
+
+```
+Every 15-30 min during active incident
+Even "still investigating" valuable
+Silence = anxiety
+```
+
+**Principle 2: Honest**
+
+```
+Don't minimize impact
+Don't promise ETAs you can't meet
+Acknowledge unknowns
+```
+
+**Principle 3: Clear**
+
+```
+Avoid jargon
+Explain impact
+Action-oriented
+```
+
+**Principle 4: Empathetic**
+
+```
+Acknowledge customer impact
+Apologize when appropriate
+Show concern
+```
+
+**Principle 5: Actionable**
+
+```
+Tell people what to do
+Or what to expect
+Workarounds if available
+```
+
+**What NOT to communicate:**
+
+```
+- Speculation without facts
+- Internal blame
+- Customer-specific data
+- Security details (during active incident)
+- ETAs you don't know
+```
+
+**Tools:**
+
+**Statuspage:**
+
+```
+- Public status page
+- Component status
+- Incident timeline
+- Subscriptions for updates
+```
+
+**Incident.io:**
+
+```
+- Incident management
+- Communications built-in
+- Status page integration
+- Multiple channels
+```
+
+**PagerDuty:**
+
+```
+- Stakeholder notifications
+- Customer notifications
+- Integration with statuspage
+```
+
+**Microsoft Teams / Slack:**
+
+```
+- Incident channels
+- Auto-posting from monitoring
+- ChatOps for actions
+```
+
+**Common mistakes:**
+
+**Mistake 1: No initial communication**
+
+```
+Engineers working in silence
+Customers complain on Twitter
+Reputation damaged
+```
+
+Communicate immediately.
+
+**Mistake 2: False ETAs**
+
+```
+"Fixed in 5 minutes"
+Takes 2 hours
+Trust damaged
+```
+
+Be conservative with ETAs.
+
+**Mistake 3: Too technical**
+
+```
+"BGP route flapping on TOR switches"
+Customers don't understand
+```
+
+Translate for audience.
+
+**Mistake 4: Defensive**
+
+```
+"This wasn't our fault, it was AWS"
+Customers don't care
+You're responsible
+```
+
+Take responsibility.
+
+**Mistake 5: Forgetting all-clear**
+
+```
+Issue resolved
+No final communication
+Customers wondering
+```
+
+Always close out.
+
+**Sequencing:**
+
+**T+0 (detected):**
+
+```
+Internal incident channel created
+IC and key responders paged
+Initial assessment
+```
+
+**T+5 minutes:**
+
+```
+Status page: "Investigating"
+Stakeholders notified
+Customer success briefed
+```
+
+**T+15 minutes (if customer-impacting):**
+
+```
+External communication if needed
+First detailed update
+Customer email for major impact
+```
+
+**Every 15-30 min:**
+
+```
+Status updates internally and externally
+Even if no progress
+```
+
+**Resolution:**
+
+```
+All channels updated
+"Resolved" status
+Final summary
+```
+
+**Post-incident (within 24h):**
+
+```
+Internal: detailed summary
+External: post-mortem preview
+Customers: acknowledgment if affected
+```
+
+**Within 7 days:**
+
+```
+Full post-mortem
+Public if appropriate
+Action items shared
+```
+
+**Templates by severity:**
+
+**SEV-1 communication plan:**
+
+```
+- Real-time status page updates
+- Customer email
+- Social media
+- Press response ready
+- Executive briefings
+```
+
+**SEV-2:**
+
+```
+- Status page updates
+- Affected customer emails
+- Internal email
+```
+
+**SEV-3:**
+
+```
+- Internal channel only
+- Status page if customer-facing
+```
+
+**Production scenarios:**
+
+1. **Status page critical**: Used statuspage.io. Customers self-served updates. Reduced support tickets 80% during incidents.
+
+2. **Communications lead role**: SEV-1 had dedicated comms lead. IC focused on tech. Comms managed updates. Smooth communication.
+
+3. **Frequent updates**: Originally 1 update per hour. Customers complained. Increased to every 15-30 min. Better received.
+
+4. **Honest ETAs**: Stopped giving optimistic ETAs. "Investigating, no ETA yet" worked better than missed promises.
+
+5. **Public postmortem**: Major outage. Published detailed public post-mortem. Customers appreciated transparency. Trust strengthened.
+
+---
+
+## 430. How do you manage on-call rotations?
+
+On-call rotations distribute incident response across engineering team. Effective management prevents burnout while maintaining response capability.
+
+**Goals:**
+
+- Coverage 24/7
+- Sustainable for engineers
+- Fast incident response
+- Knowledge spread
+- Continuous improvement
+
+**Rotation structures:**
+
+**Structure 1: Follow-the-sun**
+
+```
+Region A (Americas): 8am-4pm local
+Region B (Europe): 8am-4pm local
+Region C (Asia): 8am-4pm local
+
+Always business hours for someone
+```
+
+Best: large teams, multiple regions.
+
+**Structure 2: 24/7 rotation**
+
+```
+Engineers take 1-week shifts
+Single region
+On-call 24/7 during week
+```
+
+Common for smaller teams.
+
+**Structure 3: Primary + secondary**
+
+```
+Primary: first responder
+Secondary: backup, escalation
+```
+
+Reduces stress.
+
+**Structure 4: Tiered**
+
+```
+L1: On-call SREs (initial response)
+L2: Subject matter experts
+L3: Management
+```
+
+Hierarchical.
+
+**Rotation duration:**
+
+**Weekly:**
+
+```
+Pros: Continuity (same person for week)
+Cons: Heavy if busy week
+```
+
+**Bi-weekly:**
+
+```
+Less frequent rotation
+Heavier load each shift
+```
+
+**Half-week:**
+
+```
+Lighter shifts
+More handovers
+```
+
+**Schedule examples:**
+
+**Weekly rotation:**
+
+```
+Week 1: Alice
+Week 2: Bob
+Week 3: Carol
+Week 4: Dave
+Repeat
+```
+
+**Daytime/nighttime:**
+
+```
+Daytime: assigned engineer (business hours)
+Nighttime: rotating
+Weekends: rotating
+```
+
+Different shifts.
+
+**Pay considerations:**
+
+```
+On-call compensation:
+- Standby pay
+- Pay per incident handled
+- Time off after busy week
+- Comp for nights/weekends
+```
+
+Varies by company.
+
+**On-call responsibilities:**
+
+```
+- Respond to pages within X minutes
+- Coordinate incident response
+- Update status during incidents
+- Run runbooks
+- Escalate when needed
+- Document in handover
+```
+
+Documented clearly.
+
+**Onboarding:**
+
+**Training:**
+
+```
+New engineer:
+- Shadow on-call (2-4 weeks)
+- Secondary on-call (4-8 weeks)
+- Primary on-call (with senior support)
+- Solo primary on-call
+```
+
+Gradual.
+
+**Resources:**
+
+```
+- Runbooks accessible
+- Dashboards bookmarked
+- Tools setup
+- Knowledge of architecture
+- Contacts list
+- Escalation paths
+```
+
+Prepare before first shift.
+
+**Handover:**
+
+**Between shifts:**
+
+```
+Outgoing on-call:
+- Open incidents
+- Recent changes
+- Things to watch
+- Pending issues
+
+Document in:
+- Shared doc
+- Slack channel
+- Handover meeting
+```
+
+Smooth transition.
+
+**Tools:**
+
+**PagerDuty:**
+
+```
+- Schedule rotation
+- Multiple levels
+- Escalation policies
+- Override for sick days
+- Integration with monitoring
+```
+
+**Opsgenie:**
+
+Similar to PagerDuty.
+
+**VictorOps:**
+
+```
+Now Splunk On-Call.
+Similar capabilities.
+```
+
+**Configuring escalation:**
+
+```yaml
+# PagerDuty escalation policy:
+escalation_rules:
+  - delay: 0
+    targets:
+      - primary_oncall
+  - delay: 10m
+    targets:
+      - secondary_oncall
+  - delay: 20m
+    targets:
+      - manager
+```
+
+If primary doesn't ack, escalates.
+
+**Coverage:**
+
+**Number of engineers:**
+
+```
+24/7 coverage needs ~5-7 engineers minimum:
+- 1 on-call per week
+- Plus secondary
+- Plus vacation buffer
+```
+
+Too few = burnout.
+
+**Schedule overrides:**
+
+```
+Vacation: swap shifts
+Sick: secondary takes over
+Conferences: arrange coverage
+```
+
+Flexibility.
+
+**On-call best practices:**
+
+**Practice 1: Reasonable load**
+
+```
+Target: <2 pages per week per engineer
+If higher: too many alerts or systems unreliable
+Fix systemic issues
+```
+
+**Practice 2: Quiet nights**
+
+```
+Goal: Minimal night pages
+Only true emergencies
+Tune alerts to not page at night for SEV-3
+```
+
+**Practice 3: Document everything**
+
+```
+- Runbooks
+- Past incidents
+- Architecture diagrams
+- Contact lists
+- Escalation paths
+```
+
+New on-call shouldn't be lost.
+
+**Practice 4: Rotate fairly**
+
+```
+No one stuck with weekends
+No one always on-call
+Equal distribution
+```
+
+**Practice 5: Compensation**
+
+```
+On-call pay or comp time
+Recognition of inconvenience
+```
+
+**Practice 6: Time off**
+
+```
+After busy on-call week:
+- Comp day
+- Light week
+- Recovery time
+```
+
+**Practice 7: Team support**
+
+```
+On-call not alone:
+- Team available for help
+- No stigma asking for help
+- Senior engineers mentor
+```
+
+**Practice 8: Continuous improvement**
+
+```
+- Post-incident reviews
+- Alert tuning
+- Runbook improvements
+- System fixes
+```
+
+Reduce future on-call burden.
+
+**Anti-patterns:**
+
+**Anti-pattern 1: Single point of knowledge**
+
+```
+"Only Alice can fix X"
+Risky, burnout for Alice
+```
+
+Spread knowledge.
+
+**Anti-pattern 2: Hero culture**
+
+```
+"Bob fixed it again"
+Doesn't scale
+```
+
+Make heroics unnecessary.
+
+**Anti-pattern 3: Permanent on-call**
+
+```
+Engineers always on-call
+Burnout
+```
+
+Real rotations.
+
+**Anti-pattern 4: No improvement**
+
+```
+Same incidents recurring
+No fixes implemented
+On-call becomes hellish
+```
+
+Implement post-mortem actions.
+
+**Anti-pattern 5: Underpaid**
+
+```
+On-call without compensation
+Resentment
+Retention issues
+```
+
+Compensate appropriately.
+
+**Burnout signs:**
+
+```
+- Frequent sick days during on-call
+- Reluctance to take shifts
+- Errors during incidents
+- Negative attitude
+- Considering leaving
+```
+
+Address proactively.
+
+**Metrics:**
+
+```
+- Pages per shift
+- Time spent on calls
+- Time of day distribution
+- Recurring vs new issues
+- Engineer satisfaction
+```
+
+Track to improve.
+
+**Sustainable on-call:**
+
+**Reduce noise:**
+
+```
+- Tune alerts
+- Auto-remediation
+- Better monitoring
+- Reduce false positives
+```
+
+Less paging = sustainable.
+
+**Self-healing systems:**
+
+```
+- HPA
+- Cluster autoscaler
+- Restart policies
+- Circuit breakers
+```
+
+Many issues auto-resolve.
+
+**Runbooks:**
+
+```
+Common issues documented
+On-call doesn't think from scratch
+Faster, less stressful
+```
+
+**Production scenarios:**
+
+1. **Followed-the-sun**: 3 regions, 24/7 coverage during business hours. Better than nights for everyone.
+
+2. **Primary + secondary**: SEV-1 always required secondary. Primary not alone. Reduced stress.
+
+3. **Alert tuning sprints**: Quarterly, review and tune alerts. Pages dropped 60%. On-call sustainable.
+
+4. **Runbook investment**: Built runbooks for top 20 alert types. New on-call onboarded faster. Less senior engineer dependence.
+
+5. **Rotation fairness**: Implemented automated scheduling tool. Equal distribution of nights, weekends. Engineers happier.
+
+---
+
+## 431. Explain SLA breach handling
+
+SLA (Service Level Agreement) breaches have business and contractual implications. Proper handling preserves relationships.
+
+**SLA components:**
+
+```
+Uptime: 99.9% (8.76 hours/year allowed downtime)
+Performance: P99 latency < 500ms
+Support response: 1 hour for critical
+Resolution time: 24 hours for critical
+```
+
+Contractual obligations.
+
+**SLA vs SLO vs SLI:**
+
+```
+SLI: Service Level Indicator (measurement)
+SLO: Service Level Objective (internal goal)
+SLA: Service Level Agreement (external commitment)
+
+SLA < SLO < SLI target
+(SLA has buffer below internal SLO)
+```
+
+**Breach types:**
+
+**Type 1: Uptime breach**
+
+```
+Promised 99.9% uptime
+Delivered 99.5%
+Downtime: 43.8 hours vs 8.76 allowed
+```
+
+**Type 2: Performance breach**
+
+```
+Promised P99 < 500ms
+Delivered P99 = 800ms
+```
+
+**Type 3: Support SLA breach**
+
+```
+Promised 1-hour response
+Responded after 4 hours
+```
+
+**Detection:**
+
+**Automated monitoring:**
+
+```promql
+# SLA uptime tracking:
+sum_over_time(up{job="my-service"}[30d])
+/
+count_over_time(up{job="my-service"}[30d])
+```
+
+**Alerts:**
+
+```yaml
+# Early warning (before breach):
+- alert: SLAAtRisk
+  expr: sla_error_budget_remaining < 0.2
+  labels:
+    severity: warning
+
+# Actual breach:
+- alert: SLABreached
+  expr: sla_error_budget_remaining < 0
+  labels:
+    severity: critical
+```
+
+**During breach:**
+
+**Step 1: Confirm**
+
+```
+Verify SLA calculation
+Different SLAs have different rules:
+- Excluded maintenance windows?
+- Per-region or global?
+- Specific endpoints?
+```
+
+**Step 2: Communication**
+
+```
+Customer notification:
+- Acknowledge breach
+- Status of recovery
+- Compensation plan
+- Prevention measures
+```
+
+**Step 3: Documentation**
+
+```
+Detailed records:
+- Incident timeline
+- Affected customers
+- Duration of breach
+- Root cause
+- Actions taken
+```
+
+For credits, audits.
+
+**Step 4: Credit calculation**
+
+Contract-specified:
+
+```
+Example: 10% monthly credit for each hour of downtime beyond SLA
+
+Downtime: 5 hours
+Allowed: 0.7 hours (99.9% of month)
+Excess: 4.3 hours
+Credit: 43% (or capped at 100%)
+```
+
+Per contract.
+
+**Step 5: Issuance**
+
+```
+Apply credit to next invoice
+Or refund per contract
+Document customer-by-customer
+```
+
+**Communication templates:**
+
+**Initial notification:**
+
+```
+Subject: Service Availability Notice
+
+Dear [Customer],
+
+Between [start time] and [end time] on [date], our service 
+experienced an outage affecting [impact description].
+
+We have restored service. Per our SLA, this exceeds our 
+99.9% availability commitment.
+
+You will receive a service credit of [amount] on your 
+next invoice. A detailed post-mortem will follow within 7 days.
+
+We apologize for the disruption.
+
+[Customer Success Team]
+```
+
+**Post-mortem to customers:**
+
+```
+Subject: Detailed Service Incident Report - [Date]
+
+Dear [Customer],
+
+As promised, here is the detailed report for the incident on [date]:
+
+Summary: [Brief description]
+
+Impact:
+- Duration: [time]
+- Affected services: [list]
+- Affected users: [percentage]
+
+Root Cause: [Technical explanation]
+
+What We've Done:
+1. [Action 1]
+2. [Action 2]
+3. [Action 3]
+
+Preventive Measures:
+1. [Measure 1]
+2. [Measure 2]
+
+Service Credit:
+[Amount] applied to your account.
+
+We appreciate your patience and remain committed to providing 
+reliable service.
+
+[Engineering Team]
+```
+
+**Credit policies:**
+
+**Stepped credits:**
+
+```
+Availability         | Credit
+99.0% - 99.9%       | 10%
+95.0% - 99.0%       | 25%
+90.0% - 95.0%       | 50%
+<90%                | 100%
+```
+
+Severity-based.
+
+**Per-incident credits:**
+
+```
+Per hour of downtime beyond SLA: 5% credit
+Max 100% per month
+```
+
+**No-fault zones:**
+
+```
+Excluded from SLA:
+- Scheduled maintenance
+- Force majeure
+- Customer-caused issues
+- Beta features
+```
+
+Per contract.
+
+**Prevention:**
+
+**SLO < SLA:**
+
+```
+SLA: 99.9% (8.76 hours/year)
+SLO: 99.95% (4.38 hours/year)
+
+If meeting SLO: not breaching SLA
+Buffer for recovery
+```
+
+**Error budgets:**
+
+```
+Monthly:
+SLA: 99.9% (43 min downtime allowed)
+SLO: 99.95% (21 min)
+
+Burn rate alerts at 25%, 50%, 75%
+Plan response before breach
+```
+
+**Continuous monitoring:**
+
+```promql
+# Real-time SLA tracking:
+1 - (
+  sum(rate(http_requests_total{status=~"5.."}[30d]))
+  /
+  sum(rate(http_requests_total[30d]))
+)
+```
+
+Always know current state.
+
+**Negotiation:**
+
+**Tiered SLAs:**
+
+```
+Standard tier: 99.5%
+Premium tier: 99.9%
+Enterprise tier: 99.95%
+```
+
+Different price points.
+
+**Maintenance windows:**
+
+```
+Excluded times: weekends 2-4am
+Maintenance announced in advance
+```
+
+Reduces SLA risk.
+
+**Geographic limitations:**
+
+```
+SLA per region
+Not global
+Easier to meet
+```
+
+**Reputation impact:**
+
+```
+SLA breach:
+- Credits (small financial)
+- Trust damage (large)
+- Renewal risk
+- New customer hesitation
+```
+
+Bigger than credit amount.
+
+**Recovery actions:**
+
+```
+After breach:
+1. Customer outreach (proactive)
+2. Detailed post-mortem
+3. Action items
+4. Visible improvements
+5. Continued communication
+```
+
+Rebuild trust.
+
+**Internal handling:**
+
+**Engineering response:**
+
+```
+- Root cause analysis
+- Action items
+- Implementation
+- Verification
+```
+
+Prevent recurrence.
+
+**Leadership awareness:**
+
+```
+- SEV-1 breaches: executive notification
+- Trends in breaches: leadership review
+- Investment decisions: based on patterns
+```
+
+**Customer success role:**
+
+```
+- Direct customer outreach
+- Manage relationship
+- Coordinate credits
+- Track customer health
+```
+
+**Sales considerations:**
+
+```
+- Breach affects pipeline
+- Existing customers: retention risk
+- New deals: harder to close
+```
+
+**Best practices:**
+
+1. **SLO < SLA**: buffer for recovery
+2. **Monitor continuously**: real-time
+3. **Early warning**: alerts before breach
+4. **Honest communication**: even bad news
+5. **Proactive credits**: don't wait for request
+6. **Detailed post-mortems**: rebuild trust
+7. **Track patterns**: learn from breaches
+8. **Invest in reliability**: continuous improvement
+
+**Production scenarios:**
+
+1. **Proactive credit**: SLA breach detected. Reached out before customer noticed. Credit issued. Customer impressed.
+
+2. **Buffer paid off**: SLO 99.95%, SLA 99.9%. Bad week brought down to 99.92%. Within SLA. No credits but learnings.
+
+3. **Detailed postmortem**: Major outage. Detailed public postmortem. Customers actually said trust increased.
+
+4. **Trend analysis**: Quarterly SLA review. Identified recurring pattern. Investment in fix. Breaches dropped.
+
+5. **Enterprise SLA**: Negotiated enterprise SLA with strict requirements. Invested in reliability. Met SLA, kept account.
+
+---
+
+## 432. How do you handle sudden traffic spikes?
+
+Sudden traffic spikes (viral content, marketing events, attacks) can overwhelm systems. Strategies to handle and prevent issues.
+
+**Causes:**
+
+**Planned:**
+- Product launches
+- Marketing campaigns
+- Black Friday
+- Sports events
+- Scheduled releases
+
+**Unplanned:**
+- Viral content (social media)
+- News events
+- Press coverage
+- DDoS attacks
+- Bot traffic
+
+**Detection:**
+
+```promql
+# Traffic spike alert:
+rate(http_requests_total[5m]) > 
+  3 * avg_over_time(rate(http_requests_total[5m])[1h:5m])
+
+# Sudden increase:
+delta(http_requests_total[5m]) > 1000
+```
+
+Quick alerts.
+
+**Response strategies:**
+
+**Strategy 1: Auto-scaling**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+spec:
+  minReplicas: 5
+  maxReplicas: 100
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+```
+
+Aggressive scale-up.
+
+**Strategy 2: Pre-scaling**
+
+For known events:
+
+```bash
+# Manual scale before event:
+kubectl scale deployment my-app --replicas=50
+```
+
+Have capacity ready.
+
+**Strategy 3: Cluster autoscaling**
+
+```yaml
+# Karpenter:
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+  limits:
+    cpu: 1000
+```
+
+Nodes scale automatically.
+
+**Strategy 4: Caching**
+
+```
+CDN: cache static assets
+Application cache: Redis, Memcached
+Database cache: query results
+```
+
+Reduce load on origin.
+
+**Strategy 5: Rate limiting**
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+```
+
+Per-IP limits. Block runaway traffic.
+
+**Strategy 6: Queue-based**
+
+```
+Frontend → queue → backend processing
+Frontend accepts all (fast)
+Backend processes at sustainable pace
+```
+
+Decouples burst handling.
+
+**Strategy 7: Load shedding**
+
+```python
+if cpu_usage > 0.9:
+    return 503 Service Unavailable
+```
+
+Reject excess, save core service.
+
+**Strategy 8: Graceful degradation**
+
+```python
+def get_recommendations():
+    try:
+        return ml_service.recommend()
+    except OverloadedError:
+        return cached_popular_items
+```
+
+Fallback during spikes.
+
+**Strategy 9: Database scaling**
+
+```
+Read replicas for read-heavy
+Connection pooling
+Query optimization
+Caching layer
+```
+
+Database often bottleneck.
+
+**Strategy 10: CDN**
+
+```
+CloudFlare, Akamai, Fastly
+Cache static + dynamic content
+Absorb attacks at edge
+Geographic distribution
+```
+
+First line of defense.
+
+**Pre-event preparation:**
+
+**1 week before:**
+
+```
+- Capacity planning
+- Pre-scale where possible
+- Verify auto-scaling
+- Increase quotas if needed
+- Brief on-call
+```
+
+**1 day before:**
+
+```
+- Final capacity check
+- Cache warming
+- Monitoring verified
+- Runbooks reviewed
+- Team alerted
+```
+
+**During event:**
+
+```
+- Active monitoring
+- Manual scaling if needed
+- Communication ready
+- Decisions documented
+```
+
+**Black Friday example:**
+
+```
+Preparation:
+- 3 weeks pre-scaling
+- Database read replicas added
+- CDN cache pre-warmed
+- Extra on-call
+- Direct customer support line
+
+During:
+- Real-time monitoring
+- Auto-scaling working
+- Manual interventions ready
+
+Post:
+- Scale down gradually
+- Review performance
+- Document lessons
+```
+
+**Unplanned spikes:**
+
+**Viral content scenario:**
+
+```
+T+0: Article goes viral
+T+10m: Traffic 5x normal
+T+15m: Auto-scaling triggered
+T+20m: Pods scaled up
+T+30m: Database saturated
+       → Add read replica
+       → Optimize cache
+T+45m: Stabilized
+```
+
+**Response steps:**
+
+```
+1. Identify cause (good vs bad traffic)
+2. Trigger scaling
+3. Monitor downstream
+4. Add capacity to bottlenecks
+5. Communicate if needed
+```
+
+**Bot traffic / attacks:**
+
+**Identification:**
+
+```
+- Unusual patterns
+- Geographic concentration
+- Suspicious user agents
+- Failed authentication spike
+```
+
+**Response:**
+
+```
+- Rate limiting (per-IP)
+- WAF rules
+- IP blocking
+- Bot management
+- Geographic restrictions
+```
+
+**Architecture for spike resilience:**
+
+**Stateless services:**
+
+```
+Easy to scale
+No state to manage
+HPA effective
+```
+
+**Async patterns:**
+
+```
+Message queues
+Event streams
+Decouples bursts
+```
+
+**Microservices isolation:**
+
+```
+One service overload doesn't affect others
+Bulkheads
+Circuit breakers
+```
+
+**Auto-scaling tuning:**
+
+**Speed up:**
+
+```yaml
+behavior:
+  scaleUp:
+    stabilizationWindowSeconds: 0
+    policies:
+      - type: Percent
+        value: 200   # Double
+        periodSeconds: 30
+```
+
+Aggressive.
+
+**Slow down:**
+
+```yaml
+behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 600
+    policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+Conservative.
+
+**Custom metrics:**
+
+```yaml
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "100"
+```
+
+Better than CPU for traffic.
+
+**Database considerations:**
+
+**Connection pool:**
+
+```yaml
+maxConnections: 200
+connectionTimeout: 5s
+```
+
+Don't overwhelm DB.
+
+**Read replicas:**
+
+```
+Primary: writes
+Replicas: reads
+Scale reads independently
+```
+
+**Caching:**
+
+```
+Application cache (Redis)
+CDN cache
+HTTP cache headers
+```
+
+Reduce DB load.
+
+**Cost considerations:**
+
+**Spot for bursts:**
+
+```yaml
+# Karpenter:
+requirements:
+  - key: karpenter.sh/capacity-type
+    operator: In
+    values: ["spot"]
+```
+
+Cheaper for transient load.
+
+**Reserved for baseline:**
+
+```
+RI/SP for steady state
+Spot for spikes
+On-demand for emergency
+```
+
+Optimize cost.
+
+**Monitoring:**
+
+```promql
+# Current load:
+sum(rate(http_requests_total[1m]))
+
+# Capacity (replicas × per-pod throughput):
+kube_deployment_status_replicas{deployment="my-app"} * 1000
+
+# Headroom:
+capacity - current_load
+```
+
+Track in real-time.
+
+**Best practices:**
+
+1. **Auto-scaling configured**: HPA, cluster autoscaler
+2. **Pre-scale for known events**: capacity ready
+3. **Caching everywhere**: reduce origin load
+4. **CDN**: absorb at edge
+5. **Database resilience**: replicas, caching
+6. **Async patterns**: queues for bursts
+7. **Rate limiting**: prevent abuse
+8. **Monitoring**: real-time visibility
+9. **Game days**: practice
+10. **Cost optimization**: spot, RI
+
+**Production scenarios:**
+
+1. **Black Friday**: 5x traffic. Pre-scaled 1 week. Auto-scaling activated for peaks. Smooth event. No downtime.
+
+2. **Viral article**: 20x traffic spike. CDN absorbed most. Origin auto-scaled. Brief degradation, recovered.
+
+3. **DDoS**: 100x traffic, all malicious. Cloudflare absorbed. Origin untouched. WAF blocked patterns.
+
+4. **Product launch**: Predictable 3x spike. Pre-scaled. Caching pre-warmed. No issues.
+
+5. **Database bottleneck**: App scaled fine, DB overwhelmed. Added read replicas. Now DB scales too.
+
+---
+
+## 433. Explain disaster simulation exercises
+
+Disaster simulations test team and system readiness for major incidents. Building muscle memory for real disasters.
+
+**Goals:**
+
+- Validate disaster recovery plans
+- Identify gaps in procedures
+- Train team responses
+- Test infrastructure resilience
+- Build confidence
+- Find weaknesses before disasters
+
+**Types of simulations:**
+
+**Type 1: Tabletop exercise**
+
+```
+Discussion-based
+Walk through scenario
+"What would you do?"
+No actual technical changes
+```
+
+Good for: planning, team training.
+
+**Type 2: Walkthrough**
+
+```
+Step-by-step execution
+On test environment
+Real but controlled
+```
+
+**Type 3: Simulation**
+
+```
+Realistic scenario
+Some real failures injected
+Production-like
+```
+
+**Type 4: Production drill**
+
+```
+Real production
+Real failures (controlled)
+Real response
+Highest fidelity
+```
+
+Risky but valuable.
+
+**Common scenarios:**
+
+**Scenario 1: Region failure**
+
+```
+"AWS us-east-1 is unavailable"
+
+Test:
+- Failover to us-west-2
+- DNS update
+- Database promotion
+- Traffic shift
+- Recovery time
+```
+
+**Scenario 2: Database loss**
+
+```
+"Primary database is corrupt"
+
+Test:
+- Failover to replica
+- Backup restoration
+- Data validation
+- Recovery time
+```
+
+**Scenario 3: Major service outage**
+
+```
+"Authentication service down"
+
+Test:
+- Impact assessment
+- Cascading effects
+- Mitigation steps
+- Communication
+- Recovery
+```
+
+**Scenario 4: Security breach**
+
+```
+"Suspicious activity detected, possible compromise"
+
+Test:
+- Isolation procedures
+- Incident response
+- Forensics
+- Customer communication
+- Legal/PR coordination
+```
+
+**Scenario 5: Complete cluster failure**
+
+```
+"Production cluster completely down"
+
+Test:
+- Restore from backups
+- Rebuild infrastructure
+- Restore applications
+- Restore data
+- Verify functionality
+```
+
+**Exercise structure:**
+
+**Pre-exercise (1 week before):**
+
+```
+- Define scenario
+- Identify participants
+- Set objectives
+- Prepare environment
+- Brief participants (high-level)
+```
+
+**Day of:**
+
+```
+Morning:
+- Introduction
+- Rules of engagement
+- Communication channels
+
+Exercise (2-4 hours):
+- Inject scenario
+- Observe response
+- Document everything
+- Note decisions, actions, blockers
+
+Debrief (1 hour):
+- What went well
+- What didn't
+- Lessons learned
+- Action items
+```
+
+**Post-exercise (1 week after):**
+
+```
+- Detailed report
+- Action items in tickets
+- Track to completion
+- Schedule next exercise
+```
+
+**Rules of engagement:**
+
+```
+- Safety first (no actual customer impact)
+- Real-time response (no shortcuts)
+- Document decisions
+- Note assumptions
+- Stop if real issue arises
+- Time-bound
+```
+
+**Roles:**
+
+**Facilitator:**
+
+```
+- Inject scenarios
+- Keep on track
+- Time management
+- Provide injects
+- Stop if needed
+```
+
+**Observers:**
+
+```
+- Document responses
+- Note decisions
+- Capture lessons
+- Don't help (let them figure out)
+```
+
+**Participants:**
+
+```
+- On-call team
+- Engineering managers
+- Customer support reps
+- Communications (PR)
+- Leadership (for senior exercises)
+```
+
+**Example: Region failure drill**
+
+**Scenario:**
+
+```
+At 14:00, facilitator: "AWS us-east-1 is having a regional outage. All EC2 in that region is unreachable."
+
+Inject 1: Pages start firing for affected services.
+Inject 2: Customer reports flood in.
+Inject 3: Status page shows AWS issues.
+```
+
+**Expected response:**
+
+```
+T+0: Engineer paged
+T+5m: Incident channel created
+T+10m: IC assigned
+T+15m: Assessment complete
+T+20m: Decision: failover to us-west-2
+T+25m: Failover initiated
+T+45m: DNS updated
+T+60m: Services running in us-west-2
+T+90m: Customer communication
+T+120m: Full recovery confirmed
+```
+
+**Observations:**
+
+```
+- Failover took longer than RTO (60 min target, took 90)
+- DNS TTL too long (5 min vs 1 min ideal)
+- Database promotion script had error
+- Customer communication late
+- Some services not configured for cross-region
+```
+
+**Action items:**
+
+```
+1. Reduce DNS TTL to 1 min (P0)
+2. Fix database promotion script (P0)
+3. Configure all services for cross-region (P1)
+4. Pre-staged communication templates (P1)
+5. Practice quarterly (ongoing)
+```
+
+**Other exercises:**
+
+**Chaos Monkey**: random pod kills.
+**Game day**: scheduled chaos.
+**Fire drill**: realistic but limited scope.
+**Red team**: adversarial security testing.
+**Penetration testing**: security validation.
+
+**Tools:**
+
+**Chaos Mesh:**
+
+```yaml
+# Inject region failure:
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+spec:
+  action: partition
+  selector:
+    namespaces: [region-east]
+```
+
+**Gremlin:**
+
+Commercial chaos platform.
+
+**AWS Fault Injection Simulator:**
+
+```yaml
+# AWS-managed chaos:
+ExperimentTemplate:
+  Description: "Stop instances in us-east-1"
+  Actions:
+    - ActionId: aws:ec2:stop-instances
+```
+
+**Litmus:**
+
+CNCF chaos engineering.
+
+**Frequency:**
+
+```
+Quarterly: full-day exercise
+Monthly: smaller drills
+Weekly: automated chaos
+Daily: continuous chaos (advanced)
+```
+
+Build in regular cadence.
+
+**Maturity progression:**
+
+**Level 1: Beginner**
+
+```
+- Annual tabletop exercises
+- Documented procedures
+- Basic backups tested
+```
+
+**Level 2: Intermediate**
+
+```
+- Quarterly drills
+- DR runbooks tested
+- Some automation
+```
+
+**Level 3: Advanced**
+
+```
+- Monthly chaos engineering
+- Game days
+- Production drills
+- Automated chaos
+```
+
+**Level 4: Expert**
+
+```
+- Continuous chaos in production
+- Automated DR validation
+- Real failures handled like drills
+```
+
+**Common findings:**
+
+**Finding 1: Outdated runbooks**
+
+```
+Procedures don't match reality
+Tools changed
+Names changed
+Steps obsolete
+```
+
+Fix: regular updates.
+
+**Finding 2: Missing tools**
+
+```
+"How do I do X?"
+Tool deprecated
+Access not granted
+```
+
+Fix: tool inventory.
+
+**Finding 3: Knowledge gaps**
+
+```
+Specific person knew
+That person not available
+```
+
+Fix: document, train.
+
+**Finding 4: Communication issues**
+
+```
+Slow notifications
+Wrong people contacted
+No status updates
+```
+
+Fix: improve playbooks.
+
+**Finding 5: Timing issues**
+
+```
+RTO/RPO exceeded
+Failover slow
+Restoration takes too long
+```
+
+Fix: automate, optimize.
+
+**Best practices:**
+
+1. **Regular schedule**: quarterly minimum
+2. **Realistic scenarios**: based on real risks
+3. **Document everything**: lessons captured
+4. **Action items tracked**: real improvements
+5. **All hands**: not just SREs
+6. **Realistic conditions**: production-like
+7. **Continuous improvement**: each exercise builds
+8. **Celebrate findings**: not failures, learning
+
+**Production scenarios:**
+
+1. **Region failover drill**: Quarterly. Caught DNS TTL issue. Fixed. Real region issue later: smooth failover.
+
+2. **Database drill**: Practiced restore. Took 4 hours (RTO 2 hours). Optimized. Now 1.5 hours.
+
+3. **Security tabletop**: Practiced breach response. Found gaps in legal coordination. Fixed processes.
+
+4. **Game day**: Half-day exercises. Team practiced together. Built relationships. Real incidents: smooth response.
+
+5. **Continuous chaos**: Kube-monkey running. Random pod kills. System always resilient. Confidence high.
+
+---
+
+## 434. How do you manage noisy neighbor incidents?
+
+Noisy neighbors are workloads consuming disproportionate resources, affecting others. Common in shared Kubernetes clusters.
+
+**Symptoms:**
+
+```
+- One workload slows others on same node
+- High CPU/memory on node
+- I/O wait increased
+- Network saturation
+```
+
+Other apps suffer due to one.
+
+**Causes:**
+
+**Cause 1: No resource limits**
+
+```yaml
+# Bad - no limits:
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+# No limits - can use everything
+```
+
+**Cause 2: Aggressive workload**
+
+```
+Batch job using max CPU
+ML training consuming all memory
+Burst process spiking I/O
+```
+
+**Cause 3: Memory leak**
+
+```
+Slow leak filling node memory
+Eventually evicts others
+```
+
+**Cause 4: Network heavy**
+
+```
+Backup process saturating NIC
+Other pods can't communicate
+```
+
+**Cause 5: Disk I/O**
+
+```
+Database doing heavy writes
+Other pods I/O starved
+```
+
+**Detection:**
+
+```promql
+# Pods using most CPU on a node:
+topk(5,
+  sum by (pod) (
+    rate(container_cpu_usage_seconds_total{node="node-1"}[5m])
+  )
+)
+
+# Pods using most memory:
+topk(5,
+  container_memory_working_set_bytes{node="node-1"}
+)
+
+# Node pressure:
+kube_node_status_condition{condition="MemoryPressure", status="true"}
+```
+
+Identify culprits.
+
+**Immediate response:**
+
+**Step 1: Identify**
+
+```bash
+# Top pods on affected node:
+kubectl top pods -A --sort-by=cpu --no-headers | head -20
+
+# Or memory:
+kubectl top pods -A --sort-by=memory --no-headers | head -20
+
+# Specific node:
+kubectl top pods --field-selector spec.nodeName=node-1
+```
+
+**Step 2: Verify impact**
+
+```
+Other pods experiencing:
+- Latency
+- Errors
+- OOMKills?
+```
+
+**Step 3: Mitigate**
+
+**Option A: Apply limits**
+
+```yaml
+# Edit deployment:
+resources:
+  limits:
+    cpu: 2
+    memory: 4Gi
+```
+
+But: kills running pods.
+
+**Option B: Move workload**
+
+```yaml
+# Cordon node, drain noisy pod:
+kubectl cordon node-1
+kubectl delete pod noisy-pod
+# Pod reschedules elsewhere
+```
+
+**Option C: Scale down problematic**
+
+```bash
+kubectl scale deployment noisy-app --replicas=0
+```
+
+Stop the issue.
+
+**Option D: Move other workloads**
+
+```bash
+# Move affected pods to different node:
+kubectl drain node-1 --pod-selector='app=affected-app'
+```
+
+**Long-term fixes:**
+
+**Fix 1: Resource limits**
+
+```yaml
+spec:
+  containers:
+    - resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: 2
+          memory: 2Gi
+```
+
+Mandatory in production.
+
+**Fix 2: LimitRange (namespace)**
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: limits
+spec:
+  limits:
+    - default:
+        cpu: 1
+        memory: 1Gi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      type: Container
+```
+
+Default limits applied.
+
+**Fix 3: ResourceQuota (namespace)**
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: quota
+spec:
+  hard:
+    requests.cpu: "100"
+    requests.memory: 100Gi
+    limits.cpu: "200"
+    limits.memory: 200Gi
+```
+
+Total resources per namespace.
+
+**Fix 4: Pod priority**
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000
+
+---
+
+spec:
+  priorityClassName: high-priority
+```
+
+Important pods evict less critical.
+
+**Fix 5: Pod anti-affinity**
+
+```yaml
+spec:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: noisy
+            topologyKey: kubernetes.io/hostname
+```
+
+Avoid co-locating with known noisy.
+
+**Fix 6: Taints and tolerations**
+
+```yaml
+# Dedicated nodes for noisy workloads:
+kubectl taint nodes node-1 workload=batch:NoSchedule
+```
+
+```yaml
+# Batch pods tolerate:
+spec:
+  tolerations:
+    - key: workload
+      value: batch
+      effect: NoSchedule
+```
+
+Isolate.
+
+**Fix 7: Node pools**
+
+```yaml
+# Different node pools:
+- workload: general (most pods)
+- workload: batch (CPU-intensive)
+- workload: data (memory-intensive)
+- workload: gpu (GPU workloads)
+```
+
+Physical separation.
+
+**Fix 8: QoS classes**
+
+Kubernetes assigns automatically:
+
+```
+Guaranteed: requests == limits, both set
+Burstable: requests set, limits higher or unset
+BestEffort: no requests or limits
+```
+
+Eviction order: BestEffort → Burstable → Guaranteed.
+
+**For critical workloads:**
+
+```yaml
+resources:
+  requests:
+    cpu: 1
+    memory: 2Gi
+  limits:
+    cpu: 1
+    memory: 2Gi
+```
+
+Guaranteed QoS. Last to be evicted.
+
+**Resource types to consider:**
+
+**CPU:**
+
+```yaml
+# CPU throttling:
+limits:
+  cpu: 1
+```
+
+Throttled, not killed. Slows down.
+
+**Memory:**
+
+```yaml
+# Memory limit:
+limits:
+  memory: 1Gi
+```
+
+OOMKilled if exceeded.
+
+**Ephemeral storage:**
+
+```yaml
+limits:
+  ephemeral-storage: 5Gi
+```
+
+Disk space for pod.
+
+**Hugepages:**
+
+```yaml
+limits:
+  hugepages-2Mi: 100Mi
+```
+
+Specialized.
+
+**Network:**
+
+```
+Limited via NetworkPolicy or eBPF
+Bandwidth limits via CNI (Calico, Cilium)
+```
+
+**Disk I/O:**
+
+```yaml
+# I/O limits (cgroup v2):
+metadata:
+  annotations:
+    io.kubernetes.cri.unsafe-cgroup-only: "true"
+```
+
+Limited support, evolving.
+
+**Monitoring:**
+
+**Per-node:**
+
+```promql
+# Node CPU saturation:
+1 - (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+
+# Node memory pressure:
+1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+# Node I/O wait:
+rate(node_cpu_seconds_total{mode="iowait"}[5m])
+```
+
+**Per-pod:**
+
+```promql
+# Top consumers:
+topk(10, sum by (pod) (rate(container_cpu_usage_seconds_total[5m])))
+
+# Memory usage:
+topk(10, container_memory_working_set_bytes)
+
+# I/O:
+topk(10, rate(container_fs_writes_bytes_total[5m]))
+```
+
+**Alerts:**
+
+```yaml
+- alert: NodeHighCPU
+  expr: |
+    1 - rate(node_cpu_seconds_total{mode="idle"}[5m]) > 0.9
+  for: 15m
+
+- alert: PodHighCPU
+  expr: |
+    sum by (pod) (rate(container_cpu_usage_seconds_total[5m])) > 4
+  for: 30m
+```
+
+**Prevention strategies:**
+
+**Strategy 1: Mandatory limits**
+
+```yaml
+# OPA Gatekeeper policy:
+violation[{"msg": msg}] {
+  input.review.object.kind == "Pod"
+  container := input.review.object.spec.containers[_]
+  not container.resources.limits.cpu
+  msg := "CPU limit required"
+}
+```
+
+Enforce limits.
+
+**Strategy 2: Namespace isolation**
+
+```yaml
+# Critical apps in separate namespace
+# With own ResourceQuota
+```
+
+**Strategy 3: Dedicated nodes**
+
+```yaml
+# Critical apps on dedicated nodes
+# Taints prevent others
+```
+
+**Strategy 4: Capacity planning**
+
+```
+Track resource trends
+Add capacity before saturated
+Don't run at 100%
+```
+
+**Strategy 5: Workload classification**
+
+```
+- Critical: dedicated nodes
+- Standard: shared nodes with limits
+- Batch: separate node pool
+- Best-effort: spare capacity
+```
+
+**Best practices:**
+
+1. **Always set limits**: in production
+2. **LimitRange**: defaults for namespace
+3. **ResourceQuota**: per-namespace totals
+4. **Priority classes**: protect critical
+5. **Dedicated nodes**: for known noisy
+6. **Monitoring**: identify issues early
+7. **Capacity planning**: avoid saturation
+8. **Document**: workload classifications
+
+**Production scenarios:**
+
+1. **Batch noisy neighbor**: ML training without limits. Saturated nodes. Affected web apps. Added limits + dedicated nodes. Resolved.
+
+2. **Memory leak**: One service slow leak. Took down nodes. Implemented automatic limits. Now OOMKilled before affecting others.
+
+3. **Network saturation**: Backup process used all bandwidth. Other pods couldn't communicate. Scheduled backup off-hours. Solved.
+
+4. **Disk I/O**: Database heavy writes. Affected other pods on same node. Moved DB to dedicated node. Resolved.
+
+5. **Prevention**: Implemented LimitRange + ResourceQuota cluster-wide. New noisy neighbors prevented.
+
+---
+
+## 435. Explain memory leak incident response
+
+Memory leaks cause pods to consume increasing memory, eventually OOMKilled. Specific incident response needed.
+
+**Detection:**
+
+```promql
+# Memory growth:
+rate(container_memory_working_set_bytes[1h])
+
+# Approaching limit:
+container_memory_working_set_bytes / kube_pod_container_resource_limits{resource="memory"} > 0.85
+
+# OOMKills:
+rate(kube_pod_container_status_terminated_reason{reason="OOMKilled"}[5m])
+```
+
+Multiple signals.
+
+**Alerts:**
+
+```yaml
+- alert: PodMemoryGrowing
+  expr: |
+    rate(container_memory_working_set_bytes[1h]) > 100000000
+  for: 1h
+
+- alert: PodOOMKilled
+  expr: |
+    kube_pod_container_status_terminated_reason{reason="OOMKilled"} == 1
+```
+
+**Incident response steps:**
+
+**Step 1: Confirm leak**
+
+```promql
+# Plot memory over time:
+container_memory_working_set_bytes{pod="my-pod"}
+```
+
+If steadily increasing for hours: likely leak.
+
+**Step 2: Identify affected pods**
+
+```bash
+# All instances same pattern?
+kubectl top pods -l app=my-app
+```
+
+All affected: code issue.
+Just one: maybe local issue.
+
+**Step 3: Immediate mitigation**
+
+**Option A: Restart pods**
+
+```bash
+kubectl rollout restart deployment my-app
+```
+
+Buys time. Pods restart with fresh memory.
+
+**Option B: Increase limits**
+
+```yaml
+limits:
+  memory: 4Gi   # Was 2Gi
+```
+
+Buys more time.
+
+**Option C: Scale up**
+
+```bash
+kubectl scale deployment my-app --replicas=10
+```
+
+Distribute load.
+
+**Step 4: Workaround**
+
+**Scheduled restart:**
+
+```yaml
+# CronJob to restart deployment:
+spec:
+  schedule: "0 */4 * * *"   # Every 4 hours
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - command:
+                - kubectl
+                - rollout
+                - restart
+                - deployment/my-app
+```
+
+Masks leak.
+
+**Liveness probe:**
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+  initialDelaySeconds: 60
+```
+
+Pod restarts when unhealthy.
+
+**Step 5: Diagnose**
+
+**Language-specific tools:**
+
+**Java:**
+
+```bash
+# Heap dump:
+kubectl exec my-pod -- jcmd 1 GC.heap_dump /tmp/heap.hprof
+
+# Copy out:
+kubectl cp my-pod:/tmp/heap.hprof ./heap.hprof
+
+# Analyze with Eclipse MAT
+```
+
+**Python:**
+
+```python
+# tracemalloc:
+import tracemalloc
+tracemalloc.start()
+
+# ... code ...
+
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics('lineno')
+for stat in top_stats[:10]:
+    print(stat)
+```
+
+**Node.js:**
+
+```javascript
+// Heap snapshot:
+const v8 = require('v8');
+v8.writeHeapSnapshot('/tmp/heap.heapsnapshot');
+```
+
+**Go:**
+
+```go
+// pprof:
+import _ "net/http/pprof"
+
+// Then:
+// go tool pprof http://pod:8080/debug/pprof/heap
+```
+
+**Step 6: Find leak source**
+
+**Heap dump analysis:**
+
+```
+1. Take dump
+2. Open in profiler
+3. Look at largest retained objects
+4. Trace back to allocation
+5. Find why not released
+```
+
+**Common patterns:**
+
+```
+- Caches without size limits
+- Event listeners not removed
+- Connections not closed
+- Closures holding references
+- Static collections growing
+```
+
+**Step 7: Fix**
+
+**Code fix:**
+
+```python
+# Bad:
+cache = {}
+def get_user(id):
+    if id not in cache:
+        cache[id] = db.get_user(id)
+    return cache[id]
+# Grows forever
+
+# Fixed:
+from functools import lru_cache
+@lru_cache(maxsize=1000)
+def get_user(id):
+    return db.get_user(id)
+```
+
+**Deploy fix:**
+
+```bash
+# Build new image
+docker build -t my-app:v2 .
+kubectl set image deployment/my-app my-app=my-app:v2
+```
+
+**Step 8: Verify**
+
+```promql
+# After deploy, monitor:
+container_memory_working_set_bytes{pod=~"my-app.*"}
+```
+
+Should stabilize, not grow.
+
+**Common leak sources:**
+
+**Source 1: Unbounded caches**
+
+```python
+# Bad:
+results = {}
+def expensive_function(arg):
+    if arg not in results:
+        results[arg] = compute(arg)
+    return results[arg]
+
+# Fixed:
+results = LRUCache(maxsize=1000)
+```
+
+**Source 2: Event listeners**
+
+```javascript
+// Bad:
+function setupEvent(element) {
+  element.addEventListener('click', handler);
+}
+// Never removed
+
+// Fixed:
+element.addEventListener('click', handler);
+// Later:
+element.removeEventListener('click', handler);
+```
+
+**Source 3: Connections**
+
+```python
+# Bad:
+def query():
+    conn = pool.get_connection()
+    return conn.execute(...)
+# Connection not released
+
+# Fixed:
+def query():
+    with pool.get_connection() as conn:
+        return conn.execute(...)
+```
+
+**Source 4: Threading**
+
+```python
+# Bad (threads never end):
+threading.Thread(target=worker).start()
+
+# Fixed (use thread pool):
+executor.submit(worker)
+```
+
+**Source 5: Static collections**
+
+```java
+// Bad:
+private static List<Object> cache = new ArrayList<>();
+public static void add(Object o) {
+    cache.add(o);  // Never removed
+}
+
+// Fixed:
+private static final int MAX_SIZE = 1000;
+public static void add(Object o) {
+    if (cache.size() >= MAX_SIZE) {
+        cache.remove(0);
+    }
+    cache.add(o);
+}
+```
+
+**Source 6: Closures (JavaScript/Python)**
+
+```javascript
+// Bad:
+function setupHandler() {
+  const data = loadLargeData();
+  return function() {
+    // 'data' captured in closure, never released
+  };
+}
+
+// Fixed:
+function setupHandler() {
+  // Don't capture large data
+  return function() {
+    const data = loadLargeData();
+    // ... use data
+  };
+}
+```
+
+**Tools:**
+
+**Profiling:**
+
+```python
+# Python memory_profiler:
+from memory_profiler import profile
+
+@profile
+def my_function():
+    # ...
+```
+
+**Continuous profiling:**
+
+```yaml
+# Parca, Pyroscope:
+# Continuous CPU and memory profiling
+```
+
+**APM tools:**
+
+```
+- Datadog
+- New Relic
+- AppDynamics
+```
+
+Show memory trends, leak detection.
+
+**Prevention:**
+
+**Practice 1: Resource limits**
+
+```yaml
+resources:
+  limits:
+    memory: 2Gi
+```
+
+OOMKilled eventually catches leaks.
+
+**Practice 2: Load testing**
+
+```bash
+# Run for hours:
+hey -z 24h -c 100 http://my-app
+# Watch memory
+```
+
+Catch in dev.
+
+**Practice 3: Profiling in dev**
+
+```python
+# Always profile new code
+# Look for unbounded growth
+```
+
+**Practice 4: Code review**
+
+```
+Check for:
+- Bounded caches
+- Connection cleanup
+- Listener removal
+- Resource releases
+```
+
+**Practice 5: Continuous profiling**
+
+Production profiling catches issues early.
+
+**Best practices:**
+
+1. **Monitor memory trends**: alerts before OOMKill
+2. **Set limits**: catch leaks
+3. **Liveness probes**: auto-restart unhealthy
+4. **Profile in production**: continuous
+5. **Code review**: catch common patterns
+6. **Load test**: find leaks in dev
+7. **Tooling per language**: appropriate profilers
+8. **Document fixes**: lessons learned
+
+**Production scenarios:**
+
+1. **Cache leak**: Java app slow memory growth. Heap dump showed massive HashMap. Cache without size limit. Added LRU. Fixed.
+
+2. **Goroutine leak**: Go service. Memory + goroutine count growing. pprof showed leaked goroutines. Added context cancellation. Resolved.
+
+3. **Workaround acceptable**: Found leak. Fix would take weeks. Scheduled daily restart. Acceptable workaround. Fixed eventually.
+
+4. **Memory limit hit**: New service growing memory. Hit limit. OOMKilled. Diagnosis revealed leak. Fixed quickly.
+
+5. **Continuous profiling caught**: Parca showed unusual allocation pattern. Investigation found subtle leak. Fixed before customer impact.
+
+---
+
+## 436. How do you recover failed Stateful workloads?
+
+Stateful workloads (databases, queues) have data and identity. Recovery requires careful coordination.
+
+**Failure scenarios:**
+
+**Scenario 1: Single pod failure**
+
+```
+StatefulSet replica crashes
+Persistent storage intact
+Standard recovery
+```
+
+**Scenario 2: Data corruption**
+
+```
+Database files corrupted
+Need restoration
+```
+
+**Scenario 3: Persistent volume loss**
+
+```
+PV lost (rare, cloud issue)
+Need backup restore
+```
+
+**Scenario 4: Complete cluster failure**
+
+```
+Cluster destroyed
+Restore everything
+```
+
+**Recovery: Single pod**
+
+**Auto-recovery:**
+
+```
+Pod crashes
+       ↓
+StatefulSet detects
+       ↓
+Recreates with same name and identity
+       ↓
+Reattaches to same PVC
+       ↓
+Data preserved
+```
+
+Usually automatic. Verify:
+
+```bash
+kubectl get pods -l app=postgres
+# Should see new pod with same name
+```
+
+**If stuck:**
+
+```bash
+# Check pod status:
+kubectl describe pod postgres-0
+
+# Common issues:
+# - PVC binding (zone issue)
+# - Image pull (registry issue)
+# - Init container failure
+```
+
+**Recovery: Data corruption**
+
+**PostgreSQL example:**
+
+**Step 1: Identify**
+
+```sql
+SELECT * FROM pg_stat_database;
+-- Look for issues
+```
+
+**Step 2: Stop traffic**
+
+```bash
+# Scale to 0 to prevent further damage:
+kubectl scale statefulset postgres --replicas=0
+```
+
+**Step 3: Restore from backup**
+
+```bash
+# Restore base backup:
+kubectl exec postgres-0 -- restore_command.sh
+
+# Apply WAL files for point-in-time recovery
+```
+
+**Step 4: Verify**
+
+```sql
+-- Check data integrity:
+SELECT count(*) FROM critical_table;
+-- Verify recent transactions
+```
+
+**Step 5: Resume traffic**
+
+```bash
+kubectl scale statefulset postgres --replicas=3
+```
+
+**Recovery: PV loss**
+
+```bash
+# Old PVC unusable:
+kubectl get pvc data-postgres-0
+# Status: Lost
+
+# Delete old PVC:
+kubectl delete pvc data-postgres-0
+
+# Restore from backup:
+# Velero:
+velero restore create --from-backup latest-backup --include-resources pvc
+
+# Or manual:
+# Create new PVC from snapshot
+
+# StatefulSet recreates pod with new PVC
+```
+
+**Recovery: Complete cluster**
+
+```
+1. Restore cluster (provision new)
+2. Restore K8s resources (Velero)
+3. Restore PVs (from snapshots/backups)
+4. Verify application functionality
+5. Restore DNS/traffic
+```
+
+Detailed in DR procedures.
+
+**Database-specific recovery:**
+
+**PostgreSQL:**
+
+**Base backup + WAL:**
+
+```bash
+# Continuous archiving:
+archive_command = 'aws s3 cp %p s3://backups/wal/%f'
+
+# Restore:
+# 1. Restore base backup
+# 2. Configure recovery.conf
+# 3. Apply WAL up to point-in-time
+# 4. Start PostgreSQL
+```
+
+**Logical backup:**
+
+```bash
+# Backup:
+pg_dump -Fc database > backup.dump
+
+# Restore:
+pg_restore -d database backup.dump
+```
+
+**MongoDB:**
+
+```bash
+# Backup:
+mongodump --out=/backup
+
+# Restore:
+mongorestore /backup
+```
+
+**Replica set recovery:**
+
+```javascript
+// If primary lost:
+rs.stepDown()
+// Another member becomes primary
+
+// If majority lost:
+// Force reconfigure
+rs.reconfig({...}, {force: true})
+```
+
+**MySQL:**
+
+```bash
+# Backup:
+mysqldump database > backup.sql
+
+# Or hot backup:
+xtrabackup --backup
+
+# Restore:
+mysql database < backup.sql
+```
+
+**Tools:**
+
+**Velero:**
+
+```bash
+# Backup with data:
+velero backup create db-backup \
+  --include-namespaces production \
+  --snapshot-volumes
+
+# Restore:
+velero restore create --from-backup db-backup
+```
+
+Backs up K8s + PVs.
+
+**Database operators:**
+
+**CloudNativePG:**
+
+```yaml
+spec:
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://backups
+  bootstrap:
+    recovery:
+      backup:
+        name: original-backup
+```
+
+Operator handles backup/restore.
+
+**MongoDB Operator:**
+
+```yaml
+spec:
+  backup:
+    enabled: true
+    storages:
+      s3:
+        bucket: backups
+```
+
+**Recovery testing:**
+
+**Test regularly:**
+
+```
+Monthly: restore backup to test environment
+Verify:
+- Data integrity
+- Application functionality
+- Performance
+- Time taken
+```
+
+**Document procedures:**
+
+```
+1. When to recover
+2. Which backup to use
+3. Steps to recover
+4. How to verify
+5. How to resume traffic
+6. Communication
+```
+
+**Pre-recovery checklist:**
+
+```
+Before restoring:
+□ Confirmed need for restore
+□ Identified latest backup
+□ Verified backup integrity
+□ Notified stakeholders
+□ Have rollback plan
+□ Recovery procedure documented
+□ Team aware of recovery
+```
+
+**Restoration approaches:**
+
+**Approach 1: Full restore**
+
+```
+Restore complete database
+Long downtime
+Simple
+```
+
+**Approach 2: Point-in-time recovery**
+
+```
+Restore to specific moment
+Use WAL/replication logs
+More complex
+Less data loss
+```
+
+**Approach 3: Selective restore**
+
+```
+Restore specific tables
+For data corruption in specific area
+Complex
+```
+
+**Cross-region recovery:**
+
+```
+Primary region failed
+DR region has replicas
+Promote replica
+Update DNS
+Resume operations
+```
+
+**Common issues:**
+
+**Issue 1: Backup not tested**
+
+```
+Recovery fails when needed
+"It backed up but won't restore"
+```
+
+Fix: regular restore tests.
+
+**Issue 2: Wrong backup version**
+
+```
+Restore old backup
+Lost recent data
+```
+
+Fix: clear versioning, automated selection.
+
+**Issue 3: Configuration mismatch**
+
+```
+DB version differs
+Recovery fails
+```
+
+Fix: maintain version compatibility.
+
+**Issue 4: Network/permissions**
+
+```
+Can't access backup storage
+Slow recovery
+```
+
+Fix: test network paths.
+
+**Issue 5: Time pressure**
+
+```
+Long recovery
+Customer pressure
+Mistakes made
+```
+
+Fix: practice, automate, document.
+
+**Best practices:**
+
+1. **Regular backups**: automated
+2. **Multiple backup types**: full + incremental + transaction logs
+3. **Test restores**: monthly minimum
+4. **Document procedures**: detailed runbooks
+5. **Train team**: practice
+6. **Off-cluster storage**: backups elsewhere
+7. **Encryption**: backups encrypted
+8. **Retention policies**: appropriate keeping
+9. **Compliance**: meet regulatory requirements
+10. **Continuous improvement**: post-incident reviews
+
+**Production scenarios:**
+
+1. **PostgreSQL restore**: Database corruption. Restored from backup. WAL applied. Recent transactions preserved. 2-hour recovery.
+
+2. **PV loss**: AWS EBS issue lost volume. Restored from snapshot. New PVC. Recovery successful. 30-minute downtime.
+
+3. **MongoDB replica failover**: Primary failed. Replica promoted. Automatic. 30-second blip. Service continued.
+
+4. **Cross-region DR**: Primary region outage. Promoted replica in DR region. Updated DNS. 15-minute total recovery.
+
+5. **Monthly restore drill**: Caught backup integrity issue. Fixed before real disaster. Saved company.
+
+---
+
+## 437. Explain rollback decision-making during incidents
+
+Rollback is a powerful tool but has costs. Decision-making framework essential.
+
+**When to rollback:**
+
+**Strong signals:**
+
+```
+- Recent deploy caused issue
+- Clear error correlation with deploy
+- Customers actively affected
+- Issue gets worse over time
+- No quick forward fix
+- Rollback known to work
+```
+
+**Weak signals (might still rollback):**
+
+```
+- Suspicion of recent change
+- Mixed metrics
+- Partial impact
+```
+
+**When NOT to rollback:**
+
+**Strong signals:**
+
+```
+- Data migration in deploy (irreversible)
+- Schema changes incompatible
+- Fix forward simpler
+- Issue not related to deploy
+- Rollback risks worse outcome
+```
+
+**Decision framework:**
+
+**Question 1: Is the deploy the cause?**
+
+```
+Yes/likely: rollback candidate
+No: don't rollback (won't help)
+Uncertain: investigate briefly
+```
+
+**Question 2: Can we rollback safely?**
+
+```
+Stateless: yes
+With migrations: complex
+Data changes: maybe not
+```
+
+**Question 3: Is forward fix faster?**
+
+```
+Quick fix known: forward
+Long fix needed: rollback
+```
+
+**Question 4: What's the cost of being wrong?**
+
+```
+Rollback unnecessary: small cost
+Don't rollback when should: large cost
+```
+
+Asymmetric.
+
+**Rollback strategies:**
+
+**Strategy 1: Kubernetes rollback**
+
+```bash
+# View history:
+kubectl rollout history deployment my-app
+
+# Rollback to previous:
+kubectl rollout undo deployment my-app
+
+# Rollback to specific:
+kubectl rollout undo deployment my-app --to-revision=3
+```
+
+Standard, well-supported.
+
+**Strategy 2: GitOps rollback**
+
+```bash
+# Revert commit:
+git revert <bad-commit>
+git push
+
+# ArgoCD/Flux applies
+```
+
+Auditable, consistent.
+
+**Strategy 3: Helm rollback**
+
+```bash
+helm history my-release
+
+helm rollback my-release 3
+```
+
+Helm-managed.
+
+**Strategy 4: Traffic shift**
+
+```yaml
+# With canary, shift traffic back to old:
+spec:
+  http:
+    - route:
+        - destination:
+            host: my-app
+            subset: v1
+          weight: 100
+```
+
+Instant via service mesh.
+
+**Strategy 5: Feature flag**
+
+```python
+# Disable problematic feature:
+if feature_enabled("new-feature"):
+    new_code()
+else:
+    old_code()
+```
+
+Toggle off. Immediate.
+
+**Rollback risks:**
+
+**Risk 1: Database state**
+
+```
+v2 deploys with schema migration
+v2 runs, writes new data
+Rollback to v1
+v1 can't read new data format
+```
+
+Backward compatibility matters.
+
+**Risk 2: Data corruption**
+
+```
+v2 has bug corrupting data
+Rollback to v1
+But corrupted data remains
+Need data fix too
+```
+
+**Risk 3: Cascading effects**
+
+```
+v2 deployed cascading changes
+Rollback only one component
+Mismatch causes issues
+```
+
+Coordinated rollback needed.
+
+**Risk 4: Time loss**
+
+```
+Rollback unnecessarily
+Other engineers continuing work
+Confusion
+```
+
+Communicate.
+
+**Decision matrix:**
+
+| Severity | Recent Deploy? | Forward Fix Ready? | Decision |
+|----------|----------------|-------------------|----------|
+| SEV-1 | Yes | No | Rollback |
+| SEV-1 | Yes | Yes, <5 min | Forward |
+| SEV-1 | Uncertain | No | Rollback |
+| SEV-2 | Yes | No | Rollback |
+| SEV-2 | Yes | <30 min | Investigate first |
+| SEV-3 | Yes | Any | Forward typically |
+
+**Communication:**
+
+```
+"Rolling back deploy at 14:30 to address ongoing issue"
+- Why
+- When (time)
+- Expected outcome
+- Next steps if doesn't fix
+```
+
+**During rollback:**
+
+**Monitor:**
+
+```promql
+# Watch metrics during rollback:
+- Error rate (should decrease)
+- Latency (should improve)
+- Replica count (rollout progress)
+```
+
+Verify rollback works.
+
+**Verify completion:**
+
+```bash
+kubectl rollout status deployment my-app
+# Should show success
+```
+
+**Customer impact:**
+
+```
+- Communicate status update
+- Customers see improvement
+- Update status page
+```
+
+**Post-rollback:**
+
+**Don't rush forward:**
+
+```
+- Don't immediately re-deploy
+- Investigate why first
+- Fix issues
+- Test thoroughly
+- Deploy more carefully
+```
+
+Otherwise, repeat issue.
+
+**Backward compatibility:**
+
+**For database migrations:**
+
+```sql
+-- Phase 1: Add new column (compatible with v1):
+ALTER TABLE users ADD COLUMN new_field VARCHAR(255);
+
+-- Phase 2: Deploy v2 (uses both old and new)
+
+-- Phase 3: Migrate data:
+UPDATE users SET new_field = ...;
+
+-- Phase 4: Remove old column (only after v2 stable):
+ALTER TABLE users DROP COLUMN old_field;
+```
+
+Each phase rollback-safe.
+
+**Code patterns:**
+
+```python
+# Backward compatible code:
+def get_value():
+    try:
+        # New way
+        return data.new_field
+    except AttributeError:
+        # Old way (fallback)
+        return data.old_field
+```
+
+**Versioning:**
+
+```yaml
+# API versioning:
+/api/v1/users   # Old
+/api/v2/users   # New
+```
+
+Old and new co-exist.
+
+**Documentation:**
+
+**Pre-deploy:**
+
+```
+Document:
+- What's being deployed
+- Rollback procedure
+- Compatibility considerations
+- Time to rollback
+```
+
+**During incident:**
+
+```
+Document:
+- When rollback considered
+- Decision factors
+- Time of rollback
+- Outcome
+```
+
+**Post-incident:**
+
+```
+Document:
+- What worked
+- What didn't
+- Lessons for future
+```
+
+**Rollback testing:**
+
+**In CI/CD:**
+
+```yaml
+# Pipeline step:
+- name: Rollback test
+  run: |
+    kubectl apply -f new-version.yaml
+    sleep 30
+    kubectl rollout undo
+    sleep 30
+    # Verify back to original
+```
+
+Catch incompatibilities early.
+
+**Best practices:**
+
+1. **Backward compatibility**: always
+2. **Quick rollback**: <5 minutes
+3. **Document procedure**: clear steps
+4. **Test rollback**: in CI/CD
+5. **Coordinate**: communicate
+6. **Monitor during**: verify works
+7. **Don't rush re-deploy**: fix first
+8. **Schema strategies**: phase migrations
+9. **Feature flags**: easier than rollback
+10. **Practice**: game days
+
+**Tools:**
+
+**Argo Rollouts:**
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+spec:
+  strategy:
+    canary:
+      analysis:
+        # Auto-rollback on bad metrics
+```
+
+Automated.
+
+**Flagger:**
+
+Similar capability.
+
+**Decision flowchart:**
+
+```
+Incident detected
+       ↓
+Recent deploy?
+   ↓ No → Investigate, don't rollback
+   ↓ Yes
+Is deploy the cause?
+   ↓ No → Don't rollback
+   ↓ Likely Yes
+Can rollback safely?
+   ↓ No → Forward fix
+   ↓ Yes
+Forward fix <5 min?
+   ↓ Yes → Forward fix
+   ↓ No → Rollback
+```
+
+**Production scenarios:**
+
+1. **Quick rollback**: Deploy caused 30% errors. Rollback in 2 minutes. Investigated calmly. Fixed properly. Re-deployed safely.
+
+2. **Schema rollback risk**: v2 had migration. Considered rollback. Decided forward fix safer. Worked correctly.
+
+3. **Feature flag save**: Bad code behind flag. Disabled flag. No rollback needed. Quicker resolution.
+
+4. **Argo Rollouts auto**: Canary failed metrics. Auto-rolled back. Engineer notified. Investigated calmly.
+
+5. **Hard call**: Issue might be deploy. Forward fix available in 1 hour. Decided to wait, not rollback. Right call.
+
+---
+
+## 438. How do you troubleshoot intermittent production issues?
+
+Intermittent issues are notoriously hard to debug. Systematic approach helps.
+
+**Characteristics:**
+
+```
+- Not always reproducible
+- Time-dependent
+- Load-dependent
+- User-dependent
+- Random appearance
+```
+
+Harder than constant issues.
+
+**Initial approach:**
+
+**Gather data:**
+
+```
+- When does it happen?
+- How often?
+- What's affected?
+- Who reports?
+- Time patterns?
+- Load patterns?
+```
+
+**Look for patterns:**
+
+```
+- Time of day?
+- Day of week?
+- After deploys?
+- During backups?
+- After traffic spikes?
+- Specific users?
+- Specific data?
+```
+
+**Hypothesis-driven:**
+
+```
+1. List possible causes
+2. Prioritize by likelihood
+3. Test each
+```
+
+**Common causes:**
+
+**Cause 1: Race conditions**
+
+```
+Multiple threads/pods modifying shared resource
+Symptoms intermittent
+Hard to reproduce
+```
+
+**Cause 2: Memory pressure**
+
+```
+Random OOMKills
+Some pods affected, others not
+Garbage collection pauses
+```
+
+**Cause 3: Network blips**
+
+```
+Intermittent timeouts
+Brief connection issues
+DNS hiccups
+```
+
+**Cause 4: Database contention**
+
+```
+Locks during high load
+Slow queries occasionally
+Connection pool exhaustion
+```
+
+**Cause 5: External dependencies**
+
+```
+Third-party API blips
+DNS issues
+CDN issues
+```
+
+**Cause 6: Resource limits**
+
+```
+CPU throttling during peaks
+Memory limits approached
+Disk I/O contention
+```
+
+**Cause 7: Stale data**
+
+```
+Cache inconsistency
+Replica lag
+Eventual consistency issues
+```
+
+**Investigation:**
+
+**Step 1: Logging**
+
+```bash
+# Aggregate logs:
+kubectl logs -l app=my-app --all-containers --since=1h | grep ERROR
+
+# Or log aggregator:
+# Loki, ELK, Datadog
+```
+
+**Step 2: Metrics**
+
+```promql
+# Look for patterns:
+rate(errors[5m])
+
+# Check correlations:
+# Errors correlated with:
+- CPU usage
+- Memory usage
+- Network usage
+- Database connections
+```
+
+**Step 3: Tracing**
+
+```
+Trace random failed requests
+Compare to successful
+Find differences
+```
+
+**Step 4: User correlation**
+
+```
+Specific users always affected?
+Geographic pattern?
+Device/browser pattern?
+```
+
+**Specific scenarios:**
+
+**Scenario 1: Random 503 errors**
+
+```
+- 0.1% of requests
+- No clear pattern
+- Different endpoints
+```
+
+**Investigation:**
+
+```promql
+# 503 distribution:
+sum by (pod, endpoint) (
+  rate(http_requests_total{status="503"}[5m])
+)
+
+# Pod-specific?
+# Endpoint-specific?
+```
+
+**Possible causes:**
+
+```
+- Pod terminating during request
+- Backend service hiccup
+- Connection pool exhausted
+- Resource limits
+```
+
+**Debug:**
+
+```bash
+# Check pod restarts:
+kubectl get pods -l app=my-app
+
+# Pod evictions:
+kubectl describe pod | grep Evict
+```
+
+**Scenario 2: Intermittent slow requests**
+
+```
+- Random spikes in latency
+- Most requests fast
+- 1% take 10x normal time
+```
+
+**Investigation:**
+
+```
+- Compare slow vs fast traces
+- Look for differences
+- Database queries?
+- External calls?
+- Garbage collection?
+```
+
+**Common findings:**
+
+```
+- GC pauses (JVM)
+- Slow DB queries
+- Network jitter
+- Resource contention
+```
+
+**Scenario 3: Random crashes**
+
+```
+- Pods crashing intermittently
+- No clear pattern
+- OOMKilled or other
+```
+
+**Investigation:**
+
+```bash
+# Restart history:
+kubectl get pods --watch
+
+# Previous logs:
+kubectl logs my-pod --previous
+
+# Memory trend:
+container_memory_working_set_bytes
+```
+
+**Scenario 4: Random connection errors**
+
+```
+- "Connection refused"
+- "Connection reset"
+- Network errors
+```
+
+**Investigation:**
+
+```
+- DNS resolution issues?
+- Connection pool problems?
+- Network policy timing?
+- Service mesh config?
+```
+
+**Tools:**
+
+**Distributed tracing:**
+
+```
+- Compare traces of slow vs fast
+- Identify common bottleneck
+- Find external dependencies
+```
+
+**Profiling:**
+
+```
+- Continuous profiling
+- See CPU/memory patterns
+- Identify expensive operations
+```
+
+**Log correlation:**
+
+```
+- Search by request ID
+- Across services
+- Time-correlated
+```
+
+**Network analysis:**
+
+```bash
+# Hubble (Cilium):
+hubble observe --pod my-pod
+
+# tcpdump:
+sudo tcpdump -i any host my-pod
+```
+
+**Synthetic monitoring:**
+
+```
+Continuous requests
+Catch intermittent issues
+Pattern detection
+```
+
+**Strategies:**
+
+**Strategy 1: Reproduce**
+
+```
+- Load test
+- Specific user pattern
+- Random delays
+- Failure injection
+```
+
+If reproducible: much easier.
+
+**Strategy 2: Increase logging**
+
+```
+Add verbose logging temporarily
+Capture more data
+Look for patterns
+```
+
+**Strategy 3: A/B testing**
+
+```
+Deploy variation
+Compare to baseline
+Identify culprit
+```
+
+**Strategy 4: Wait and watch**
+
+```
+Sometimes can't reproduce
+Wait for next occurrence
+Have monitoring ready
+Capture data
+```
+
+**Strategy 5: Process of elimination**
+
+```
+Disable suspected component
+See if issue stops
+Re-enable, see if returns
+```
+
+**Patterns by time:**
+
+**Every hour:**
+
+```
+Cron job?
+Backup process?
+Scheduled task?
+```
+
+**Every day:**
+
+```
+Daily batch?
+Maintenance window?
+Time zone related?
+```
+
+**Random:**
+
+```
+Likely race condition
+Or external dependency
+```
+
+**During load:**
+
+```
+Resource limits
+Connection pools
+Database contention
+```
+
+**Patterns by usage:**
+
+**Specific users:**
+
+```
+User-specific data?
+Geographic?
+Account features?
+```
+
+**New users:**
+
+```
+Onboarding flow issue
+Cache miss patterns
+First-time database queries
+```
+
+**Production scenarios:**
+
+1. **Random 503 every hour**: Cron job ran every hour, briefly overloaded one service. Identified via correlation. Fixed.
+
+2. **Slow GC**: Random latency spikes. JVM GC pauses. Tuned GC settings. Latency stabilized.
+
+3. **Connection pool**: Random connection errors during peaks. Pool exhausted. Increased pool. Resolved.
+
+4. **DNS intermittent**: Random DNS failures. CoreDNS overloaded periodically. Scaled CoreDNS + NodeLocal DNSCache. Fixed.
+
+5. **Specific users affected**: Random users getting errors. Discovered specific data pattern triggered bug. Fixed code path.
+
+---
+
+## 439. Explain production freeze management
+
+Production freezes restrict changes during sensitive periods. Common during peak business times.
+
+**Why freeze:**
+
+- Reduce risk during high-revenue periods
+- Stable system for important events
+- Lower change-related incidents
+- Allow team focus elsewhere
+
+**Common freezes:**
+
+**Black Friday / Cyber Monday:**
+
+```
+Freeze: Wednesday before through following Monday
+Reason: Highest revenue period
+```
+
+**End of quarter:**
+
+```
+Freeze: Last week of quarter
+Reason: Revenue close, no risk
+```
+
+**Holidays:**
+
+```
+Freeze: Christmas through New Year
+Reason: Reduced staff, customer activity
+```
+
+**Major launches:**
+
+```
+Freeze: Week before through week after
+Reason: Focus on launch
+```
+
+**Compliance audits:**
+
+```
+Freeze: During audit
+Reason: Stable system for review
+```
+
+**Freeze scope:**
+
+**Hard freeze:**
+
+```
+- No deploys
+- No infrastructure changes
+- No configuration changes
+- Emergency only
+```
+
+**Soft freeze:**
+
+```
+- Critical fixes allowed
+- New features blocked
+- More review required
+```
+
+**Selective freeze:**
+
+```
+- Frontend only
+- Specific services
+- Production but not staging
+```
+
+**Communication:**
+
+**Internal:**
+
+```
+2 weeks before:
+- Announcement to engineering
+- Calendar marked
+- Plans adjusted
+
+1 week before:
+- Reminder
+- Outstanding work pushed
+
+Day before:
+- Final reminder
+- Emergency contacts
+```
+
+**Stakeholders:**
+
+```
+- Product managers
+- Customer success
+- Sales (for customer communications)
+- Leadership
+```
+
+**Customers:**
+
+```
+For major freezes:
+"We'll be in code freeze from X to Y for stability"
+```
+
+**Process:**
+
+**Pre-freeze:**
+
+```
+- Complete in-progress work
+- Test thoroughly
+- Document state
+- Brief on-call
+- Verify monitoring
+```
+
+**During freeze:**
+
+```
+- No regular deploys
+- Exception process for emergencies
+- Increased monitoring
+- More on-call coverage
+```
+
+**Post-freeze:**
+
+```
+- Resume deploys carefully
+- Catch up on backlog
+- Review freeze period
+```
+
+**Exception process:**
+
+**Criteria:**
+
+```
+Emergency only:
+- Security issue
+- Critical bug affecting customers
+- Compliance issue
+- Data integrity
+```
+
+**Approval:**
+
+```
+Required:
+- Engineering manager
+- Director (for major freezes)
+- Risk assessment
+- Rollback plan
+- Communication plan
+```
+
+**Documentation:**
+
+```
+- What's changing
+- Why critical
+- Risk assessment
+- Approvers
+- Outcome
+```
+
+**Mitigation:**
+
+```
+During freeze:
+- Increased monitoring
+- More on-call coverage
+- Active incident response
+- Skilled engineers available
+```
+
+**Automated freezes:**
+
+```yaml
+# CI/CD freeze:
+# Check if in freeze period:
+if datetime.now() in freeze_periods:
+    block_deployment()
+```
+
+System-enforced.
+
+**Or with approval gate:**
+
+```yaml
+# Pipeline:
+- stage: deploy
+  rules:
+    - if: $FREEZE_OVERRIDE == "approved"
+      when: manual
+```
+
+Manual override required.
+
+**Tracking:**
+
+```
+Metric: Deploys during freeze
+Should be near zero
+Investigate any exceptions
+```
+
+**Best practices:**
+
+1. **Clear communication**: well in advance
+2. **Defined exceptions**: criteria
+3. **Approval process**: prevent abuse
+4. **Increased monitoring**: during freeze
+5. **More on-call**: ready to respond
+6. **Post-freeze review**: lessons learned
+7. **Calendar visibility**: everyone knows
+8. **Don't over-freeze**: only when needed
+
+**Cultural considerations:**
+
+```
+- Engineers need to plan around
+- Pushing work before freeze
+- Slowdown during freeze
+- Productivity considerations
+```
+
+Balance freeze benefits with productivity.
+
+**Modern approach:**
+
+**Continuous deployment with safety:**
+
+```
+Instead of long freezes:
+- Better testing
+- Automated rollbacks
+- Feature flags
+- Canary deployments
+- More confidence in safety
+```
+
+Some companies eliminate freezes via better practices.
+
+**Hybrid:**
+
+```
+Normal periods: continuous deployment
+High-risk periods: enhanced safeguards
+Truly critical: short freezes
+```
+
+**Production scenarios:**
+
+1. **Black Friday freeze**: 1-week freeze. Zero deploys. No incidents. Standard practice.
+
+2. **Emergency during freeze**: Critical security issue. Exception approved. Fix deployed with extra scrutiny. Other freeze rules maintained.
+
+3. **Mini-freeze**: 2-day freeze before major launch. Caught last-minute issue not deployed. Saved launch.
+
+4. **Cultural shift**: Reduced freezes by improving deployment safety. Better tests, canary, rollback. Less need for freezes.
+
+5. **Post-freeze**: After freeze, ran pent-up changes. Some failures. Lesson: gradual resumption.
+
+---
+
+## 440. How do you coordinate cross-team incident response?
+
+Major incidents often involve multiple teams. Coordination is essential.
+
+**Why cross-team:**
+
+```
+- Multiple services involved
+- Different expertise needed
+- External dependencies
+- Customer-facing impact
+- Communication requirements
+```
+
+**Team types:**
+
+**Engineering teams:**
+
+```
+- Service owners
+- Platform team (infrastructure)
+- Database team
+- Security team
+- Network team
+```
+
+**Non-engineering:**
+
+```
+- Customer support
+- Sales
+- Marketing/PR
+- Legal
+- Executive leadership
+```
+
+**Coordination structure:**
+
+**Incident Commander (IC):**
+
+```
+- Single point of authority
+- Makes decisions
+- Coordinates teams
+- Manages communication
+```
+
+**Technical Lead:**
+
+```
+- Deep technical knowledge
+- Drives investigation
+- Coordinates with IC
+```
+
+**Communications Lead:**
+
+```
+- Internal updates
+- External communications
+- Status page
+- Customer briefings
+```
+
+**Subject Matter Experts:**
+
+```
+- From each affected team
+- Provide expertise
+- Execute fixes
+```
+
+**For major incidents (SEV-1):**
+
+**Initial response:**
+
+```
+T+0: Alert
+T+2m: IC assigned
+T+5m: SMEs paged from relevant teams
+T+10m: War room (video call) open
+T+15m: Initial assessment
+```
+
+**War room:**
+
+```
+- Video call always-on
+- Incident channel in Slack
+- Real-time discussion
+- Decision tracking
+```
+
+**Roles in war room:**
+
+```
+- IC: leading
+- Tech lead: investigating
+- SMEs: providing expertise
+- Comms lead: updates
+- Scribe: documenting
+```
+
+**Communication channels:**
+
+**Engineering:**
+
+```
+- #incident-X channel (real-time)
+- Video call (urgent)
+- Specific team channels
+```
+
+**Business:**
+
+```
+- Stakeholder email updates
+- Executive briefings
+- Customer-facing teams
+```
+
+**External:**
+
+```
+- Status page
+- Customer emails
+- Social media
+- Press
+```
+
+**Cross-team challenges:**
+
+**Challenge 1: Different priorities**
+
+```
+Team A: focus on their service
+Team B: focus on theirs
+Need: holistic view
+```
+
+IC ensures alignment.
+
+**Challenge 2: Knowledge gaps**
+
+```
+Service A team doesn't know B
+B doesn't know A
+```
+
+SMEs bridge.
+
+**Challenge 3: Different processes**
+
+```
+Each team has own runbooks
+Different tools
+Different communication
+```
+
+Standardize during incidents.
+
+**Challenge 4: Authority**
+
+```
+Who decides?
+Service owner?
+IC?
+Manager?
+```
+
+IC has authority during incident.
+
+**Challenge 5: Communication overhead**
+
+```
+Many people involved
+Information lost
+Decisions duplicated
+```
+
+Centralized comms.
+
+**Handoffs:**
+
+**For long incidents:**
+
+```
+Shift changes:
+- 12-hour shifts
+- Detailed handoff
+- IC handoff specifically
+- Continuity
+```
+
+**Handoff doc:**
+
+```
+- Current state
+- What's been tried
+- Current hypothesis
+- Active workstreams
+- Open questions
+- Decisions made
+```
+
+**External coordination:**
+
+**Cloud providers:**
+
+```
+- AWS Premium Support
+- Azure escalation
+- GCP TAM
+```
+
+When cloud provider issue.
+
+**Vendors:**
+
+```
+- Database vendor (Oracle, etc.)
+- Software vendors
+- Service providers
+```
+
+When their issue.
+
+**Partners:**
+
+```
+- Integration partners
+- API providers
+```
+
+Coordinate fixes.
+
+**Tools:**
+
+**PagerDuty:**
+
+```
+- Multi-team paging
+- Escalation policies
+- Conference bridges
+```
+
+**Slack:**
+
+```
+- Incident channels
+- Bot integrations
+- Search history
+```
+
+**Incident.io:**
+
+```
+- Full incident management
+- Team coordination
+- Communication
+```
+
+**Zoom/Teams:**
+
+```
+- War rooms
+- Video collaboration
+```
+
+**Communication patterns:**
+
+**Status updates:**
+
+```
+Every 15-30 min:
+- Internal: detailed
+- External: summarized
+- Customers: if affected
+```
+
+**Decision logging:**
+
+```
+"Decision at 14:30:
+- Decision: rollback v2 deploy
+- Reason: errors continuing
+- Approved by: IC, Tech Lead
+- Risk: minor revenue impact for 10 min
+"
+```
+
+Document key decisions.
+
+**Action tracking:**
+
+```
+Slack pins:
+- @alice: investigate DB
+- @bob: prepare rollback
+- @carol: update status page
+```
+
+Visible assignments.
+
+**Lessons learned:**
+
+**Post-incident:**
+
+```
+- All teams contribute to postmortem
+- Cross-team learnings
+- Process improvements
+- Tool improvements
+```
+
+**Game days:**
+
+```
+Practice cross-team:
+- Multiple teams involved
+- Communication tested
+- Coordination improved
+```
+
+**Cultural aspects:**
+
+**No blame:**
+
+```
+Cross-team issues:
+- Multiple teams "responsible"
+- Focus on system
+- Not finger-pointing
+```
+
+**Mutual support:**
+
+```
+- Teams help each other
+- Shared incident experience
+- Build relationships
+```
+
+**Joint planning:**
+
+```
+- Shared roadmap items
+- Cross-team architecture
+- Coordinated changes
+```
+
+**Best practices:**
+
+1. **Clear IC**: single point of authority
+2. **Defined roles**: clear responsibilities
+3. **Central communication**: avoid silos
+4. **Document decisions**: traceability
+5. **Cross-team relationships**: built outside incidents
+6. **Joint runbooks**: shared procedures
+7. **Practice together**: game days
+8. **Blameless culture**: across teams
+9. **Tools**: support coordination
+10. **Continuous improvement**: each incident
+
+**Common scenarios:**
+
+**Scenario: Database + application issue**
+
+```
+Symptoms: slow API
+Investigation:
+- App team: API metrics
+- DB team: query performance
+- Network team: connectivity
+
+Coordination:
+- War room with all three
+- Different angles
+- Shared investigation
+- Found: slow query + connection pool
+- Resolution: fix query + tune pool
+```
+
+**Scenario: Cloud provider issue**
+
+```
+Symptoms: services down
+Investigation:
+- Platform team: cloud
+- App teams: services
+- Comms: customers
+
+Coordination:
+- Platform leads
+- Other teams provide impact
+- Cloud provider engaged
+- Communication coordinated
+```
+
+**Scenario: Security incident**
+
+```
+Symptoms: suspicious activity
+Investigation:
+- Security team: analysis
+- Platform team: infrastructure
+- App teams: code review
+- Legal: compliance
+- PR: communications
+
+Coordination:
+- Security leads
+- Strict information control
+- Legal review for comms
+- Coordinated response
+```
+
+**Production scenarios:**
+
+1. **Cross-team war room**: Major outage. War room with 4 teams. IC coordinated. Resolved in 90 minutes. Smooth coordination.
+
+2. **Shift handoff**: 18-hour incident. Three IC shifts. Detailed handoffs. Continuity maintained. Resolved.
+
+3. **External vendor**: Issue in vendor service. Engaged vendor. Joint investigation. Coordinated fix. Communicated to customers.
+
+4. **Tabletop joint**: Cross-team tabletop exercise. Practiced major incident. Built relationships. Real incident smoother.
+
+5. **Process improvement**: Postmortem revealed coordination gaps. Implemented cross-team runbook. Future incidents better coordinated.
