@@ -1906,3 +1906,1513 @@ That's the full set across all three rounds. Likely Atlassian-specific follow-up
 - **"How would you onboard a 20-person team to your platform?"** — paved roads, office hours, internal Slack support, documentation that anticipates failure modes, and explicit "platform service-level commitments" so teams know what to expect from us.
 - **"Describe a time you were wrong about an architecture decision."** — have one ready, structured: what I decided, why, what went wrong, how I noticed, what I did, what I learned and changed.
 
+# Amazon Senior DevOps Interview — Complete Walkthrough
+
+Amazon's bar is high on systems thinking and operational depth. They want to see structured reasoning, ownership instincts, and the ability to handle ambiguity — not just textbook answers. Going through each with the depth a senior engineer brings.
+
+---
+
+# 🎯 Round 1 — System Thinking
+
+## 1. Request flow: DNS → LB → Service → Pod → Database
+
+Walking through every hop, what happens, and where things can go wrong.
+
+**Hop 1: DNS resolution**
+
+The user types `app.example.com` or the browser makes a request.
+
+- Browser checks its own DNS cache, then the OS resolver cache.
+- If miss, OS asks the configured resolver (usually ISP or corporate DNS).
+- Resolver walks the DNS hierarchy: root → TLD (`com`) → authoritative (`example.com`).
+- For us, that authoritative server is **Route 53**.
+- Route 53 returns an answer based on the configured routing policy:
+  - **Simple**: one record.
+  - **Latency-based**: returns the IP for the lowest-latency region.
+  - **Geolocation**: returns based on user's geographic region.
+  - **Failover with health checks**: returns primary if healthy, secondary otherwise.
+  - **Weighted**: splits by percentage (canary, A/B).
+- The returned record is typically an **alias** to an ALB or CloudFront distribution.
+- Response cached at each hop per TTL.
+
+What can go wrong: stale DNS caches at clients ignoring TTL, Route 53 health checks misfiring, third-party DNS provider issues.
+
+**Hop 2: CloudFront (if used)**
+
+If the alias resolves to CloudFront:
+- User hits the nearest edge POP via anycast.
+- CloudFront checks its cache; serves cached response if hit.
+- On miss, forwards to the origin (typically an ALB) over the AWS backbone.
+- TLS terminated at the edge (faster handshake, AWS-managed certificate).
+- WAF rules evaluated; bad requests rejected here.
+
+What can go wrong: cache poisoning, origin failover misconfigured, WAF rules blocking legitimate traffic.
+
+**Hop 3: Application Load Balancer**
+
+CloudFront (or the client directly) hits the ALB:
+- ALB sits in public subnets, spanning multiple AZs.
+- TLS handshake (if not terminated at CloudFront).
+- ALB applies listener rules: path-based / host-based routing to a target group.
+- ALB checks target health; only routes to healthy targets.
+- Picks a target via round-robin or least-outstanding-requests algorithm.
+- Forwards the request, preserving original headers (`X-Forwarded-For`, `X-Forwarded-Proto`).
+
+What can go wrong: TLS handshake failures (cert mismatch, policy too strict), target group health-check misconfiguration, sticky session conflicts.
+
+**Hop 4: Kubernetes Service / Ingress**
+
+The ALB target is typically managed by the **AWS Load Balancer Controller**:
+- For an Ingress, the ALB targets are pod IPs (via IP target type) or node-port targets.
+- For a LoadBalancer Service, similar but at L4.
+- Traffic arrives at the pod's IP directly (if using IP target mode + VPC CNI).
+
+If using an in-cluster ingress controller (NGINX) instead:
+- ALB forwards to NGINX pods.
+- NGINX reads the Host header / path, maps to a Service.
+- NGINX forwards to a backend pod via the Service.
+
+**Hop 5: kube-proxy / Service DNS / pod**
+
+Inside the cluster:
+- Pod-to-pod calls hit a `ClusterIP` Service.
+- The pod's DNS resolver (CoreDNS) resolves `myservice.namespace.svc.cluster.local` to the ClusterIP.
+- kube-proxy (via iptables or IPVS) intercepts traffic to the ClusterIP and DNATs it to a backing pod IP.
+- Traffic arrives at the pod.
+
+What can go wrong: CoreDNS overloaded, kube-proxy iptables stale after pod churn, EndpointSlice out of sync.
+
+**Hop 6: Pod / container / application**
+
+The container receives the request:
+- Sidecar (Envoy, Istio) intercepts if there's a service mesh — adds mTLS, retries, telemetry.
+- Application code processes the request.
+- App calls downstream services (other pods, AWS APIs) via similar paths.
+
+**Hop 7: Database**
+
+The application opens (or reuses) a connection to RDS:
+- Connection goes through the Service / pod network to the RDS endpoint.
+- RDS endpoint is a DNS name; resolves to the writer instance's private IP.
+- Traffic routes through private subnets to the RDS network interface.
+- DB processes the query, returns a result.
+- For reads, the app may use a separate reader endpoint that load-balances across read replicas.
+
+What can go wrong: connection pool exhausted, DNS failover during failover event, slow queries, lock contention.
+
+**The response path:**
+
+Reversed back through the stack. Some layers (like CloudFront) may cache the response based on headers.
+
+**Architect's framing:**
+> "Every hop is an opportunity for latency, failure, or observability gap. The skill is knowing which hop owns which class of problem — DNS owns name resolution and failover speed, ALB owns connection handling and L7 routing, the service mesh owns identity and retry policy, the database owns query time. When something goes wrong, the diagnostic question is always 'which hop is responsible' before 'what's broken.'"
+
+## 2. Kubernetes pods restarting every few minutes
+
+Structured debugging flow:
+
+**Step 1: Confirm and characterize**
+
+```bash
+# How often, and what's the pattern?
+kubectl get pods -n <ns> -w
+kubectl get events -n <ns> --sort-by='.lastTimestamp'
+
+# Restart count tells me how long this has been happening
+kubectl get pods -n <ns> -o wide
+```
+
+Single pod restarting vs. all pods restarting tells me very different things.
+
+**Step 2: Look at the pod's exit reason**
+
+```bash
+kubectl describe pod <pod>
+# Look at "Last State" section:
+#   - Reason: OOMKilled, Error, Completed
+#   - Exit Code
+kubectl get pod <pod> -o yaml | yq '.status.containerStatuses'
+```
+
+Common patterns:
+- **OOMKilled (exit 137)**: container exceeded memory limit.
+- **Error with non-zero exit**: application crash.
+- **Completed with restart policy Always**: app exiting cleanly but kubelet restarting because it's expected to stay up.
+- **Liveness probe failed**: kubelet killed the container.
+
+**Step 3: Check logs from BOTH current and previous containers**
+
+The critical command: `--previous` gives you the logs from the crashed container.
+
+```bash
+kubectl logs <pod> --previous          # last crash
+kubectl logs <pod>                     # current
+kubectl logs <pod> -c <container>      # multi-container
+```
+
+The most common mistake here is looking only at the current pod's logs, missing the actual crash.
+
+**Step 4: Probes**
+
+Probes are a leading suspect when "restarting every few minutes" matches the liveness probe cadence.
+
+```bash
+kubectl get pod <pod> -o yaml | yq '.spec.containers[0].livenessProbe'
+```
+
+Check:
+- Is the probe path correct? Did it change in the latest deploy?
+- Is `initialDelaySeconds` long enough for slow-starting apps (JVM, Spring Boot)?
+- Is the timeout (`timeoutSeconds`) realistic for the endpoint's actual response time?
+- Does the probe accidentally check a downstream dependency (DB, cache)? That's a common cascade-failure pattern — DB blip → all probes fail → all pods restart.
+
+**Step 5: Resource constraints**
+
+```bash
+kubectl top pod <pod>
+kubectl describe pod <pod> | grep -A5 "Limits"
+
+# At node level
+kubectl top nodes
+kubectl describe node <node> | grep -A5 "Allocated resources"
+```
+
+OOMKill indicates memory limit too low. CPU throttling can cause request timeouts that *look* like crashes if the probe times out.
+
+**Step 6: Recent changes**
+
+```bash
+kubectl rollout history deployment/<deploy>
+kubectl describe deployment/<deploy> | head -50
+```
+
+What changed recently? Image tag, env vars, probe config, resource limits, ConfigMap?
+
+**Step 7: Node-level health**
+
+```bash
+kubectl describe node <node>
+# Look at Conditions: MemoryPressure, DiskPressure, PIDPressure
+
+ssh <node>
+dmesg -T | tail -50
+journalctl -u kubelet -n 100
+df -h
+free -m
+```
+
+**Step 8: Dependencies**
+
+If the app dies because it can't reach a downstream:
+- DB available?
+- Cache reachable?
+- Service mesh sidecar healthy?
+- DNS resolution working from the pod?
+
+```bash
+kubectl exec <pod> -- nslookup mydb.namespace.svc.cluster.local
+kubectl exec <pod> -- nc -zv mydb 5432
+```
+
+**Common root causes ranked by likelihood:**
+
+1. **Liveness probe failing** because of slow startup or accidental dependency check — fix by adding `startupProbe` and decoupling liveness from dependencies.
+2. **OOMKill** from undersized limits — fix by VPA recommendations and right-sizing.
+3. **App crashes on startup** because of missing config — check `--previous` logs.
+4. **Recent deploy regression** — `kubectl rollout undo deployment/<deploy>` while investigating.
+5. **Dependency unavailable** causing app to exit — check service connectivity from pod.
+6. **Node-level pressure** evicting pods — check node conditions.
+
+**Architect's framing:**
+> "The single most diagnostic command is `kubectl logs --previous`. It tells you what the application said before dying. Combined with `kubectl describe pod` for the kubelet's view of the death, those two answer 80% of restart questions in under a minute. The trap is jumping to conclusions before reading those two outputs."
+
+## 3. Latency increased after deployment
+
+Walking through what I'd check first, in priority order:
+
+**Step 1: Confirm the correlation**
+
+Look at the deployment timeline vs latency graph. Is the increase actually correlated with the deploy, or coincidental?
+
+```promql
+# Latency p99
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+Overlay deployment annotations on the dashboard. If latency increased exactly at deploy time → deploy is the cause. If it increased an hour later → maybe traffic patterns changed.
+
+**Step 2: Rollback first, investigate second**
+
+For a customer-facing service with measurable latency regression, my first action is rollback. The system spends less time degraded; I have time to investigate calmly.
+
+```bash
+kubectl rollout undo deployment/<deploy>
+# or in GitOps
+git revert <bad-commit> && git push
+```
+
+This isn't avoiding investigation — it's reducing customer impact while investigating.
+
+**Step 3: Diff the change**
+
+What actually shipped?
+
+```bash
+# Image diff
+kubectl rollout history deployment/<deploy> --revision=N
+# Git diff between current and previous tags
+git log <previous-tag>..<current-tag> --oneline
+git diff <previous-tag>..<current-tag>
+```
+
+Categorize the changes:
+- **Code changes** — algorithm changes, new dependencies, removed caching.
+- **Config changes** — env vars, ConfigMaps, feature flags.
+- **Dependency bumps** — library upgrades that might have behavioral changes.
+- **Infrastructure changes** — resource limits, replicas, probe config.
+
+**Step 4: Look at RED metrics broken down**
+
+Latency in aggregate hides what's actually happening. Break it down:
+
+```promql
+# Per-endpoint p99
+histogram_quantile(0.99, sum by (le, endpoint) (rate(http_request_duration_seconds_bucket[5m])))
+
+# Per-pod
+histogram_quantile(0.99, sum by (le, pod) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+If one endpoint regressed but others didn't → look at the code path for that endpoint.
+
+If one pod is slow but others are fine → pod-level issue (bad node, image pull mid-deployment, etc).
+
+**Step 5: Downstream dependencies**
+
+```promql
+# DB query duration
+histogram_quantile(0.99, sum by (le) (rate(db_query_duration_seconds_bucket[5m])))
+
+# External API calls
+histogram_quantile(0.99, sum by (le, target) (rate(http_client_duration_seconds_bucket[5m])))
+```
+
+Did the new version start hitting the DB more (N+1 query introduced)? Did it switch to a slower downstream?
+
+**Step 6: Connection pool / resource saturation**
+
+```promql
+# DB connection pool
+hikari_connections_active
+hikari_connections_pending
+
+# Thread pool
+jvm_threads_states_threads
+```
+
+New version might have lower pool size, or new code path holds connections longer.
+
+**Step 7: GC and JVM behavior (for JVM apps)**
+
+```promql
+rate(jvm_gc_pause_seconds_sum[5m])
+jvm_memory_used_bytes
+```
+
+A memory leak introduced in the new version causes longer GC pauses, which look like increased latency.
+
+**Step 8: Trace a slow request end-to-end**
+
+If distributed tracing is set up:
+
+```bash
+# Look at a recent slow request in Tempo/Jaeger
+# Find the span that consumed the time
+```
+
+Tracing surfaces "we spent 2s in the DB call" vs "we spent 2s in the app" instantly.
+
+**Step 9: Configuration deltas**
+
+```bash
+# Diff ConfigMaps
+kubectl get cm -n <ns> -o yaml > current.yaml
+git checkout <previous-commit> -- cm.yaml
+diff current.yaml cm.yaml
+
+# Diff resource specs
+kubectl get deploy <name> -o yaml > current.yaml
+```
+
+Often the code is fine but config changed (smaller cache size, lower timeout, new logging level that flooded I/O).
+
+**Step 10: Check resource throttling**
+
+```bash
+# CPU throttling
+kubectl exec <pod> -- cat /sys/fs/cgroup/cpu.stat | grep throttled
+```
+
+CPU limit too low + busy traffic → throttling → latency. Common when teams add CPU limits without realizing how aggressive CFS throttling is.
+
+**Common root causes ranked by likelihood:**
+
+1. **N+1 query** introduced by ORM change or refactor.
+2. **Missing cache** — code removed a cache or changed cache key, causing more DB calls.
+3. **Smaller connection pool** in new version.
+4. **CPU/memory limit too tight** for new version's resource needs.
+5. **Slower dependency** — new library version with different perf characteristics.
+6. **More logging** flooding I/O.
+7. **Memory leak** causing GC pressure.
+8. **New feature flag** enabled an expensive code path.
+
+**Architect's framing:**
+> "Rollback first, investigate second — that's the operational discipline. Then methodically: confirm correlation with deploy time, diff what changed, break down RED metrics by dimension to find which slice regressed, follow that thread. The diff is usually small; one of those code changes is the cause. Distributed tracing turns this from forensics into a 30-second investigation, which is why I push hard for tracing on every service."
+
+## 4. 10× traffic during peak — bottlenecks
+
+Walking through the stack from edge to data layer:
+
+**Edge / CDN tier**
+
+Usually scales transparently:
+- **CloudFront** auto-scales to billions of requests; rarely a bottleneck.
+- **Route 53** scales similarly.
+- **Risk:** misconfigured cache headers cause too many origin hits.
+
+**Load balancer tier**
+
+- **ALB** uses LCUs (Load Balancer Capacity Units) — scales but with a warm-up period for very sudden spikes.
+- **Risk:** brief 5xx during scale-up if the spike is genuinely instant.
+- **NLB** scales faster but at L4 only.
+- **Mitigation:** for predictable traffic events (Black Friday, sale launches), AWS recommends pre-warming via support ticket.
+
+**Compute tier (the most common bottleneck)**
+
+- **Pods** — HPA scales replicas but takes time. Typical HPA reaction: 1-3 minutes to start scaling, plus pod startup time.
+- **Nodes** — Cluster Autoscaler or Karpenter must provision new EC2 instances. Cluster Autoscaler: 60-90s. Karpenter: 20-60s.
+- **Spot capacity** — if depending on Spot, capacity may not be available during peak.
+
+Common compute bottlenecks:
+- **CPU throttling** on pods with limits set too low.
+- **Memory exhaustion** triggering OOMKills.
+- **Thread pool exhaustion** in the app.
+- **File descriptor limits** on nodes.
+- **Connection pool exhaustion** for downstream calls.
+
+**Cache tier**
+
+- **ElastiCache Redis** scales but cluster mode resharding takes time. Pre-warm cluster before known traffic events.
+- **Risk:** cache miss storms — cold cache during scale-up causes DB stampede.
+- **Mitigation:** request coalescing, jittered cache TTLs, cache warming.
+
+**Database tier (usually the hardest to scale)**
+
+- **RDS writer** is the throughput ceiling. You can vertical-scale (downtime) or shard (architectural change).
+- **Read replicas** scale reads but have replication lag.
+- **Connection limits** — RDS instance classes have max connections. Hit this and queries fail.
+- **Aurora** scales storage transparently but write throughput is still bound by the writer.
+- **DynamoDB** can scale, but on-demand mode is required for unpredictable spikes; provisioned mode hits throttling.
+
+**Async / messaging tier**
+
+- **SQS** scales transparently for throughput.
+- **Kafka (MSK)** — partition count is the scaling unit. Adding partitions mid-stream requires consumer rebalancing.
+- **Risk:** consumer lag grows; downstream processing falls behind.
+
+**External dependencies**
+
+- **Third-party APIs** with rate limits. Even if you scale, the API doesn't.
+- **Payment processors, identity providers** — your scaling doesn't matter if their rate limit hits.
+
+**The order in which bottlenecks usually appear:**
+
+1. **HPA / autoscaler lag** — 1-3 min before new pods are ready.
+2. **Node provisioning** — 30-90s for new nodes.
+3. **Database connection pool exhausted** — pod-level pool sized for normal traffic.
+4. **Database CPU** at writer.
+5. **External API rate limits**.
+6. **Cache miss storm during cold start**.
+7. **External API throttling**.
+
+**Mitigations I'd implement:**
+
+- **Pre-scaling for predictable events** — manually scale up before known traffic spikes via scheduled HPA or override.
+- **Cluster overprovisioning** — pause pods or low-priority workloads that get evicted to make room for real workload spikes.
+- **Connection pool sizing** for peak, not average.
+- **Read replicas pre-provisioned**.
+- **Cache warming jobs** run before traffic spike.
+- **Rate limiting at the edge** so the system degrades gracefully rather than collapses.
+- **Circuit breakers** on downstream calls.
+- **Graceful degradation** — turn off expensive features under load (recommendations, related-products).
+- **Async-ify where possible** — turn synchronous calls into queued processing during spikes.
+
+**Architect's framing:**
+> "10× traffic finds the weakest link. The compute tier is the obvious one but scales easiest. The hidden bottlenecks are usually database write throughput, connection pools, external API rate limits, and cold cache. The discipline isn't predicting which will break — it's load-testing the system at 10× ahead of time to find them. For known events like sale launches, pre-warming is the operational answer."
+
+## 5. Monitoring didn't detect an outage for 10 minutes
+
+This is a postmortem-style question. Walking through the layered failure analysis.
+
+**Step 1: What "didn't detect" means**
+
+Several variants:
+- Alert never fired.
+- Alert fired but didn't page anyone.
+- Alert fired but went to a channel nobody watched.
+- Alert fired but was misclassified as low priority.
+
+Each has different root causes. Establish which one first.
+
+**Step 2: Common failure modes**
+
+**A. Alert threshold wrong**
+
+Alert was on "5xx rate > 5%" — but during the outage, the service returned 200 with empty body (broken UI), not 5xx. So alert never fired.
+
+Fix: alerts based on user-visible outcomes (synthetic monitoring, business KPIs) rather than just HTTP status codes.
+
+**B. Metric source went down with the system**
+
+Monitoring agent runs on the same nodes that are failing. Pods can't push metrics. Prometheus can't scrape unhealthy pods. The system became "metric-dark."
+
+Looking at the dashboard during the outage shows flat lines — looks like "everything fine" but actually means "no data."
+
+Fix:
+- **Stale-metric alerts** — alert when expected metrics stop arriving (`absent(http_requests_total{job="api"})`).
+- **External synthetic monitoring** (Pingdom, CloudWatch Synthetics) — measures from outside the system.
+- **Heartbeat metrics** that should always be present.
+
+**C. Alert routing misconfigured**
+
+Alert fired but was routed to the wrong channel or to a paused PagerDuty service.
+
+Fix: regular fire drills — deliberately trigger test alerts to verify routing actually reaches the on-call.
+
+**D. Alert noise** — boy who cried wolf
+
+Hundreds of low-value alerts per day caused on-call to mute or ignore. The critical alert was lost in the noise.
+
+Fix:
+- **SLO-based alerting** that only pages on user-visible impact.
+- **Alert review meetings** — kill alerts that didn't lead to action.
+- **Symptom-based alerts** (user experience), not cause-based (CPU > 80%).
+
+**E. Threshold too lenient or window too long**
+
+Alert: "Error rate > 5% for 15 minutes" — outage was 10 minutes, so alert didn't fire.
+
+Fix: multi-window burn-rate alerts (short window for acute, long window for chronic). The Google SRE workbook approach.
+
+**F. Wrong dimensions**
+
+Alert on "error rate across all of /api/* > 1%" — but only `/api/payments` was broken at 50% error rate. Aggregated across all endpoints, it looked like 2% — below threshold but not flagged urgently.
+
+Fix: alert on per-endpoint SLOs for tier-1 endpoints, not just aggregated metrics.
+
+**G. Cascading failure obscured the signal**
+
+The outage triggered so many other alarms (downstream services failing) that the on-call missed which one was the actual root cause for 10 minutes.
+
+Fix:
+- **Alert dependencies / inhibition rules** in Alertmanager — suppress downstream alerts when upstream alerts fire.
+- **Service maps** showing dependencies so the on-call can quickly identify root cause vs symptom.
+
+**H. Customer-perceived outage that's not visible in technical metrics**
+
+Sometimes the system is "up" (returning 200s) but actually broken (returning wrong data, broken JavaScript, payment flow not completing). Technical metrics look fine; users are impacted.
+
+Fix:
+- **Business metric alerts** — orders/sec, signups/min. If those drop, something's wrong even if the system "looks healthy."
+- **Real User Monitoring (RUM)** — catches client-side issues that server-side monitoring misses.
+- **Synthetic transactions** that complete an actual user journey.
+
+**Step 3: Process failure**
+
+Sometimes monitoring detected but humans didn't react:
+- On-call ack'ed and then forgot.
+- Paging fatigue.
+- Vacation coverage gap.
+
+These aren't monitoring problems — they're process problems. Distinct fix.
+
+**Step 4: The postmortem**
+
+A 10-minute detection gap warrants a postmortem regardless of severity. Output:
+
+1. **Timeline** — when did the outage actually start, when did first signal appear, when did the alert fire (if at all), when did the on-call notice.
+2. **Root cause of the detection gap** — which of the above categories.
+3. **Action items**:
+   - Add the missing alert.
+   - Tune the threshold.
+   - Add synthetic monitoring for this code path.
+   - Improve runbook so future on-call recognizes the signal faster.
+
+**Architect's framing:**
+> "Monitoring isn't 'do we have alerts' — it's 'do alerts reliably surface user impact within a target time.' MTTD (Mean Time to Detect) is a measurable SLO. When MTTD exceeds target, that itself is an incident worthy of postmortem. Common root causes: alerts based on cause not symptom, no external synthetic monitoring, alert fatigue causing real signals to be ignored, and missing alerts for things like 'metrics stopped arriving.' The fix is layered: SLO-based alerts for user-visible symptoms, synthetic monitoring from outside the system, stale-data alerts, and disciplined alert review to kill noise."
+
+---
+
+# 🎯 Round 2 — Production Debugging
+
+## 1. Nodes healthy, users get 502 errors
+
+502 (Bad Gateway) means an intermediate proxy got an invalid response from the upstream. Working through systematically.
+
+**Step 1: Where exactly is the 502 coming from?**
+
+```bash
+curl -v https://app.example.com/ 2>&1 | grep -i "server"
+# Server: awselb/2.0       → ALB emitted the 502
+# Server: nginx            → in-cluster ingress emitted it
+# Server: cloudfront       → CloudFront emitted it
+```
+
+Different sources, different root causes.
+
+**Step 2: ALB-emitted 502**
+
+ALB returns 502 when it got an invalid response from the target. Common causes:
+
+- **Target returned non-HTTP response** — app crashed mid-response, returned malformed bytes.
+- **Connection reset by target** — app crashed and closed the connection.
+- **Keep-alive timeout mismatch** — ALB's idle timeout is longer than app's; app closes idle connection while ALB tries to reuse.
+- **Target health check passing but target actually unhealthy** — e.g., `/health` returns 200 but `/api` is broken.
+
+```bash
+# Check target group health
+aws elbv2 describe-target-health --target-group-arn <arn>
+# All healthy? But 502s? → keep-alive or per-request failure
+
+# Check ALB access logs for the specific 502
+# Athena query:
+SELECT * FROM alb_logs
+WHERE elb_status_code = '502'
+ORDER BY time DESC
+LIMIT 100;
+# Look at target_status_code and target_processing_time
+```
+
+If `target_status_code = '-'` and `target_processing_time = -1`, the target never responded properly (connection reset, crash).
+
+**Step 3: NGINX-emitted 502**
+
+NGINX returns 502 when its upstream (backend pod) didn't respond properly:
+
+```bash
+kubectl logs -n ingress-nginx <controller-pod> | grep "502"
+# Look for:
+#   upstream prematurely closed connection
+#   connect() failed (111: Connection refused)
+#   upstream timed out
+```
+
+**Step 4: Pod-level investigation**
+
+```bash
+# Are pods actually serving traffic?
+kubectl get pods -n <ns> -l app=<app>
+kubectl get endpoints -n <ns> <service>
+# Endpoints should list pod IPs. If empty or wrong → service selector issue or all pods unhealthy
+
+# Are pods restarting?
+kubectl get pods -n <ns> -l app=<app> -o wide
+# Restart count? Recent restarts mean intermittent crashes → 502s during the crashes
+
+# Logs from a pod
+kubectl logs <pod> -n <ns> | tail -100
+kubectl logs <pod> -n <ns> --previous   # if recently restarted
+
+# Resource pressure
+kubectl top pod -n <ns> -l app=<app>
+```
+
+**Step 5: Connection-level issues**
+
+Even if pods look fine individually, connection issues cause 502s:
+
+- **SNAT port exhaustion** on EKS — high outbound connection rate exhausts NAT ports, causing intermittent connection failures.
+- **Connection pool exhaustion** in the app — incoming requests succeed but app can't open a downstream connection.
+- **DNS resolution failures** inside pods — CoreDNS overloaded.
+- **Keep-alive mismatch** — covered above.
+
+```bash
+# Check SNAT ports
+aws ec2 describe-nat-gateways --filter Name=state,Values=available
+# Each NAT GW has ~55,000 ports per destination IP combo
+
+# DNS
+kubectl exec <pod> -n <ns> -- nslookup mydb.namespace.svc.cluster.local
+kubectl logs -n kube-system -l k8s-app=kube-dns | tail
+```
+
+**Step 6: Downstream dependencies**
+
+If pods are serving but their downstream calls fail:
+- Pod returns an error 502 to NGINX, which propagates.
+- Could be DB unavailable, third-party API timing out, cache down.
+
+```bash
+# Check app error logs for downstream failures
+kubectl logs <pod> -n <ns> | grep -i "error\|failed\|timeout"
+```
+
+**Step 7: Cascade pattern**
+
+Sometimes 502s come and go in waves. Pattern: pod crashes → pod restarts → traffic rebalances → other pods overloaded → more crashes.
+
+Looking at:
+- Pod restart count over time.
+- Service Endpoints membership changes.
+- 502 rate correlated with deploy or pod-churn events.
+
+**Common root causes ranked by likelihood:**
+
+1. **Keep-alive timeout mismatch** — ALB idle timeout 60s, app idle 30s. ALB tries to reuse closed connection.
+2. **App crashing intermittently** under load — exit during request → 502.
+3. **Health check too lenient** — pods pass health check but actual endpoints fail.
+4. **Downstream timeout** — app waits, ALB times out at 60s, returns 502.
+5. **Pod-to-pod connectivity issues** — NetworkPolicy blocking, CoreDNS issues.
+6. **SNAT exhaustion** for high-outbound-traffic clusters.
+
+**Mitigation patterns:**
+
+```yaml
+# Tune timeouts to match
+# In Spring Boot
+server.tomcat.connection-timeout: 60s
+server.tomcat.keep-alive-timeout: 65s   # slightly longer than ALB idle (60s)
+
+# Annotation on ALB
+service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout: "60"
+```
+
+**Architect's framing:**
+> "502 means a proxy got an invalid response from upstream. The diagnosis order: which proxy emitted it (header), what does that proxy's log say about the upstream failure, is the upstream actually responding, why not. Keep-alive mismatch and app-side crashes are the most common at scale. Healthy nodes don't mean healthy pods, and healthy pods don't mean healthy responses — each layer needs its own observability."
+
+## 2. Redis latency spikes during peak
+
+Walking through the diagnostic flow:
+
+**Step 1: Characterize the spike**
+
+```promql
+# Redis command latency p99
+histogram_quantile(0.99,
+  sum by (le, command) (rate(redis_command_duration_seconds_bucket[1m]))
+)
+
+# Is it certain commands? All commands?
+```
+
+If it's all commands → infrastructure or capacity issue. If it's specific commands → command-specific (slow query, large value).
+
+**Step 2: Check ElastiCache / Redis metrics**
+
+```
+CPUUtilization              — Redis is single-threaded, one core matters most
+EngineCPUUtilization        — actual Redis engine, not the host
+NetworkBytesIn/Out          — bandwidth saturation?
+CurrConnections             — connection storm?
+NewConnections              — high churn?
+Evictions                   — running out of memory, evicting keys
+ReplicationLag              — if using replicas
+```
+
+**Common patterns:**
+
+**A. EngineCPU saturated**
+Redis is single-threaded. If EngineCPU is 100%, you're maxed out regardless of how many cores the instance has. Need to either shard (cluster mode), scale up (bigger instance), or reduce command rate.
+
+**B. Slow commands blocking the event loop**
+Single-threaded Redis means one slow `KEYS *`, `SUNION`, `SORT`, or `LRANGE` on a huge list blocks every other client.
+
+```bash
+# Check slow log
+redis-cli SLOWLOG GET 100
+redis-cli SLOWLOG RESET
+```
+
+Look for `KEYS`, large `SORT`, large `SUNION`, anything operating on big collections.
+
+**C. High connection churn**
+Apps not using connection pools open/close connections per request. Each connection costs CPU.
+
+```bash
+redis-cli INFO clients
+# Look at:
+#   connected_clients
+#   total_connections_received   ← high churn rate is bad
+```
+
+Fix in the application: connection pool with appropriate size and timeout settings.
+
+**D. Memory pressure / evictions**
+If `maxmemory-policy` is `allkeys-lru` and memory is full, every write triggers an eviction (LRU sampling overhead).
+
+```bash
+redis-cli INFO memory
+# Look at:
+#   used_memory
+#   used_memory_peak
+#   maxmemory
+#   maxmemory_policy
+#   evicted_keys
+```
+
+If evictions are happening, cache hit ratio drops, application makes more DB calls, which often cascades.
+
+**E. Hot keys**
+A single key being hammered. All requests for that key serialize behind one another.
+
+```bash
+redis-cli --hotkeys
+# Or with newer Redis:
+redis-cli CLUSTER COUNTKEYSINSLOT <slot>
+```
+
+Fix: split the hot key (sharded counter), use a local in-process cache for read-heavy hot keys, use Redis cluster mode and distribute.
+
+**F. Network bandwidth saturation**
+Especially with large values. ElastiCache instance has a fixed network ceiling.
+
+Check `NetworkBytesIn/Out` against the instance's bandwidth spec. If close to ceiling, you're network-bound.
+
+**G. Replication lag affecting reads**
+If reading from replicas and lag spikes, queries hit slow replicas.
+
+**H. Backup taking resources**
+ElastiCache nightly snapshots can cause brief latency spikes. Confirm via the snapshot schedule.
+
+**Step 3: Application-side investigation**
+
+```bash
+# What's the app doing with Redis?
+# Trace a slow request — what Redis commands were issued?
+```
+
+Common app-side issues:
+- **N+1 cache calls** — fetching items one at a time instead of MGET batch.
+- **Large values** — serializing huge objects as single Redis values.
+- **Wrong data structures** — using a single SET with millions of members instead of multiple smaller SETs.
+- **Cache stampede** — many requests miss simultaneously and all rebuild the cache, hammering both Redis and the DB.
+
+**Step 4: Mitigation patterns**
+
+- **Pipeline commands** to reduce round-trips.
+- **MGET / MSET** for batch operations.
+- **Cluster mode** if hitting single-instance limits.
+- **Connection pooling** with reasonable pool size.
+- **Read replicas** for read-heavy workloads.
+- **Cache stampede prevention** — request coalescing, jittered TTLs, probabilistic early expiration.
+- **Eliminate or rewrite slow commands** — never `KEYS *` in production.
+
+**Step 5: Long-term architectural patterns**
+
+- **Local in-process cache** for hot data (Caffeine in Java, lru-cache in Node) — Redis becomes the second tier.
+- **Multi-tier caching** — local → Redis → DB.
+- **Async cache warming** for predictable access patterns.
+
+**Architect's framing:**
+> "Redis is single-threaded — once EngineCPU saturates, no amount of instance scaling helps. The diagnostic path: EngineCPU first (is the engine maxed?), slow log second (which commands?), eviction/memory third (are we thrashing?). Most production Redis latency issues at scale trace to slow commands on the wrong data structure, connection churn from missing pools, or hot keys that need to be sharded. The architectural answer for cache-heavy systems is multi-tier caching — local cache in process, Redis for shared cache."
+
+## 3. HPA didn't scale despite high CPU
+
+Systematic check, in priority order:
+
+**Step 1: What does HPA actually see?**
+
+```bash
+kubectl describe hpa <name> -n <ns>
+# Look at the "Metrics" section:
+#   - resource cpu on pods (as a percentage of request):  85% (170m) / 70%
+#   - Current/Desired replicas
+# Look at "Conditions":
+#   - AbleToScale, ScalingActive, ScalingLimited
+
+# Events at the bottom are crucial:
+kubectl describe hpa <name> -n <ns> | tail -30
+```
+
+The events tell you in plain English why HPA isn't scaling.
+
+**Step 2: Common root causes**
+
+**A. Pod doesn't have CPU request set**
+
+HPA computes utilization as `usage / request`. Without a request, there's no denominator — HPA can't compute utilization.
+
+```bash
+kubectl get pod <pod> -o jsonpath='{.spec.containers[*].resources}'
+# If empty or no "requests" → that's the problem
+```
+
+Fix: set CPU requests on the pod template.
+
+**B. Metrics server not running or unhealthy**
+
+```bash
+kubectl get apiservice v1beta1.metrics.k8s.io
+kubectl get pods -n kube-system -l k8s-app=metrics-server
+kubectl logs -n kube-system <metrics-server-pod>
+
+# Can it actually report metrics?
+kubectl top pod <pod>
+# If "Unknown" or error, metrics-server is broken
+```
+
+**C. HPA at maxReplicas**
+
+```bash
+kubectl get hpa <name> -o yaml | grep -E "min|max|current|desired"
+```
+
+If `desired_replicas == max_replicas` and HPA wanted more, the `ScalingLimited` condition would be true.
+
+**D. Stabilization window**
+
+HPA v2 has scale-up stabilization. If `behavior.scaleUp.stabilizationWindowSeconds` is set high (e.g., 5 min), HPA waits before scaling up even with high CPU.
+
+```yaml
+behavior:
+  scaleUp:
+    stabilizationWindowSeconds: 300   # waits 5min before scaling
+```
+
+For aggressive scale-up:
+```yaml
+behavior:
+  scaleUp:
+    stabilizationWindowSeconds: 0
+    policies: [{ type: Percent, value: 100, periodSeconds: 30 }]
+```
+
+**E. Cool-down from recent scale event**
+
+If HPA scaled down recently, the default 5-min cool-down may be preventing scale-up.
+
+**F. Multiple metrics, one unavailable**
+
+If HPA uses both CPU and a custom metric, and the custom metric returns errors, HPA may not act.
+
+**G. Custom metrics adapter missing**
+
+If HPA references custom metrics that aren't being collected (Prometheus adapter not installed or misconfigured), it can't compute desired replicas.
+
+**H. RBAC issue**
+
+HPA needs permission to patch the Deployment. If RBAC was changed and the HPA controller's service account lost permission, scaling fails.
+
+```bash
+kubectl logs -n kube-system -l component=kube-controller-manager | grep -i hpa
+# Look for "forbidden" errors
+```
+
+**I. CPU utilization vs. CPU usage confusion**
+
+HPA's `averageUtilization` is *percent of requests*. If pod requests 1 CPU and uses 0.5 CPU, that's 50% utilization. If utilization target is 70%, no scale-up.
+
+But the user might be looking at *raw CPU usage* on the node (e.g., 90% of node CPU) and assume HPA should scale. These are different things.
+
+**J. Pod template hash matches existing RS**
+
+This is more subtle: if HPA tries to scale but the Deployment can't roll due to some other constraint (PDB blocking, resource quota, no nodes available), scaling stalls.
+
+**K. ResourceQuota at the namespace level**
+
+```bash
+kubectl get resourcequota -n <ns>
+```
+
+If quota cap is reached, new pods can't be created regardless of what HPA wants.
+
+**Step 3: Verify the chain end-to-end**
+
+```bash
+# 1. Are metrics flowing?
+kubectl top pod <pod>
+
+# 2. Is HPA reading them?
+kubectl get hpa <name> -o yaml | grep currentMetrics -A10
+
+# 3. Is HPA computing correctly?
+kubectl describe hpa <name>
+
+# 4. Is the deployment being patched?
+kubectl get deploy <name> -o yaml | grep replicas
+
+# 5. Are pods being scheduled?
+kubectl get pods -n <ns> -l app=<app>
+```
+
+**Architect's framing:**
+> "HPA failures almost always trace to one of three: missing CPU request (no denominator), metrics-server broken, or stabilization window throttling. `kubectl describe hpa` events tell you which one. Less common: RBAC, ResourceQuota, or wrong metric type. The systematic mistake is debugging by changing config instead of reading the HPA's own status, which explicitly explains why it isn't scaling."
+
+## 4. Memory leak in deployment — early signals
+
+Signals ranked from earliest to most obvious:
+
+**Earliest signals (would catch a leak in hours):**
+
+**1. RSS growth without level-off**
+
+In a healthy app under steady traffic, memory grows during startup and warm-up, then plateaus. A leak shows monotonic growth that doesn't plateau.
+
+```promql
+# Memory trend
+container_memory_working_set_bytes{pod=~"myapp.*"}
+
+# Slope over the last hour
+deriv(container_memory_working_set_bytes{pod=~"myapp.*"}[1h])
+# Positive and not decreasing → potential leak
+```
+
+Alert: memory derivative consistently positive over 24h.
+
+**2. Increasing GC pause frequency (JVM specifically)**
+
+```promql
+rate(jvm_gc_pause_seconds_count{action="end of major GC"}[5m])
+# Increasing trend over time → heap pressure
+```
+
+As heap fills, major GC runs more frequently. Each GC reclaims less. This pattern precedes the OOM by hours or days.
+
+**3. Increasing GC duration**
+
+```promql
+rate(jvm_gc_pause_seconds_sum[5m])
+/
+rate(jvm_gc_pause_seconds_count[5m])
+# Average GC pause time — increasing → leak symptoms
+```
+
+**4. Old generation heap usage trending up**
+
+```promql
+jvm_memory_used_bytes{area="heap", id="G1 Old Gen"}
+# Trending up over time after each GC → objects being retained that shouldn't be
+```
+
+This is the cleanest leak signal in JVMs: even after GC, heap stays elevated.
+
+**5. Native memory growth (non-heap)**
+
+```promql
+process_resident_memory_bytes - jvm_memory_used_bytes{area="heap"}
+# Native portion of RSS
+```
+
+If JVM heap is stable but RSS grows, the leak is in native memory (direct buffers, JNI, native libraries). Pure-Java leak detection misses this.
+
+**Mid-term signals (hours to days):**
+
+**6. Decreasing throughput**
+
+GC stop-the-world pauses reduce effective throughput. Even before OOM, requests per second drops.
+
+```promql
+rate(http_requests_total[5m])
+# Trending down without traffic decrease → app slowing down
+```
+
+**7. Increasing latency**
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+# Climbing p99 → GC pauses lengthening request times
+```
+
+**8. Connection pool / thread pool saturation**
+
+Leaked objects might be holding connections or threads. Pool exhaustion follows.
+
+```promql
+hikari_connections_active
+jvm_threads_states_threads{state="blocked"}
+```
+
+**Late signals (about to break):**
+
+**9. Approaching memory limit**
+
+```promql
+container_memory_working_set_bytes / container_spec_memory_limit_bytes
+# > 0.8 → close to OOM
+```
+
+**10. OOMKill (the post-mortem signal)**
+
+```bash
+kubectl describe pod <pod>
+# Last State: Terminated, Reason: OOMKilled, Exit Code: 137
+```
+
+Once you see OOMKills, the leak has been there for a while and only now manifested as crash-and-restart cycles.
+
+**Comprehensive alerting strategy:**
+
+```yaml
+groups:
+- name: memory-leak-detection
+  rules:
+  # Earliest: long-term memory growth
+  - alert: PossibleMemoryLeak
+    expr: |
+      deriv(
+        container_memory_working_set_bytes{
+          container="app", pod=~"myapp.*"
+        }[6h]
+      ) > 1024 * 1024   # growing >1MB/sec over 6h
+    for: 1h
+    labels: { severity: ticket }
+    annotations:
+      summary: "Memory growing in {{ $labels.pod }} — possible leak"
+
+  # JVM heap pressure
+  - alert: JVMOldGenGrowing
+    expr: |
+      deriv(
+        jvm_memory_used_bytes{
+          area="heap", id="G1 Old Gen", pod=~"myapp.*"
+        }[2h]
+      ) > 0
+    for: 30m
+    labels: { severity: ticket }
+
+  # GC time increasing
+  - alert: GCTimeHigh
+    expr: |
+      (rate(jvm_gc_pause_seconds_sum[5m]) / rate(jvm_gc_pause_seconds_count[5m])) > 0.5
+    for: 10m
+    labels: { severity: page }
+
+  # Near OOM
+  - alert: MemoryNearLimit
+    expr: |
+      container_memory_working_set_bytes / container_spec_memory_limit_bytes > 0.85
+    for: 5m
+    labels: { severity: page }
+```
+
+**Investigative tools when alerts fire:**
+
+- **Heap dump on OOM** — `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/dumps/`
+- **Periodic heap dumps** — Cron-triggered every hour, analyzed offline.
+- **JFR (Java Flight Recorder)** — continuous, low-overhead profiling.
+- **Memory profiler (async-profiler, YourKit, JProfiler)** for live diagnosis.
+- **Pyroscope / Grafana Profiles** for continuous profiling in production.
+
+**Architect's framing:**
+> "The earliest signal is monotonic memory growth without plateau — visible hours or days before the OOM. The next signals are GC behavior changes — frequency, duration, old-gen retention. By the time you see OOMKill, the leak has been brewing. Investment in heap-dump-on-OOM + continuous profiling means leak diagnosis goes from 'why did pod crash' (forensics) to 'why is heap growing' (proactive). Most teams have OOMKill alerting; few have leak-detection alerting."
+
+---
+
+# 🎯 Round 3 — Engineering Depth
+
+## 1. Designing systems that fail gracefully
+
+Graceful degradation means: when something fails, the system continues operating at reduced capability rather than collapsing. This is fundamentally a *design* property, not something you bolt on afterwards.
+
+**Core principles:**
+
+**1. Identify what's critical vs nice-to-have**
+
+Not every feature is equal. In an e-commerce checkout:
+- **Critical**: take payment, create order.
+- **Important**: send confirmation email.
+- **Nice-to-have**: show recommended products, update loyalty points.
+
+Design so failure of nice-to-have features doesn't break critical paths. If the recommendations service is down, checkout still works.
+
+**2. Circuit breakers**
+
+Stop calling downstream services that are clearly failing. Prevents cascade failures where one slow service drags down all callers.
+
+```java
+// Resilience4j example
+CircuitBreaker breaker = CircuitBreaker.of("recommendations",
+  CircuitBreakerConfig.custom()
+    .failureRateThreshold(50)
+    .slowCallRateThreshold(50)
+    .slowCallDurationThreshold(Duration.ofMillis(500))
+    .waitDurationInOpenState(Duration.ofSeconds(30))
+    .build()
+);
+
+return breaker.executeSupplier(() -> recommendationsClient.fetch())
+  .orElse(Collections.emptyList());   // fallback to empty
+```
+
+State machine: closed (healthy) → open (failing, short-circuit) → half-open (probing). Failure doesn't propagate; users see empty recommendations instead of failed checkouts.
+
+**3. Timeouts and retries**
+
+Every external call has a timeout. Default to "no timeout" means default to "system hangs forever when downstream is slow."
+
+```yaml
+# Sensible defaults
+connect-timeout: 1s
+read-timeout: 3s
+
+# Retries with backoff and jitter
+retries: 3
+backoff:
+  initial: 100ms
+  multiplier: 2
+  max: 5s
+  jitter: 0.3
+```
+
+Retries with jitter prevent thundering herds.
+
+**4. Bulkheads**
+
+Isolate resources so failure in one area can't exhaust resources used by another.
+
+- Separate connection pools per downstream service.
+- Separate thread pools per workload type.
+- Separate request queues with bounded capacity.
+
+If downstream A is slow, only the A pool is exhausted; B keeps working.
+
+**5. Graceful degradation paths**
+
+Pre-design what "degraded" looks like:
+- **Cache miss → serve stale data** with a warning.
+- **Recommendation service down → return empty list.**
+- **Search down → fallback to category browsing.**
+- **Payment provider A down → failover to provider B.**
+- **Image CDN down → serve from origin with degraded latency.**
+
+This must be in the design phase, not invented during an incident.
+
+**6. Feature flags for emergency degradation**
+
+```python
+if feature_flag("expensive_recommendation_algorithm"):
+    return ml_recommendations(user)
+else:
+    return simple_popularity_recommendations()
+```
+
+When ML inference latency spikes, flip the flag, switch to cheap recommendations. No deploy needed.
+
+**7. Load shedding**
+
+Under extreme load, reject some requests gracefully rather than collapse entirely:
+- Rate limiting at the edge (CloudFront, API Gateway, NGINX).
+- Priority queues — drop low-priority requests first.
+- Adaptive concurrency limits — reduce concurrency as latency rises.
+
+Better to serve 80% of users well than 100% of users poorly.
+
+**8. Async patterns for non-critical paths**
+
+```
+Order placed → Queue (durable) →
+  ├── Charge payment (sync, critical)
+  ├── Send confirmation email (async via SQS)
+  ├── Update loyalty points (async)
+  └── Refresh recommendations (async)
+```
+
+If the email service is down, the order still completes. Email retries from the queue when the service recovers.
+
+**9. Idempotency**
+
+Retries are meaningless without idempotency. Every write operation should have an idempotency key so it's safe to retry without double-effect.
+
+```http
+POST /api/payments
+Idempotency-Key: 7f8e9d10-payment-attempt-1
+```
+
+**10. Health checks that mean something**
+
+Health endpoints should reflect *real* health:
+- Dependent on internal queue depth, downstream availability, cache reachability.
+- Not just "process is running."
+
+But carefully — health check that depends on downstream causes cascading failures. Use **deep health** for operator dashboards and **shallow health** for load balancer probes.
+
+**11. Default to denying gracefully**
+
+When in doubt: fail closed (deny) for security-sensitive, fail open (allow) for non-critical features. Either way, **fail consistently** so callers know what to expect.
+
+**12. Observability for graceful degradation**
+
+You need to know when degradation is happening:
+- Metric: "circuit breaker open" count.
+- Metric: "fallback path taken" count.
+- Alert: "more than X% of requests using degraded path."
+
+Without this, degradation is invisible until it crosses into outage.
+
+**Practical example — checkout flow:**
+
+```
+User clicks "place order"
+    │
+    ▼
+[Validate cart] ──────── DB down? → return cached cart with warning
+    │
+    ▼
+[Reserve inventory] ──── timeout? → retry with backoff; if still fails, page on-call
+    │
+    ▼
+[Charge payment] ─────── provider A down? → failover to provider B
+    │
+    ▼
+[Create order in DB] ─── critical path; cannot fail
+    │
+    ├──→ [Send email] ───────── async via SQS; retries
+    ├──→ [Update loyalty] ──── async; non-blocking
+    └──→ [Fraud check async] ─ async; flag for review if fails
+    │
+    ▼
+Return success to user
+```
+
+Critical path is short (validate → reserve → charge → create order). Everything else is async. A failure in non-critical paths doesn't break the order.
+
+**Architect's framing:**
+> "Graceful degradation is a design discipline, not a feature. The skill is knowing which parts are critical and which can degrade — and that conversation happens during design, not during an incident. The patterns are well-known: timeouts, circuit breakers, bulkheads, async non-critical paths, feature flags, load shedding. The hard part is the cultural discipline of asking 'what happens if this dependency fails?' for every dependency, every time."
+
+## 2. Reducing MTTR in production
+
+**MTTR (Mean Time To Recovery)** is the time from outage start to restoration. Reducing it has compounding value — every minute saved is one less minute of customer impact.
+
+Breaking it down: MTTR = MTTD (detect) + MTTI (investigate) + MTTM (mitigate) + MTTR-recover (verify).
+
+Each component has different levers.
+
+**Reducing MTTD — Detection time**
+
+- **SLO-based alerting** based on user-visible symptoms (error rate, latency), not infrastructure (CPU).
+- **External synthetic monitoring** that catches issues internal monitoring misses.
+- **Multi-window burn-rate alerts** — short window catches acute issues, long window catches slow degradation.
+- **Business KPI alerts** — orders/sec dropping is a faster signal than 5xx rate sometimes.
+- **Aliveness alerts** — alert when expected metrics stop arriving (`absent()`).
+- **Stale data alerts** — last-update timestamp on dashboards so flat graphs don't masquerade as healthy.
+
+Goal: MTTD < 2 minutes for tier-1 issues.
+
+**Reducing MTTI — Investigation time**
+
+The longest MTTR contributor for most incidents. Levers:
+
+- **Distributed tracing** — answers "where is the time being spent" in seconds, not minutes.
+- **Structured logging** with correlation IDs — find all log lines for a slow request in one query.
+- **Per-service runbooks** linked from alerts. "API has 5xx spike" alert → click → runbook with diagnostic queries.
+- **Dependency maps** — see at a glance which downstreams are affected.
+- **Recent-change dashboards** — what deployed in the last hour, what configs changed.
+- **Pre-built incident dashboards** per service so the on-call doesn't build queries during an incident.
+- **Correlation tools** — automatic anomaly detection that points at "this metric is unusual right now."
+
+Goal: identify root cause within 10 minutes.
+
+**Reducing MTTM — Mitigation time**
+
+This is where rollback culture matters.
+
+- **One-click rollback** — `kubectl rollout undo`, `helm rollback`, GitOps `git revert`. Should take < 60 seconds.
+- **Feature flag kill switches** — disable risky features without redeploy.
+- **Pre-tested runbooks** — manual mitigation steps tested in DR drills, not invented during incidents.
+- **Automated runbook execution** — for known patterns, automate the mitigation (Rundeck, AWS SSM Documents).
+- **Decision frameworks** — rollback first vs investigate first? Default: rollback first for any tier-1 customer-impacting issue.
+
+Goal: mitigation within 5 minutes of identifying root cause.
+
+**Reducing MTTR-recover — Verification time**
+
+- **Automated synthetic tests** post-mitigation to verify recovery.
+- **SLO dashboards** with real-time burn-rate showing recovery.
+- **Customer impact metrics** clearly visible (orders/sec, error rate by region).
+
+**Cross-cutting practices:**
+
+**1. Blameless postmortems with action items**
+
+Every incident produces tracked action items. MTTR improvements compound only if past incidents inform future architecture.
+
+**2. Game days**
+
+Quarterly DR drills, chaos exercises. Practiced incidents have faster MTTR than novel ones.
+
+**3. On-call training**
+
+New on-call shadows experienced on-call for several rotations. Documented decision trees. Runbooks reviewed regularly.
+
+**4. Reduced cognitive load during incidents**
+
+- **Incident commander role** — one person directing, others investigating.
+- **Standardized comm channels** — every incident has a Slack channel with the same template.
+- **Status pages** — automated, not manually updated during incidents.
+
+**5. Pre-built mitigation tooling**
+
+- **Rollback buttons** in deployment dashboards.
+- **Traffic shifting tools** (Route 53, ALB weighted target groups) at the ready.
+- **Database failover scripts** tested and documented.
+
+**6. Eliminate manual steps**
+
+Manual = slow + error-prone. Automate any step that's been done more than twice during incidents.
+
+**7. Observability investments**
+
+- **Continuous profiling** — when investigating "why is service slow," profile is ready.
+- **Pre-aggregated dashboards** — don't query raw data during incidents.
+- **Audit trails** — who deployed what, who ran what command.
+
+**8. Architectural patterns that enable fast recovery**
+
+- **Immutable infrastructure** — replace, don't repair.
+- **Blue-green or canary deployments** — rollback is just a traffic flip.
+- **Multi-region** — fail over instead of fixing.
+- **Idempotent operations** — safely retry without double-effect.
+
+**MTTR metric tracking:**
+
+Measure and review:
+- MTTR per quarter, trending down or up.
+- MTTR by severity tier.
+- Breakdown: MTTD + MTTI + MTTM.
+
+If MTTI dominates, invest in observability. If MTTM dominates, invest in mitigation tooling. If MTTD dominates, invest in alerts.
+
+**Architect's framing:**
+> "MTTR isn't one thing — it's four phases, each with different levers. Detection is alerts; investigation is observability; mitigation is rollback tooling; verification is monitoring. The biggest wins for most teams are in MTTI — distributed tracing alone often cuts MTTR by half. The cultural piece: every incident either produces an MTTR improvement, or we're not learning. Postmortem action items should be tracked with the same rigor as feature work — MTTR improvement is product work, not toil."
+
+## 3. Preventing repeated incidents in a platform team
+
+The fundamental insight: repeated incidents indicate systemic gaps, not bad luck. The goal is structural prevention, not "tell people to be more careful."
+
+**Layer 1: Blameless postmortems with action items**
+
+Non-negotiable for any non-trivial incident. Structure:
+
+- **What happened** — timeline with timestamps.
+- **What was the impact** — customer-visible, business metrics.
+- **Why it happened** — root cause analysis (5-whys, fishbone). Look for systemic causes, not "operator error."
+- **What did we do well** — preserve the practices that worked.
+- **What did we miss** — gaps in monitoring, runbooks, design.
+- **Action items** with owners, deadlines, and tracked completion.
+
+Blameless means: assume people made the best decision they could with the information available. Look at why the system allowed the mistake.
+
+**Layer 2: Action item tracking**
+
+Action items must close. The single biggest postmortem failure mode is producing great action items that never ship.
+
+- Tracked in Jira/Linear like any other work.
+- Quarterly review: action items overdue >30 days get escalated.
+- Action items have priority tiers — P0 must ship in current sprint, P1 in current quarter.
+
+**Layer 3: Pattern detection across incidents**
+
+After enough incidents, patterns emerge. Quarterly review:
+
+- Same root cause appearing repeatedly? → invest in fixing the underlying class.
+- Same service in multiple incidents? → architectural review of that service.
+- Same on-call pattern (Monday morning deploys)? → process change.
+
+**Layer 4: Pre-incident investments**
+
+Most incidents are preventable with upfront engineering. The hard part is justifying preventive work that has no immediate visible payoff.
+
+- **Capacity planning** before traffic events.
+- **Chaos engineering** to surface unknown failure modes.
+- **DR drills** that find latent issues.
+- **Load testing** for new services before launch.
+- **Service Level Objectives** with error budgets to allocate engineering time between reliability and features.
+
+**Layer 5: Process for high-risk changes**
+
+Not every change needs heavy process, but high-risk changes need it:
+
+- **Change Review Board** for schema migrations, infrastructure changes, security changes.
+- **Pre-deploy checklists** for production changes.
+- **Mandatory canary** for tier-1 services.
+- **Pre-deploy approvals** for production database changes.
+- **Backout plan documented** for any non-trivial change.
+
+This isn't bureaucracy if calibrated to risk — light process for low-risk, heavy process for high-risk.
+
+**Layer 6: Architectural improvements**
+
+Some incidents prevent themselves only via architecture:
+
+- **Multi-region** if single-region outages keep happening.
+- **Idempotency everywhere** if retry-induced data corruption recurs.
+- **Service mesh with circuit breakers** if cascade failures recur.
+- **Better isolation** if multi-tenant noisy-neighbor recurs.
+- **Replace fragile components** that keep breaking.
+
+**Layer 7: Observability investments**
+
+If incidents recur because nobody saw them coming:
+
+- **Add the missing metric/alert** identified in postmortems.
+- **Synthetic monitoring** for previously-blind code paths.
+- **Distributed tracing** if "we couldn't tell where the time went" appears repeatedly.
+- **Continuous profiling** if performance issues are recurring.
+
+**Layer 8: Runbook investments**
+
+If incidents recur because operators didn't know how to respond:
+
+- **Runbooks linked from alerts** — alert annotation includes runbook URL.
+- **Runbook review cadence** — runbooks tested in DR drills, updated when stale.
+- **Onboarding documentation** for new on-call.
+
+**Layer 9: Training and team practices**
+
+- **Game days** quarterly — practice incident response.
+- **Cross-team on-call shadowing** — share knowledge.
+- **Postmortem readouts** across the org — lessons aren't locked to one team.
+- **Reliability office hours** — platform team available for design reviews.
+
+**Layer 10: Culture and incentives**
+
+The cultural piece is what makes everything else work:
+
+- **Reliability is a feature, not a tax** — leadership treats SRE work with the same priority as product work.
+- **Blameless culture** — engineers report issues without fear, leading to better data.
+- **SLO compliance reviewed in product roadmaps** — error budget burn slows feature shipping.
+- **Reliability metrics in performance reviews** — engineers rewarded for reliability work, not just shipping.
+
+**Anti-patterns that perpetuate repeated incidents:**
+
+- **Postmortems with no action items** — fundamental cause not addressed.
+- **Action items that don't ship** — same issue happens again.
+- **Blame culture** — people hide issues; you lose data.
+- **"Fix it manually" repeatedly** — symptoms patched, not causes.
+- **Ignoring small incidents** — they're warnings; the next one is bigger.
+- **"It only happens occasionally"** — that means it'll happen at the worst time.
+
+**The platform team's responsibility specifically:**
+
+A platform team prevents incidents *for product teams*:
+
+- **Paved roads** — make the easy path the right path. Golden Helm charts, templated CI/CD, secure-by-default infrastructure.
+- **Guardrails** — admission policies preventing dangerous configurations.
+- **Self-service tooling** so teams don't depend on platform team for routine operations.
+- **Standard observability** in base images — RED metrics, traces, logs automatic.
+- **Platform-level SLOs** that aggregate across product teams' issues.
+
+**Architect's framing:**
+> "Repeated incidents indicate systemic gaps that individual operators can't fix. The pattern: postmortem → identify systemic cause → tracked action item → architectural or process change → measured outcome. The hard part isn't producing postmortems — it's closing the action items. Many teams produce great postmortems and then revisit the same issues 6 months later because the action items sat in backlog. The platform team's contribution is structural: paved roads, guardrails, and observability that make incidents harder to cause and faster to detect. The cultural piece is treating reliability as product work, not toil — that's what enables engineering time to be allocated to prevention rather than just response."
+
+---
+
+That covers all three rounds. Likely Amazon-style follow-ups to be ready for:
+
+- **"Tell me about a time you owned a difficult production incident."** — they want LP examples: Ownership, Bias for Action, Dive Deep, Earn Trust.
+- **"You disagreed with a team about the right architecture. What happened?"** — Disagree and Commit, Have Backbone.
+- **"How do you mentor junior engineers on reliability?"** — Hire and Develop the Best.
+- **"How would you decide between cost and reliability when budgets are tight?"** — Frugality, Customer Obsession, balancing trade-offs.
+- **"Describe your highest-impact engineering improvement in the last year."** — Deliver Results, with measurable outcomes.
+
+Amazon interviews lean heavily on STAR-format Leadership Principle stories. Have 6-8 strong incident/architecture stories prepared, each mappable to multiple LPs.
