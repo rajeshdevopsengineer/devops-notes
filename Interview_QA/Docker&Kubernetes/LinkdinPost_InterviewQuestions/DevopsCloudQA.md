@@ -2660,3 +2660,4 @@ That covers all the questions. Likely follow-ups to be ready for:
 - **"Walk me through a real incident where error budget burn rate alerted you in time."** — have a specific story ready.
 - **"What's the difference between `terraform import` and `data` blocks?"** — import brings unmanaged resources under TF management; data blocks read existing resources for reference without managing them.
 - **"How do you handle stateful workloads in K8s for a regulated environment?"** — operators, encrypted PVs, strict backup, PDBs, and honestly: prefer managed services where possible.
+
