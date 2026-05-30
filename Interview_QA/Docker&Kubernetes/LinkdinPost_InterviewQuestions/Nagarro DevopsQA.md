@@ -1936,3 +1936,4 @@ That covers all 11 questions. Likely follow-ups to be ready for:
 - **"How do you handle a failed canary that needs immediate rollback?"** — Argo Rollouts auto-aborts on SLO regression; pre-promotion analysis gates each step; manual `kubectl argo rollouts abort` if needed.
 
 Your Finastra/banking background lets you go deep on the operational and compliance aspects — emphasize the audit trail, segregation of duties, and security gates throughout the pipeline.
+
