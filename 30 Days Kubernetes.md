@@ -1783,4 +1783,739 @@ kubectl patch service app-svc -p '{"spec":{"selector":{"app":"app-blue"}}}'
 ***
 
 
+# 🔐 Day 5: ConfigMaps & Secrets
+
+Welcome to Day 5, Rajesh! You've built workloads, networked them, and exposed them — but here's a hard truth: **hardcoding config in your container images is one of the biggest anti-patterns in DevOps**. Today we'll fix that with **ConfigMaps** (non-sensitive config) and **Secrets** (sensitive data), and you'll learn how to securely manage credentials in production — a topic that comes up in *every* Senior DevOps interview.
+
+***
+
+## 📚 Part 1: Theory — Externalizing Configuration
+
+### The Problem: Config Baked into Images
+
+```
+❌ ANTI-PATTERN:
+Docker Image
+├── /app
+├── /config
+│   ├── prod-db-password.txt   ← embedded in image!
+│   └── app-settings.json       ← changes need rebuild!
+```
+
+**Consequences:**
+
+* 🔥 Rebuild image for every config change
+* 🔥 Same image can't run in dev/test/prod
+* 🔥 Secrets leaked into registries
+* 🔥 Violates **12-Factor App** principle (Factor III: Config in environment)
+
+### The Solution: External Configuration
+
+```
+✅ BEST PRACTICE:
+Docker Image (immutable, env-agnostic)
+       │
+       ├──> ConfigMap (dev/test/prod)   ← non-sensitive
+       └──> Secret (dev/test/prod)      ← sensitive
+```
+
+**One image** → many environments. Config injected at runtime via **ConfigMaps** and **Secrets**.
+
+***
+
+### 📋 ConfigMap Deep Dive
+
+A **ConfigMap** stores **non-sensitive configuration data** as **key-value pairs** or **files**.
+
+**Use cases:**
+
+* App settings (log level, feature flags)
+* Environment-specific URLs (API endpoints)
+* Configuration files (nginx.conf, application.properties)
+* Command-line arguments
+
+**Limits:**
+
+* Max size: **1 MiB** per ConfigMap (etcd constraint)
+* Not encrypted at rest by default
+* Namespace-scoped
+
+**Data types stored:**
+
+* `data` — UTF-8 string values
+* `binaryData` — base64-encoded binary content
+
+***
+
+### 🔒 Secret Deep Dive
+
+A **Secret** stores **sensitive data** like passwords, tokens, certificates, SSH keys.
+
+**Key fact**: Secrets are **base64-encoded, NOT encrypted**! 🚨
+
+```
+"password123" → base64 → "cGFzc3dvcmQxMjM="
+```
+
+> ⚠️ **Critical interview point**: Base64 is **encoding**, not **encryption**. Anyone with `kubectl get secret -o yaml` access can decode it instantly: `echo "cGFzc3dvcmQxMjM=" | base64 -d`.
+
+### Built-in Secret Types
+
+| Type                                  | Use Case                            |
+| ------------------------------------- | ----------------------------------- |
+| `Opaque`                              | Generic user-defined data (default) |
+| `kubernetes.io/service-account-token` | Auto-created for service accounts   |
+| `kubernetes.io/dockerconfigjson`      | Docker registry credentials         |
+| `kubernetes.io/tls`                   | TLS cert + private key              |
+| `kubernetes.io/basic-auth`            | Username + password                 |
+| `kubernetes.io/ssh-auth`              | SSH private key                     |
+
+***
+
+### 🎯 Mounting: Env Vars vs Volumes
+
+You can consume ConfigMaps/Secrets in **three ways**:
+
+#### Option 1: Environment Variables
+
+```yaml
+env:
+- name: LOG_LEVEL
+  valueFrom:
+    configMapKeyRef:
+      name: app-config
+      key: log_level
+```
+
+**Pros**: Simple, familiar pattern
+**Cons**: ⚠️ Not updated automatically when ConfigMap changes — pod must restart!
+
+#### Option 2: Volume Mounts (Files)
+
+```yaml
+volumeMounts:
+- name: config-volume
+  mountPath: /etc/app/config
+volumes:
+- name: config-volume
+  configMap:
+    name: app-config
+```
+
+**Pros**:
+
+* ✅ **Auto-updates** (within \~60s by default) without pod restart!
+* ✅ Best for config **files** (nginx.conf, application.yml)
+* ✅ Better for large configs
+
+**Cons**: App must re-read files (or use file watchers)
+
+#### Option 3: envFrom (Bulk Import)
+
+```yaml
+envFrom:
+- configMapRef:
+    name: app-config
+- secretRef:
+    name: db-credentials
+```
+
+Injects **all keys** as environment variables. Convenient but less explicit.
+
+***
+
+### 📊 Env Var vs Volume — When to Use What
+
+| Aspect                 | Env Variables                    | Volume Mounts           |
+| ---------------------- | -------------------------------- | ----------------------- |
+| **Auto-update**        | ❌ Pod restart needed             | ✅ \~60s, no restart     |
+| **Best for**           | Simple key-values                | Config files, certs     |
+| **Security (Secrets)** | ⚠️ Visible in `kubectl describe` | ✅ Less exposure         |
+| **Multi-line content** | ❌ Awkward                        | ✅ Natural               |
+| **Atomicity**          | ❌ One-by-one                     | ✅ Symlink swap (atomic) |
+| **App reload**         | Pod restart                      | App must watch files    |
+
+> 💡 **Rule of thumb**: Use **volumes for files & certs**, **env vars for simple flags & small values**, and prefer **volumes for production secrets**.
+
+***
+
+### 🛡️ Secret Storage Reality
+
+By default in Kubernetes:
+
+* Secrets are stored **base64-encoded** in **etcd**
+* If etcd disk is compromised → secrets exposed
+* **Encryption at rest** must be **enabled explicitly** (EncryptionConfiguration)
+* **In-transit** is protected via TLS (between API server & etcd)
+
+### Secret Encryption at Rest
+
+Cluster admins should configure `EncryptionConfiguration`:
+
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources: ["secrets"]
+  providers:
+  - aescbc:
+      keys:
+      - name: key1
+        secret: <base64-encoded-32-byte-key>
+  - identity: {}     # fallback (no encryption)
+```
+
+**Better**: Use **KMS provider** (Azure Key Vault, AWS KMS, HashiCorp Vault) for envelope encryption — keys never touch etcd disk.
+
+***
+
+## 🛠️ Part 2: Hands-On — Real-World App with Config + Secrets
+
+### Scenario
+
+Deploy a Node.js-style web app that needs:
+
+* `LOG_LEVEL`, `APP_ENV`, `API_BASE_URL` → ConfigMap
+* `DB_PASSWORD`, `JWT_SECRET` → Secret
+* `application.properties` file → ConfigMap as volume
+
+***
+
+### Step 1: Create a ConfigMap (Imperative)
+
+```powershell
+# From literal values
+kubectl create configmap app-config `
+  --from-literal=LOG_LEVEL=info `
+  --from-literal=APP_ENV=production `
+  --from-literal=API_BASE_URL=https://api.example.com
+
+# From a file
+echo "log.level=info`napp.env=prod`napp.name=myapp" > application.properties
+kubectl create configmap app-properties --from-file=application.properties
+
+# From a directory (all files become keys)
+kubectl create configmap app-configs --from-file=./config-dir/
+
+# Verify
+kubectl get configmap
+kubectl describe configmap app-config
+kubectl get configmap app-config -o yaml
+```
+
+***
+
+### Step 2: Create a ConfigMap (Declarative — Recommended)
+
+Create `app-configmap.yaml`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: default
+data:
+  # Simple key-value pairs
+  LOG_LEVEL: "info"
+  APP_ENV: "production"
+  API_BASE_URL: "https://api.example.com"
+  MAX_CONNECTIONS: "100"
+  
+  # Multi-line file content
+  application.properties: |
+    log.level=info
+    app.env=production
+    app.name=myapp
+    db.pool.size=20
+  
+  nginx.conf: |
+    server {
+      listen 80;
+      server_name myapp.local;
+      location / {
+        proxy_pass http://backend:3000;
+      }
+    }
+```
+
+```powershell
+kubectl apply -f app-configmap.yaml
+kubectl get cm app-config -o yaml
+```
+
+***
+
+### Step 3: Create a Secret (Imperative)
+
+```powershell
+# Generic secret from literals
+kubectl create secret generic db-credentials `
+  --from-literal=DB_USER=admin `
+  --from-literal=DB_PASSWORD='S3cur3P@ssw0rd!' `
+  --from-literal=JWT_SECRET='my-super-secret-jwt-key'
+
+# From file
+echo "S3cur3P@ssw0rd!" > db_password.txt
+kubectl create secret generic db-pwd --from-file=db_password.txt
+
+# Docker registry credentials
+kubectl create secret docker-registry regcred `
+  --docker-server=myregistry.azurecr.io `
+  --docker-username=myuser `
+  --docker-password=mypassword `
+  --docker-email=me@example.com
+
+# TLS certificate
+kubectl create secret tls tls-secret `
+  --cert=path/to/tls.crt `
+  --key=path/to/tls.key
+
+# Verify (only metadata shown — values masked)
+kubectl get secret
+kubectl describe secret db-credentials
+```
+
+***
+
+### Step 4: Create a Secret (Declarative)
+
+Create `db-secret.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+type: Opaque
+data:
+  # Base64-encoded values
+  DB_USER: YWRtaW4=                                    # admin
+  DB_PASSWORD: UzNjdXIzUEBzc3cwcmQh                   # S3cur3P@ssw0rd!
+  JWT_SECRET: bXktc3VwZXItc2VjcmV0LWp3dC1rZXk=        # my-super-secret-jwt-key
+
+# Alternative: use stringData (auto-encoded, easier to read)
+# stringData:
+#   DB_USER: admin
+#   DB_PASSWORD: S3cur3P@ssw0rd!
+```
+
+**Encode values for Secrets:**
+
+```powershell
+# PowerShell
+:ToBase64String([Text.Encoding]::UTF8.GetBytes("S3cur3P@ssw0rd!"))
+
+# Bash / Linux
+echo -n "S3cur3P@ssw0rd!" | base64
+
+# Decode
+echo "UzNjdXIzUEBzc3cwcmQh" | base64 -d
+```
+
+```powershell
+kubectl apply -f db-secret.yaml
+```
+
+> 💡 **`stringData` vs `data`**: Use `stringData` in YAML for plain text — K8s auto-encodes it. Cleaner for humans, perfect for templates.
+
+***
+
+### Step 5: Deploy App Consuming Both
+
+Create `app-deployment.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        
+        # 1️⃣ Env vars from ConfigMap (single key)
+        env:
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: LOG_LEVEL
+        - name: APP_ENV
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: APP_ENV
+        
+        # 2️⃣ Env vars from Secret (single key)
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: DB_PASSWORD
+        
+        # 3️⃣ Bulk import — all keys as env vars
+        envFrom:
+        - configMapRef:
+            name: app-config
+        - secretRef:
+            name: db-credentials
+        
+        # 4️⃣ Mount config files as volumes
+        volumeMounts:
+        - name: app-config-vol
+          mountPath: /etc/app/config
+          readOnly: true
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: nginx.conf
+          readOnly: true
+        - name: db-creds
+          mountPath: /etc/app/secrets
+          readOnly: true
+      
+      volumes:
+      # Mount specific keys from ConfigMap
+      - name: app-config-vol
+        configMap:
+          name: app-config
+          items:
+          - key: application.properties
+            path: application.properties
+      
+      # Mount nginx.conf as a single file
+      - name: nginx-config
+        configMap:
+          name: app-config
+          items:
+          - key: nginx.conf
+            path: nginx.conf
+      
+      # Mount entire Secret as files
+      - name: db-creds
+        secret:
+          secretName: db-credentials
+          defaultMode: 0400    # read-only for owner only
+```
+
+```powershell
+kubectl apply -f app-deployment.yaml
+kubectl get pods -l app=webapp
+```
+
+***
+
+### Step 6: Verify Inside the Pod
+
+```powershell
+# Get pod name
+$pod = kubectl get pod -l app=webapp -o jsonpath='{.items[0].metadata.name}'
+
+# 1. Check env vars
+kubectl exec $pod -- env | Select-String "LOG_LEVEL|APP_ENV|DB_PASSWORD"
+
+# 2. Check mounted config files
+kubectl exec $pod -- ls /etc/app/config
+kubectl exec $pod -- cat /etc/app/config/application.properties
+
+# 3. Check mounted secret files
+kubectl exec $pod -- ls /etc/app/secrets
+kubectl exec $pod -- cat /etc/app/secrets/DB_PASSWORD
+
+# 4. Check nginx.conf injection
+kubectl exec $pod -- cat /etc/nginx/conf.d/default.conf
+```
+
+***
+
+### Step 7: Test Hot Reload (Volume Mounts)
+
+```powershell
+# Edit the ConfigMap
+kubectl edit configmap app-config
+# Change LOG_LEVEL: "info" → "debug" and save
+
+# Within ~60 seconds, the mounted file updates automatically!
+kubectl exec $pod -- cat /etc/app/config/application.properties
+
+# But env vars DO NOT update — verify:
+kubectl exec $pod -- env | Select-String "LOG_LEVEL"
+# Still shows old value!
+
+# To force env var refresh, restart the deployment
+kubectl rollout restart deployment webapp
+```
+
+***
+
+### Step 8: Immutable ConfigMaps & Secrets (Performance)
+
+For configs that **never change** (use new ones for updates):
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config-v1
+immutable: true     # ← can't be modified or rolled back to mutable
+data:
+  LOG_LEVEL: "info"
+```
+
+**Benefit**: Reduces kube-apiserver load (no watch needed). Ideal for large clusters.
+
+***
+
+### 🎯 Mini-Exercise: Multi-Environment with Same Image
+
+```powershell
+# Same image, different ConfigMaps per environment
+kubectl create namespace dev
+kubectl create namespace prod
+
+# Dev config
+kubectl create configmap app-config -n dev `
+  --from-literal=LOG_LEVEL=debug `
+  --from-literal=API_BASE_URL=https://dev-api.example.com
+
+# Prod config
+kubectl create configmap app-config -n prod `
+  --from-literal=LOG_LEVEL=warn `
+  --from-literal=API_BASE_URL=https://api.example.com
+
+# Same deployment YAML, different namespace — different behavior!
+kubectl apply -f app-deployment.yaml -n dev
+kubectl apply -f app-deployment.yaml -n prod
+```
+
+***
+
+## 💻 Part 3: Essential Commands Cheat Sheet
+
+### ConfigMap
+
+```powershell
+# Create
+kubectl create configmap NAME --from-literal=key=value
+kubectl create configmap NAME --from-file=path/to/file
+kubectl create configmap NAME --from-file=path/to/dir/
+kubectl create configmap NAME --from-env-file=.env
+
+# Read
+kubectl get configmap
+kubectl get cm
+kubectl describe cm app-config
+kubectl get cm app-config -o yaml
+kubectl get cm app-config -o jsonpath='{.data.LOG_LEVEL}'
+
+# Update
+kubectl edit cm app-config
+kubectl apply -f cm.yaml
+kubectl create cm app-config --from-literal=key=newval -o yaml --dry-run=client | kubectl apply -f -
+
+# Delete
+kubectl delete cm app-config
+```
+
+### Secret
+
+```powershell
+# Create
+kubectl create secret generic NAME --from-literal=key=value
+kubectl create secret generic NAME --from-file=path/to/file
+kubectl create secret docker-registry NAME --docker-server=... --docker-username=...
+kubectl create secret tls NAME --cert=tls.crt --key=tls.key
+
+# Read
+kubectl get secret
+kubectl describe secret db-credentials
+kubectl get secret db-credentials -o yaml
+
+# Decode a secret value
+kubectl get secret db-credentials -o jsonpath='{.data.DB_PASSWORD}' | base64 -d
+
+# Update
+kubectl edit secret db-credentials
+kubectl apply -f secret.yaml
+
+# Delete
+kubectl delete secret db-credentials
+```
+
+### Useful Tricks
+
+```powershell
+# Create ConfigMap/Secret from .env file
+kubectl create cm app-env --from-env-file=.env
+
+# Compare two ConfigMaps across namespaces
+diff <(kubectl get cm app-config -n dev -o yaml) <(kubectl get cm app-config -n prod -o yaml)
+
+# Bulk decode secret
+kubectl get secret db-credentials -o json | jq '.data | map_values(@base64d)'
+```
+
+***
+
+## 🎤 Part 4: Interview Prep
+
+### ⭐ Star Question: *"How do you securely manage secrets in Kubernetes?"*
+
+**Model answer for a Senior DevOps interview:**
+
+> "Managing secrets securely in Kubernetes is a layered challenge — it's not just about creating a Secret object, because **Secrets in K8s are base64-encoded, not encrypted by default**. So my strategy in production combines **multiple controls**.
+>
+> **First, encryption at rest**: I enable `EncryptionConfiguration` at the API server level so etcd doesn't store secrets in plaintext. In managed services like **AKS**, I configure the **KMS provider integration with Azure Key Vault** — this gives envelope encryption where the data encryption key is itself encrypted by a KMS key that never leaves Key Vault.
+>
+> **Second, externalize secrets** — I avoid storing production secrets in K8s entirely when possible. I use **CSI Secret Store Driver** with the **Azure Key Vault provider** to mount secrets directly from Key Vault as a volume. The secret never persists in etcd; it's pulled at pod startup. This is the gold standard for Azure-based clusters.
+>
+> Alternatives include **HashiCorp Vault** with the Vault Agent Injector (mutating webhook injects a sidecar that fetches secrets dynamically) or **External Secrets Operator** (ESO), which syncs from external stores like Key Vault, AWS Secrets Manager, or 1Password into native K8s Secrets — useful for legacy apps that expect env-var-based secrets.
+>
+> **Third, RBAC and least privilege**: I lock down `get`, `list`, `watch` on Secrets via Role/RoleBinding. Service accounts should only access secrets they need. I audit access via the K8s audit log.
+>
+> **Fourth, no secrets in Git**. Never commit raw YAML with secrets. For GitOps workflows, I use **Sealed Secrets** (Bitnami) — the controller decrypts them in-cluster — or **SOPS with Mozilla SOPS + age/PGP**, encrypting only the secret values in YAML. This makes secrets safe in Git and decryptable only by the cluster.
+>
+> **Fifth, rotation and audit**: I enforce regular rotation (every 30/60/90 days) via automation — Azure Key Vault has built-in rotation policies. The CSI driver auto-syncs new versions. I also enable Kubernetes audit logs to detect unauthorized secret access.
+>
+> **Sixth, runtime hardening**: I avoid env vars for sensitive secrets — they show up in `kubectl describe`, process listings, crash dumps. Volume mounts with `defaultMode: 0400` reduce surface area. I also use **Pod Security Standards (restricted)** to prevent privileged containers from accessing host paths.
+>
+> So in short: **Encrypt at rest → externalize via CSI / Vault → enforce RBAC → never store in Git → rotate continuously → mount as files, not env vars**."
+
+***
+
+### 🔥 Likely Follow-Up Questions
+
+| #  | Question                                                              | Quick Pointer                                                                                                                                                        |
+| -- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1  | **Are Secrets encrypted in Kubernetes?**                              | **No, only base64-encoded by default**. Must enable `EncryptionConfiguration` for at-rest encryption.                                                                |
+| 2  | **What's the difference between `data` and `stringData` in Secrets?** | `data` requires base64 values; `stringData` accepts plain text and K8s encodes it. `stringData` overrides `data` if both present.                                    |
+| 3  | **What happens when you update a ConfigMap mounted as a volume?**     | Files auto-update within \~60s (kubelet sync period). Atomic via symlink swap.                                                                                       |
+| 4  | **What happens when you update a ConfigMap consumed as env var?**     | **Nothing** — pod must be restarted. Use `kubectl rollout restart` to trigger.                                                                                       |
+| 5  | **How do you trigger a pod restart when a ConfigMap changes?**        | Add a hash annotation to deployment template, or use **Reloader** (Stakater) operator, or use **immutable ConfigMaps** with new names per version.                   |
+| 6  | **Max size of a ConfigMap/Secret?**                                   | **1 MiB** (etcd limit). For larger data, use PersistentVolume or external storage.                                                                                   |
+| 7  | **How does the CSI Secret Store driver work?**                        | CSI volume plugin that mounts secrets from external stores (Azure Key Vault, Vault, AWS SM) as a volume. Optionally syncs to a K8s Secret.                           |
+| 8  | **What is Sealed Secrets?**                                           | Bitnami tool. You encrypt a Secret YAML with a public key; only the in-cluster controller (with private key) can decrypt. Safe to commit to Git.                     |
+| 9  | **Difference between Sealed Secrets and External Secrets?**           | Sealed Secrets = encrypted YAML in Git, decrypted in-cluster. External Secrets = synced from external secret manager (Key Vault, AWS SM) into K8s Secrets.           |
+| 10 | **What's a ServiceAccount token Secret?**                             | Auto-created Secret of type `kubernetes.io/service-account-token` for pods to authenticate to API server. K8s 1.24+ moved to projected volumes (short-lived tokens). |
+| 11 | **How do you mount only specific keys from a ConfigMap?**             | Use `items` in volume spec with `key` and `path` mapping.                                                                                                            |
+| 12 | **What is `subPath` in volume mount?**                                | Mount a single file from ConfigMap/Secret without overwriting the whole directory. Drawback: no auto-update for subPath.                                             |
+| 13 | **What's `defaultMode` for Secret volumes?**                          | File permissions (e.g., `0400` = owner read-only). Critical for sensitive files.                                                                                     |
+| 14 | **Can ConfigMaps be shared across namespaces?**                       | No — they're namespace-scoped. Replicate via tools like `kubed` (Bitnami) or copy in CI/CD.                                                                          |
+| 15 | **What's an immutable ConfigMap/Secret?**                             | `immutable: true` — can't be modified, only deleted/recreated. Reduces API watches, useful for large clusters.                                                       |
+
+***
+
+### 💡 Senior-Level Scenario Questions
+
+**Q1: "Your dev team accidentally committed a Secret YAML with a real database password to Git. What's your response?"**
+
+> "Immediate steps:
+>
+> 1. **Rotate the password immediately** in the database — the compromised one is now public.
+> 2. Update the secret in the cluster: `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -`.
+> 3. Trigger a `kubectl rollout restart` on affected deployments to pick up new credentials.
+> 4. **Scrub Git history** using `git filter-repo` or BFG Repo-Cleaner, then force-push (coordinate with the team).
+> 5. **Notify security & rotate any downstream tokens** that might have been derived.
+>
+> **Preventive measures going forward**:
+>
+> * Install **pre-commit hooks** with `gitleaks` or `detect-secrets`.
+> * Adopt **Sealed Secrets** or **SOPS** so committed YAML is encrypted.
+> * Set up **External Secrets Operator** so secrets come from Key Vault, not Git.
+> * Enable GitHub Advanced Security secret scanning.
+> * Conduct a team workshop on secret hygiene."
+
+**Q2: "How would you implement zero-downtime secret rotation for a database password?"**
+
+> "Two strategies:
+>
+> **Approach A (App supports dual-secret reload):**
+>
+> 1. Generate new DB password while keeping the old one valid.
+> 2. Update the K8s Secret with the new password.
+> 3. App watches the mounted file (or use Reloader to auto-restart pods).
+> 4. After all pods are on the new password, revoke the old one.
+>
+> **Approach B (CSI + Key Vault — recommended for AKS):**
+>
+> 1. Update password in Azure Key Vault — version increments automatically.
+> 2. CSI driver syncs the new version to the pod volume within polling interval.
+> 3. App reloads from the file watcher OR a sidecar signals SIGHUP.
+> 4. No K8s API interaction needed — secret never touches etcd.
+>
+> For databases that don't support multi-credential overlap, use a **rolling restart** during low-traffic windows. For PostgreSQL/MySQL, use **dual credentials** with `pg_hba.conf` allowing both for the transition window."
+
+**Q3: "How do you prevent a developer from reading production Secrets via kubectl?"**
+
+> "Layered RBAC:
+>
+> 1. **Namespace isolation** — devs only have access to `dev` namespace, prod is locked.
+> 2. **RBAC Role** explicitly excluding `secrets`:
+>    ```yaml
+>    rules:
+>    - apiGroups: [\"\"]
+>      resources: [\"pods\", \"deployments\"]
+>      verbs: [\"get\", \"list\"]
+>    # secrets NOT included
+>    ```
+> 3. Use **Azure AD integration** with AKS — map AD groups to RoleBindings.
+> 4. **Audit logging** to detect any unauthorized attempts.
+> 5. For break-glass scenarios, use **just-in-time access** via PIM (Privileged Identity Management).
+> 6. Migrate secrets to **Key Vault via CSI driver** — even if someone gets pod access, the secret isn't in etcd; access is governed by Key Vault RBAC + Azure AD."
+
+**Q4: "ConfigMap changes are not reflected in the running pod. What's happening?"**
+
+> "Depends on how it's mounted:
+>
+> 1. **If env var** — env vars never refresh; pod restart required. Use `kubectl rollout restart deployment/<name>`.
+> 2. **If volume mount** — should auto-update in \~60s. If not, check:
+>    * `subPath` is used (subPath mounts don't auto-update).
+>    * Pod is not using `readOnly: true` filesystem incorrectly.
+>    * kubelet sync interval (`--sync-frequency`).
+> 3. **App-level cache** — many apps cache config in memory; restart or trigger reload (SIGHUP).
+> 4. **Solution for env vars**: deploy **Reloader operator** which annotates deployments and auto-restarts pods on ConfigMap/Secret changes."
+
+***
+
+## 🔐 Bonus: Secret Management Tools Comparison
+
+| Tool                          | Best For               | Pros                              | Cons                                 |
+| ----------------------------- | ---------------------- | --------------------------------- | ------------------------------------ |
+| **Native K8s Secrets**        | Simple cases           | Built-in, no extra setup          | Base64 only, no rotation             |
+| **Sealed Secrets**            | GitOps                 | Safe in Git, simple               | Manual encryption per env            |
+| **External Secrets Operator** | Multi-cloud sync       | Pulls from Key Vault/AWS SM/Vault | Adds operator complexity             |
+| **CSI Secret Store Driver**   | Cloud-native (AKS/EKS) | Secrets never in etcd             | Slightly higher latency on pod start |
+| **HashiCorp Vault**           | Enterprise             | Dynamic secrets, leasing, audit   | Complex setup, ops overhead          |
+| **SOPS**                      | Lightweight GitOps     | Multi-key (PGP, age, KMS)         | CLI-based workflow                   |
+
+***
+
+## ✅ Day 5 Checklist
+
+* [ ] Understood why externalizing config matters (12-Factor App)
+* [ ] Created ConfigMaps imperatively and declaratively
+* [ ] Created Secrets imperatively, declaratively, and with `stringData`
+* [ ] Mounted ConfigMaps/Secrets as **env vars** and **volumes**
+* [ ] Differentiated when to use env vars vs volumes
+* [ ] Tested auto-reload behavior of volume-mounted ConfigMaps
+* [ ] Understood that Secrets are **base64, not encrypted** by default
+* [ ] Reviewed encryption-at-rest, KMS, Sealed Secrets, External Secrets Operator
+* [ ] Practiced multi-environment configs using namespace separation
+* [ ] Articulated production-grade secret management strategy
+
+***
+
+
 
