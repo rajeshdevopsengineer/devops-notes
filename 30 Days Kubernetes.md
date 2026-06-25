@@ -2502,20 +2502,1617 @@ kubectl get secret db-credentials -o json | jq '.data | map_values(@base64d)'
 
 ***
 
-## ✅ Day 5 Checklist
+# 🏢 Day 6: Namespaces, Labels & Selectors
 
-* [ ] Understood why externalizing config matters (12-Factor App)
-* [ ] Created ConfigMaps imperatively and declaratively
-* [ ] Created Secrets imperatively, declaratively, and with `stringData`
-* [ ] Mounted ConfigMaps/Secrets as **env vars** and **volumes**
-* [ ] Differentiated when to use env vars vs volumes
-* [ ] Tested auto-reload behavior of volume-mounted ConfigMaps
-* [ ] Understood that Secrets are **base64, not encrypted** by default
-* [ ] Reviewed encryption-at-rest, KMS, Sealed Secrets, External Secrets Operator
-* [ ] Practiced multi-environment configs using namespace separation
-* [ ] Articulated production-grade secret management strategy
+Welcome to Day 6, Rajesh! So far you've built workloads and exposed them — but in real enterprises, you're not running **one app on one cluster**. You're running **dozens of teams, hundreds of microservices, multiple environments** on shared infrastructure. Today you'll master the **organizational backbone** of Kubernetes: Namespaces (isolation), Labels (grouping), and Selectors (querying). These are the tools that turn chaos into a multi-tenant, governable platform.
 
 ***
+
+## 📚 Part 1: Theory — The Organizational Trinity
+
+### Why Do These Three Concepts Exist Together?
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  KUBERNETES CLUSTER                       │
+│                                                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │  NAMESPACE   │  │  NAMESPACE   │  │  NAMESPACE   │  │
+│  │   "team-a"   │  │   "team-b"   │  │   "shared"   │  │
+│  │              │  │              │  │              │  │
+│  │  Pods, SVCs  │  │  Pods, SVCs  │  │  Monitoring  │  │
+│  │  ConfigMaps  │  │  ConfigMaps  │  │  Logging     │  │
+│  │  Secrets     │  │  Secrets     │  │  Ingress     │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  │
+│                                                           │
+│  Each resource has LABELS → queried via SELECTORS        │
+└──────────────────────────────────────────────────────────┘
+```
+
+| Concept       | Purpose                                                                   |
+| ------------- | ------------------------------------------------------------------------- |
+| **Namespace** | **Isolation boundary** — scope for resources, quotas, RBAC                |
+| **Label**     | **Identifying metadata** attached to objects (`app=frontend`, `env=prod`) |
+| **Selector**  | **Query language** to filter/group objects by labels                      |
+
+***
+
+### 🏠 Namespaces Deep Dive
+
+A **Namespace** is a virtual cluster within a physical cluster — a way to partition resources.
+
+**What's namespaced vs not?**
+
+| ✅ Namespaced                | ❌ Cluster-Scoped                  |
+| --------------------------- | --------------------------------- |
+| Pods, Services, Deployments | Nodes                             |
+| ConfigMaps, Secrets         | PersistentVolumes                 |
+| ReplicaSets, StatefulSets   | StorageClasses                    |
+| Roles, RoleBindings         | ClusterRoles, ClusterRoleBindings |
+| Ingress, NetworkPolicies    | Namespaces themselves             |
+| ServiceAccounts             | CustomResourceDefinitions (CRDs)  |
+
+**Default namespaces in every cluster:**
+
+| Namespace         | Purpose                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `default`         | Where resources go if you don't specify (avoid in prod!) |
+| `kube-system`     | Control plane components (CoreDNS, kube-proxy)           |
+| `kube-public`     | Publicly readable, for cluster discovery                 |
+| `kube-node-lease` | Node heartbeat lease objects (perf optimization)         |
+
+***
+
+### 🎯 What Namespaces DO Provide
+
+✅ **Logical separation** — same name resources in different namespaces  
+✅ **RBAC boundary** — grant access per namespace  
+✅ **Resource quotas** — limit CPU, memory, object counts per namespace  
+✅ **LimitRanges** — default/min/max per container  
+✅ **DNS scoping** — services get `<svc>.<ns>.svc.cluster.local`  
+✅ **NetworkPolicy boundary** — easy to write "allow only within ns" policies  
+✅ **Cost allocation** — chargeback per team/namespace
+
+### ⚠️ What Namespaces DO NOT Provide
+
+❌ **Strong security isolation** — pods in different namespaces can still talk by default!  
+❌ **Network isolation** — requires explicit **NetworkPolicies** (Day 14)  
+❌ **Hardware isolation** — pods still share nodes (use **node selectors** + **taints**)  
+❌ **Kernel isolation** — same kernel; one bad pod can still affect node
+
+> 🔑 **Senior interview insight**: Namespaces are a **soft boundary**, not a security boundary. For **hard multi-tenancy**, you need separate clusters or **virtual clusters** (vCluster, Capsule, Kiosk).
+
+***
+
+### 🏷️ Labels Deep Dive
+
+A **Label** is a `key=value` pair attached to objects via metadata. It's how Kubernetes **identifies, groups, and connects** objects.
+
+```yaml
+metadata:
+  labels:
+    app: frontend
+    tier: web
+    env: production
+    version: v2.1.0
+    team: payments
+    owner: rajesh
+```
+
+**Label rules:**
+
+* Keys: alphanumeric, `-`, `_`, `.` (max 63 chars)
+* Optional prefix: `domain.com/key` (max 253 chars)
+* Values: alphanumeric, `-`, `_`, `.` (max 63 chars)
+* Multiple labels per object — design them for queries
+
+***
+
+### 📋 Recommended Standard Labels (Kubernetes Convention)
+
+| Label                          | Example      | Meaning              |
+| ------------------------------ | ------------ | -------------------- |
+| `app.kubernetes.io/name`       | `mysql`      | Application name     |
+| `app.kubernetes.io/instance`   | `mysql-abcd` | Unique instance ID   |
+| `app.kubernetes.io/version`    | `5.7.21`     | App version          |
+| `app.kubernetes.io/component`  | `database`   | Functional component |
+| `app.kubernetes.io/part-of`    | `wordpress`  | Higher-level app     |
+| `app.kubernetes.io/managed-by` | `helm`       | Tool that manages it |
+
+These are **convention**, not enforced — but adopting them makes tooling (Helm, ArgoCD, monitoring) work seamlessly.
+
+***
+
+### 🏷️ Labels vs Annotations
+
+| Aspect                 | Labels                  | Annotations                                           |
+| ---------------------- | ----------------------- | ----------------------------------------------------- |
+| **Purpose**            | Identify, group, select | Attach non-identifying metadata                       |
+| **Used by selectors?** | ✅ Yes                   | ❌ No                                                  |
+| **Size limit**         | 63 chars per value      | Up to 256 KB total                                    |
+| **Examples**           | `env=prod`, `tier=web`  | Build info, commit SHA, contact email, ingress config |
+
+```yaml
+metadata:
+  labels:
+    app: web         # ← used to select
+  annotations:
+    git.commit: "abc123"               # ← descriptive
+    contact: "rajesh@example.com"       # ← descriptive
+    nginx.ingress.kubernetes.io/rewrite-target: "/"   # ← controller config
+```
+
+***
+
+### 🔍 Selectors Deep Dive
+
+A **Selector** filters objects based on their labels. Used everywhere — Services, Deployments, NetworkPolicies, kubectl queries.
+
+#### Two Selector Types
+
+**1. Equality-based** (simple `=`, `==`, `!=`):
+
+```bash
+kubectl get pods -l env=production
+kubectl get pods -l env!=dev
+kubectl get pods -l env=prod,tier=web    # AND logic
+```
+
+**2. Set-based** (richer — `In`, `NotIn`, `Exists`, `DoesNotExist`):
+
+```bash
+kubectl get pods -l 'env in (prod, staging)'
+kubectl get pods -l 'env notin (dev, test)'
+kubectl get pods -l 'tier'                # has 'tier' label (any value)
+kubectl get pods -l '!tier'               # does NOT have 'tier' label
+```
+
+**In YAML** (used by Deployments, NetworkPolicies):
+
+```yaml
+selector:
+  matchLabels:
+    app: web                    # equality
+  matchExpressions:
+    - key: env
+      operator: In              # In, NotIn, Exists, DoesNotExist
+      values: [prod, staging]
+```
+
+***
+
+### 💰 Resource Quotas & LimitRanges (Multi-Tenancy)
+
+Namespaces become **truly useful for multi-tenancy** when paired with **ResourceQuotas** and **LimitRanges**.
+
+#### ResourceQuota — "How much can the namespace consume?"
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    requests.cpu: "10"            # Total CPU requests
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"                    # Max pods
+    services: "20"
+    persistentvolumeclaims: "10"
+    secrets: "30"
+    configmaps: "30"
+```
+
+#### LimitRange — "What's the default/max per pod or container?"
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-a-limits
+  namespace: team-a
+spec:
+  limits:
+  - type: Container
+    default:                    # Default LIMITS if not specified
+      cpu: 500m
+      memory: 512Mi
+    defaultRequest:             # Default REQUESTS if not specified
+      cpu: 100m
+      memory: 128Mi
+    max:                        # Max allowed per container
+      cpu: "2"
+      memory: 2Gi
+    min:                        # Min allowed
+      cpu: 50m
+      memory: 64Mi
+```
+
+> 💡 Together, **ResourceQuota + LimitRange = enforceable team boundaries** without overcommitting the cluster.
+
+***
+
+## 🛠️ Part 2: Hands-On — Multi-Team Cluster Setup
+
+### Scenario
+
+You're the platform engineer for a company with two teams — **payments** and **catalog** — plus shared **monitoring**. Each team has dev + prod environments.
+
+***
+
+### Step 1: Create Namespaces
+
+**Imperative:**
+
+```powershell
+# Create namespaces
+kubectl create namespace payments-dev
+kubectl create namespace payments-prod
+kubectl create namespace catalog-dev
+kubectl create namespace catalog-prod
+kubectl create namespace shared-monitoring
+
+# List
+kubectl get namespaces
+kubectl get ns
+```
+
+**Declarative** (`namespaces.yaml`):
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments-dev
+  labels:
+    team: payments
+    env: dev
+    cost-center: "1001"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments-prod
+  labels:
+    team: payments
+    env: prod
+    cost-center: "1001"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: catalog-dev
+  labels:
+    team: catalog
+    env: dev
+    cost-center: "1002"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: catalog-prod
+  labels:
+    team: catalog
+    env: prod
+    cost-center: "1002"
+```
+
+```powershell
+kubectl apply -f namespaces.yaml
+
+# Label-based namespace queries
+kubectl get ns -l team=payments
+kubectl get ns -l env=prod
+kubectl get ns -l 'env in (dev,test)'
+```
+
+***
+
+### Step 2: Set Default Namespace (Avoid Typing `-n` Every Time)
+
+```powershell
+# Switch default namespace for current context
+kubectl config set-context --current --namespace=payments-dev
+
+# Verify
+kubectl config view --minify | Select-String namespace
+
+# Now all commands target payments-dev
+kubectl get pods
+```
+
+> 💡 **Pro tool**: Install **`kubens`** (part of `kubectx`) for super-fast namespace switching:
+>
+> ```powershell
+> choco install kubens
+> kubens payments-prod    # instant switch
+> kubens                  # interactive picker
+> ```
+
+***
+
+### Step 3: Apply Resource Quotas
+
+`quotas.yaml`:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: payments-prod-quota
+  namespace: payments-prod
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    pods: "100"
+    services: "30"
+    services.loadbalancers: "2"
+    persistentvolumeclaims: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: payments-prod-limits
+  namespace: payments-prod
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 500m
+      memory: 512Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    max:
+      cpu: "4"
+      memory: 4Gi
+```
+
+```powershell
+kubectl apply -f quotas.yaml
+
+# Verify
+kubectl describe quota -n payments-prod
+kubectl describe limitrange -n payments-prod
+```
+
+***
+
+### Step 4: Deploy Labeled Workloads
+
+`payments-app.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api
+  namespace: payments-prod
+  labels:
+    app.kubernetes.io/name: payments-api
+    app.kubernetes.io/instance: payments-api-v2
+    app.kubernetes.io/version: "2.1.0"
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: payments
+    app.kubernetes.io/managed-by: kubectl
+    team: payments
+    env: prod
+    tier: backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payments-api
+      env: prod
+  template:
+    metadata:
+      labels:
+        app: payments-api
+        env: prod
+        tier: backend
+        team: payments
+        version: v2.1.0
+    spec:
+      containers:
+      - name: api
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-frontend
+  namespace: payments-prod
+  labels:
+    team: payments
+    env: prod
+    tier: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payments-frontend
+  template:
+    metadata:
+      labels:
+        app: payments-frontend
+        team: payments
+        env: prod
+        tier: frontend
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.25
+```
+
+```powershell
+kubectl apply -f payments-app.yaml
+kubectl get pods -n payments-prod --show-labels
+```
+
+***
+
+### Step 5: Query with Selectors
+
+```powershell
+# By single label
+kubectl get pods -n payments-prod -l app=payments-api
+
+# AND logic — multiple labels
+kubectl get pods -n payments-prod -l team=payments,tier=backend
+
+# Set-based queries
+kubectl get pods -n payments-prod -l 'tier in (backend, frontend)'
+kubectl get pods -n payments-prod -l 'env!=dev'
+kubectl get pods -n payments-prod -l 'team,!deprecated'
+
+# Across all namespaces
+kubectl get pods -A -l team=payments
+
+# Combined with output formatting
+kubectl get pods -A -l env=prod -o wide
+kubectl get pods -A -l env=prod -o custom-columns=NS:.metadata.namespace,POD:.metadata.name,STATUS:.status.phase
+
+# Show all labels
+kubectl get pods -n payments-prod --show-labels
+
+# Filter by label and apply action
+kubectl delete pods -l app=payments-api -n payments-prod
+```
+
+***
+
+### Step 6: Add / Modify / Remove Labels
+
+```powershell
+# Add a label
+kubectl label pod <pod-name> -n payments-prod owner=rajesh
+
+# Overwrite existing label
+kubectl label pod <pod-name> -n payments-prod env=staging --overwrite
+
+# Remove a label (note the trailing minus)
+kubectl label pod <pod-name> -n payments-prod owner-
+
+# Bulk label all pods matching a selector
+kubectl label pods -n payments-prod -l tier=backend reviewed=true
+
+# Label a namespace
+kubectl label namespace payments-prod environment=production
+```
+
+***
+
+### Step 7: Annotations Example
+
+```powershell
+# Add annotation
+kubectl annotate deployment payments-api -n payments-prod `
+  contact="rajesh@example.com" `
+  git.commit="abc123def" `
+  build.number="456"
+
+# View
+kubectl get deployment payments-api -n payments-prod -o jsonpath='{.metadata.annotations}'
+
+# Remove
+kubectl annotate deployment payments-api -n payments-prod contact-
+```
+
+***
+
+### Step 8: Service Selector Demo
+
+Watch how the Service selector "magically" connects to pods via labels:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-api-svc
+  namespace: payments-prod
+spec:
+  selector:
+    app: payments-api        # ← selects ALL pods with this label
+    env: prod
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+```powershell
+kubectl apply -f payments-svc.yaml
+
+# Check which pods are selected
+kubectl get endpoints payments-api-svc -n payments-prod
+
+# Add a new pod with matching labels — auto-added!
+kubectl run extra-pod --image=nginx -n payments-prod -l app=payments-api,env=prod
+kubectl get endpoints payments-api-svc -n payments-prod
+# New pod IP appears in endpoints!
+```
+
+***
+
+### Step 9: Cross-Namespace Service Discovery
+
+```powershell
+# From a pod in catalog-prod, reach payments-prod service:
+kubectl run client --image=busybox:1.36 -n catalog-prod -it --rm --restart=Never -- sh
+
+# Inside the pod:
+nslookup payments-api-svc.payments-prod.svc.cluster.local
+wget -qO- http://payments-api-svc.payments-prod
+```
+
+> 💡 **FQDN pattern**: `<service>.<namespace>.svc.cluster.local`
+
+***
+
+### 🎯 Mini-Exercise: Test Quota Enforcement
+
+```powershell
+# Try to exceed the quota
+$yaml = @"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greedy-app
+  namespace: payments-prod
+spec:
+  replicas: 200
+  selector:
+    matchLabels:
+      app: greedy
+  template:
+    metadata:
+      labels:
+        app: greedy
+    spec:
+      containers:
+      - name: app
+        image: nginx
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+"@
+$yaml | kubectl apply -f -
+
+# Watch what happens
+kubectl get deployment greedy-app -n payments-prod
+kubectl describe replicaset -n payments-prod | Select-String "exceeded quota"
+# Quota blocks further pods, but doesn't fail the deployment — RS retries
+```
+
+***
+
+## 💻 Part 3: Essential Commands Cheat Sheet
+
+### Namespaces
+
+```powershell
+kubectl create namespace <name>
+kubectl get namespaces
+kubectl get ns
+kubectl describe ns <name>
+kubectl delete ns <name>                        # ⚠️ deletes EVERYTHING inside
+
+# Switch default namespace
+kubectl config set-context --current --namespace=<name>
+
+# Run commands in a specific namespace
+kubectl get pods -n <namespace>
+kubectl get all -A                              # all namespaces, all resources
+```
+
+### Labels
+
+```powershell
+# Add
+kubectl label <resource> <name> key=value
+
+# Overwrite
+kubectl label <resource> <name> key=value --overwrite
+
+# Remove
+kubectl label <resource> <name> key-
+
+# Bulk
+kubectl label pods -l app=web reviewed=true
+
+# Show
+kubectl get pods --show-labels
+kubectl get pods -L app,env,tier               # specific labels as columns
+```
+
+### Selectors
+
+```powershell
+# Equality
+kubectl get pods -l env=prod
+kubectl get pods -l env=prod,tier=web
+
+# Inequality
+kubectl get pods -l env!=dev
+
+# Set-based
+kubectl get pods -l 'env in (prod,staging)'
+kubectl get pods -l 'env notin (dev)'
+kubectl get pods -l 'tier'                     # has label
+kubectl get pods -l '!tier'                    # missing label
+
+# Combined with field selectors
+kubectl get pods --field-selector status.phase=Running -l env=prod
+```
+
+### Quotas & LimitRanges
+
+```powershell
+kubectl get resourcequota -A
+kubectl describe quota <name> -n <ns>
+
+kubectl get limitrange -A
+kubectl describe limitrange <name> -n <ns>
+```
+
+### Annotations
+
+```powershell
+kubectl annotate <resource> <name> key=value
+kubectl annotate <resource> <name> key- 
+kubectl get <resource> <name> -o jsonpath='{.metadata.annotations}'
+```
+
+***
+
+## 🎤 Part 4: Interview Prep
+
+### ⭐ Star Question: *"How would you isolate workloads for different teams?"*
+
+**Model answer for a Senior DevOps interview:**
+
+> "Workload isolation in Kubernetes is a **multi-layered design** — namespaces alone are not enough for real production isolation, so my approach combines several mechanisms.
+>
+> **Layer 1 — Namespaces for logical separation**: I create per-team, per-environment namespaces — `team-payments-dev`, `team-payments-prod`, etc. Each namespace gets labels like `team`, `env`, `cost-center` for governance and billing chargeback.
+>
+> **Layer 2 — RBAC for access control**: I create `Role` and `RoleBinding` objects per namespace. Teams get edit rights only in their own namespace. I integrate with **Azure AD** on AKS so RBAC is mapped to AD groups — `payments-devs` group gets edit on `payments-*` namespaces. Cluster admins use `ClusterRole` sparingly.
+>
+> **Layer 3 — ResourceQuotas + LimitRanges**: To prevent one team from starving others, I apply ResourceQuotas (`requests.cpu`, `requests.memory`, `pods`, `services.loadbalancers`) and LimitRanges (defaults and maximums per container). This enforces fair share and predictable costs.
+>
+> **Layer 4 — NetworkPolicies for traffic isolation**: By default, all pods in K8s can talk to each other — even across namespaces. I deploy a default **deny-all** NetworkPolicy per namespace, then explicitly allow only required ingress/egress. This is critical because namespaces alone don't isolate networking.
+>
+> **Layer 5 — Node-level isolation (when required)**: For sensitive workloads, I use **taints, tolerations, and node selectors** so payments workloads run on dedicated node pools — separate from catalog. On AKS, this maps to multiple node pools with different VM SKUs or security profiles. For compliance use cases (PCI-DSS, HIPAA), I'd go further with **separate clusters or virtual clusters via vCluster**.
+>
+> **Layer 6 — Pod Security Standards**: I enforce the `restricted` profile per namespace using Pod Security Admission so no privileged containers, no hostPath mounts, no root users.
+>
+> **Layer 7 — GitOps boundaries**: Each team has their own Git repo / folder, and ArgoCD or Flux is configured so team A's pipeline can't deploy to team B's namespace. This shifts isolation left into the platform layer.
+>
+> **Layer 8 — Cost visibility and audit**: Labels like `team`, `cost-center`, `env` feed into tools like **Kubecost** or **OpenCost** for chargeback. Audit logs help detect cross-team violations.
+>
+> So in short: **Namespaces (logical) → RBAC (who) → Quotas (how much) → NetworkPolicies (traffic) → Node pools (compute) → PSS (security) → GitOps (deploy) → Cost/audit (governance)**. Namespaces alone are a soft boundary; real isolation comes from layering all of these."
+
+***
+
+### 🔥 Likely Follow-Up Questions
+
+| #  | Question                                                                                   | Quick Pointer                                                                                                                                    |
+| -- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1  | **Are namespaces a security boundary?**                                                    | **No** — they're a logical boundary. Pods can talk across namespaces by default. Need NetworkPolicies + RBAC.                                    |
+| 2  | **What resources are cluster-scoped vs namespaced?**                                       | Cluster: Nodes, PVs, StorageClass, ClusterRole. Namespaced: Pods, Services, ConfigMaps, Roles.                                                   |
+| 3  | **What happens when you delete a namespace?**                                              | All namespaced resources inside get deleted. Cluster-scoped resources (like PVs) are unaffected.                                                 |
+| 4  | **Can you have the same resource name across namespaces?**                                 | Yes — names are unique only within a namespace.                                                                                                  |
+| 5  | **What's the difference between labels and annotations?**                                  | Labels are for **identification & selection**. Annotations are non-identifying metadata (build info, ingress config, contacts).                  |
+| 6  | **How do Services use labels?**                                                            | Services use a **selector** to find pods. The Service's `spec.selector` must match pod labels exactly.                                           |
+| 7  | **What are equality-based vs set-based selectors?**                                        | Equality: `=`, `!=`. Set-based: `In`, `NotIn`, `Exists`, `DoesNotExist`. Set-based is more powerful.                                             |
+| 8  | **How do you enforce naming/labeling standards?**                                          | Use **OPA Gatekeeper** or **Kyverno** policies. Reject resources without required labels.                                                        |
+| 9  | **What if a pod has multiple replicas and you want only one selected?**                    | Add a unique label like `pod-hash` and use that in selector. But typically Services select ALL replicas — that's the point.                      |
+| 10 | **What is `kubectl explain`?**                                                             | Built-in docs for any resource and field: `kubectl explain pod.metadata.labels`.                                                                 |
+| 11 | **How do ResourceQuotas interact with LimitRanges?**                                       | LimitRanges set defaults per container; ResourceQuota enforces totals at the namespace level. Together they enforce both micro and macro limits. |
+| 12 | **What happens if a pod doesn't specify `requests`/`limits` in a namespace with a quota?** | The pod is **rejected** unless a LimitRange provides defaults.                                                                                   |
+| 13 | **Can NetworkPolicies span namespaces?**                                                   | Yes — selectors can use `namespaceSelector`.                                                                                                     |
+| 14 | **Why might you use multiple clusters instead of namespaces?**                             | Stronger isolation, different K8s versions, regulatory compliance, blast radius reduction, independent upgrade cycles.                           |
+| 15 | **What is vCluster / Capsule?**                                                            | Virtual clusters running inside a host cluster. Stronger multi-tenancy than namespaces — each tenant gets their own API server.                  |
+
+***
+
+### 💡 Senior-Level Scenario Questions
+
+**Q1: "Two teams are sharing a cluster. Team A keeps deploying buggy apps that consume all resources, starving Team B. How do you solve this?"**
+
+> "Multi-pronged response:
+>
+> 1. **Apply ResourceQuota** to Team A's namespace — cap their `requests.cpu`, `requests.memory`, and pod counts. This enforces a hard upper bound.
+> 2. **Apply LimitRange** — set sensible defaults and maximums per container, so individual pods can't be massive.
+> 3. **PriorityClasses** — assign higher priority to Team B's critical workloads so the scheduler preempts Team A's low-priority pods under contention.
+> 4. **Separate node pools** with taints and tolerations — Team A runs on `nodepool-team-a`, Team B on `nodepool-team-b`. They no longer compete for the same compute.
+> 5. **NetworkPolicies** ensure no cross-team interference at the network layer.
+> 6. **Monitoring & alerts** via Prometheus on per-namespace usage. Alert when a team approaches quota.
+> 7. Long-term, if conflicts persist — consider **separate clusters** or **vCluster** for stronger isolation."
+
+**Q2: "A developer accidentally ran `kubectl delete namespace production`. What's your incident response?"**
+
+> "Immediate steps:
+>
+> 1. **Check status** — `kubectl get ns production` (it's likely in `Terminating` phase with finalizers).
+> 2. If still terminating, **STOP if possible** — depending on finalizers, you may be able to abort by editing them out. But this is risky.
+> 3. **Restore from backup** — ideally we have **Velero** or **AKS Backup** taking scheduled snapshots. Restore the namespace: `velero restore create --from-backup <backup-name> --include-namespaces production`.
+> 4. **Restore PVs/data** — PersistentVolumes are cluster-scoped, so if the **ReclaimPolicy was `Retain`**, the underlying storage survives. Re-create PVCs to bind back.
+> 5. **GitOps recovery** — if managed by ArgoCD/Flux, re-applying the Git state recreates resources.
+> 6. **Post-incident**:
+>    * Enable **RBAC** so devs can't delete namespaces (`delete` verb on `namespaces` removed).
+>    * Add **OPA Gatekeeper/Kyverno** policy: protected namespaces require an annotation override to delete.
+>    * Implement **just-in-time admin access** via Azure PIM.
+>    * Daily Velero backups + tested DR runbook."
+
+**Q3: "How do you organize labels for a 200-microservice platform?"**
+
+> "I'd standardize on **Kubernetes recommended labels** plus organizational labels:
+>
+> **Identity labels (required, enforced by Gatekeeper):**
+>
+> * `app.kubernetes.io/name` — service name
+> * `app.kubernetes.io/version` — semver
+> * `app.kubernetes.io/component` — frontend/backend/db
+> * `app.kubernetes.io/part-of` — bounded context (e.g., `checkout`)
+>
+> **Operational labels:**
+>
+> * `team` — owning team
+> * `env` — dev/staging/prod
+> * `tier` — frontend/backend/data
+> * `criticality` — tier-1/tier-2/tier-3
+>
+> **Governance labels:**
+>
+> * `cost-center` — for chargeback
+> * `compliance` — pci/hipaa/none
+> * `data-classification` — public/internal/confidential
+>
+> **Release labels:**
+>
+> * `version` — semver
+> * `release` — canary/stable
+>
+> I'd enforce these via **Kyverno policies** that reject resources missing required labels. I'd document the schema in an internal developer portal (Backstage). Tools like **Kubecost** consume these for cost allocation; **Prometheus** uses them for alerting rules; **ArgoCD** uses them for app grouping."
+
+**Q4: "Your monitoring tool needs to read pods across ALL namespaces. How do you grant that without giving full cluster admin?"**
+
+> "Use a **ClusterRole** with read-only verbs on the needed resources, bound to a ServiceAccount via **ClusterRoleBinding**.
+>
+> ```yaml
+> apiVersion: rbac.authorization.k8s.io/v1
+> kind: ClusterRole
+> metadata:
+>   name: monitoring-reader
+> rules:
+> - apiGroups: [\"\"]
+>   resources: [\"pods\", \"services\", \"nodes\", \"endpoints\"]
+>   verbs: [\"get\", \"list\", \"watch\"]
+> - apiGroups: [\"metrics.k8s.io\"]
+>   resources: [\"pods\", \"nodes\"]
+>   verbs: [\"get\", \"list\"]
+> ```
+>
+> Then a ClusterRoleBinding ties this to the Prometheus ServiceAccount in `shared-monitoring` namespace. Principle of least privilege — read-only, only required resources. We'd also enable **audit logs** to track what monitoring reads."
+
+***
+
+## 🏆 Bonus: Multi-Tenancy Models Comparison
+
+| Model                                                | Isolation   | Complexity | Cost   | When to Use                          |
+| ---------------------------------------------------- | ----------- | ---------- | ------ | ------------------------------------ |
+| **Shared cluster + namespaces**                      | Soft        | Low        | Low    | Small/medium teams, internal trust   |
+| **Shared cluster + NetworkPolicies + Quotas + RBAC** | Medium      | Medium     | Low    | Most enterprise platforms            |
+| **Shared cluster + node pools per team**             | Medium-High | Medium     | Medium | Performance/compliance needs         |
+| **vCluster (virtual clusters)**                      | High        | Medium     | Low    | Many tenants, dev/test isolation     |
+| **Separate clusters per team**                       | Highest     | High       | High   | Strong compliance, isolated upgrades |
+
+***
+
+# 🎯 Day 7: Week 1 Review + Mini Project
+
+Welcome to Day 7, We've covered massive ground this week — from architecture to networking to configuration management. Today we consolidate everything into a **real, working 2-tier application** (Node.js + PostgreSQL) that exercises every concept from Days 1–6. Then we'll close with **20 fundamental interview questions** to lock in your knowledge. Let's build something real! 🚀
+
+***
+
+## 📋 Part 1: Week 1 Recap
+
+### What You've Mastered
+
+| Day       | Topic                | Key Takeaway                                                                                                  |
+| --------- | -------------------- | ------------------------------------------------------------------------------------------------------------- |
+| **Day 1** | Architecture         | Control plane (API server, etcd, scheduler, controller manager) + Worker nodes (kubelet, kube-proxy, runtime) |
+| **Day 2** | Pods                 | Smallest deployable unit — shared network/storage; init containers + sidecars                                 |
+| **Day 3** | Deployments          | Manage ReplicaSets → Pods; rolling updates, rollbacks, scaling                                                |
+| **Day 4** | Services             | Stable network endpoint — ClusterIP, NodePort, LoadBalancer, ExternalName                                     |
+| **Day 5** | ConfigMaps & Secrets | Externalize config; env vars vs volume mounts; Secrets are **base64, not encrypted**                          |
+| **Day 6** | Namespaces & Labels  | Logical isolation, multi-tenancy, label-based queries, quotas                                                 |
+
+### The Big Picture
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    KUBERNETES CLUSTER                        │
+│                                                              │
+│  ┌──────────────────── NAMESPACE: petstore ────────────────┐│
+│  │                                                          ││
+│  │  ┌─────────────┐         ┌─────────────────┐           ││
+│  │  │ ConfigMap   │         │   Secret        │           ││
+│  │  │ app-config  │         │ db-credentials  │           ││
+│  │  └──────┬──────┘         └────────┬────────┘           ││
+│  │         │                          │                    ││
+│  │         ▼                          ▼                    ││
+│  │  ┌─────────────────────────────────────┐               ││
+│  │  │     Deployment: nodejs-app          │               ││
+│  │  │  ┌──────┐ ┌──────┐ ┌──────┐         │               ││
+│  │  │  │ Pod  │ │ Pod  │ │ Pod  │         │               ││
+│  │  │  └──────┘ └──────┘ └──────┘         │               ││
+│  │  └────────────────┬────────────────────┘               ││
+│  │                   │                                     ││
+│  │  ┌────────────────▼────────────────┐                   ││
+│  │  │ Service: nodejs-svc (ClusterIP) │                   ││
+│  │  └────────────────┬────────────────┘                   ││
+│  │                   │                                     ││
+│  │  ┌────────────────▼────────────────────┐               ││
+│  │  │   Deployment: postgres              │               ││
+│  │  │        ┌──────┐                     │               ││
+│  │  │        │ Pod  │ ◄── PersistentVolume│               ││
+│  │  │        └──────┘                     │               ││
+│  │  └─────────────────────────────────────┘               ││
+│  │                   ▲                                     ││
+│  │  ┌────────────────┴───────────────┐                    ││
+│  │  │ Service: postgres-svc (ClusterIP)│                  ││
+│  │  └──────────────────────────────────┘                  ││
+│  └────────────────────────────────────────────────────────┘│
+│                                                              │
+│  ┌──────────── Service: nodejs-public (NodePort) ─────────┐│
+│  │      External access on <NodeIP>:30080                  ││
+│  └─────────────────────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────────┘
+```
+
+***
+
+## 🛠️ Part 2: Mini Project — 2-Tier App (Node.js + PostgreSQL)
+
+### Project Overview
+
+We'll deploy a **simple Pet Store API** — a Node.js app that talks to PostgreSQL. This mini-project will use **every concept** from Week 1:
+
+✅ Dedicated **Namespace** with labels & quota  
+✅ **PostgreSQL Deployment** with **PVC** (basic storage — full StatefulSet on Day 7 of Week 2)  
+✅ **Node.js Deployment** with **ConfigMap** + **Secret**  
+✅ Internal **ClusterIP Service** for DB  
+✅ External **NodePort Service** for app  
+✅ Init container to wait for DB readiness  
+✅ Resource requests/limits  
+✅ Readiness & liveness probes
+
+***
+
+### File Structure
+
+Create a project folder:
+
+```powershell
+mkdir petstore-k8s
+cd petstore-k8s
+```
+
+You'll create **6 files**:
+
+1. `00-namespace.yaml`
+2. `01-configmap.yaml`
+3. `02-secret.yaml`
+4. `03-postgres.yaml`
+5. `04-nodejs.yaml`
+6. `05-services.yaml`
+
+***
+
+### Step 1: Namespace + Quota
+
+**`00-namespace.yaml`:**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: petstore
+  labels:
+    app: petstore
+    env: dev
+    team: backend
+    cost-center: "2001"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: petstore-quota
+  namespace: petstore
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 4Gi
+    limits.cpu: "8"
+    limits.memory: 8Gi
+    pods: "20"
+    services: "10"
+    persistentvolumeclaims: "5"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: petstore-limits
+  namespace: petstore
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 250m
+      memory: 256Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    max:
+      cpu: "1"
+      memory: 1Gi
+```
+
+***
+
+### Step 2: ConfigMap (App Settings)
+
+**`01-configmap.yaml`:**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: petstore
+  labels:
+    app: petstore
+data:
+  # Non-sensitive app configuration
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  APP_PORT: "3000"
+  DB_HOST: "postgres-svc"        # ← uses K8s DNS
+  DB_PORT: "5432"
+  DB_NAME: "petstore"
+  POOL_SIZE: "10"
+  REQUEST_TIMEOUT: "30000"
+  
+  # App config file (mounted as volume)
+  app.properties: |
+    feature.newCheckout=true
+    feature.recommendations=false
+    cache.ttl=3600
+    metrics.enabled=true
+```
+
+***
+
+### Step 3: Secret (DB Credentials)
+
+**`02-secret.yaml`:**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+  namespace: petstore
+  labels:
+    app: petstore
+type: Opaque
+stringData:
+  # stringData = plain text, K8s base64-encodes automatically
+  POSTGRES_USER: "petadmin"
+  POSTGRES_PASSWORD: "S3cur3P@ss2026!"
+  POSTGRES_DB: "petstore"
+  DB_USER: "petadmin"
+  DB_PASSWORD: "S3cur3P@ss2026!"
+```
+
+> 🔒 **Production note**: In real life, this Secret would come from **Azure Key Vault via CSI Secret Store Driver**, never committed to Git. For learning, this works.
+
+***
+
+### Step 4: PostgreSQL Deployment + PVC
+
+**`03-postgres.yaml`:**
+
+```yaml
+# Persistent Volume Claim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: petstore
+  labels:
+    app: postgres
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+# PostgreSQL Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: petstore
+  labels:
+    app: postgres
+    tier: database
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # DB shouldn't have multiple writers
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        tier: database
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: POSTGRES_DB
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        readinessProbe:
+          exec:
+            command:
+              - sh
+              - -c
+              - "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+        livenessProbe:
+          exec:
+            command:
+              - sh
+              - -c
+              - "pg_isready -U $POSTGRES_USER"
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+```
+
+***
+
+### Step 5: Node.js Application Deployment
+
+**`04-nodejs.yaml`:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodejs-app
+  namespace: petstore
+  labels:
+    app: nodejs-app
+    tier: backend
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: nodejs-app
+  template:
+    metadata:
+      labels:
+        app: nodejs-app
+        tier: backend
+        version: v1.0.0
+    spec:
+      # 🚦 Init container: wait until DB is ready
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for PostgreSQL...";
+          until nc -z postgres-svc 5432; do
+            echo "DB not ready, sleeping 2s...";
+            sleep 2;
+          done;
+          echo "PostgreSQL is ready!"
+      
+      containers:
+      - name: app
+        # Using nginx as a placeholder; in real life this is your Node.js image
+        # Example: rajesh/petstore-api:1.0.0
+        image: nginx:1.25-alpine
+        ports:
+        - containerPort: 80
+          name: http
+        
+        # Inject ALL ConfigMap & Secret keys as env vars
+        envFrom:
+        - configMapRef:
+            name: app-config
+        - secretRef:
+            name: db-credentials
+        
+        # Mount config file as volume (auto-reloads on change)
+        volumeMounts:
+        - name: app-config-vol
+          mountPath: /etc/app/config
+          readOnly: true
+        
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 15
+          periodSeconds: 20
+      
+      volumes:
+      - name: app-config-vol
+        configMap:
+          name: app-config
+          items:
+          - key: app.properties
+            path: app.properties
+```
+
+***
+
+### Step 6: Services (Internal + External)
+
+**`05-services.yaml`:**
+
+```yaml
+# Internal Service for PostgreSQL (ClusterIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: petstore
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+    protocol: TCP
+---
+# Internal Service for Node.js (ClusterIP — service-to-service)
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-svc
+  namespace: petstore
+  labels:
+    app: nodejs-app
+spec:
+  type: ClusterIP
+  selector:
+    app: nodejs-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+---
+# External Service for Node.js (NodePort — for testing access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-public
+  namespace: petstore
+  labels:
+    app: nodejs-app
+spec:
+  type: NodePort
+  selector:
+    app: nodejs-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    nodePort: 30080
+```
+
+***
+
+### 🚀 Deploy It All!
+
+```powershell
+# Apply in order (or all at once — K8s resolves dependencies eventually)
+kubectl apply -f 00-namespace.yaml
+kubectl apply -f 01-configmap.yaml
+kubectl apply -f 02-secret.yaml
+kubectl apply -f 03-postgres.yaml
+kubectl apply -f 04-nodejs.yaml
+kubectl apply -f 05-services.yaml
+
+# OR deploy everything in one shot
+kubectl apply -f .
+```
+
+***
+
+### 🔍 Verify the Deployment
+
+```powershell
+# Switch context to petstore namespace
+kubectl config set-context --current --namespace=petstore
+
+# 1. Check all resources
+kubectl get all
+kubectl get configmap,secret,pvc
+
+# 2. Watch pods come up
+kubectl get pods -w
+
+# 3. Verify init container ran for nodejs-app
+kubectl describe pod -l app=nodejs-app | Select-String "init|Init"
+
+# 4. Check rollout status
+kubectl rollout status deployment/postgres
+kubectl rollout status deployment/nodejs-app
+
+# 5. Inspect Service endpoints
+kubectl get endpoints
+kubectl describe svc postgres-svc
+
+# 6. Verify quota usage
+kubectl describe quota petstore-quota
+```
+
+***
+
+### 🧪 Test Connectivity
+
+```powershell
+# Test 1: External access via NodePort
+# On Minikube:
+minikube service nodejs-public -n petstore --url
+# Or get node IP and curl:
+$nodeIP = kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+curl http://$nodeIP:30080
+
+# Test 2: From inside the cluster — service discovery
+kubectl run debug --image=busybox:1.36 -it --rm --restart=Never -- sh
+# Inside the pod:
+nslookup nodejs-svc
+nslookup postgres-svc.petstore.svc.cluster.local
+wget -qO- http://nodejs-svc
+
+# Test 3: Connect to Postgres from a temp pod
+kubectl run pg-client --image=postgres:15-alpine -it --rm --restart=Never `
+  --env="PGPASSWORD=S3cur3P@ss2026!" `
+  -- psql -h postgres-svc -U petadmin -d petstore -c "SELECT version();"
+
+# Test 4: Verify env vars and config file inside the app pod
+$pod = kubectl get pod -l app=nodejs-app -o jsonpath='{.items[0].metadata.name}'
+kubectl exec $pod -- env | Select-String "NODE_ENV|DB_HOST|DB_USER"
+kubectl exec $pod -- cat /etc/app/config/app.properties
+```
+
+***
+
+### 🎬 Bonus Demos to Run
+
+```powershell
+# Demo 1: Scale the Node.js app
+kubectl scale deployment/nodejs-app --replicas=5
+kubectl get pods -l app=nodejs-app
+
+# Demo 2: Rolling update (change image tag)
+kubectl set image deployment/nodejs-app app=nginx:1.26-alpine --record
+kubectl rollout status deployment/nodejs-app
+kubectl rollout history deployment/nodejs-app
+
+# Demo 3: Rollback
+kubectl rollout undo deployment/nodejs-app
+
+# Demo 4: Update ConfigMap → see file auto-update
+kubectl edit configmap app-config
+# Change LOG_LEVEL: "info" → "debug"
+# Wait ~60s, then:
+kubectl exec $pod -- cat /etc/app/config/app.properties
+
+# Demo 5: Check that postgres data survives pod restart
+kubectl exec -it deploy/postgres -- psql -U petadmin -d petstore -c "CREATE TABLE pets (id SERIAL, name VARCHAR(50)); INSERT INTO pets (name) VALUES ('Buddy');"
+kubectl delete pod -l app=postgres
+# Wait for new pod
+kubectl get pods -l app=postgres -w
+# Verify data survived
+kubectl exec -it deploy/postgres -- psql -U petadmin -d petstore -c "SELECT * FROM pets;"
+```
+
+***
+
+### 🧹 Cleanup
+
+```powershell
+# Delete everything by deleting the namespace
+kubectl delete namespace petstore
+
+# OR delete one by one
+kubectl delete -f .
+```
+
+***
+
+## 🎤 Part 3: 20 Fundamental Interview Questions
+
+### Section A: Architecture & Basics (Q1–Q5)
+
+**Q1. What is Kubernetes, and what problems does it solve?**
+
+> Kubernetes is an open-source container orchestration platform that automates **deployment, scaling, networking, and management** of containerized applications. It solves problems like manual container scheduling, self-healing (auto-restart failed containers), scaling under load, rolling updates without downtime, service discovery, and infrastructure abstraction across cloud/on-prem.
+
+***
+
+**Q2. Explain the role of each control plane component.**
+
+> * **kube-apiserver**: REST API gateway; all components talk to it
+> * **etcd**: distributed key-value store; the single source of truth for cluster state
+> * **kube-scheduler**: decides which node a new Pod runs on (filter + score)
+> * **kube-controller-manager**: runs reconciliation loops (node, replicaset, endpoint controllers)
+> * **cloud-controller-manager**: cloud-specific logic (LBs, disks, routes for Azure/AWS/GCP)
+
+***
+
+**Q3. What runs on a Kubernetes worker node?**
+
+> * **kubelet**: node agent that ensures containers in PodSpecs are running
+> * **kube-proxy**: implements Service networking via iptables/IPVS rules
+> * **Container runtime**: actually runs containers (containerd, CRI-O); communicates via CRI
+
+***
+
+**Q4. What's the difference between a Pod and a container?**
+
+> A **container** is a runtime instance of an image — OS-level virtualization unit. A **Pod** is the smallest Kubernetes scheduling unit — a logical wrapper around one or more containers that share the same network namespace (same IP, localhost communication), shared volumes, and lifecycle. Kubernetes schedules Pods, not containers directly.
+
+***
+
+**Q5. Why use a Deployment instead of bare Pods?**
+
+> Bare Pods don't self-heal, scale, or update. A Deployment provides:
+>
+> * **Self-healing** via ReplicaSet (replaces dead Pods)
+> * **Declarative updates** with rolling strategy
+> * **Rollback** to any previous revision
+> * **Scaling** with one command
+> * **Version history** for audit
+
+***
+
+### Section B: Workloads & Updates (Q6–Q10)
+
+**Q6. Explain RollingUpdate vs Recreate strategies.**
+
+> * **RollingUpdate** (default): gradually replaces old Pods with new ones; controlled by `maxSurge` and `maxUnavailable`. Zero downtime. Requires backward-compatible versions.
+> * **Recreate**: kills ALL old Pods first, then creates new ones. Causes downtime. Used when versions can't coexist (e.g., DB schema changes).
+
+***
+
+**Q7. How does Kubernetes handle a failed Deployment rollout?**
+
+> The new ReplicaSet scales up only when new Pods become **Ready** (via probes). If new Pods never become Ready, old Pods aren't killed (governed by `maxUnavailable`) → no downtime. After `progressDeadlineSeconds` (default 600s), the Deployment is marked failed. `kubectl rollout undo` instantly reverts by scaling up the old ReplicaSet (still retained at zero replicas).
+
+***
+
+**Q8. What is the Pod lifecycle?**
+
+> Phases: **Pending** → **Running** → **Succeeded** or **Failed** (or **Unknown** for communication issues). Container states inside: **Waiting**, **Running**, **Terminated**. Conditions track readiness: `PodScheduled`, `Initialized`, `ContainersReady`, `Ready`.
+
+***
+
+**Q9. What's the difference between init containers and sidecars?**
+
+> * **Init containers**: run **to completion sequentially BEFORE** the main containers start. Used for one-time setup (DB readiness check, Git clone, schema migration).
+> * **Sidecars**: run **alongside** the main container for the pod's entire lifetime. Used for cross-cutting concerns (logging, proxy, metrics export).
+
+***
+
+**Q10. What's the difference between `kubectl apply` and `kubectl create`?**
+
+> * **`create`** is imperative — fails if the object already exists.
+> * **`apply`** is declarative — idempotent, creates or updates based on the YAML; tracks last-applied-configuration for proper merging. **`apply` is the production standard.**
+
+***
+
+### Section C: Services & Networking (Q11–Q14)
+
+**Q11. Explain the four Service types and when to use each.**
+
+> * **ClusterIP** (default): internal-only; microservice-to-microservice
+> * **NodePort**: exposes on every node IP at a high port (30000–32767); dev/test or on-prem
+> * **LoadBalancer**: provisions a cloud LB with public IP; production on AKS/EKS/GKE
+> * **ExternalName**: DNS CNAME alias to an external host; migrations and external service abstraction
+
+***
+
+**Q12. How does service discovery work in Kubernetes?**
+
+> **CoreDNS** auto-creates DNS records for every Service: `<svc>.<ns>.svc.cluster.local`. Pods resolve service names via DNS to the ClusterIP (a stable virtual IP). kube-proxy programs iptables/IPVS rules to load-balance traffic from the ClusterIP to backing Pod IPs.
+
+***
+
+**Q13. What's the difference between `port`, `targetPort`, and `nodePort`?**
+
+> * **`port`**: the Service's port (used by clients via ClusterIP)
+> * **`targetPort`**: the container port the traffic is forwarded to
+> * **`nodePort`**: the port exposed on every node (NodePort/LoadBalancer types only)
+
+***
+
+**Q14. How do pods in different namespaces communicate?**
+
+> Via the **fully qualified DNS name**: `<service>.<namespace>.svc.cluster.local`. Pods can reach services in other namespaces by default (namespaces don't isolate network) — you need **NetworkPolicies** to restrict.
+
+***
+
+### Section D: Config, Secrets & Storage (Q15–Q17)
+
+**Q15. Are Secrets encrypted in Kubernetes?**
+
+> **No** — by default Secrets are only **base64-encoded** (which is NOT encryption — easily reversible). Encryption at rest in etcd must be **explicitly enabled** via `EncryptionConfiguration`. Production should use **KMS providers** (Azure Key Vault) or external systems like **CSI Secret Store Driver** or **HashiCorp Vault**.
+
+***
+
+**Q16. What's the difference between mounting a ConfigMap as env var vs volume?**
+
+> * **Env var**: simpler, but does **NOT auto-update** — pod restart required.
+> * **Volume mount**: auto-updates within \~60 seconds (no restart); better for files and large configs. Atomic via symlink swap.
+
+***
+
+**Q17. How do you securely manage secrets in Kubernetes?**
+
+> Layered approach:
+>
+> 1. **Enable encryption at rest** (KMS via Azure Key Vault)
+> 2. **Externalize via CSI Secret Store Driver** or HashiCorp Vault
+> 3. **RBAC** — restrict `get/list` on secrets
+> 4. **No secrets in Git** — use Sealed Secrets, SOPS, or External Secrets Operator
+> 5. **Rotate regularly** with automation
+> 6. **Mount as files, not env vars** (env vars leak in `describe`, process listings)
+
+***
+
+### Section E: Organization & Multi-Tenancy (Q18–Q20)
+
+**Q18. Are namespaces a security boundary?**
+
+> **No** — they're a logical/organizational boundary. By default, pods in different namespaces can talk to each other. Real isolation requires **NetworkPolicies**, **RBAC**, **ResourceQuotas**, and possibly **separate node pools** or **separate clusters/vClusters** for hard multi-tenancy.
+
+***
+
+**Q19. What's the difference between labels and annotations?**
+
+> * **Labels**: identifying metadata used by **selectors** to group and query objects (`app=web`, `env=prod`). Limited to 63 chars per value.
+> * **Annotations**: non-identifying metadata for tools/humans (build info, commit SHA, ingress controller config). Up to 256 KB. **Cannot be queried with selectors.**
+
+***
+
+**Q20. How would you isolate workloads for different teams?**
+
+> Multi-layer strategy:
+>
+> 1. **Namespace per team/env** for logical separation
+> 2. **RBAC** with Role/RoleBinding scoped to namespace
+> 3. **ResourceQuotas + LimitRanges** for fair resource share
+> 4. **NetworkPolicies** for network isolation (default deny + explicit allow)
+> 5. **Taints/tolerations + node selectors** for compute isolation
+> 6. **Pod Security Standards** (restricted profile)
+> 7. **GitOps boundaries** so teams can only deploy to their namespaces
+> 8. **Labels** for cost allocation (Kubecost/OpenCost) and audit
+> 9. **vCluster or separate clusters** for hard multi-tenancy / compliance
+
+***
+
+
+
+
+
 
 
 
