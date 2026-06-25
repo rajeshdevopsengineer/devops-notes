@@ -7780,4 +7780,1923 @@ kubectl get jobs --sort-by=.metadata.creationTimestamp
 
 ***
 
+# 🌐 Day 11: Ingress & Ingress Controllers
+
+Welcome to Day 11, Rajesh! On Day 4 you learned that LoadBalancer Services give you external access — but if you have 20 microservices, that's **20 expensive cloud LBs**. Today you'll master **Ingress** — the L7 routing layer that solves this elegantly. You'll route by hostname, path, terminate TLS, and stand up production-grade external access with a single LoadBalancer. This is one of the **most common Senior DevOps interview topics**. Let's go! 🚀
+
+***
+
+## 📚 Part 1: Theory — Why Ingress Exists
+
+### The Problem Without Ingress
+
+Imagine 5 microservices needing external access:
+
+```
+❌ EXPENSIVE & MESSY:
+┌─────────┐    ┌────────────┐    ┌─────────────┐
+│ Client  │ →  │ Azure LB 1 │ →  │ api-svc     │  $$$
+├─────────┤    ├────────────┤    ├─────────────┤
+│ Client  │ →  │ Azure LB 2 │ →  │ web-svc     │  $$$
+├─────────┤    ├────────────┤    ├─────────────┤
+│ Client  │ →  │ Azure LB 3 │ →  │ admin-svc   │  $$$
+├─────────┤    ├────────────┤    ├─────────────┤
+│ Client  │ →  │ Azure LB 4 │ →  │ payments-svc│  $$$
+├─────────┤    ├────────────┤    ├─────────────┤
+│ Client  │ →  │ Azure LB 5 │ →  │ catalog-svc │  $$$
+└─────────┘    └────────────┘    └─────────────┘
+
+5 Load Balancers × ~$25/month each = $125/month + 5 Public IPs
++ No SSL termination at LB
++ No path-based routing
++ No WAF
+```
+
+### The Ingress Solution
+
+```
+✅ ELEGANT & COST-EFFECTIVE:
+
+┌─────────┐
+│ Client  │ ──HTTPS──┐
+└─────────┘          │
+                     ▼
+              ┌──────────────┐
+              │  1 LoadBalancer │ ← single public IP
+              │  (Azure LB)     │   single cost
+              └──────┬──────────┘
+                     │
+                     ▼
+              ┌──────────────────┐
+              │ Ingress Controller│ ← NGINX/AGIC pod(s)
+              │  (deciphers L7)   │   running in cluster
+              └──────┬───────────┘
+                     │ routes by hostname/path
+        ┌────────────┼─────────────┬────────────┐
+        ▼            ▼             ▼            ▼
+   ┌─────────┐ ┌─────────┐  ┌──────────┐  ┌──────────┐
+   │ api-svc │ │ web-svc │  │admin-svc │  │payments  │
+   │ (Cluster│ │ (Cluster│  │ (Cluster │  │   svc    │
+   │   IP)   │ │   IP)   │  │   IP)    │  │          │
+   └─────────┘ └─────────┘  └──────────┘  └──────────┘
+
+1 LB + 1 Public IP + SSL termination + Path routing + WAF
+```
+
+***
+
+### 🎯 Ingress vs Service — The Layer Difference
+
+| Aspect                  | Service (LoadBalancer)             | Ingress                                   |
+| ----------------------- | ---------------------------------- | ----------------------------------------- |
+| **OSI Layer**           | L4 (TCP/UDP)                       | L7 (HTTP/HTTPS)                           |
+| **Routes by**           | Port + Protocol                    | Hostname + Path + Headers                 |
+| **TLS termination**     | Pass-through only                  | ✅ Native                                  |
+| **One external IP for** | 1 service                          | Many services                             |
+| **Cost**                | 1 LB per service                   | 1 LB for all                              |
+| **Cloud independence**  | Cloud-specific                     | Standard K8s API                          |
+| **L7 features**         | None                               | Rewrite, redirect, auth, rate limit, CORS |
+| **Use case**            | TCP databases, gRPC, raw protocols | HTTP/HTTPS web traffic                    |
+
+***
+
+### 🧩 Two Components You Need
+
+#### 1. **Ingress Resource** (declarative routing rules)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-svc
+            port:
+              number: 80
+```
+
+This is **just configuration** — it does nothing on its own.
+
+#### 2. **Ingress Controller** (the actual proxy)
+
+A pod (or pods) running in your cluster that:
+
+* Watches Ingress resources
+* Translates them into proxy configuration
+* Receives external traffic and routes it
+
+> 🎯 **Critical Senior insight**: Kubernetes ships **no built-in Ingress Controller**. You **MUST install one**. Common options:
+
+| Controller                                        | Notes                                                        |
+| ------------------------------------------------- | ------------------------------------------------------------ |
+| **NGINX Ingress Controller**                      | Most popular OSS option (community-maintained)               |
+| **NGINX Plus Ingress**                            | Enterprise version with advanced features                    |
+| **Application Gateway Ingress Controller (AGIC)** | Azure-native, integrates with App Gateway WAF                |
+| **Traefik**                                       | Modern, dynamic config, great for K8s-native workflows       |
+| **HAProxy Ingress**                               | High-performance, mature                                     |
+| **Istio Gateway**                                 | Part of service mesh (different API: Gateway/VirtualService) |
+| **Contour**                                       | Envoy-based, by VMware                                       |
+| **Kong Ingress**                                  | API management features built-in                             |
+
+***
+
+### 🛣️ Routing Patterns
+
+#### Path-Based Routing
+
+```yaml
+spec:
+  rules:
+  - host: example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend: {service: {name: api-svc, port: {number: 80}}}
+      - path: /web
+        pathType: Prefix
+        backend: {service: {name: web-svc, port: {number: 80}}}
+```
+
+```
+example.com/api/*    → api-svc
+example.com/web/*    → web-svc
+```
+
+#### Host-Based (Subdomain) Routing
+
+```yaml
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: api-svc, port: {number: 80}}}}
+  - host: web.example.com
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: web-svc, port: {number: 80}}}}
+```
+
+```
+api.example.com/*    → api-svc
+web.example.com/*    → web-svc
+```
+
+#### Combined (Most Common)
+
+```yaml
+spec:
+  rules:
+  - host: shop.example.com
+    http:
+      paths:
+      - {path: /api/v1, pathType: Prefix, backend: ...}
+      - {path: /api/v2, pathType: Prefix, backend: ...}
+      - {path: /, pathType: Prefix, backend: ...}
+```
+
+***
+
+### 🎚️ Path Types — Subtle but Important
+
+| Type                       | Behavior                  | Example                                               |
+| -------------------------- | ------------------------- | ----------------------------------------------------- |
+| **Exact**                  | URL must match exactly    | `/api` matches only `/api`, NOT `/api/users`          |
+| **Prefix**                 | Element-wise prefix match | `/api` matches `/api`, `/api/users`, `/api/v1/orders` |
+| **ImplementationSpecific** | Up to the controller      | Often regex/glob with NGINX                           |
+
+> 💡 **Use `Prefix`** for most cases. `Exact` is rarely what you want.
+
+***
+
+### 🔐 TLS Termination
+
+TLS termination at the Ingress means:
+
+* Client → Ingress: encrypted (HTTPS)
+* Ingress → backend Service: usually plain HTTP (inside cluster)
+
+```yaml
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls-cert      # K8s Secret of type kubernetes.io/tls
+  rules:
+  - host: api.example.com
+    http:
+      paths: [...]
+```
+
+The `Secret` contains:
+
+```yaml
+type: kubernetes.io/tls
+data:
+  tls.crt: <base64-encoded-cert>
+  tls.key: <base64-encoded-private-key>
+```
+
+For production: use **cert-manager** to auto-provision certs from Let's Encrypt or Azure Key Vault.
+
+***
+
+### 🏷️ IngressClass — Multi-Controller Support
+
+What if you have **NGINX for public traffic** and **AGIC for internal**? Use `IngressClass`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+spec:
+  ingressClassName: nginx        # ← uses NGINX, not other controllers
+  rules: [...]
+```
+
+> 🎯 **Senior tip**: Always set `ingressClassName` explicitly. The "default" IngressClass behavior can be confusing in multi-controller setups.
+
+***
+
+### 🔄 Common Ingress Annotations (Controller-Specific)
+
+NGINX-specific annotations modify behavior:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8"
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com"
+```
+
+> ⚠️ **Caveat**: Annotations are **controller-specific** — what works for NGINX won't work for AGIC. Read the controller's docs.
+
+***
+
+### 🆕 Gateway API — The Future
+
+Kubernetes is moving toward the **Gateway API** as the next-generation replacement for Ingress (more expressive, role-oriented). Key resources: `GatewayClass`, `Gateway`, `HTTPRoute`, `TCPRoute`. Still GA only since 2023, but worth knowing.
+
+***
+
+## 🛠️ Part 2: Hands-On — Production Ingress Setup
+
+### Step 1: Install NGINX Ingress Controller
+
+**On Minikube:**
+
+```powershell
+minikube addons enable ingress
+kubectl get pods -n ingress-nginx
+```
+
+**On AKS / general clusters (via Helm — preview of Day 12):**
+
+```powershell
+# Add the Helm repo
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+# Install in a dedicated namespace
+helm install ingress-nginx ingress-nginx/ingress-nginx `
+  --namespace ingress-nginx `
+  --create-namespace `
+  --set controller.replicaCount=2 `
+  --set controller.service.type=LoadBalancer
+
+# Wait for external IP
+kubectl get svc -n ingress-nginx -w
+# EXTERNAL-IP transitions from <pending> to actual IP
+```
+
+**On Kind (local):**
+
+```powershell
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+# Wait until ready
+kubectl wait --namespace ingress-nginx `
+  --for=condition=ready pod `
+  --selector=app.kubernetes.io/component=controller `
+  --timeout=120s
+```
+
+#### Verify
+
+```powershell
+kubectl get pods -n ingress-nginx
+kubectl get svc -n ingress-nginx
+kubectl get ingressclass
+# IngressClass "nginx" should exist
+```
+
+***
+
+### Step 2: Deploy 3 Demo Services
+
+```yaml
+# 01-demo-apps.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+# App 1: API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-app
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: api-app}
+  template:
+    metadata:
+      labels: {app: api-app}
+    spec:
+      containers:
+      - name: app
+        image: hashicorp/http-echo:1.0
+        args:
+        - -text=Hello from API service! v1.0
+        - -listen=:5678
+        ports:
+        - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-svc
+  namespace: demo
+spec:
+  selector: {app: api-app}
+  ports:
+  - port: 80
+    targetPort: 5678
+---
+# App 2: WEB
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: web-app}
+  template:
+    metadata:
+      labels: {app: web-app}
+    spec:
+      containers:
+      - name: app
+        image: hashicorp/http-echo:1.0
+        args:
+        - -text=Hello from WEB frontend!
+        - -listen=:5678
+        ports:
+        - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-svc
+  namespace: demo
+spec:
+  selector: {app: web-app}
+  ports:
+  - port: 80
+    targetPort: 5678
+---
+# App 3: ADMIN
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-app
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: admin-app}
+  template:
+    metadata:
+      labels: {app: admin-app}
+    spec:
+      containers:
+      - name: app
+        image: hashicorp/http-echo:1.0
+        args:
+        - -text=Admin Portal - Restricted Access!
+        - -listen=:5678
+        ports:
+        - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-svc
+  namespace: demo
+spec:
+  selector: {app: admin-app}
+  ports:
+  - port: 80
+    targetPort: 5678
+```
+
+```powershell
+kubectl apply -f 01-demo-apps.yaml
+kubectl get pods,svc -n demo
+```
+
+***
+
+### Step 3: Path-Based Routing Ingress
+
+```yaml
+# 02-path-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: path-ingress
+  namespace: demo
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: demo.local                  # use hostnames you control (add to /etc/hosts)
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api-svc
+            port:
+              number: 80
+      - path: /web
+        pathType: Prefix
+        backend:
+          service:
+            name: web-svc
+            port:
+              number: 80
+      - path: /admin
+        pathType: Prefix
+        backend:
+          service:
+            name: admin-svc
+            port:
+              number: 80
+```
+
+```powershell
+kubectl apply -f 02-path-ingress.yaml
+kubectl get ingress -n demo
+```
+
+**Find the Ingress IP:**
+
+```powershell
+# On Minikube
+minikube ip
+# Returns something like 192.168.49.2
+
+# On AKS / cloud
+kubectl get svc -n ingress-nginx
+# Look for EXTERNAL-IP of ingress-nginx-controller
+```
+
+**Map the hostname locally** by editing `C:\Windows\System32\drivers\etc\hosts`:
+
+```
+192.168.49.2  demo.local
+```
+
+**Test:**
+
+```powershell
+curl http://demo.local/api
+# → Hello from API service! v1.0
+
+curl http://demo.local/web
+# → Hello from WEB frontend!
+
+curl http://demo.local/admin
+# → Admin Portal - Restricted Access!
+```
+
+***
+
+### Step 4: Host-Based Routing
+
+```yaml
+# 03-host-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: host-ingress
+  namespace: demo
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: api.demo.local
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: api-svc, port: {number: 80}}}}
+  - host: web.demo.local
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: web-svc, port: {number: 80}}}}
+  - host: admin.demo.local
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: admin-svc, port: {number: 80}}}}
+```
+
+Add to `hosts` file:
+
+```
+192.168.49.2  api.demo.local web.demo.local admin.demo.local
+```
+
+```powershell
+kubectl apply -f 03-host-ingress.yaml
+
+curl http://api.demo.local
+curl http://web.demo.local
+curl http://admin.demo.local
+```
+
+***
+
+### Step 5: TLS Termination with Self-Signed Cert
+
+#### Generate a self-signed certificate:
+
+```powershell
+# Using OpenSSL (install via Chocolatey if missing: choco install openssl)
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 `
+  -keyout tls.key -out tls.crt `
+  -subj "/CN=secure.demo.local/O=demo" `
+  -addext "subjectAltName=DNS:secure.demo.local"
+
+# Create K8s TLS Secret
+kubectl create secret tls demo-tls `
+  --cert=tls.crt `
+  --key=tls.key `
+  -n demo
+```
+
+#### Ingress with TLS:
+
+```yaml
+# 04-tls-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tls-ingress
+  namespace: demo
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - secure.demo.local
+    secretName: demo-tls
+  rules:
+  - host: secure.demo.local
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api-svc
+            port: {number: 80}
+      - path: /web
+        pathType: Prefix
+        backend:
+          service:
+            name: web-svc
+            port: {number: 80}
+```
+
+Add to hosts file:
+
+```
+192.168.49.2  secure.demo.local
+```
+
+```powershell
+kubectl apply -f 04-tls-ingress.yaml
+
+# Test (use -k to skip cert validation for self-signed)
+curl -k https://secure.demo.local/api
+curl -k https://secure.demo.local/web
+
+# HTTP requests auto-redirect to HTTPS
+curl -kIL http://secure.demo.local/api
+# Should show 308 redirect → HTTPS
+```
+
+***
+
+### Step 6: Production-Grade Annotations
+
+```yaml
+# 05-prod-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: production-ingress
+  namespace: demo
+  annotations:
+    # SSL
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    
+    # Body size (e.g., file uploads)
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    
+    # Rate limiting (requests per second per IP)
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+    
+    # IP whitelisting (restrict to corporate network)
+    # nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16"
+    
+    # CORS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.demo.local"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    
+    # Custom headers
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: SAMEORIGIN";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-XSS-Protection: 1; mode=block";
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts: [secure.demo.local]
+    secretName: demo-tls
+  rules:
+  - host: secure.demo.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-svc
+            port: {number: 80}
+```
+
+***
+
+### Step 7: Sticky Sessions (Session Affinity)
+
+```yaml
+# 06-sticky-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sticky-ingress
+  namespace: demo
+  annotations:
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "INGRESSCOOKIE"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "172800"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "172800"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: sticky.demo.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-svc
+            port: {number: 80}
+```
+
+Now a client gets pinned to one pod for the cookie's lifetime — useful for stateful apps that haven't fully externalized session state.
+
+***
+
+### Step 8: Multi-Tenant Ingress with cert-manager (Production Pattern)
+
+```yaml
+# 07-cert-manager-issuer.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: rajesh@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prod-ingress
+  namespace: demo
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.realdomain.com
+    secretName: api-tls-cert       # cert-manager AUTO-CREATES this!
+  rules:
+  - host: api.realdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service: {name: api-svc, port: {number: 80}}
+```
+
+> 🚀 **In production this is the gold standard**: cert-manager + Let's Encrypt = **fully automated, free, auto-renewing TLS certificates**. Set it once, forget it.
+
+***
+
+### Step 9: Debugging an Ingress
+
+```powershell
+# View ingress
+kubectl describe ingress path-ingress -n demo
+
+# Check NGINX controller logs
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller -f
+
+# Get the actual NGINX configuration generated by the controller
+$ctrl = kubectl get pods -n ingress-nginx -l app.kubernetes.io/component=controller -o jsonpath='{.items[0].metadata.name}'
+kubectl exec -n ingress-nginx $ctrl -- cat /etc/nginx/nginx.conf | findstr "demo.local"
+
+# Test from inside the cluster
+kubectl run debug --image=curlimages/curl:8.5.0 -it --rm --restart=Never -- sh
+# Inside:
+curl -H "Host: demo.local" http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/api
+```
+
+***
+
+## 💻 Part 3: Commands Cheat Sheet
+
+### Ingress Operations
+
+```powershell
+# CRUD
+kubectl apply -f ingress.yaml
+kubectl get ingress -A
+kubectl get ing
+kubectl describe ingress <name> -n <ns>
+kubectl delete ingress <name>
+
+# IngressClass
+kubectl get ingressclass
+kubectl describe ingressclass nginx
+
+# TLS Secret
+kubectl create secret tls <name> --cert=tls.crt --key=tls.key
+kubectl get secret -n demo
+```
+
+### Controller Operations
+
+```powershell
+# Pods
+kubectl get pods -n ingress-nginx
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller
+
+# Service (find external IP)
+kubectl get svc -n ingress-nginx
+
+# Reload config (rarely needed — controller auto-reloads)
+kubectl rollout restart deployment ingress-nginx-controller -n ingress-nginx
+```
+
+### Quick Test
+
+```powershell
+# Get external IP
+$ingressIP = kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+# Send request with host header
+curl -H "Host: demo.local" http://$ingressIP/api
+```
+
+***
+
+## 🎤 Part 4: Interview Prep
+
+### ⭐ Star Question: *"How does Ingress differ from a Service?"*
+
+**Senior DevOps model answer:**
+
+> "The difference comes down to **OSI layer, capabilities, and cost model**.
+>
+> A **Service** operates at **Layer 4** — TCP/UDP. It exposes pods using a port and protocol. Specifically, a Service of type `LoadBalancer` provisions a cloud load balancer that forwards raw TCP traffic to your pods. It's a great fit for non-HTTP workloads — databases, gRPC streams, raw TCP. But it has no awareness of HTTP semantics. If you want path-based routing or TLS termination, the Service can't do that.
+>
+> An **Ingress** operates at **Layer 7** — HTTP/HTTPS. It's an **API object** that defines routing rules: 'requests for `api.example.com/v1` go to api-svc, `api.example.com/v2` go to api-v2-svc, and so on.' The actual proxy work is done by an **Ingress Controller** — NGINX, AGIC, Traefik — which is a pod (or set of pods) running in the cluster. The Ingress is just config; the Controller is the engine.
+>
+> Here's the **practical impact**: imagine 20 microservices needing external HTTPS. With LoadBalancer Services, you'd provision **20 cloud LBs and 20 public IPs** — costly, hard to manage, no SSL termination at the LB layer. With Ingress, you provision **one LoadBalancer Service** that points to the Ingress Controller; the Controller routes by hostname/path to the right ClusterIP Service. Single LB, single IP, single cert management workflow — far cheaper and more elegant.
+>
+> **Ingress also adds L7 features Services can't provide**: SSL termination, host-based routing, path-based routing, redirects, rewrites, basic auth, rate limiting, CORS, WAF integration, sticky sessions, header manipulation. All of this is impossible at L4.
+>
+> **However**, Ingress has its own caveats. The Kubernetes Ingress API is **only HTTP/HTTPS** — for TCP/UDP traffic, you still need LoadBalancer Services (or NGINX's TCP/UDP ConfigMap extension). Annotations are **controller-specific** — what works for NGINX won't work for AGIC. Also, the Ingress API itself is being superseded by the new **Gateway API**, which is more expressive and role-oriented.
+>
+> So in my decision matrix: **Use Service-type LoadBalancer for raw TCP/UDP traffic or single-service exposure. Use Ingress for HTTP/HTTPS with multiple services — which is most production microservice traffic.** In a typical AKS setup, I deploy NGINX Ingress (or AGIC on Azure) backed by a single Standard SKU LoadBalancer, with cert-manager for automated TLS, plus annotations for rate limiting, WAF, and CORS. That's the **standard production pattern** for any team with more than 2–3 web services."
+
+***
+
+### 🔥 Common Follow-Ups
+
+| #  | Question                                                                           | Quick Answer                                                                                                                                                                                              |
+| -- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1  | **What's an Ingress Controller?**                                                  | A pod that watches Ingress resources and translates them into proxy config (NGINX, Traefik, AGIC). Kubernetes ships none — you must install one.                                                          |
+| 2  | **Does Ingress replace Services?**                                                 | No — Ingress routes TO Services. You still need ClusterIP Services for each backend.                                                                                                                      |
+| 3  | **What's the difference between `Prefix` and `Exact` pathType?**                   | `Prefix` matches `/api` and `/api/anything`. `Exact` matches only `/api`.                                                                                                                                 |
+| 4  | **How do you enable TLS on Ingress?**                                              | Create a Secret of type `kubernetes.io/tls` with cert + key, then reference it in `spec.tls`. Or use cert-manager for automation.                                                                         |
+| 5  | **What is `IngressClass`?**                                                        | Identifies which Ingress Controller handles an Ingress when you have multiple. Set via `spec.ingressClassName`.                                                                                           |
+| 6  | **Can Ingress handle TCP/UDP traffic?**                                            | The standard API: no — HTTP/HTTPS only. NGINX supports TCP/UDP via a ConfigMap extension. For native L4, use LoadBalancer Services.                                                                       |
+| 7  | **What's the difference between NGINX OSS and AGIC?**                              | NGINX = generic, runs in-cluster, vendor-neutral. AGIC = Azure-native, leverages Azure Application Gateway (WAF, autoscaling) — Ingress traffic doesn't enter the cluster network until backend services. |
+| 8  | **How does cert-manager work?**                                                    | It's a K8s operator that watches Ingress resources, requests certs from issuers (Let's Encrypt, Azure Key Vault, internal CA), stores them as Secrets, auto-renews before expiry.                         |
+| 9  | **What are common Ingress annotations?**                                           | `rewrite-target`, `ssl-redirect`, `proxy-body-size`, `rate-limit`, `whitelist-source-range`, `enable-cors`. All controller-specific.                                                                      |
+| 10 | **How do you do canary deployments with NGINX Ingress?**                           | Add `nginx.ingress.kubernetes.io/canary: "true"` + `canary-weight: "10"` to a second Ingress pointing to the new version. Or use Argo Rollouts/Flagger.                                                   |
+| 11 | **What's `externalTrafficPolicy: Local` for the Ingress Controller's LB Service?** | Preserves client source IP for the Ingress Controller (important for rate limiting and IP allowlisting). Trade-off: pods on nodes without controller pods don't get traffic.                              |
+| 12 | **Why might Ingress traffic bypass NetworkPolicies?**                              | If the Ingress Controller is in a different namespace, NetworkPolicies in your app namespace must explicitly allow ingress from the controller's namespace.                                               |
+| 13 | **What's the difference between Ingress and a Service Mesh?**                      | Ingress = north-south traffic (external → cluster). Service Mesh (Istio, Linkerd) = east-west traffic (pod to pod) plus advanced policy, mTLS, observability.                                             |
+| 14 | **What's the Gateway API?**                                                        | The next-gen replacement for Ingress. More expressive, role-oriented (`GatewayClass`, `Gateway`, `HTTPRoute`). GA since 2023; still gaining adoption.                                                     |
+| 15 | **How do you do sticky sessions?**                                                 | NGINX annotations: `affinity: cookie`, `session-cookie-name`. Pins client to one backend pod via cookie.                                                                                                  |
+
+***
+
+### 💡 Senior Scenario Questions
+
+**Scenario 1: "Your Ingress returns 502 Bad Gateway. How do you debug?"**
+
+> Systematic approach:
+>
+> 1. **Verify backend Service**: `kubectl get svc -n <ns>`. Does the Service exist with the name referenced in Ingress?
+> 2. **Check Endpoints**: `kubectl get endpoints <svc-name>`. If empty → Service selector doesn't match any healthy pods. Pods may be unhealthy (readiness failing) or label mismatch.
+> 3. **Pod readiness**: `kubectl get pods -l <selector>`. Are they `Ready 1/1`?
+> 4. **Controller logs**: `kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller`. Look for upstream errors.
+> 5. **Test from inside cluster**: `kubectl run curl --image=curlimages/curl -it --rm -- curl http://api-svc.demo.svc.cluster.local`. If this also fails, problem is backend, not Ingress.
+> 6. **Check Ingress definition**: `kubectl describe ingress <name>`. Port number correct? Service name correct? Namespace match (Ingress and Service must be in same NS)?
+> 7. **NetworkPolicy blocking**: ingress controller might be denied from reaching the pods.
+> 8. **Resource limits**: backend pods OOMKilled? Check events.
+
+***
+
+**Scenario 2: "How would you implement zero-downtime deployment with Ingress for a blue-green release?"**
+
+> Multiple approaches:
+>
+> **Approach A — Service selector swap**:
+>
+> 1. Deploy `app-v2` Deployment alongside `app-v1`.
+> 2. Both have ClusterIP Services: `app-v1-svc` and `app-v2-svc`.
+> 3. Ingress points to a "production" Service whose `selector` decides who serves.
+> 4. To cut over: patch the Service selector from `version: v1` to `version: v2`. Instant cutover.
+>
+> **Approach B — NGINX canary with two Ingresses**:
+>
+> ```yaml
+> # Primary Ingress → v1
+> # Second Ingress with canary annotations → v2
+> annotations:
+>   nginx.ingress.kubernetes.io/canary: "true"
+>   nginx.ingress.kubernetes.io/canary-weight: "10"  # 10% to v2
+> ```
+>
+> Gradually shift from 10% → 50% → 100%.
+>
+> **Approach C — Argo Rollouts** (production gold standard):
+> Replace Deployment with Rollout CR. It manipulates Service selectors, runs analysis steps with Prometheus, auto-promotes or rolls back based on SLO metrics. Combine with Ingress for traffic shifting.
+
+***
+
+**Scenario 3: "Your team wants to expose 50 microservices to the internet on AKS. What's your architecture?"**
+
+> **Single Ingress Controller pattern**:
+>
+> 1. Deploy **NGINX Ingress** (or AGIC) backed by **one Standard SKU Azure Load Balancer**.
+> 2. All 50 microservices have ClusterIP Services.
+> 3. Each service has an Ingress resource (or one Ingress with 50 rules — split based on team ownership for RBAC).
+> 4. **cert-manager** + **Let's Encrypt DNS-01 challenge** for wildcard cert `*.api.example.com` or per-service certs.
+> 5. **External DNS operator** auto-syncs hostnames to Azure DNS.
+> 6. **Annotations** for rate limiting, WAF rules, IP allowlisting (per service).
+> 7. **Multi-zone HA**: 3+ Ingress Controller replicas across zones, with PodAntiAffinity.
+> 8. **Cost optimization**: 1 LB (~~$25/month) vs 50 (~~$1,250/month) — \~98% savings.
+> 9. **Observability**: NGINX metrics → Prometheus → Grafana for per-service traffic, error rates, latencies.
+> 10. **WAF**: either use AGIC + Application Gateway WAF, or ModSecurity in NGINX.
+
+***
+
+**Scenario 4: "How do you handle multi-tenancy with Ingress — different teams shouldn't see each other's Ingress configs?"**
+
+> Multi-layer:
+>
+> 1. **Namespace per team** — Ingress objects are namespaced. Team A's Ingress is in `team-a` namespace; can only reach Services in same namespace by default.
+> 2. **RBAC** — Roles allow `get/list/create/update/delete` on `ingresses` in their own namespace only.
+> 3. **OPA Gatekeeper / Kyverno policies** — enforce that Team A can only use hostnames matching `*.team-a.example.com`. Prevents Team A from claiming `team-b.example.com`.
+> 4. **IngressClass restriction** — Team A can only use `ingressClassName: team-a-nginx` (separate controller instance for sensitive workloads).
+> 5. **Shared controller, separate certs** — cert-manager `Certificate` resources are namespaced; each team manages their own.
+> 6. **Audit logging** for any Ingress create/update operations.
+
+***
+
+**Scenario 5: "Your Ingress was working yesterday, today suddenly all requests are 404. What changed?"**
+
+> Investigation:
+>
+> 1. **Recent changes?** Check Git history, ArgoCD/Flux sync logs.
+> 2. **`kubectl get ingress -A`** — does the Ingress still exist?
+> 3. **`kubectl describe ingress <name>`** — check Rules, are hostnames correct?
+> 4. **IngressClass missing or changed?** A common bug — if `ingressClassName` is removed or `IngressClass` deleted, the controller stops handling it.
+> 5. **Controller upgrade** — did NGINX upgrade overnight? Check version, breaking changes in annotations.
+> 6. **DNS** — did the hostname resolve elsewhere? `nslookup api.example.com`.
+> 7. **Certificate expiry** — for HTTPS, expired cert triggers connection failure (but usually shows in browser, not 404).
+> 8. **NGINX config errors** — `kubectl logs -n ingress-nginx ...` for syntax errors, often shown as `nginx: [emerg] ...`.
+> 9. **Service / Endpoints** — backend Service was deleted/renamed?
+> 10. **Common culprit**: annotations changed format between NGINX versions — `kubernetes.io/ingress.class` was deprecated in favor of `spec.ingressClassName`.
+
+***
+
+## 📊 Decision Matrix: Service vs Ingress vs Gateway API
+
+| Need                                                 | Use                                          |
+| ---------------------------------------------------- | -------------------------------------------- |
+| Expose one HTTP service externally, quickly          | LoadBalancer Service (dev) or Ingress (prod) |
+| Expose many HTTP services on one IP                  | **Ingress**                                  |
+| TLS termination                                      | **Ingress** + cert-manager                   |
+| TCP/UDP (databases, gRPC streaming)                  | **LoadBalancer Service**                     |
+| Path/host-based HTTP routing                         | **Ingress**                                  |
+| Advanced traffic management (mTLS, canary by header) | **Service Mesh** (Istio/Linkerd)             |
+| Future-proof, role-oriented routing                  | **Gateway API**                              |
+| Internal-only east-west routing                      | ClusterIP Services + DNS                     |
+
+***
+
+## 🧠 Production Best Practices
+
+✅ **Use cert-manager** + Let's Encrypt for automated TLS  
+✅ **Single Ingress Controller** with multiple Ingress resources — not multiple LBs  
+✅ **`force-ssl-redirect: true`** on all production Ingresses  
+✅ **Set `proxy-body-size`** appropriately (default 1m blocks uploads!)  
+✅ **Rate limiting** per Ingress to prevent DoS  
+✅ **WAF**: AGIC + Azure Application Gateway, or ModSecurity for NGINX  
+✅ **Multi-replica Ingress Controller** with PodAntiAffinity across nodes/zones  
+✅ **Monitor** controller metrics: `nginx_ingress_controller_requests`, error rates, p99 latency  
+✅ **HorizontalPodAutoscaler** on Ingress Controller for traffic spikes  
+✅ **`externalTrafficPolicy: Local`** on the controller Service to preserve client IPs  
+✅ **PodDisruptionBudget** so cluster ops don't kill all controller pods at once
+
+***
+
+# 🌐 Day 12: Kubernetes Networking Deep Dive
+
+Welcome to Day 12, Rajesh! Today is **the day** that separates Kubernetes users from Kubernetes engineers. Networking is the most-asked, least-understood topic in K8s interviews. By the end of today, you'll trace a packet from one pod to another across nodes, explain why every pod gets its own IP, and articulate the Kubernetes networking model better than 90% of candidates. This is **deep stuff** — let's go! 🚀
+
+***
+
+## 📚 Part 1: Theory — The K8s Networking Model
+
+### The 4 Fundamental Requirements
+
+Kubernetes mandates that any networking solution must satisfy these **4 rules** — no NAT, full reachability:
+
+```
+1️⃣  Pod-to-Pod (same node)        ← every pod gets a unique IP
+2️⃣  Pod-to-Pod (across nodes)     ← no NAT, direct reachability  
+3️⃣  Pod-to-Service                ← virtual IP, load-balanced
+4️⃣  External-to-Service           ← LoadBalancer, NodePort, Ingress
+```
+
+This is enforced by the **CNI (Container Network Interface)** plugin.
+
+***
+
+### 🎯 The 5 Networks in Every Cluster
+
+```
+┌────────────────────────────────────────────────────────┐
+│                  KUBERNETES CLUSTER                     │
+│                                                         │
+│  1. NODE NETWORK    (e.g., 10.0.0.0/16)                │
+│     The VNet your AKS/EKS nodes live in                │
+│                                                         │
+│  2. POD NETWORK     (e.g., 10.244.0.0/16)              │
+│     CIDR allocated to pods by the CNI                   │
+│                                                         │
+│  3. SERVICE NETWORK (e.g., 10.96.0.0/12)               │
+│     Virtual IPs for Services (ClusterIPs)              │
+│                                                         │
+│  4. CLUSTER DNS     (e.g., 10.96.0.10)                 │
+│     CoreDNS Service IP                                  │
+│                                                         │
+│  5. EXTERNAL        Public IPs, LoadBalancer endpoints │
+└────────────────────────────────────────────────────────┘
+```
+
+***
+
+### 🔌 CNI — The Container Network Interface
+
+**CNI** is a **specification** (not a tool) that defines how container runtimes set up networking. When kubelet creates a pod, it calls the CNI plugin which:
+
+1. Assigns the pod an **IP** from the cluster's pod CIDR
+2. Creates a **veth pair** (virtual ethernet) — one end in the pod's network namespace, the other on the host
+3. Configures **routing rules** so the pod can reach other pods, services, and the internet
+
+```
+┌──────── Node ─────────┐
+│                        │
+│  ┌──────┐  veth pair   │
+│  │ Pod  │═════════════════ cbr0/cni0 ────── eth0 ──→ network
+│  │ IP   │  (10.244.1.5)│   (bridge)         (10.0.0.5)
+│  └──────┘              │
+│                        │
+└────────────────────────┘
+```
+
+***
+
+### 🎭 Popular CNI Plugins Comparison
+
+| CNI                   | Approach                      | Pros                                         | Cons                               | Best For                     |
+| --------------------- | ----------------------------- | -------------------------------------------- | ---------------------------------- | ---------------------------- |
+| **Flannel**           | Overlay (VXLAN)               | Simplest, just works                         | No NetworkPolicy in basic mode     | Learning, small clusters     |
+| **Calico**            | Routing (BGP) + iptables/eBPF | Fast, mature, NetworkPolicy, eBPF dataplane  | Steeper learning curve             | Production, security-focused |
+| **Cilium**            | eBPF-native                   | Best perf, observability (Hubble), L7 policy | Newer, requires modern kernel      | Modern cloud-native          |
+| **Weave Net**         | Overlay + mesh routing        | Easy multi-cloud                             | Slower than Calico/Cilium          | Multi-cloud                  |
+| **Azure CNI**         | Native VNet                   | Pods get real VNet IPs (no overlay)          | Limited pods per node by VNet size | AKS production               |
+| **Azure CNI Overlay** | Overlay on AKS                | Scales to massive clusters                   | Pod IPs not VNet-routable          | AKS at scale                 |
+| **AWS VPC CNI**       | Native VPC                    | Pods get real VPC IPs                        | ENI limits per node                | EKS                          |
+
+***
+
+### 🏗️ Overlay vs Underlay — The Key Decision
+
+#### Overlay (Flannel, Calico VXLAN, Azure CNI Overlay)
+
+* Pod IPs live on a **virtual network** layered on top of node network
+* Traffic between nodes is **encapsulated** (VXLAN, IP-in-IP)
+* ✅ Easy to scale; doesn't require infrastructure changes
+* ❌ \~5–10% performance overhead from encapsulation
+
+#### Underlay (Calico BGP, Azure CNI native, AWS VPC CNI)
+
+* Pod IPs are **routable on the actual network**
+* ✅ Best performance, no encapsulation overhead
+* ✅ Direct visibility from outside (security tools, monitoring)
+* ❌ Requires IP space planning; harder to scale
+
+***
+
+### 🔄 kube-proxy Deep Dive
+
+`kube-proxy` runs as a **DaemonSet** on every node. Its job: implement the **Service abstraction** by programming the kernel's network rules.
+
+When you create a Service:
+
+1. K8s assigns a virtual IP (ClusterIP) from the service CIDR
+2. EndpointSlices track healthy backing pod IPs
+3. kube-proxy programs kernel rules so traffic to ClusterIP gets DNAT'd to a pod IP
+
+### kube-proxy Modes
+
+| Mode                          | How it Works             | Pros                                             | Cons                                         |
+| ----------------------------- | ------------------------ | ------------------------------------------------ | -------------------------------------------- |
+| **iptables** (default)        | Adds iptables NAT rules  | Stable, works everywhere                         | O(n) match — slow with thousands of services |
+| **IPVS**                      | Linux IPVS kernel module | O(1) lookup, more LB algorithms (rr, lc, dh, sh) | Requires kernel modules                      |
+| **nftables** (new, K8s 1.29+) | Replaces iptables        | Faster, modern                                   | Still maturing                               |
+| **userspace** (deprecated)    | Proxy in userspace       | —                                                | Slow, gone                                   |
+
+```powershell
+# Check current mode
+kubectl get configmap kube-proxy -n kube-system -o yaml | findstr mode
+```
+
+> 🎯 **Senior gotcha**: For clusters with **1000+ Services**, switch from iptables to IPVS. iptables matches rules **linearly**; with 5000 services, every packet walks through thousands of rules.
+
+***
+
+### 🌍 CoreDNS — Cluster DNS
+
+**CoreDNS** is the default DNS server in K8s (replaced kube-dns since 1.13). Runs as a Deployment in `kube-system`.
+
+Every pod gets `/etc/resolv.conf` pointing to CoreDNS's ClusterIP:
+
+```
+# Inside any pod:
+$ cat /etc/resolv.conf
+search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+```
+
+### DNS Records Created
+
+For a Service `web-svc` in namespace `prod`:
+
+| Query                                       | Resolves To              |
+| ------------------------------------------- | ------------------------ |
+| `web-svc` (same NS)                         | ClusterIP                |
+| `web-svc.prod`                              | ClusterIP                |
+| `web-svc.prod.svc.cluster.local` (FQDN)     | ClusterIP                |
+| `_http._tcp.web-svc.prod.svc.cluster.local` | SRV record (port + host) |
+
+For **headless Services** (Day 9 — StatefulSets):
+
+| Query                                  | Resolves To             |
+| -------------------------------------- | ----------------------- |
+| `web-svc.prod.svc.cluster.local`       | All pod IPs (A records) |
+| `web-0.web-svc.prod.svc.cluster.local` | Specific pod IP         |
+
+***
+
+### 🔍 The `ndots:5` Gotcha
+
+```
+options ndots:5
+```
+
+This means: **if the hostname has fewer than 5 dots, try search domains first**.
+
+```
+Query: api               → tries: api.default.svc.cluster.local → api.svc.cluster.local → api.cluster.local → api  (slow!)
+Query: api.prod          → tries: api.prod.default.svc... → api.prod.svc... → api.prod.cluster... → api.prod
+Query: api.example.com.  → tries: api.example.com. directly (trailing dot = FQDN, no search)
+```
+
+> 💡 **Production tip**: For external lookups, append a **trailing dot** or set `ndots:1` to avoid unnecessary lookups. Saves milliseconds and reduces CoreDNS load by 4x.
+
+***
+
+### 📡 The Pod-to-Pod DNS Resolution Flow
+
+This is **THE interview question**. Memorize this flow:
+
+```
+Pod-A (10.244.1.5) needs to talk to "web-svc" in another namespace
+│
+▼
+1. Pod-A's app calls: getaddrinfo("web-svc.prod")
+│
+▼
+2. resolv.conf says: ask 10.96.0.10 (CoreDNS ClusterIP)
+│
+▼
+3. DNS query packet: dst=10.96.0.10:53, src=10.244.1.5
+│
+▼
+4. Packet hits node's kernel — kube-proxy iptables rules DNAT it
+│  to one of CoreDNS pods (e.g., 10.244.0.20)
+│
+▼
+5. CoreDNS pod receives query, checks if "web-svc.prod" is a 
+│  K8s service → looks up EndpointSlices in etcd cache
+│
+▼
+6. Returns A record: "web-svc.prod" → 10.96.45.123 (ClusterIP)
+│
+▼
+7. Pod-A now opens TCP connection: dst=10.96.45.123:80
+│
+▼
+8. Packet hits kernel — kube-proxy's iptables rules DNAT
+│  10.96.45.123 → one of the backing pod IPs (e.g., 10.244.3.7)
+│
+▼
+9. Packet routed across CNI overlay/underlay to target node
+│
+▼
+10. Target node delivers packet to Pod-B at 10.244.3.7:80
+```
+
+***
+
+### 🛡️ NetworkPolicies — Firewall in Kubernetes
+
+By default, **all pods can talk to all pods** in K8s. This is dangerous! `NetworkPolicy` adds firewall rules:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-default
+  namespace: prod
+spec:
+  podSelector: {}              # applies to ALL pods in namespace
+  policyTypes:
+  - Ingress
+  - Egress
+  # No rules = deny all
+```
+
+> 🎯 **Senior insight**: NetworkPolicies need a CNI that supports them. **Flannel doesn't** (out of the box). Calico, Cilium, Azure CNI, Weave all do.
+
+We'll cover NetworkPolicies in depth on Day 13.
+
+***
+
+### 🌐 Container Network Anatomy
+
+When a pod starts, this happens on the node:
+
+```
+┌─────────────── Node ────────────────────────┐
+│                                              │
+│  ┌────── Pod (network namespace) ────┐      │
+│  │   ┌─────────┐                      │      │
+│  │   │ Container│  eth0 (10.244.1.5)  │      │
+│  │   └─────────┘   │                  │      │
+│  │                 │ veth pair         │      │
+│  │                 ├─ pause container  │      │
+│  └─────────────────┼───────────────────┘     │
+│                    │                          │
+│              veth-abc123 (host side)         │
+│                    │                          │
+│              ┌─────▼─────┐                   │
+│              │ cni0 bridge│  (or routes)    │
+│              └─────┬──────┘                  │
+│                    │                          │
+│                  eth0 (10.0.0.5)              │
+│                    │                          │
+└────────────────────┼──────────────────────────┘
+                     │
+                     ▼
+              ┌────────────┐
+              │  Network   │
+              └────────────┘
+```
+
+### The Pause Container (Hidden Gem)
+
+Every pod has a **hidden "pause" container** (`registry.k8s.io/pause:3.x`). It:
+
+* Holds the network namespace
+* Lets app containers join the namespace
+* Survives container restarts → pod IP doesn't change
+
+```powershell
+# See pause containers (on Minikube or any node access)
+docker ps | findstr pause
+```
+
+***
+
+### 🎯 Where K8s Networking Fits the OSI Model
+
+```
+┌──────────────────────────────────────────┐
+│ L7 (App)      │ Ingress, HTTP, gRPC      │
+├──────────────────────────────────────────┤
+│ L4 (Transport)│ Service, kube-proxy,     │
+│               │ TCP/UDP                  │
+├──────────────────────────────────────────┤
+│ L3 (Network)  │ CNI (Calico BGP, IP-IP)  │
+├──────────────────────────────────────────┤
+│ L2 (Data Link)│ CNI overlay (VXLAN),     │
+│               │ veth pairs               │
+└──────────────────────────────────────────┘
+```
+
+***
+
+## 🛠️ Part 2: Hands-On — Trace Packets in Your Cluster
+
+### Setup: Deploy Two Pods to Trace
+
+```yaml
+# 01-trace-setup.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: trace-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  namespace: trace-demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: server}
+  template:
+    metadata:
+      labels: {app: server}
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: server-svc
+  namespace: trace-demo
+spec:
+  selector: {app: server}
+  ports:
+  - port: 80
+    targetPort: 80
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: trace-demo
+spec:
+  containers:
+  - name: tools
+    image: nicolaka/netshoot:latest
+    command: ['sleep', '3600']
+```
+
+```powershell
+kubectl apply -f 01-trace-setup.yaml
+kubectl get pods,svc -n trace-demo -o wide
+```
+
+***
+
+### Lab 1: Inspect Cluster Network Configuration
+
+```powershell
+# Pod CIDR (where pods get IPs)
+kubectl cluster-info dump | findstr -i "cluster-cidr"
+
+# Service CIDR (where Services get virtual IPs)
+kubectl cluster-info dump | findstr -i "service-cluster-ip-range"
+
+# Per-node Pod CIDR allocation
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podCIDR}{"\n"}{end}'
+
+# CoreDNS info
+kubectl get svc -n kube-system kube-dns
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+
+# kube-proxy info
+kubectl get pods -n kube-system -l k8s-app=kube-proxy
+kubectl get cm -n kube-system kube-proxy -o yaml | findstr mode
+```
+
+***
+
+### Lab 2: Identify the CNI Plugin
+
+```powershell
+# Method 1: Check CNI config on a node (works on Minikube)
+minikube ssh
+sudo ls /etc/cni/net.d/
+sudo cat /etc/cni/net.d/*.conflist
+
+# Method 2: Look for CNI pods
+kubectl get pods -n kube-system -o wide | findstr -i "calico flannel cilium azure"
+
+# Method 3: Check for CNI-specific CRDs
+kubectl api-resources | findstr -i "calico cilium"
+```
+
+***
+
+### Lab 3: Trace DNS Resolution
+
+```powershell
+# Get into the netshoot client pod
+kubectl exec -n trace-demo -it client -- bash
+
+# Inside:
+cat /etc/resolv.conf
+# search trace-demo.svc.cluster.local svc.cluster.local cluster.local
+# nameserver 10.96.0.10
+# options ndots:5
+
+# Query CoreDNS directly
+nslookup server-svc
+nslookup server-svc.trace-demo.svc.cluster.local
+nslookup kubernetes.default
+
+# See ALL queries to CoreDNS
+nslookup -type=SRV _http._tcp.server-svc.trace-demo.svc.cluster.local
+
+# Use dig for detailed view
+dig server-svc.trace-demo.svc.cluster.local +trace
+
+# Time how long DNS takes
+time nslookup server-svc
+time nslookup google.com
+
+exit
+```
+
+***
+
+### Lab 4: Trace a Real Packet
+
+```powershell
+kubectl exec -n trace-demo -it client -- bash
+
+# Inside the client pod:
+# Get our IP
+ip addr show eth0
+# 10.244.x.x
+
+# Get the target service
+nslookup server-svc
+# server-svc.trace-demo.svc.cluster.local → 10.96.x.x (ClusterIP)
+
+# Get backing pod IPs
+nslookup server-svc      # returns ClusterIP
+kubectl exec -n trace-demo client -- nslookup -type=A server-svc
+
+# Watch a packet trip
+# Open 2 terminals — in one, run tcpdump on host or use ksniff plugin
+# In the other:
+curl -v http://server-svc/
+
+# See the path
+traceroute server-svc       # may not show much in overlay networks
+mtr server-svc
+
+exit
+```
+
+***
+
+### Lab 5: Inspect kube-proxy iptables Rules
+
+```powershell
+# SSH into a node (Minikube)
+minikube ssh
+
+# Look at iptables rules for the Service
+sudo iptables-save | grep -A 5 "server-svc"
+# You'll see:
+# -A KUBE-SERVICES -d 10.96.x.x/32 ... -j KUBE-SVC-XXXXX
+# -A KUBE-SVC-XXXXX ... -m statistic --mode random --probability 0.33 -j KUBE-SEP-AAA
+# -A KUBE-SVC-XXXXX ... -m statistic --mode random --probability 0.50 -j KUBE-SEP-BBB
+# -A KUBE-SVC-XXXXX ... -j KUBE-SEP-CCC
+
+# Each KUBE-SEP-XXX is a DNAT to a pod IP
+sudo iptables-save | grep "KUBE-SEP-AAA"
+# -A KUBE-SEP-AAA -p tcp -m tcp -j DNAT --to-destination 10.244.x.x:80
+
+# View the chain hierarchy
+sudo iptables -t nat -L KUBE-SERVICES -n | head -20
+
+exit
+```
+
+> 🎯 **Insight**: With 3 backend pods, you'll see 3 KUBE-SEP rules with random probabilities (0.33, 0.50, 1.0). That's how iptables does load balancing — sequential probability checks. This is why iptables mode doesn't scale to thousands of services.
+
+***
+
+### Lab 6: Compare iptables vs IPVS Modes
+
+```powershell
+# Check current mode
+kubectl get cm -n kube-system kube-proxy -o yaml | findstr mode
+
+# In IPVS mode, use ipvsadm instead
+minikube ssh
+sudo ipvsadm -L -n
+# Lists virtual servers (ClusterIPs) and real servers (pod IPs) with weight, conn count
+```
+
+***
+
+### Lab 7: CoreDNS Configuration & Performance
+
+```powershell
+# View CoreDNS config
+kubectl get cm coredns -n kube-system -o yaml
+
+# Look for the Corefile data section
+# .:53 {
+#     errors
+#     health
+#     ready
+#     kubernetes cluster.local in-addr.arpa ip6.arpa {
+#         pods insecure
+#         fallthrough in-addr.arpa ip6.arpa
+#     }
+#     prometheus :9153
+#     forward . /etc/resolv.conf
+#     cache 30
+#     loop
+#     reload
+#     loadbalance
+# }
+
+# Watch CoreDNS metrics
+kubectl get svc -n kube-system kube-dns
+kubectl port-forward -n kube-system svc/kube-dns 9153:9153
+# Browse to http://localhost:9153/metrics
+
+# DNS query latency from a pod
+kubectl exec -n trace-demo client -- bash -c "for i in 1 2 3; do time nslookup server-svc; done"
+```
+
+***
+
+### Lab 8: NodeLocal DNSCache (Production Optimization)
+
+NodeLocal DNSCache runs as a DaemonSet — pods talk to local cache instead of CoreDNS. Reduces DNS latency and load by \~80%.
+
+```powershell
+# Check if installed
+kubectl get pods -n kube-system | findstr node-local-dns
+
+# If on AKS, can be enabled with:
+# az aks enable-addons --addons azure-keyvault-secrets-provider,confcom -g <rg> -n <aks>
+# OR via cluster creation flag
+
+# View resolv.conf on a pod with NodeLocal DNSCache enabled
+kubectl exec -n trace-demo client -- cat /etc/resolv.conf
+# nameserver 169.254.20.10  ← node-local cache (instead of CoreDNS ClusterIP)
+```
+
+***
+
+### Lab 9: Trace a Cross-Node Packet (Advanced)
+
+```powershell
+# Find two pods on different nodes
+kubectl get pods -n trace-demo -o wide
+
+# Get the client pod's node and server pod's node
+$clientNode = kubectl get pod client -n trace-demo -o jsonpath='{.spec.nodeName}'
+$serverPod = kubectl get pods -n trace-demo -l app=server -o jsonpath='{.items[0].metadata.name}'
+$serverNode = kubectl get pod $serverPod -n trace-demo -o jsonpath='{.spec.nodeName}'
+
+Write-Host "Client on $clientNode → Server on $serverNode"
+
+# From client, hit the specific pod IP
+$serverPodIP = kubectl get pod $serverPod -n trace-demo -o jsonpath='{.status.podIP}'
+kubectl exec -n trace-demo client -- curl -s http://$serverPodIP
+
+# On the server node (Minikube)
+minikube ssh
+sudo tcpdump -i any -nn host $serverPodIP and port 80 -c 5
+# (re-run the curl from the client pod)
+exit
+```
+
+***
+
+### Lab 10: Network Performance Test
+
+```powershell
+# Deploy iperf3 server
+$iperfYaml = @"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: iperf-server
+  namespace: trace-demo
+  labels: {app: iperf-server}
+spec:
+  containers:
+  - name: iperf
+    image: networkstatic/iperf3
+    args: ['-s']
+    ports:
+    - containerPort: 5201
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iperf-svc
+  namespace: trace-demo
+spec:
+  selector: {app: iperf-server}
+  ports:
+  - port: 5201
+    targetPort: 5201
+"@
+$iperfYaml | kubectl apply -f -
+
+# Run iperf3 client
+kubectl run -n trace-demo iperf-client --rm -it --image=networkstatic/iperf3 -- -c iperf-svc -t 10
+
+# Compare: same node vs different node (use nodeSelector to force placement)
+```
+
+***
+
+## 💻 Part 3: Commands Cheat Sheet
+
+### Inspect Networking
+
+```powershell
+# Cluster CIDRs
+kubectl cluster-info dump | findstr -i "cidr"
+
+# Per-node Pod CIDR
+kubectl get nodes -o custom-columns=NAME:.metadata.name,POD_CIDR:.spec.podCIDR
+
+# Pod IPs
+kubectl get pods -A -o wide
+
+# Service IPs
+kubectl get svc -A -o wide
+
+# Endpoints
+kubectl get endpoints -A
+kubectl get endpointslices -A
+
+# CNI info
+kubectl get pods -n kube-system | findstr -i "calico cilium flannel azure"
+kubectl get crds | findstr -i "calico cilium"
+
+# CoreDNS
+kubectl get svc -n kube-system kube-dns
+kubectl get cm coredns -n kube-system
+kubectl logs -n kube-system -l k8s-app=kube-dns
+
+# kube-proxy
+kubectl get ds -n kube-system kube-proxy
+kubectl get cm kube-proxy -n kube-system -o yaml | findstr mode
+kubectl logs -n kube-system -l k8s-app=kube-proxy
+```
+
+### Debug from Inside a Pod
+
+```powershell
+# Quick netshoot pod
+kubectl run debug --image=nicolaka/netshoot -it --rm --restart=Never -- bash
+
+# Inside:
+# ─── DNS ───
+nslookup <service>
+dig <service>.<namespace>.svc.cluster.local
+host <service>
+
+# ─── Connectivity ───
+curl -v http://<service>
+nc -zv <service> 80
+telnet <service> 80
+ping <pod-ip>           # may not work — CNI dependent
+
+# ─── Network namespace ───
+ip addr
+ip route
+ip neigh
+ss -tnp                 # listening sockets
+ss -ant                 # active connections
+
+# ─── Trace ───
+traceroute <target>
+mtr <target>
+tcpdump -i any -nn
+```
+
+### Debug from a Node
+
+```powershell
+# Iptables (kube-proxy iptables mode)
+iptables-save | grep KUBE-SERVICES
+iptables -t nat -L KUBE-SERVICES -n
+iptables -t nat -L KUBE-SVC-XXXXX -n
+
+# IPVS (kube-proxy IPVS mode)
+ipvsadm -L -n
+ipvsadm -L -n -t <ClusterIP>:80
+
+# CNI
+ls /etc/cni/net.d/
+cat /etc/cni/net.d/*.conflist
+
+# Interfaces
+ip addr | grep -E "cni|veth|calico|flannel"
+```
+
+***
+
+## 🎤 Part 4: Interview Prep
+
+### ⭐ Star Question: *"Walk through how a Pod resolves another Pod's DNS name."*
+
+**Senior DevOps model answer:**
+
+> "Let me walk through the complete journey of a DNS query — say `Pod-A` (in namespace `default`) calling `web-svc.prod` — touching every component along the way.
+>
+> **Step 1 — The application calls a DNS function.** Code like `connect('web-svc.prod', 80)` triggers the libc resolver, which reads `/etc/resolv.conf`. In every K8s pod, that file is injected by kubelet with three things: a `nameserver` pointing to CoreDNS's ClusterIP (typically `10.96.0.10`), a `search` list of suffixes (`default.svc.cluster.local`, `svc.cluster.local`, `cluster.local`), and an `options ndots:5` setting.
+>
+> **Step 2 — `ndots` logic kicks in.** Because `web-svc.prod` has only 1 dot (less than 5), the resolver tries the **search domains first**. So it first attempts `web-svc.prod.default.svc.cluster.local` (NXDOMAIN — wrong namespace), then `web-svc.prod.svc.cluster.local` (HIT!). This is why I often advise developers to use FQDNs with a trailing dot for external lookups — it skips this expensive search.
+>
+> **Step 3 — The DNS query packet leaves the pod.** Source: `Pod-A`'s IP, destination: `10.96.0.10:53` (CoreDNS ClusterIP). The packet enters the node's kernel network stack.
+>
+> **Step 4 — kube-proxy's iptables/IPVS rules DNAT the destination.** `10.96.0.10` isn't a real IP — it's a virtual IP backed by EndpointSlices. The kernel rewrites the destination to one of the actual CoreDNS pod IPs, say `10.244.0.20`. Load balancing happens here — random in iptables mode, weighted in IPVS mode.
+>
+> **Step 5 — Packet routes via CNI to the CoreDNS pod.** Depending on the CNI plugin, this might be a VXLAN-encapsulated overlay packet (Flannel), a directly routed packet (Calico BGP), or a native VNet packet (Azure CNI). On the destination node, the CNI delivers the packet to CoreDNS through its veth pair.
+>
+> **Step 6 — CoreDNS resolves the query.** It checks if `web-svc.prod.svc.cluster.local` matches any K8s resource via the `kubernetes` plugin. It queries its in-memory cache (synced from etcd via the API server). Finding the Service, it returns an A record with the ClusterIP, say `10.96.45.123`. Importantly, this is a **virtual IP**, not a real one.
+>
+> **Step 7 — Pod-A now opens a TCP connection** to `10.96.45.123:80`. Same flow as before: packet enters the kernel, hits kube-proxy's iptables/IPVS rules. The rules see `10.96.45.123` is the ClusterIP for `web-svc`, look up the EndpointSlice, pick one of the backing pod IPs (e.g., `10.244.3.7`), and DNAT the destination.
+>
+> **Step 8 — Cross-node delivery via CNI.** The packet now has destination `10.244.3.7`. The CNI plugin's routing tables know which node owns that CIDR range, and the packet is forwarded — encapsulated or directly routed — to the right node.
+>
+> **Step 9 — Delivery to the target pod.** The destination node's CNI delivers the packet through the veth pair into the pod's network namespace. The app's listener accepts the connection.
+>
+> **A few production gotchas I always mention**:
+>
+> * **DNS is a hidden performance bottleneck**. With ndots:5 and 4 search domains, every external lookup does 5 queries. NodeLocal DNSCache solves this by running a per-node DNS cache as a DaemonSet, reducing CoreDNS load by 80% and DNS latency to sub-millisecond.
+> * **`headless Services` skip steps 4 and 7** — DNS returns pod IPs directly instead of a ClusterIP. Used heavily by StatefulSets for stable per-pod DNS.
+> * **`ExternalName` Services** are pure DNS CNAMEs — no proxying, no load balancing, just CoreDNS returning the external name.
+> * **The CNI plugin matters massively**. Calico in BGP mode performs better than Flannel VXLAN because there's no encapsulation. Cilium with eBPF can bypass kube-proxy entirely, replacing iptables with eBPF programs for 10x performance.
+> * **NetworkPolicies are enforced at the CNI layer** — Flannel can't enforce them by itself; you need Calico, Cilium, or Azure CNI.
+>
+> That's the full path — DNS resolution + Service load balancing + CNI routing, all working together to make `web-svc.prod` reachable from any pod in the cluster."
+
+***
+
+### 🔥 Common Follow-Ups
+
+| #  | Question                                                  | Quick Answer                                                                                                                                                               |
+| -- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1  | **What are the 4 K8s networking requirements?**           | Pod-to-Pod (same node), Pod-to-Pod (across nodes), Pod-to-Service, External-to-Service. All without NAT inside the cluster.                                                |
+| 2  | **What is CNI?**                                          | Container Network Interface — a spec (not a tool) for how runtimes set up pod networking. Plugins: Calico, Flannel, Cilium, Azure CNI.                                     |
+| 3  | **Difference between overlay and underlay networks?**     | Overlay encapsulates pod traffic (VXLAN, IP-in-IP) — easy, \~5–10% overhead. Underlay routes pod IPs natively (BGP, Azure CNI) — faster, requires IP planning.             |
+| 4  | **What does kube-proxy actually do?**                     | Programs kernel networking rules (iptables/IPVS/nftables) to implement Service virtual IPs. Doesn't proxy traffic itself — kernel does.                                    |
+| 5  | **iptables vs IPVS — when to use IPVS?**                  | IPVS: better perf with thousands of services (O(1) vs O(n)), more LB algorithms. Switch when you have 1000+ services.                                                      |
+| 6  | **What's the pause container?**                           | Tiny container in every pod that holds the network namespace. Lets pod IPs survive container restarts.                                                                     |
+| 7  | **Why does every pod have its own IP?**                   | K8s networking model mandates flat networking — no NAT, no port mapping headaches. Makes microservice communication identical to traditional VMs.                          |
+| 8  | **What's CoreDNS?**                                       | Default cluster DNS (replaced kube-dns in 1.13). Resolves Service names, headless pod names, external lookups via forward plugin.                                          |
+| 9  | **What is ndots:5?**                                      | resolv.conf option — hostnames with fewer than 5 dots try search domains first. Causes extra DNS queries for external lookups.                                             |
+| 10 | **What's NodeLocal DNSCache?**                            | DaemonSet that caches DNS per node — pods talk to `169.254.20.10`. Reduces CoreDNS load and DNS latency by \~80%.                                                          |
+| 11 | **How does a headless Service differ from regular?**      | `clusterIP: None`. DNS returns all pod IPs directly (A records), not a load-balanced virtual IP. Used by StatefulSets.                                                     |
+| 12 | **What happens if CoreDNS crashes?**                      | New DNS lookups fail; pods using cached entries keep working briefly. Existing TCP connections survive (they use IPs, not names). Critical reason for HA CoreDNS replicas. |
+| 13 | **Can pods on different nodes ping each other directly?** | Yes — that's a K8s networking requirement. The CNI plugin ensures pod IPs are routable cluster-wide.                                                                       |
+| 14 | **What's a NetworkPolicy?**                               | Firewall rules for pod traffic. Requires a CNI that supports them (Calico, Cilium, Azure CNI — NOT basic Flannel).                                                         |
+| 15 | **How does Cilium with eBPF differ from kube-proxy?**     | Cilium can fully replace kube-proxy. Instead of iptables, it loads eBPF programs into the kernel for L3-L7 filtering and load balancing — 10x faster at scale.             |
+| 16 | **What is the service CIDR?**                             | The IP range used by ClusterIPs (default `10.96.0.0/12`). Disjoint from pod CIDR. Configured at cluster creation.                                                          |
+| 17 | **How do pods reach the internet?**                       | Outbound traffic from pod → SNAT'd at the node (using node's IP) → routed to internet. In cloud, often via NAT Gateway.                                                    |
+| 18 | **What's MTU and why does it matter in K8s?**             | Maximum Transmission Unit. Overlay networks reduce effective MTU (VXLAN headers eat \~50 bytes). Miscounted MTU causes silent packet drops or fragmentation.               |
+
+***
+
+### 💡 Senior Scenario Questions
+
+**Scenario 1: "Your pod can't reach a Service. Walk through how you debug."**
+
+> Methodical approach:
+>
+> 1. **Verify Service exists**: `kubectl get svc -n <ns>`. Right name, right namespace?
+> 2. **Check Endpoints**: `kubectl get endpoints <svc-name>`. If empty → selector doesn't match any pod, OR pods are not Ready.
+> 3. **Check pod labels**: `kubectl get pods -l <selector>`. Mismatched labels are the #1 cause.
+> 4. **DNS test from inside the cluster**: `kubectl run debug --image=nicolaka/netshoot -it --rm -- nslookup <svc>`. NXDOMAIN? FQDN vs short name issue.
+> 5. **CoreDNS health**: `kubectl get pods -n kube-system -l k8s-app=kube-dns` — all Ready? `kubectl logs -n kube-system -l k8s-app=kube-dns` for errors.
+> 6. **Direct connection test**: `curl http://<ClusterIP>:<port>` — bypasses DNS.
+> 7. **Pod IP direct**: `curl http://<pod-ip>:<port>` — bypasses Service entirely. If this works but ClusterIP doesn't, kube-proxy issue.
+> 8. **kube-proxy logs**: `kubectl logs -n kube-system -l k8s-app=kube-proxy`.
+> 9. **NetworkPolicy?** `kubectl get netpol -A` — accidentally blocking traffic?
+> 10. **MTU mismatch** — check `ip link show` on nodes. If overlay MTU > underlay MTU, packets silently dropped.
+
+***
+
+**Scenario 2: "DNS lookups in your AKS cluster are taking 2–5 seconds. How do you fix?"**
+
+> Likely causes & fixes:
+>
+> 1. **ndots:5 amplification** — every external lookup is 5 queries (4 search domains + actual). Solution: use FQDN with trailing dot, or set `dnsConfig` in pods to override ndots.
+> 2. **CoreDNS overloaded** — `kubectl top pods -n kube-system | grep dns`. Scale up replicas, increase CPU limits, enable autoscaling.
+> 3. **No NodeLocal DNSCache** — install it. Pods then query `169.254.20.10` (per-node cache) instead of CoreDNS Service IP. Cuts DNS load 80%.
+> 4. **CoreDNS upstream slow** — check `forward . /etc/resolv.conf` in Corefile. Replace with explicit `forward . 168.63.129.16` (Azure DNS).
+> 5. **Negative caching too aggressive** — tune `cache 30` in Corefile (TTL for negative responses).
+> 6. **DNS spoofing/loop** — check for `loop` plugin detecting loops.
+> 7. **conntrack table full** — `dmesg | grep conntrack`. Increase `net.netfilter.nf_conntrack_max`.
+> 8. **Monitor**: Prometheus metrics `coredns_dns_request_duration_seconds`, `coredns_cache_hits_total`.
+
+***
+
+**Scenario 3: "Pods in `team-a` namespace can't reach pods in `team-b`. We just installed Calico. What did we miss?"**
+
+> Likely cause: **NetworkPolicy applied somewhere**. Calico installs the enforcement engine — if NetworkPolicies exist, they're now enforced.
+>
+> Debug:
+>
+> 1. `kubectl get netpol -A` — list all policies.
+> 2. Look for `deny-all` defaults in `team-a` or `team-b`.
+> 3. If `team-b` has a default-deny on Ingress, `team-a` pods are blocked.
+> 4. Add explicit allow rule:
+>    ```yaml
+>    apiVersion: networking.k8s.io/v1
+>    kind: NetworkPolicy
+>    metadata:
+>      name: allow-team-a
+>      namespace: team-b
+>    spec:
+>      podSelector: {}
+>      ingress:
+>      - from:
+>        - namespaceSelector:
+>            matchLabels: {team: a}
+>    ```
+> 5. Test with `kubectl exec` + `curl` from team-a pod.
+> 6. Use Calico's `calicoctl get policies` for detailed view.
+
+***
+
+**Scenario 4: "Your AKS cluster's pods can reach external internet but not Azure VNet peer."**
+
+> Investigation:
+>
+> 1. **Azure CNI vs Kubenet/Overlay** — if using Kubenet, pod IPs are NAT'd to the node's IP for outbound. Peer VNet sees node IPs, not pod IPs. Some peer firewalls reject this.
+> 2. **Effective routes**: in AKS Kubenet, an Azure route table is auto-managed. Confirm it's attached to the VNet.
+> 3. **UDR (User-Defined Route)** — does a custom route table override system routes?
+> 4. **NSG rules** on the AKS subnet or peer VNet subnet. Check both inbound and outbound rules.
+> 5. **VNet peering settings** — is `Forwarded traffic` allowed? Is `Use remote gateways` set correctly?
+> 6. **Firewall in between** — Azure Firewall or NVA in transit VNet?
+> 7. Fix: switch to Azure CNI for direct pod IPs in VNet; or whitelist node CIDR in firewall.
+
+***
+
+**Scenario 5: "Your cluster has 5000 Services and pod-to-Service latency is high."**
+
+> Root cause: **iptables mode kube-proxy** doesn't scale. Each Service adds \~5 rules; 5000 services = 25,000+ rules walked linearly per packet.
+>
+> Solutions:
+>
+> 1. **Switch to IPVS mode**:
+>    ```powershell
+>    kubectl edit cm kube-proxy -n kube-system
+>    # mode: "ipvs"
+>    kubectl rollout restart ds kube-proxy -n kube-system
+>    ```
+>    IPVS uses hash tables — O(1) lookups.
+> 2. **Switch to nftables mode** (K8s 1.29+, GA in newer releases).
+> 3. **Move to Cilium** with kube-proxy replacement — uses eBPF, even faster.
+> 4. **Reduce service count** — do you really need 5000? Maybe consolidate.
+> 5. **Tune conntrack**: `sysctl -w net.netfilter.nf_conntrack_max=2097152` on nodes.
+
+***
+
+## 📊 CNI Decision Matrix
+
+| Need                              | Pick                                   |
+| --------------------------------- | -------------------------------------- |
+| Learning K8s, simplest setup      | **Flannel**                            |
+| Production, NetworkPolicy, mature | **Calico**                             |
+| Best perf, observability, eBPF    | **Cilium**                             |
+| AKS with VNet integration         | **Azure CNI (native)**                 |
+| AKS at massive scale              | **Azure CNI Overlay**                  |
+| EKS, AWS-native                   | **AWS VPC CNI**                        |
+| GKE                               | **GKE-native (Dataplane V2 = Cilium)** |
+| Multi-cloud / hybrid              | **Calico** or **Cilium**               |
+| On-prem, BGP-friendly             | **Calico BGP**                         |
+
+***
 
