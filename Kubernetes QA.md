@@ -787,4 +787,299 @@ After this, all `kubectl` commands will apply to that namespace unless overridde
 
 ---
 
+Here's a detailed breakdown of these Kubernetes fundamentals, structured for interview prep with practical context. 🚀
+
+## 1. What is Kubernetes?
+
+Kubernetes (often abbreviated **K8s**) is an **open-source container orchestration platform** originally developed by Google and now maintained by the Cloud Native Computing Foundation (CNCF). It automates the **deployment, scaling, healing, and management** of containerized applications across a cluster of machines.
+
+**Key value propositions:**
+
+* **Self-healing** – restarts failed containers, reschedules them on healthy nodes, and kills unresponsive ones.
+* **Horizontal scaling** – scale apps up/down manually or automatically based on CPU/memory or custom metrics.
+* **Service discovery & load balancing** – exposes containers via DNS names and distributes traffic.
+* **Automated rollouts & rollbacks** – progressive deployments with the ability to revert on failure.
+* **Declarative configuration** – you describe the *desired state* in YAML, and Kubernetes continuously reconciles the *actual state* to match it.
+
+> **Interview tip:** Emphasize the **declarative + reconciliation loop** concept — it's the heart of how Kubernetes works.
+
+***
+
+## 2. Architecture of Kubernetes
+
+Kubernetes follows a **master–worker (control plane + data plane)** architecture.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     CONTROL PLANE                         │
+│  ┌────────────┐  ┌──────┐  ┌────────────┐  ┌──────────┐  │
+│  │kube-apiserver│ │ etcd │  │  scheduler │  │controller│  │
+│  └────────────┘  └──────┘  └────────────┘  │ manager  │  │
+│                                            └──────────┘  │
+└─────────────────────────────────────────────────────────┘
+                          │  (API)
+        ┌─────────────────┼─────────────────┐
+        ▼                 ▼                 ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  WORKER NODE │  │  WORKER NODE │  │  WORKER NODE │
+│ ┌─────────┐  │  │ ┌─────────┐  │  │ ┌─────────┐  │
+│ │ kubelet │  │  │ │ kubelet │  │  │ │ kubelet │  │
+│ │kube-proxy│ │  │ │kube-proxy│ │  │ │kube-proxy│ │
+│ │ runtime │  │  │ │ runtime │  │  │ │ runtime │  │
+│ │  Pods   │  │  │ │  Pods   │  │  │ │  Pods   │  │
+│ └─────────┘  │  │ └─────────┘  │  │ └─────────┘  │
+└──────────────┘  └──────────────┘  └──────────────┘
+```
+
+* **Control Plane** – the "brain" that makes global decisions (scheduling, detecting/responding to events).
+* **Worker Nodes** – the "muscle" where your actual application Pods run.
+
+***
+
+## 3. What is a Kubernetes Cluster?
+
+A **Kubernetes cluster** is a set of machines (physical or virtual) that work together to run containerized workloads. It consists of:
+
+| Component                           | Role                                              |
+| ----------------------------------- | ------------------------------------------------- |
+| **At least one Control Plane node** | Manages cluster state and orchestration decisions |
+| **One or more Worker nodes**        | Run the application Pods                          |
+
+The cluster is the **fundamental unit of Kubernetes**. When you `kubectl apply` a manifest, you are telling the cluster your desired state, and the cluster collectively works to achieve it. In production, you typically run **multiple control-plane nodes** (HA setup) to avoid a single point of failure.
+
+***
+
+## 4. Components of the Kubernetes Control Plane
+
+The control plane comprises these core components:
+
+1. **kube-apiserver** – the front door / API gateway to the cluster.
+2. **etcd** – the distributed key-value store (source of truth).
+3. **kube-scheduler** – assigns Pods to nodes.
+4. **kube-controller-manager** – runs controller loops that reconcile state.
+5. **cloud-controller-manager** – integrates with the underlying cloud provider.
+
+> Together these ensure the **desired state** stored in etcd is continuously enforced across the cluster.
+
+***
+
+## 5. Role of the kube-apiserver
+
+The **kube-apiserver** is the **central management hub** and the **only component that talks directly to etcd**.
+
+**Key functions:**
+
+* Exposes the **Kubernetes REST API** (what `kubectl`, controllers, and kubelets talk to).
+* **Authentication, authorization (RBAC), and admission control** for every request.
+* **Validates** and processes API objects (Pods, Services, Deployments).
+* Acts as the **communication hub** — all components interact *through* the API server, never directly with each other.
+
+```bash
+# Every kubectl command hits the apiserver
+kubectl get pods        # → GET request to kube-apiserver
+kubectl apply -f app.yaml  # → POST/PATCH to kube-apiserver
+```
+
+> **Interview tip:** It's **stateless and horizontally scalable** — you can run multiple replicas behind a load balancer for HA.
+
+***
+
+## 6. Function of etcd in Kubernetes
+
+**etcd** is a **consistent, distributed, highly-available key-value store** that serves as the **single source of truth** for the entire cluster.
+
+**What it stores:**
+
+* All cluster state and configuration (Pods, Services, ConfigMaps, Secrets, node info, etc.).
+* The **desired state** and **current state** of every object.
+
+**Key characteristics:**
+
+* Uses the **Raft consensus algorithm** for consistency across replicas.
+* Should be deployed in an **odd number** (3, 5) for quorum.
+* **Critical to back up** — losing etcd means losing your cluster state.
+
+```bash
+# Back up etcd (essential for disaster recovery)
+ETCDCTL_API=3 etcdctl snapshot save snapshot.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+```
+
+> **Interview tip:** A common real-world question is *"How do you back up and restore a cluster?"* → answer with etcd snapshots.
+
+***
+
+## 7. Role of the kube-scheduler
+
+The **kube-scheduler** watches for **newly created Pods that have no node assigned** and selects the best node for them to run on.
+
+**Two-phase decision process:**
+
+1. **Filtering (Predicates)** – eliminates nodes that can't run the Pod (insufficient CPU/memory, taints, node selectors not matching).
+2. **Scoring (Priorities)** – ranks the remaining feasible nodes and picks the highest-scoring one.
+
+**Factors it considers:**
+
+* Resource requests/limits, node affinity/anti-affinity, taints & tolerations, data locality, and inter-Pod affinity.
+
+> Note: The scheduler only **decides** placement — the **kubelet** on the chosen node actually starts the Pod.
+
+***
+
+## 8. What is the kube-controller-manager?
+
+The **kube-controller-manager** is a single binary that runs multiple **controller loops**, each continuously watching the cluster state and working to move the *current state* toward the *desired state*.
+
+**Key built-in controllers:**
+
+| Controller                    | Responsibility                             |
+| ----------------------------- | ------------------------------------------ |
+| **Node Controller**           | Monitors node health; marks nodes NotReady |
+| **ReplicaSet Controller**     | Ensures the correct number of Pod replicas |
+| **Deployment Controller**     | Manages rollouts/rollbacks                 |
+| **Job Controller**            | Runs Pods for batch jobs to completion     |
+| **Endpoints Controller**      | Populates Service endpoints                |
+| **ServiceAccount Controller** | Creates default accounts/tokens            |
+
+> **Interview tip:** Explain the **reconciliation loop**: *observe → compare desired vs actual → act → repeat*.
+
+***
+
+## 9. Purpose of the cloud-controller-manager
+
+The **cloud-controller-manager (CCM)** embeds **cloud-provider-specific control logic**, decoupling it from the core Kubernetes code. This lets cloud vendors (Azure, AWS, GCP) evolve their integrations independently.
+
+**Controllers it runs:**
+
+* **Node Controller** – checks the cloud provider to determine if a deleted node still exists.
+* **Route Controller** – configures network routes in the cloud infrastructure.
+* **Service Controller** – creates/manages cloud **load balancers** when you deploy a `Service` of type `LoadBalancer`.
+
+> **Real-world example:** On **Azure AKS**, when you create a `LoadBalancer` service, the CCM provisions an **Azure Load Balancer** and assigns a public IP automatically. In an on-prem cluster, this component isn't used.
+
+***
+
+## 10. Role of the kubelet
+
+The **kubelet** is the **primary node agent** that runs on **every worker node**. It's the bridge between the control plane and the container runtime.
+
+**Key responsibilities:**
+
+* Registers the node with the API server.
+* Receives **PodSpecs** and ensures the described containers are **running and healthy**.
+* Runs **liveness, readiness, and startup probes**.
+* Reports node and Pod status back to the API server.
+* Mounts volumes, pulls secrets, and interacts with the container runtime via **CRI (Container Runtime Interface)**.
+
+> **Interview tip:** The kubelet only manages containers created by Kubernetes — it does **not** manage arbitrary containers on the host.
+
+***
+
+## 11. Function of kube-proxy
+
+**kube-proxy** is a network component running on **each node** that maintains network rules to enable **Service communication** and load balancing.
+
+**How it works:**
+
+* Watches the API server for **Service** and **Endpoint** changes.
+* Programs the node's networking (via **iptables** or **IPVS** mode) to route traffic destined for a Service's virtual IP (ClusterIP) to one of the backing Pods.
+* Provides **basic L4 (TCP/UDP) load balancing** across Pod replicas.
+
+```bash
+# A Service's ClusterIP is virtual — kube-proxy makes it work
+kubectl get svc my-app
+# NAME      TYPE        CLUSTER-IP      PORT(S)
+# my-app    ClusterIP   10.96.145.22    80/TCP
+# Traffic to 10.96.145.22:80 → distributed to healthy Pods
+```
+
+> **Interview tip:** **IPVS mode** scales better than iptables for clusters with thousands of Services.
+
+***
+
+## 12. Role of a Pod in Kubernetes
+
+A **Pod** is the **smallest deployable unit** in Kubernetes. It's a wrapper around **one or more containers** that share:
+
+* The same **network namespace** (same IP address & port space — containers communicate via `localhost`).
+* The same **storage volumes**.
+* The same **lifecycle** (created and destroyed together).
+
+**Key points:**
+
+* Most Pods run a **single container**; multi-container Pods use the **sidecar pattern** (e.g., a logging agent alongside the main app).
+* Pods are **ephemeral** — they get a new IP when recreated, which is why you use **Services** for stable networking.
+* You rarely create Pods directly; you use controllers like **Deployments** that manage Pods for you.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-pod
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+    ports:
+    - containerPort: 80
+```
+
+***
+
+## 13. How do Namespaces work in Kubernetes?
+
+**Namespaces** provide a mechanism to **logically partition a single cluster** into multiple virtual clusters. They enable **multi-tenancy** and resource isolation.
+
+**Use cases:**
+
+* Separate **environments** (dev, staging, prod) in one cluster.
+* Isolate **teams or projects**.
+* Apply **ResourceQuotas** and **LimitRanges** per namespace.
+* Scope **RBAC permissions** to specific namespaces.
+
+**Default namespaces:**
+
+| Namespace         | Purpose                            |
+| ----------------- | ---------------------------------- |
+| `default`         | Where objects go if none specified |
+| `kube-system`     | Kubernetes system components       |
+| `kube-public`     | Publicly readable resources        |
+| `kube-node-lease` | Node heartbeat lease objects       |
+
+```bash
+kubectl create namespace dev
+kubectl get pods -n dev
+kubectl apply -f app.yaml -n dev
+```
+
+> **Important:** Not all objects are namespaced — cluster-scoped objects like **Nodes**, **PersistentVolumes**, and **ClusterRoles** live outside namespaces.
+
+***
+
+## 14. Role of the Container Runtime in Kubernetes
+
+The **container runtime** is the software responsible for **actually running the containers** on each node. Kubernetes doesn't run containers itself — it delegates this to a runtime via the **CRI (Container Runtime Interface)**.
+
+**Responsibilities:**
+
+* Pulling container images from registries.
+* Creating, starting, stopping, and deleting containers.
+* Managing container isolation, resources, and lifecycle.
+
+**Common runtimes:**
+
+| Runtime                 | Notes                                                                                          |
+| ----------------------- | ---------------------------------------------------------------------------------------------- |
+| **containerd**          | Most widely used; default in most clusters (incl. AKS)                                         |
+| **CRI-O**               | Lightweight, purpose-built for Kubernetes                                                      |
+| **Docker (dockershim)** | **Removed in Kubernetes v1.24+** — Docker images still work, but the runtime is now containerd |
+
+> **Interview tip:** A very common question — *"What happened to Docker in Kubernetes?"* → Explain the **dockershim deprecation** (removed in v1.24). Docker-built images (OCI-compliant) still run fine; only the runtime shim was removed.
+
+***
+
+
 
