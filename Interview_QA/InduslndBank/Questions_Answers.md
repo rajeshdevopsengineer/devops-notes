@@ -1026,3 +1026,456 @@ helm secrets install myapp ./mychart -f secrets.yaml
 - Or integrate with **Sealed Secrets** or **External Secrets Operator**.
 
 ---
+# IaC & Terraform Interview Questions — Answers (101–120)
+
+Here's your next set, Rajesh — architect-level answers written to be interview-ready, with practical context and examples where they add value.
+
+***
+
+### 101. What is Infrastructure as Code (IaC)?
+
+IaC is the practice of **provisioning and managing infrastructure through machine-readable definition files** rather than manual console clicks or ad-hoc scripts. Infrastructure (VMs, networks, load balancers, DNS, IAM) is described in code, version-controlled in Git, peer-reviewed, and applied through automation.
+
+**Key benefits:**
+
+* **Repeatability & consistency** — the same code produces identical environments (dev/test/prod), eliminating configuration drift.
+* **Version control & auditability** — every change is tracked, reviewable, and reversible.
+* **Speed & scalability** — spin up entire environments in minutes.
+* **Disaster recovery** — rebuild infrastructure from source of truth.
+
+IaC tools fall into two camps: **declarative** (Terraform, ARM, Bicep, CloudFormation — you declare *what* you want) and **imperative** (scripts, Ansible in procedural mode — you specify *how*).
+
+***
+
+### 102. What is Terraform?
+
+Terraform is an **open-source IaC tool by HashiCorp** that lets you define infrastructure using a declarative language (**HCL — HashiCorp Configuration Language**). It's **cloud-agnostic**, supporting Azure, AWS, GCP, Kubernetes, and hundreds of other platforms through providers.
+
+**Core characteristics:**
+
+* **Declarative** — you describe desired end state; Terraform figures out the execution plan.
+* **State-based** — tracks real-world resources in a state file to map config to reality.
+* **Plan/Apply workflow** — preview changes before committing.
+* **Dependency graph** — automatically orders resource creation/destruction based on dependencies.
+
+Typical workflow: `terraform init` → `terraform plan` → `terraform apply` → `terraform destroy`.
+
+***
+
+### 103. Difference between Terraform and ARM templates
+
+| Aspect              | Terraform                           | ARM Templates                                |
+| ------------------- | ----------------------------------- | -------------------------------------------- |
+| **Vendor**          | HashiCorp (third-party)             | Native Microsoft Azure                       |
+| **Scope**           | Multi-cloud (Azure, AWS, GCP, etc.) | Azure-only                                   |
+| **Language**        | HCL (concise, readable)             | JSON (verbose)                               |
+| **State**           | Explicit state file (local/remote)  | Stateless — Azure Resource Manager tracks it |
+| **Preview**         | `terraform plan` (rich diff)        | `what-if` operation                          |
+| **Modularity**      | Modules, Terraform Registry         | Linked/nested templates                      |
+| **Drift detection** | Built-in via state comparison       | Limited natively                             |
+| **Ecosystem**       | Huge community + provider registry  | Azure-native tooling                         |
+
+**When to choose:** Terraform for multi-cloud or hybrid estates and superior developer experience; ARM/Bicep when you're 100% Azure and want native integration, day-0 support for new Azure features, and no state management overhead.
+
+***
+
+### 104. What are Terraform providers?
+
+Providers are **plugins that enable Terraform to interact with a specific platform's API** — Azure (`azurerm`), AWS (`aws`), Kubernetes (`kubernetes`), GitHub, Datadog, etc. Each provider exposes a set of **resources** (things you create) and **data sources** (things you read).
+
+```hcl
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+  subscription_id = var.subscription_id
+}
+```
+
+**Architect notes:**
+
+* Always **pin provider versions** (`~> 3.0`) to avoid breaking changes.
+* You can configure **multiple provider instances** using `alias` (e.g., deploying across two Azure subscriptions or regions).
+
+***
+
+### 105. What are Terraform modules?
+
+A module is a **reusable, self-contained package of Terraform configuration** — essentially a folder of `.tf` files with defined inputs (variables), resources, and outputs. Modules promote **DRY principles**, standardization, and consistency across teams.
+
+* **Root module** — the working directory where you run Terraform.
+* **Child modules** — called by the root or other modules.
+
+```hcl
+module "network" {
+  source              = "./modules/network"
+  vnet_name           = "prod-vnet"
+  address_space       = ["10.0.0.0/16"]
+  resource_group_name = azurerm_resource_group.main.name
+}
+```
+
+**Best practices:** version your modules (especially from registries/Git via `?ref=v1.2.0`), keep them focused (single responsibility), expose sensible defaults, and document inputs/outputs. This is how large orgs enforce guardrails — e.g., a "landing zone" module that bakes in tagging, RBAC, and network policies.
+
+***
+
+### 106. What is a Terraform state file?
+
+The state file (`terraform.tfstate`) is a **JSON file that maps your configuration to real-world resources**. It records resource IDs, metadata, dependencies, and attribute values — acting as Terraform's **source of truth** about what it manages.
+
+Terraform uses it to:
+
+* Determine what exists vs. what's declared (to compute the plan diff).
+* Track resource metadata and dependency ordering.
+* Store output values and cache attribute data for performance.
+
+⚠️ It can contain **sensitive data** (passwords, keys) in plaintext, so it must be stored securely.
+
+***
+
+### 107. Why is Terraform state important?
+
+State is the **mechanism that links your declarative code to actual deployed infrastructure**. Without it, Terraform would have no way to know which real resources correspond to your config.
+
+**Critical roles:**
+
+* **Mapping** — connects config resource addresses to real cloud resource IDs.
+* **Drift detection** — compares desired state (code) with recorded state to plan changes.
+* **Performance** — caches attributes so Terraform doesn't query every resource on each run (`refresh`).
+* **Dependency tracking** — knows correct create/update/destroy order.
+* **Collaboration** — shared remote state lets teams work on the same infrastructure safely.
+
+If state is lost or corrupted, Terraform may try to **recreate existing resources** or lose track of them — hence remote state + backups + locking are non-negotiable in production.
+
+***
+
+### 108. How do you handle Terraform state locking?
+
+State locking **prevents concurrent operations from corrupting state** when multiple people/pipelines run Terraform simultaneously. Terraform automatically acquires a lock during operations that write state (`apply`, `plan` with refresh) and releases it afterward.
+
+**Implementation depends on backend:**
+
+* **Azure Storage backend** — uses **blob lease** for locking (built-in, automatic).
+* **AWS S3 backend** — uses a **DynamoDB table** for lock records.
+* **Terraform Cloud / Enterprise** — locking managed automatically.
+
+```hcl
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "tfstate-rg"
+    storage_account_name = "tfstatestorage"
+    container_name       = "tfstate"
+    key                  = "prod.terraform.tfstate"
+  }
+}
+```
+
+If a run crashes and leaves a stale lock, use `terraform force-unlock <LOCK_ID>` — **cautiously**, only after confirming no operation is truly running.
+
+***
+
+### 109. How do you store Terraform state remotely?
+
+Remote state stores the `tfstate` file in a **shared, secure backend** instead of locally — essential for team collaboration, locking, and durability.
+
+**Azure example (most relevant for your stack):**
+
+```hcl
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "tfstate-rg"
+    storage_account_name = "tfstatestorage"
+    container_name       = "tfstate"
+    key                  = "prod.terraform.tfstate"
+  }
+}
+```
+
+**Common backends:** Azure Blob Storage, AWS S3 (+ DynamoDB), Google Cloud Storage, Terraform Cloud, Consul.
+
+**Best practices:**
+
+* Enable **encryption at rest** and **versioning/soft-delete** on the storage account (for recovery).
+* Restrict access via **RBAC** and use **Managed Identity / Service Principal** for auth.
+* Use **separate state keys per environment** (dev/test/prod) to isolate blast radius.
+* Never commit state to Git.
+
+***
+
+### 110. What are Terraform variables and outputs?
+
+**Input variables** parameterize configurations, making them reusable and environment-agnostic:
+
+```hcl
+variable "location" {
+  type        = string
+  default     = "East US"
+  description = "Azure region"
+}
+```
+
+Set them via `terraform.tfvars`, `-var` flags, environment variables (`TF_VAR_location`), or CI/CD pipeline variables.
+
+**Outputs** expose computed values after apply — useful for surfacing info (IPs, IDs) or passing data between modules:
+
+```hcl
+output "vm_public_ip" {
+  value       = azurerm_public_ip.main.ip_address
+  description = "Public IP of the VM"
+  sensitive   = false
+}
+```
+
+Mark secrets with `sensitive = true` to redact them from CLI output. Variable **types** (string, number, bool, list, map, object) and **validation blocks** add safety.
+
+***
+
+### 111. What are workspaces in Terraform?
+
+Workspaces let you **manage multiple distinct state files from the same configuration** — commonly used to separate environments (dev/staging/prod) without duplicating code.
+
+```bash
+terraform workspace new dev
+terraform workspace select prod
+terraform workspace list
+```
+
+Reference the current workspace in code via `terraform.workspace`:
+
+```hcl
+resource "azurerm_resource_group" "main" {
+  name     = "rg-${terraform.workspace}"
+  location = var.location
+}
+```
+
+**⚠️ Architect caveat:** Workspaces are fine for small variations but **not ideal for strongly isolated environments**. Because they share the same backend/config, a mistake can cross environments. For production isolation, many teams prefer **separate directories/state files per environment** (or Terragrunt) over CLI workspaces.
+
+***
+
+### 112. What is `terraform plan` used for?
+
+`terraform plan` generates an **execution plan** — a preview of what Terraform *will do* to reach the desired state, **without making any changes**. It compares desired config, current state, and real infrastructure.
+
+Output shows:
+
+* `+` **create** — new resources
+* `~` **update in-place** — modified attributes
+* `-/+` **replace** (destroy + recreate) — forced by immutable attribute changes
+* `-` **destroy** — resources to remove
+
+```bash
+terraform plan -out=tfplan
+```
+
+**Best practice:** Save the plan to a file (`-out`) and apply *that exact plan* in CI/CD, so what you reviewed is precisely what gets applied — no surprises from drift between plan and apply.
+
+***
+
+### 113. What is `terraform apply`?
+
+`terraform apply` **executes the changes** required to reach the desired state defined in your configuration. By default it generates a plan, shows it, and prompts for confirmation before proceeding.
+
+```bash
+terraform apply                 # interactive, shows plan + prompts
+terraform apply tfplan          # applies a saved plan (no prompt)
+terraform apply -auto-approve   # skips confirmation (use in automation carefully)
+```
+
+During apply, Terraform:
+
+1. Acquires the **state lock**.
+2. Builds the **dependency graph** and executes changes in correct order (parallelized where possible).
+3. Updates the **state file** to reflect the new reality.
+4. Releases the lock and displays **outputs**.
+
+In pipelines, always apply a **pre-approved saved plan** and gate prod with manual approval.
+
+***
+
+### 114. How do you destroy infrastructure in Terraform?
+
+`terraform destroy` **removes all resources** tracked in the current state/workspace:
+
+```bash
+terraform destroy                    # prompts for confirmation
+terraform destroy -auto-approve      # no prompt
+terraform destroy -target=azurerm_virtual_machine.example   # destroy specific resource
+```
+
+**Alternative approaches:**
+
+* Removing a resource block from config and running `apply` destroys just that resource.
+* `terraform plan -destroy` previews what a destroy would remove.
+
+**Safeguards:**
+
+* Use `lifecycle { prevent_destroy = true }` on critical resources (e.g., production databases) to block accidental deletion.
+* Be cautious with `-target` — it can create inconsistent state.
+* In prod, gate destroys behind approvals and never enable `-auto-approve` casually.
+
+***
+
+### 115. Difference between `count` and `for_each`
+
+Both create multiple resource instances, but they differ fundamentally:
+
+| Aspect        | `count`                                                                        | `for_each`                                  |
+| ------------- | ------------------------------------------------------------------------------ | ------------------------------------------- |
+| **Input**     | A number (integer)                                                             | A map or set of strings                     |
+| **Index key** | Numeric index (`[0]`, `[1]`)                                                   | Named key (`["web"]`, `["db"]`)             |
+| **Address**   | `resource.name[0]`                                                             | `resource.name["key"]`                      |
+| **Stability** | Fragile — removing a middle item **reindexes** and can destroy/recreate others | Stable — keyed by identity, safe add/remove |
+| **Best for**  | Identical instances, or conditional creation                                   | Distinct instances with unique attributes   |
+
+```hcl
+# count — conditional / identical
+resource "azurerm_public_ip" "ip" {
+  count = var.create_ip ? 1 : 0
+  name  = "pip-${count.index}"
+}
+
+# for_each — keyed, stable
+resource "azurerm_storage_account" "sa" {
+  for_each = toset(["logs", "data", "backup"])
+  name     = "st${each.key}"
+}
+```
+
+**Rule of thumb:** Use `for_each` when instances have distinct identities (avoids the reindexing trap); use `count` for simple on/off conditionals or truly identical copies.
+
+***
+
+### 116. How do you handle secrets in Terraform?
+
+Secrets are a well-known Terraform pain point because **state stores values in plaintext**. Best practices:
+
+* **Never hardcode secrets** in `.tf` files or commit `.tfvars` with secrets to Git.
+* **Use a secrets manager** — pull secrets at runtime via data sources:
+  ```hcl
+  data "azurerm_key_vault_secret" "db_password" {
+    name         = "db-password"
+    key_vault_id = data.azurerm_key_vault.main.id
+  }
+  ```
+* **Environment variables** — `TF_VAR_db_password` injected by the pipeline.
+* **Mark variables/outputs `sensitive = true`** to redact from CLI/logs (note: still in state).
+* **Secure the state backend** — encryption at rest, RBAC, private endpoints, versioning.
+* **Use Managed Identity / Service Principal** for provider auth instead of static credentials.
+* **CI/CD secret stores** — Azure DevOps secret variables / variable groups linked to Key Vault, GitHub Actions secrets.
+
+**Architect takeaway:** treat state as sensitive itself; the goal is to keep secrets *out of code* and *access-controlled in state*.
+
+***
+
+### 117. What is the Terraform Registry?
+
+The **Terraform Registry** (registry.terraform.io) is HashiCorp's **public repository of providers and reusable modules**. It's the central hub for discovering, sharing, and consuming Terraform components.
+
+**Contents:**
+
+* **Providers** — official (HashiCorp), partner (verified vendors), and community.
+* **Modules** — pre-built, versioned infrastructure patterns (VNets, AKS clusters, etc.).
+
+```hcl
+module "vnet" {
+  source  = "Azure/vnet/azurerm"
+  version = "4.0.0"
+  # ...inputs
+}
+```
+
+**Private Registry** (via Terraform Cloud/Enterprise) lets enterprises host **internal, approved modules** — critical in regulated environments like BFSI where you want curated, compliance-baked modules rather than pulling arbitrary public code. Always **pin versions** for supply-chain safety.
+
+***
+
+### 118. What are provisioners in Terraform?
+
+Provisioners execute **scripts or commands on a local or remote machine** as part of resource creation or destruction — e.g., bootstrapping software after a VM is created.
+
+**Types:**
+
+* `local-exec` — runs a command on the machine running Terraform.
+* `remote-exec` — runs commands on the newly created remote resource (via SSH/WinRM).
+* `file` — copies files to the remote resource.
+
+```hcl
+resource "azurerm_linux_virtual_machine" "vm" {
+  # ...
+  provisioner "remote-exec" {
+    inline = ["sudo apt update", "sudo apt install -y nginx"]
+    connection {
+      type     = "ssh"
+      user     = "azureuser"
+      host     = self.public_ip_address
+    }
+  }
+}
+```
+
+**⚠️ HashiCorp's guidance — provisioners are a last resort.** They break the declarative model, aren't tracked in state, and can cause non-idempotent behavior. **Prefer alternatives:** cloud-init / custom\_data, VM extensions, Packer (baked images), or configuration management tools (Ansible). Use provisioners only when no native option exists.
+
+***
+
+### 119. What is the difference between declarative and imperative IaC?
+
+| Aspect              | Declarative                                                 | Imperative                                                  |
+| ------------------- | ----------------------------------------------------------- | ----------------------------------------------------------- |
+| **Focus**           | **What** the end state should be                            | **How** to achieve it (step-by-step)                        |
+| **Approach**        | Describe desired result; tool computes steps                | Explicitly script each action                               |
+| **Idempotency**     | Naturally idempotent                                        | Must be handled manually                                    |
+| **State awareness** | Tool tracks & reconciles state                              | You manage state/checks yourself                            |
+| **Examples**        | Terraform, ARM, Bicep, CloudFormation, Kubernetes manifests | Shell scripts, Azure CLI scripts, Ansible (procedural mode) |
+
+**Declarative example (Terraform):** "I want 3 VMs" — Terraform creates/adjusts to reach 3.
+**Imperative example (script):** "Loop and run `az vm create` 3 times" — you handle existence checks and errors.
+
+**Trade-off:** Declarative is preferred for infrastructure because of idempotency, drift detection, and predictability. Imperative offers fine-grained control but is harder to maintain and error-prone at scale. Some tools (like Ansible) blend both.
+
+***
+
+### 120. How do you import existing infrastructure into Terraform?
+
+Importing brings **manually-created (or pre-existing) resources under Terraform management** so they're tracked in state — without recreating them.
+
+**Method 1 — `terraform import` command (traditional):**
+
+```bash
+# 1. Write a matching resource block in config
+resource "azurerm_resource_group" "existing" {
+  name     = "my-existing-rg"
+  location = "East US"
+}
+# 2. Import into state
+terraform import azurerm_resource_group.existing \
+  /subscriptions/<sub-id>/resourceGroups/my-existing-rg
+# 3. Run terraform plan to verify config matches reality (no changes should show)
+```
+
+**Method 2 — `import` block (Terraform 1.5+, declarative & preferred):**
+
+```hcl
+import {
+  to = azurerm_resource_group.existing
+  id = "/subscriptions/<sub-id>/resourceGroups/my-existing-rg"
+}
+```
+
+This is plan-reviewable and can even **auto-generate config** via `terraform plan -generate-config-out=generated.tf`.
+
+**Key points:**
+
+* Import only populates **state** — you must still write matching config manually (with the older command method).
+* After import, run `plan` and iterate until it shows **no changes**, confirming config matches reality.
+* For bulk imports, tools like **Terraformer** or **aztfexport** (Azure Export for Terraform) can generate both config and state.
+
+***
+
+
