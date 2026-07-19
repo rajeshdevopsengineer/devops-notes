@@ -1,0 +1,34 @@
+Based on below job description create top 2500 interview questions 
+
+Job Description:
+DEVOPS TEAM LEAD
+ 
+Skill Set
+• Technical Leadership: Platform squad oversight; sprint task definition; infrastructure architectural decisions
+• Containers & Orchestration: Docker; Kubernetes/AKS (RBAC, HPA/KEDA, PDB); Helm (chart authoring, library charts)
+• IaC: Terraform (Azure — AKS, PostgreSQL, Service Bus, Key Vault, APIM); Atlantis/Terraform Cloud
+• CI/CD & GitOps: Jenkins, GitLab CI, GitHub Actions; ArgoCD/Flux; Trivy, Checkov, OWASP dep-check
+• Cloud & Observability: Azure AKS/Service Bus/Monitor; Prometheus + Grafana; OpenTelemetry; ELK/OpenSearch
+• Messaging & Security: Kafka; RabbitMQ; Azure Key Vault / HashiCorp Vault; mTLS; Trivy/Snyk; FCA/PCI-DSS
+• Scripting: Python, Bash, Groovy — pipelines, runbooks, automated incident response
+• People: Mentoring/line management of 3–6 DevOps engineers; 1:1s, onboarding, performance reviews
+ 
+Key Responsibilities
+• Lead the DevOps/platform squad; own Definition of Done/Ready; track velocity and flag risks.
+• Own and evolve CI/CD pipelines; implement blue/green, canary, and feature-flag progressive delivery.
+• Manage AKS clusters: node pool sizing, upgrades, namespace isolation, network policies, cost optimisation.
+• Author and maintain Terraform modules for all Azure infrastructure; enforce IaC review and state lock.
+• Design and operate observability stack: Prometheus, per-squad Grafana dashboards, distributed tracing.
+• Manage Kafka clusters and Azure Service Bus; drive pipeline security automation (SAST, scanning, secrets).
+• Maintain Elasticsearch cluster health; tune ILM policies for 52M+ invoice documents.
+• Lead on-call rotation; own post-incident reviews; mentor DevOps engineers and run knowledge-sharing sessions.
+• Coordinate with software delivery squads on platform enablement and pipeline improvements.
+ 
+Requirements
+• 8+ yrs DevOps / Platform Engineering / SRE; 2+ yrs in a team lead or tech lead role.
+• Expert Kubernetes (CKA or equivalent) and Helm; strong Terraform on Azure or AWS.
+• Production Kafka operations and Elasticsearch cluster management.
+• CI/CD pipeline design (Jenkins / GitLab CI / GitHub Actions) and GitOps (ArgoCD or Flux).
+• Python for operational automation; FCA/PCI-DSS cloud security understanding essential.
+• Fintech or financial services background advantageous; Azure certs (AZ-104, AZ-400, CKA) a plus.
+• Nice to have: RabbitMQ; Groovy pipeline scripting; GitHub Actions
