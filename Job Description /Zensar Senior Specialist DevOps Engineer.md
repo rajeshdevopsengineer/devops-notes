@@ -30,7 +30,8 @@ The role has a dual focus. On one hand, the engineers will support and maintain 
 
 This means the role is not only about future-state platform engineering, but also about keeping the current delivery engine running while we transition to a more modern and scalable setup.
 
-Key responsibilities 1. Maintain and support the current Bitbucket/Bamboo CI/CD landscape
+Key responsibilities 
+1. Maintain and support the current Bitbucket/Bamboo CI/CD landscape
 Maintain and troubleshoot existing Bitbucket repositories and Bamboo build/release pipelines.
 Support teams with pipeline failures, build issues, deployment issues, permissions, repository setup, and configuration problems.
 Improve the stability, reliability, and maintainability of existing Bamboo plans where needed.
@@ -81,7 +82,8 @@ Help teams understand and adopt standardized pipelines and reusable workflows.
 Create practical documentation, how-to guides, examples, and onboarding material.
 Act as a sparring partner for teams facing build, release, test automation, or deployment challenges.
 Contribute to the broader DevOps transformation and platform engineering roadmap.
-Required experience
+
+**Required experience**
 Strong hands-on experience with CI/CD pipeline design, maintenance, and troubleshooting.
 Practical experience with Bitbucket and Bamboo in an enterprise environment.
 Experience maintaining existing CI/CD platforms while supporting a migration or modernization journey.
@@ -106,7 +108,8 @@ Experience with software delivery for complex systems involving multiple product
 Experience with SAFe, Agile Release Trains, or large-scale agile delivery organizations.
 Experience setting up developer portals or internal developer platforms, for example Backstage.
 Experience with Jira integration and traceability between work items, code, builds, and releases.
-Technical skills
+
+**Technical skills**
 GitHub Enterprise
 
 GitHub Actions
