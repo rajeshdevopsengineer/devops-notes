@@ -2883,4 +2883,2676 @@ git config user.email "rajesh.singh@company.com"
 
 ***
 
+# Version Control Interview Questions and Answers
+
+## Git, GitHub, and Azure Repos: Questions 51–100
+
+Continuing the Senior DevOps Engineer interview series, these answers focus on Git configuration, authentication, repository maintenance, history recovery, advanced branching, Git LFS, submodules, worktrees, and troubleshooting.
+
+***
+
+## 51. What is `git config --list`?
+
+`git config --list` displays the effective Git configuration available in the current context.
+
+```bash
+git config --list
+```
+
+It can show settings such as:
+
+* User name and email
+* Default branch
+* Credential helper
+* Line-ending behavior
+* Configured aliases
+* Merge and rebase preferences
+* Proxy settings
+* Commit-signing configuration
+* Remote and branch configuration
+
+Example output:
+
+```text
+user.name=Rajesh Singh
+user.email=rajesh.singh@example.com
+init.defaultbranch=main
+credential.helper=manager
+core.autocrlf=true
+pull.rebase=true
+```
+
+Git configuration can come from multiple scopes. To identify where each setting originated, use:
+
+```bash
+git config --list --show-origin
+```
+
+To display the scope:
+
+```bash
+git config --list --show-scope
+```
+
+Display only global settings:
+
+```bash
+git config --global --list
+```
+
+Display repository-specific settings:
+
+```bash
+git config --local --list
+```
+
+Display a particular value:
+
+```bash
+git config user.email
+```
+
+> This command is especially useful when troubleshooting incorrect commit identities, proxy problems, authentication behavior, line-ending changes, or unexpected pull strategies.
+
+***
+
+## 52. How do you set up credential caching for HTTPS?
+
+Git uses credential helpers to securely retrieve or temporarily store credentials used for HTTPS authentication.
+
+View the configured credential helper:
+
+```bash
+git config --show-origin --get-all credential.helper
+```
+
+### Temporary in-memory caching
+
+On supported Unix-like environments:
+
+```bash
+git config --global credential.helper cache
+```
+
+Set the cache duration to one hour:
+
+```bash
+git config --global credential.helper "cache --timeout=3600"
+```
+
+The credentials are stored in memory and removed when the cache expires or the credential-cache daemon stops.
+
+### Git Credential Manager
+
+For Windows and many cross-platform environments, Git Credential Manager is preferred:
+
+```bash
+git config --global credential.helper manager
+```
+
+Depending on the installation, the helper may be registered as:
+
+```bash
+git config --global credential.helper manager-core
+```
+
+Git Credential Manager can support:
+
+* Secure operating-system credential storage
+* Browser-based authentication
+* Personal access tokens
+* Multifactor authentication
+* Microsoft Entra ID authentication
+* GitHub and Azure Repos authentication flows
+
+### Plaintext credential storage
+
+```bash
+git config --global credential.helper store
+```
+
+This stores credentials persistently, commonly in a plaintext file such as:
+
+```text
+~/.git-credentials
+```
+
+Because this is not encrypted, it is generally unsuitable for production servers, shared workstations, and enterprise environments.
+
+### Remove a configured helper
+
+```bash
+git config --global --unset-all credential.helper
+```
+
+> Prefer Git Credential Manager, SSH authentication, or an enterprise-approved secret mechanism. Do not place personal access tokens directly in repository URLs, scripts, pipeline YAML, or shell history.
+
+***
+
+## 53. How do you set up SSH keys for Git authentication?
+
+SSH keys provide public-key authentication between a Git client and a Git hosting platform.
+
+### Step 1: Generate a key pair
+
+Use Ed25519 where supported:
+
+```bash
+ssh-keygen -t ed25519 -C "rajesh.singh@example.com"
+```
+
+A common key location is:
+
+```text
+~/.ssh/id_ed25519
+~/.ssh/id_ed25519.pub
+```
+
+The private key must remain confidential. The `.pub` file is the public key that can be uploaded to GitHub, Azure DevOps, or another Git server.
+
+### Step 2: Start the SSH agent
+
+```bash
+eval "$(ssh-agent -s)"
+```
+
+### Step 3: Add the private key
+
+```bash
+ssh-add ~/.ssh/id_ed25519
+```
+
+### Step 4: Copy the public key
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+Add the displayed public key to the Git hosting account.
+
+### Step 5: Test authentication
+
+GitHub example:
+
+```bash
+ssh -T git@github.com
+```
+
+Azure Repos example:
+
+```bash
+ssh -T git@ssh.dev.azure.com
+```
+
+### Step 6: Clone using an SSH URL
+
+GitHub:
+
+```bash
+git clone git@github.com:organization/payment-service.git
+```
+
+Azure Repos commonly uses a URL similar to:
+
+```bash
+git clone git@ssh.dev.azure.com:v3/organization/project/payment-service
+```
+
+### Multiple-account configuration
+
+An SSH configuration file can associate different keys with different hosts:
+
+```text
+Host github-corporate
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519_corporate
+    IdentitiesOnly yes
+
+Host github-personal
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519_personal
+    IdentitiesOnly yes
+```
+
+Clone using the configured alias:
+
+```bash
+git clone git@github-corporate:organization/payment-service.git
+```
+
+> Protect private keys using strong file permissions and, where operationally practical, a passphrase. Use separate service identities and keys for CI/CD automation rather than personal developer credentials.
+
+***
+
+## 54. What is `.gitmodules`, and when does it appear?
+
+The `.gitmodules` file stores configuration for Git submodules associated with a parent repository.
+
+It normally appears after adding a submodule:
+
+```bash
+git submodule add https://github.com/company/shared-library.git libs/shared-library
+```
+
+Example `.gitmodules` content:
+
+```ini
+[submodule "libs/shared-library"]
+    path = libs/shared-library
+    url = https://github.com/company/shared-library.git
+```
+
+It contains:
+
+* Submodule name
+* Local path
+* Remote repository URL
+* Optional branch or update configuration
+
+The parent repository does not store all submodule files directly. Instead, it stores a reference to a specific commit in the submodule repository.
+
+The `.gitmodules` file should normally be committed:
+
+```bash
+git add .gitmodules libs/shared-library
+git commit -m "Add shared library as a submodule"
+```
+
+> A submodule provides dependency separation, but it adds operational complexity. Teams must ensure cloning, CI pipelines, credentials, security scanning, and updates all handle submodules correctly.
+
+***
+
+## 55. What is Git LFS, and when would you use it?
+
+Git Large File Storage, or Git LFS, is an extension for managing large binary files without storing every binary version directly in the normal Git object database.
+
+Instead of storing the complete binary file in each commit, Git stores a small pointer file. The corresponding large content is stored in an LFS-compatible storage service.
+
+### Initialize Git LFS
+
+```bash
+git lfs install
+```
+
+### Track file types
+
+```bash
+git lfs track "*.zip"
+git lfs track "*.psd"
+git lfs track "*.dll"
+```
+
+This updates `.gitattributes`, which should be committed:
+
+```bash
+git add .gitattributes
+git commit -m "Configure Git LFS tracking"
+```
+
+### Add and commit a large file
+
+```bash
+git add assets/application-package.zip
+git commit -m "Add application package using Git LFS"
+git push
+```
+
+### List LFS-managed files
+
+```bash
+git lfs ls-files
+```
+
+### Appropriate use cases
+
+Git LFS can be used for:
+
+* Large media assets
+* Design files
+* Machine-learning models
+* Large test datasets
+* Vendor binaries that must remain versioned
+* Game-development assets
+
+### Operational considerations
+
+* Hosting platforms may impose LFS storage and bandwidth quotas.
+* CI agents need Git LFS installed and authenticated.
+* Existing large files are not automatically migrated by adding a tracking rule.
+* LFS is not a replacement for an artifact repository.
+* Build packages should generally be stored in Azure Artifacts, GitHub Packages, JFrog Artifactory, Nexus, or object storage.
+
+> Source repositories should primarily contain source code. Use Git LFS only when large files genuinely require source-style versioning.
+
+***
+
+## 56. What is a pull request or merge request?
+
+A **pull request**, or PR, is a controlled proposal to merge changes from one branch into another.
+
+GitHub and Azure Repos commonly use the term **pull request**. GitLab commonly uses **merge request**. The fundamental concept is similar.
+
+A PR usually contains:
+
+* Source and target branches
+* Commit list
+* File differences
+* Author and reviewers
+* Discussion comments
+* Linked issues or work items
+* Build and test results
+* Security and quality checks
+* Merge status
+
+### Typical workflow
+
+1. Create a feature branch.
+2. Develop and test the change.
+3. Push the branch.
+4. Open a pull request.
+5. Run automated validation.
+6. Perform peer review.
+7. Resolve comments and conflicts.
+8. Obtain approvals.
+9. Merge using the approved strategy.
+10. Delete the completed feature branch.
+
+### Common branch policies
+
+* Minimum number of reviewers
+* Prohibition on self-approval
+* Successful CI build
+* Unit- and integration-test completion
+* Work-item association
+* Comment resolution
+* Code-owner approval
+* Security scanning
+* Restricted merge strategies
+
+> A pull request is more than a Git merge mechanism. It is a governance, quality, security, collaboration, and audit control in the software-delivery process.
+
+***
+
+## 57. What are commit-message best practices?
+
+A good commit message explains what changed and why the change was required.
+
+### Recommended structure
+
+```text
+Short imperative summary
+
+Additional explanation of the problem, technical decision,
+risk, and implementation details.
+
+Refs: AB#12345
+```
+
+Example:
+
+```text
+Handle payment API timeout gracefully
+
+Return a retryable response when the upstream bank service
+exceeds the configured timeout. This prevents the transaction
+worker from failing without a valid status.
+
+Refs: AB#12345
+```
+
+### Best practices
+
+* Keep the subject concise and meaningful.
+* Use imperative language such as `Add`, `Fix`, `Update`, or `Remove`.
+* Explain why the change was needed.
+* Keep each commit focused on one logical change.
+* Reference the relevant issue, ticket, work item, or incident.
+* Mention breaking changes when applicable.
+* Avoid vague messages such as `changes`, `fix`, or `updated code`.
+* Do not include secrets or sensitive customer information.
+* Follow organizational conventions, such as Conventional Commits, if adopted.
+
+Example using Conventional Commits:
+
+```text
+fix(payment-api): handle upstream timeout
+
+Refs: AB#12345
+```
+
+> A useful test is whether another engineer can understand the purpose and impact of the commit six months later without opening every changed file.
+
+***
+
+## 58. What is the difference between `git blame` and `git log -S`?
+
+`git blame` identifies the most recent commit associated with each current line of a file.
+
+```bash
+git blame src/payment-service.cs
+```
+
+Use it when you want to know:
+
+* Who last changed a particular line
+* Which commit introduced the current line
+* When the current line was last modified
+
+`git log -S` searches history for commits that changed the number of occurrences of a specific string.
+
+```bash
+git log -S "PaymentTimeout" --oneline
+```
+
+Search within a particular file:
+
+```bash
+git log -S "PaymentTimeout" -- src/payment-service.cs
+```
+
+Show associated patches:
+
+```bash
+git log -S "PaymentTimeout" -p
+```
+
+### Practical difference
+
+* `git blame` starts from the current file and maps existing lines to commits.
+* `git log -S` searches historical commits for additions or removals of a string.
+* `git log -G` searches patches using a regular expression.
+
+Example:
+
+```bash
+git log -G "Payment.*Timeout" -p
+```
+
+> Use `git blame` to investigate the current implementation. Use `git log -S` or `git log -G` to locate when a concept, variable, function, or configuration entered or left the history.
+
+***
+
+## 59. How do you re-stage files after partial commits?
+
+Use patch mode to interactively select parts of a file:
+
+```bash
+git add -p
+```
+
+Apply patch mode to a particular file:
+
+```bash
+git add -p src/payment-service.cs
+```
+
+Git divides the changes into hunks and offers actions such as:
+
+* `y`: Stage the current hunk
+* `n`: Do not stage the current hunk
+* `s`: Split the hunk into smaller hunks
+* `e`: Manually edit the hunk
+* `q`: Quit
+* `?`: Display help
+
+After staging selected hunks, inspect them:
+
+```bash
+git diff --staged
+```
+
+Commit them:
+
+```bash
+git commit -m "Add payment validation"
+```
+
+Then stage the remaining logical change:
+
+```bash
+git add -p
+git commit -m "Improve payment error logging"
+```
+
+Interactively unstage selected changes:
+
+```bash
+git reset -p
+```
+
+A modern alternative is:
+
+```bash
+git restore --staged -p
+```
+
+> Patch staging supports atomic commits when one file contains changes for multiple tickets or logical purposes.
+
+***
+
+## 60. What is `git shortlog`?
+
+`git shortlog` summarizes commit history by author.
+
+```bash
+git shortlog
+```
+
+A common form shows commit counts and author names:
+
+```bash
+git shortlog -s -n
+```
+
+Options:
+
+* `-s`: Show only the commit count
+* `-n`: Sort numerically by commit count
+* `-e`: Include email addresses
+
+Example:
+
+```bash
+git shortlog -sne
+```
+
+Summarize all branches:
+
+```bash
+git shortlog -sne --all
+```
+
+Summarize a release range:
+
+```bash
+git shortlog -sne v2.0.0..v2.1.0
+```
+
+### Use cases
+
+* Generate contributor summaries
+* Review release contributions
+* Identify duplicate author identities
+* Audit inconsistent names or email addresses
+* Produce release documentation
+
+> Commit counts should not be used as a standalone productivity metric. Commit size, complexity, testing, review, operational impact, and collaboration are not represented by raw counts.
+
+***
+
+## 61. How do you see which files changed in a commit?
+
+Use:
+
+```bash
+git show --name-only <commit>
+```
+
+Example:
+
+```bash
+git show --name-only a7b31f2
+```
+
+Show file names without the patch:
+
+```bash
+git show --name-only --format=fuller a7b31f2
+```
+
+Show only the names, with minimal commit output:
+
+```bash
+git show --name-only --format="" a7b31f2
+```
+
+Show status letters:
+
+```bash
+git show --name-status a7b31f2
+```
+
+Example status letters:
+
+* `A`: Added
+* `M`: Modified
+* `D`: Deleted
+* `R`: Renamed
+* `C`: Copied
+
+Show a statistical summary:
+
+```bash
+git show --stat a7b31f2
+```
+
+Show exact changes:
+
+```bash
+git show a7b31f2
+```
+
+> `--name-status` is useful in deployment reviews because it shows both affected paths and the type of change.
+
+***
+
+## 62. What is `git archive` used for?
+
+`git archive` creates an archive of files from a specified commit, branch, or tag without including the `.git` directory.
+
+Create a ZIP archive from `main`:
+
+```bash
+git archive --format=zip --output=source.zip main
+```
+
+Create a compressed tar archive from a release tag:
+
+```bash
+git archive --format=tar.gz --output=payment-service-v2.1.0.tar.gz v2.1.0
+```
+
+Add a directory prefix inside the archive:
+
+```bash
+git archive \
+  --format=zip \
+  --prefix=payment-service-v2.1.0/ \
+  --output=payment-service-v2.1.0.zip \
+  v2.1.0
+```
+
+Archive a subdirectory:
+
+```bash
+git archive --format=zip --output=manifests.zip HEAD:manifests
+```
+
+### Use cases
+
+* Create source-release packages
+* Export a clean repository snapshot
+* Provide code without Git metadata
+* Package deployment manifests
+* Generate audit evidence for a tagged release
+
+> `git archive` packages tracked content from a Git tree. It generally does not include untracked files, working-directory changes, or independent submodule content.
+
+***
+
+## 63. How do you remove a file from Git history, and why must you be careful?
+
+Removing a file from the latest version does not remove it from earlier commits. Sensitive or oversized content may require history rewriting.
+
+The modern, preferred tool is generally `git filter-repo`.
+
+Example:
+
+```bash
+git filter-repo --path config/secrets.json --invert-paths
+```
+
+For historical Git installations, `git filter-branch` may be encountered:
+
+```bash
+git filter-branch \
+  --force \
+  --index-filter \
+  "git rm --cached --ignore-unmatch config/secrets.json" \
+  --prune-empty \
+  --tag-name-filter cat \
+  -- --all
+```
+
+After rewriting, updated branches and tags may need to be force-pushed:
+
+```bash
+git push origin --force --all
+git push origin --force --tags
+```
+
+### Why this is dangerous
+
+History rewriting changes commit hashes for affected commits. This can:
+
+* Disrupt open pull requests
+* Break existing clones
+* Invalidate commit signatures
+* Affect tags and release references
+* Require force-pushing
+* Cause deleted content to reappear from an old clone
+* Affect CI/CD or audit references based on commit hashes
+
+### If a secret was committed
+
+1. Revoke or rotate the secret immediately.
+2. Investigate usage and exposure.
+3. Remove the secret from the current branch.
+4. Rewrite history if required by security policy.
+5. Coordinate the force-push.
+6. Ask developers to re-clone or carefully reset their repositories.
+7. Update secret scanning and preventive controls.
+
+> History removal is not a substitute for credential rotation. Once a secret is published, it must be treated as compromised.
+
+***
+
+## 64. What is `git gc`, and why run it?
+
+`git gc` means Git garbage collection. It optimizes the repository by consolidating objects, compressing data, cleaning unnecessary files, and pruning eligible unreachable objects.
+
+```bash
+git gc
+```
+
+More aggressive optimization:
+
+```bash
+git gc --aggressive
+```
+
+Prune unreachable objects immediately:
+
+```bash
+git gc --prune=now
+```
+
+Use immediate pruning carefully because it can reduce recovery opportunities for recently deleted commits.
+
+### Why run it?
+
+* Reduce repository disk usage
+* Improve some Git operations
+* Pack loose objects
+* Clean temporary data
+* Maintain long-lived repositories
+* Optimize repositories after extensive history rewriting
+
+Git often runs maintenance automatically, so manual execution is not normally required.
+
+For ongoing maintenance, modern Git also provides:
+
+```bash
+git maintenance start
+```
+
+> Avoid aggressive garbage collection during active repository operations. Ensure no other process is writing to the repository and preserve recovery references before pruning immediately.
+
+***
+
+## 65. What is `git fsck`?
+
+`git fsck` checks the connectivity and validity of objects in a Git repository.
+
+```bash
+git fsck
+```
+
+A more comprehensive form is:
+
+```bash
+git fsck --full
+```
+
+It can identify:
+
+* Missing objects
+* Corrupt objects
+* Broken references
+* Dangling commits
+* Dangling trees
+* Dangling blobs
+* Unreachable objects
+
+Example output might include:
+
+```text
+dangling commit a7b31f2...
+```
+
+A dangling commit is not necessarily corruption. It may be an older commit left after rebase, reset, amend, or branch deletion.
+
+Inspect it:
+
+```bash
+git show a7b31f2
+```
+
+Recover it:
+
+```bash
+git branch recovered-work a7b31f2
+```
+
+> Before attempting repository repair, create a backup and verify whether the remote repository or another clone contains a healthy copy.
+
+***
+
+## 66. What is `git reflog` used for?
+
+`git reflog` records local movements of references such as `HEAD` and branch tips.
+
+```bash
+git reflog
+```
+
+It can show operations such as:
+
+* Commits
+* Resets
+* Rebases
+* Branch switches
+* Amendments
+* Merges
+* Pulls
+* Detached HEAD movements
+
+Example:
+
+```text
+a7b31f2 HEAD@{0}: reset: moving to HEAD~2
+d8e42a1 HEAD@{1}: commit: Add payment validation
+```
+
+Inspect a previous state:
+
+```bash
+git show HEAD@{1}
+```
+
+Recover it by creating a branch:
+
+```bash
+git branch recovered-payment-work HEAD@{1}
+```
+
+Show a branch-specific reflog:
+
+```bash
+git reflog show feature/payment-validation
+```
+
+### Important limitations
+
+* Reflog is local to the repository.
+* It is not pushed to GitHub or Azure Repos.
+* Entries expire according to Git configuration.
+* Garbage collection may eventually prune unreachable objects.
+
+> Reflog is one of the most important Git recovery tools for accidental resets, deleted branches, failed rebases, and amended commits.
+
+***
+
+## 67. How do you recover a lost commit after a reset?
+
+First, inspect the reflog:
+
+```bash
+git reflog
+```
+
+Suppose the output shows:
+
+```text
+a1b2c3d HEAD@{0}: reset: moving to HEAD~2
+f4e5d6c HEAD@{1}: commit: Add payment retry logic
+```
+
+Inspect the lost commit:
+
+```bash
+git show f4e5d6c
+```
+
+Create a recovery branch:
+
+```bash
+git branch recovery/payment-retry f4e5d6c
+```
+
+Switch to it:
+
+```bash
+git switch recovery/payment-retry
+```
+
+Alternatively, restore the branch pointer directly:
+
+```bash
+git reset --hard f4e5d6c
+```
+
+The direct reset should be used only after confirming that the current state is no longer required.
+
+If reflog does not reveal the commit, try:
+
+```bash
+git fsck --full --no-reflogs --unreachable
+```
+
+Then inspect candidate commits with:
+
+```bash
+git show <commit-hash>
+```
+
+> The safest recovery approach is to create a recovery branch first. This preserves both the recovered commit and the current branch while you validate the result.
+
+***
+
+## 68. How do you view branches that contain a commit?
+
+List local branches containing a commit:
+
+```bash
+git branch --contains <commit>
+```
+
+Example:
+
+```bash
+git branch --contains a7b31f2
+```
+
+List remote-tracking branches:
+
+```bash
+git branch -r --contains a7b31f2
+```
+
+List both local and remote-tracking branches:
+
+```bash
+git branch -a --contains a7b31f2
+```
+
+Find branches that do not contain the commit:
+
+```bash
+git branch --no-contains a7b31f2
+```
+
+### Use cases
+
+* Verify whether a hotfix reached a release branch.
+* Confirm whether a commit is included in `main`.
+* Check whether a branch can be safely deleted.
+* Determine which supported versions contain a security fix.
+* Investigate deployment discrepancies.
+
+> Fetch the latest remote references before making remote-branch conclusions:
+
+```bash
+git fetch --all --prune
+```
+
+***
+
+## 69. What is `git describe` used for?
+
+`git describe` generates a human-readable name for a commit based on the nearest reachable tag.
+
+```bash
+git describe
+```
+
+Example output:
+
+```text
+v2.1.0-5-ga7b31f2
+```
+
+This means:
+
+* Nearest tag: `v2.1.0`
+* Number of commits since that tag: `5`
+* Abbreviated commit hash: `a7b31f2`
+* The `g` prefix indicates a Git commit identifier
+
+Include lightweight tags:
+
+```bash
+git describe --tags
+```
+
+Always return a result even when no tag is reachable:
+
+```bash
+git describe --tags --always
+```
+
+Describe the current commit and include dirty working-tree status:
+
+```bash
+git describe --tags --always --dirty
+```
+
+### Use cases
+
+* Generate development build versions
+* Include source identity in application metadata
+* Label non-release packages
+* Troubleshoot deployed versions
+* Create traceable container-image tags
+
+> For official releases, use an immutable release tag. For development builds, combine `git describe` output with the complete commit hash and CI build number when stronger traceability is required.
+
+***
+
+## 70. What is `git clean`, and when should you use it?
+
+`git clean` removes untracked files from the working directory.
+
+Preview what would be removed:
+
+```bash
+git clean -n
+```
+
+The `-n` option performs a dry run.
+
+Remove untracked files:
+
+```bash
+git clean -f
+```
+
+Remove untracked directories:
+
+```bash
+git clean -fd
+```
+
+Remove ignored files too:
+
+```bash
+git clean -fdx
+```
+
+Remove only ignored files:
+
+```bash
+git clean -fdX
+```
+
+Interactively select files:
+
+```bash
+git clean -i
+```
+
+### Appropriate use cases
+
+* Clean a CI workspace
+* Remove generated build files
+* Reproduce a fresh checkout
+* Remove temporary test output
+* Troubleshoot contamination from previous builds
+
+### Critical warning
+
+Files removed by `git clean` are untracked, so Git usually cannot restore them using normal history or reflog.
+
+Always preview first:
+
+```bash
+git clean -nd
+git clean -ndx
+```
+
+> `git clean -fdx` is highly destructive because it removes both untracked and ignored content. This may include local configuration files, downloaded tools, credential files, build caches, and secrets.
+
+***
+
+## 71. How do you configure the default branch name globally?
+
+Configure new repositories to use `main`:
+
+```bash
+git config --global init.defaultBranch main
+```
+
+Verify:
+
+```bash
+git config --global --get init.defaultBranch
+```
+
+New repositories initialized afterward will use:
+
+```bash
+git init
+```
+
+and start with `main` as the initial branch.
+
+This does not rename existing branches.
+
+Rename the current existing branch:
+
+```bash
+git branch -m main
+```
+
+If changing an existing remote repository, also update:
+
+* The remote default branch
+* Branch protection rules
+* Pipeline triggers
+* Pull-request targets
+* Deployment configurations
+* Documentation and badges
+* Automation scripts
+
+> Standardizing the default branch name reduces automation inconsistencies across new repositories.
+
+***
+
+## 72. What is the purpose of `HEAD` in Git?
+
+`HEAD` represents the currently checked-out position in a Git repository.
+
+Normally, it symbolically references a branch:
+
+```text
+HEAD -> main -> commit a7b31f2
+```
+
+View its symbolic target:
+
+```bash
+git symbolic-ref HEAD
+```
+
+Typical output:
+
+```text
+refs/heads/main
+```
+
+Show the commit currently referenced by `HEAD`:
+
+```bash
+git rev-parse HEAD
+```
+
+Common relative references include:
+
+```text
+HEAD      Current commit
+HEAD^     First parent of the current commit
+HEAD~1    One generation before HEAD
+HEAD~3    Three generations before HEAD
+```
+
+Examples:
+
+```bash
+git show HEAD
+git diff HEAD~1..HEAD
+git reset --soft HEAD~1
+```
+
+In detached HEAD state, `HEAD` points directly to a commit rather than a branch.
+
+> `HEAD` provides the context for committing, merging, rebasing, comparing, and navigating history.
+
+***
+
+## 73. What does `origin` commonly represent?
+
+`origin` is the conventional name Git assigns to the remote repository from which a repository was cloned.
+
+```bash
+git clone https://github.com/company/payment-service.git
+```
+
+Git generally creates:
+
+```text
+origin
+```
+
+View it:
+
+```bash
+git remote -v
+```
+
+Examples:
+
+```bash
+git fetch origin
+git pull origin main
+git push origin feature/payment-validation
+```
+
+Important points:
+
+* `origin` is not a special mandatory Git keyword.
+* It can be renamed.
+* It may point to any repository.
+* It does not necessarily represent the authoritative repository.
+* In a fork workflow, `origin` often represents the developer’s fork and `upstream` represents the original project.
+
+Rename it:
+
+```bash
+git remote rename origin corporate
+```
+
+> Always inspect `git remote -v` before pushing from sensitive environments to ensure that the remote URL is correct.
+
+***
+
+## 74. What is `git show-ref`?
+
+`git show-ref` lists references in a local repository and the object IDs to which they point.
+
+```bash
+git show-ref
+```
+
+Example:
+
+```text
+a7b31f2... refs/heads/main
+b8c42d3... refs/remotes/origin/main
+c9d53e4... refs/tags/v2.1.0
+```
+
+Show only branches:
+
+```bash
+git show-ref --heads
+```
+
+Show only tags:
+
+```bash
+git show-ref --tags
+```
+
+Check whether an exact reference exists:
+
+```bash
+git show-ref --verify refs/heads/main
+```
+
+Suppress normal output and rely on the exit code:
+
+```bash
+git show-ref --verify --quiet refs/heads/main
+```
+
+This is useful in scripts:
+
+```bash
+if git show-ref --verify --quiet refs/heads/main; then
+    echo "main branch exists"
+fi
+```
+
+> `git branch` and `git tag` provide user-friendly lists, while `git show-ref` is useful for low-level inspection and automation involving full reference names.
+
+***
+
+## 75. How do you cherry-pick a range of commits?
+
+To include commits from `A` through `B`, inclusive:
+
+```bash
+git cherry-pick A^..B
+```
+
+The caret includes commit `A` by starting the range from its parent.
+
+Example:
+
+```bash
+git cherry-pick a1b2c3d^..f4e5d6c
+```
+
+Without the caret:
+
+```bash
+git cherry-pick A..B
+```
+
+commit `A` is excluded.
+
+### Recommended workflow
+
+```bash
+git switch release/2.1
+git pull --ff-only
+git switch -c backport/payment-fix
+git cherry-pick a1b2c3d^..f4e5d6c
+```
+
+If conflicts occur:
+
+```bash
+git status
+```
+
+Resolve and stage them:
+
+```bash
+git add <resolved-files>
+git cherry-pick --continue
+```
+
+Abort the entire operation:
+
+```bash
+git cherry-pick --abort
+```
+
+> Validate the commit range with `git log --oneline A^..B` before applying it. Ranges involving merge commits or non-linear history may require more careful selection.
+
+***
+
+## 76. How do you amend a commit?
+
+Amend the latest commit with newly staged changes:
+
+```bash
+git add <files>
+git commit --amend
+```
+
+Change only the latest commit message:
+
+```bash
+git commit --amend -m "Corrected commit message"
+```
+
+Add staged content without changing the message:
+
+```bash
+git commit --amend --no-edit
+```
+
+Example:
+
+```bash
+git add tests/payment-service-tests.cs
+git commit --amend --no-edit
+```
+
+Amending creates a new commit with a new commit hash because the content or metadata changes.
+
+If the commit has already been pushed, the remote update usually requires:
+
+```bash
+git push --force-with-lease
+```
+
+> Amend is ideal for correcting the latest unpublished commit, such as adding a forgotten file, correcting metadata, or improving the message.
+
+***
+
+## 77. When should you avoid amending a pushed commit?
+
+Avoid amending a pushed commit when the commit is part of shared or public history.
+
+Amending changes the commit hash. If other developers have based work on the original commit, they may experience:
+
+* Divergent history
+* Duplicate commits
+* Rebase conflicts
+* Rejected pushes
+* Confusing pull-request updates
+* Inconsistent audit references
+
+Avoid amending when:
+
+* The commit is on `main` or a release branch.
+* Other developers are using the branch.
+* The commit has been deployed.
+* A release tag points to it.
+* Compliance records reference the original hash.
+* Branch policies prohibit history rewriting.
+
+Instead, create a new corrective commit:
+
+```bash
+git add <files>
+git commit -m "Correct configuration from previous change"
+git push
+```
+
+If amendment is necessary on a private feature branch:
+
+```bash
+git push --force-with-lease
+```
+
+> Treat published commit hashes as immutable unless the team has explicitly coordinated the rewrite.
+
+***
+
+## 78. What is a merge commit?
+
+A merge commit is a commit that joins two or more lines of development.
+
+A normal non-merge commit usually has one parent. A merge commit typically has two parents:
+
+1. The previous target-branch commit
+2. The source-branch commit
+
+Example history:
+
+```text
+      C---D  feature
+     /     \
+A---B---E---M  main
+```
+
+`M` is the merge commit.
+
+Create one by merging divergent branches:
+
+```bash
+git switch main
+git merge feature/payment-validation
+```
+
+Inspect parent relationships:
+
+```bash
+git show --summary <merge-commit>
+```
+
+Display parent hashes:
+
+```bash
+git show -s --format="%H %P" <merge-commit>
+```
+
+### Benefits
+
+* Preserves branch topology
+* Shows when integration occurred
+* Groups feature commits under an integration point
+* Supports auditing of parallel development
+
+### Consideration
+
+Too many unnecessary merge commits can make history difficult to read. Teams should standardize whether they use merge commits, squash merges, or rebase-based workflows.
+
+***
+
+## 79. What is `git merge --no-ff`?
+
+`git merge --no-ff` forces Git to create a merge commit even when a fast-forward merge is possible.
+
+```bash
+git switch main
+git merge --no-ff feature/payment-validation
+```
+
+Without `--no-ff`, Git might simply move the `main` pointer forward when no divergent commits exist.
+
+With `--no-ff`, the branch relationship remains visible:
+
+```text
+      C---D
+     /     \
+A---B-------M
+```
+
+Add a merge message:
+
+```bash
+git merge --no-ff feature/payment-validation \
+  -m "Merge payment validation feature"
+```
+
+### Advantages
+
+* Preserves feature boundaries
+* Makes feature-level reversion easier to understand
+* Provides an explicit integration event
+* Supports some audit workflows
+
+### Disadvantages
+
+* Creates additional merge commits
+* Can make high-volume repository history noisy
+* May be unnecessary for very small changes
+
+> Use `--no-ff` only when preserving the branch integration point provides meaningful operational or audit value.
+
+***
+
+## 80. How do you list remote branches?
+
+List locally known remote-tracking branches:
+
+```bash
+git branch -r
+```
+
+List both local and remote-tracking branches:
+
+```bash
+git branch -a
+```
+
+Refresh them first:
+
+```bash
+git fetch --all --prune
+git branch -r
+```
+
+Query references directly from a remote:
+
+```bash
+git ls-remote --heads origin
+```
+
+List all remote references:
+
+```bash
+git ls-remote origin
+```
+
+List remote tags:
+
+```bash
+git ls-remote --tags origin
+```
+
+### Difference
+
+* `git branch -r` displays local remote-tracking references from the last fetch.
+* `git ls-remote` queries the remote server directly.
+* `git fetch --prune` updates local references and removes stale tracking branches.
+
+> When investigating whether a branch currently exists on GitHub or Azure Repos, `git ls-remote --heads origin` provides a direct remote query.
+
+***
+
+## 81. How do you set an upstream branch for a local branch?
+
+Push a branch and establish upstream tracking:
+
+```bash
+git push -u origin feature/payment-validation
+```
+
+The longer form is:
+
+```bash
+git push --set-upstream origin feature/payment-validation
+```
+
+Afterward, these shorter commands can usually be used:
+
+```bash
+git push
+git pull
+```
+
+Set tracking for an existing remote branch without pushing:
+
+```bash
+git branch --set-upstream-to=origin/feature/payment-validation
+```
+
+Short form:
+
+```bash
+git branch -u origin/feature/payment-validation
+```
+
+View tracking relationships:
+
+```bash
+git branch -vv
+```
+
+Remove the upstream association:
+
+```bash
+git branch --unset-upstream
+```
+
+> An upstream branch provides the default push, pull, comparison, ahead, and behind relationship for the local branch.
+
+***
+
+## 82. What is `git pull --rebase`, and why use it?
+
+`git pull --rebase` fetches remote changes and then rebases local commits onto the updated remote branch instead of creating a merge commit.
+
+```bash
+git pull --rebase origin main
+```
+
+Conceptually:
+
+```bash
+git fetch origin
+git rebase origin/main
+```
+
+### Why use it?
+
+* Maintains a more linear history
+* Avoids unnecessary merge commits from routine pulls
+* Places local work on top of the latest remote work
+* Makes feature-branch history easier to review
+
+### If conflicts occur
+
+Resolve the files and stage them:
+
+```bash
+git add <resolved-files>
+git rebase --continue
+```
+
+Abort:
+
+```bash
+git rebase --abort
+```
+
+Configure it globally:
+
+```bash
+git config --global pull.rebase true
+```
+
+Configure it only for the current repository:
+
+```bash
+git config pull.rebase true
+```
+
+### Caution
+
+Rebase recreates local commits with new hashes. It is safe for normal unpublished local commits, but shared history should not be rewritten casually.
+
+> `git pull --rebase` is often preferred on developer feature branches, while protected branch integration should follow the repository’s approved pull-request strategy.
+
+***
+
+## 83. How do you configure automatic CRLF handling?
+
+Git uses `core.autocrlf` to manage line-ending conversion between:
+
+* LF: Common on Linux and macOS
+* CRLF: Common on Windows
+
+### Common Windows setting
+
+```bash
+git config --global core.autocrlf true
+```
+
+This generally converts LF to CRLF during checkout and converts CRLF back to LF when committing.
+
+### Common Linux or macOS setting
+
+```bash
+git config --global core.autocrlf input
+```
+
+This converts CRLF to LF when committing but does not convert LF to CRLF during checkout.
+
+### Disable automatic conversion
+
+```bash
+git config --global core.autocrlf false
+```
+
+### Recommended repository-level control
+
+Use `.gitattributes` to establish consistent behavior:
+
+```gitattributes
+* text=auto
+
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.jpg binary
+*.zip binary
+```
+
+After introducing normalized rules:
+
+```bash
+git add --renormalize .
+git status
+git diff --staged
+```
+
+Review carefully before committing.
+
+> `.gitattributes` is more predictable for cross-platform teams because the policy travels with the repository rather than depending only on each developer’s global configuration.
+
+***
+
+## 84. What is `git blame -L`?
+
+`git blame -L` limits blame output to a selected line range or function.
+
+Show lines 50 through 80:
+
+```bash
+git blame -L 50,80 src/payment-service.cs
+```
+
+Start from line 50 and display the next 20 lines:
+
+```bash
+git blame -L 50,+20 src/payment-service.cs
+```
+
+Show a range ending before a pattern:
+
+```bash
+git blame -L 50,/return/ src/payment-service.cs
+```
+
+In supported source formats, blame a function by name:
+
+```bash
+git blame -L :ProcessPayment src/payment-service.cs
+```
+
+Ignore whitespace-only changes:
+
+```bash
+git blame -w -L 50,80 src/payment-service.cs
+```
+
+> The line-range option is useful for large files because it limits the investigation to the specific function or block associated with an incident.
+
+***
+
+## 85. How do you check file differences between branches?
+
+Compare the tips of two branches:
+
+```bash
+git diff branchA..branchB
+```
+
+Example:
+
+```bash
+git diff main..feature/payment-validation
+```
+
+Compare only a particular file:
+
+```bash
+git diff main..feature/payment-validation -- src/payment-service.cs
+```
+
+Display only changed file names:
+
+```bash
+git diff --name-only main..feature/payment-validation
+```
+
+Display change status:
+
+```bash
+git diff --name-status main..feature/payment-validation
+```
+
+Display a statistical summary:
+
+```bash
+git diff --stat main..feature/payment-validation
+```
+
+### Two-dot versus three-dot comparison
+
+Two dots compare the two branch tips:
+
+```bash
+git diff main..feature
+```
+
+Three dots compare the merge base with the source branch tip:
+
+```bash
+git diff main...feature
+```
+
+The three-dot comparison is often useful for reviewing what the feature branch introduced relative to its common ancestor with `main`.
+
+> Fetch remote changes before comparison when accuracy against the current remote state is important.
+
+***
+
+## 86. How do you find commits by author?
+
+Search by author name:
+
+```bash
+git log --author="Rajesh Singh"
+```
+
+Search using an email pattern:
+
+```bash
+git log --author="rajesh.singh@company.com"
+```
+
+Concise output:
+
+```bash
+git log --author="Rajesh Singh" --oneline
+```
+
+Limit by date:
+
+```bash
+git log \
+  --author="Rajesh Singh" \
+  --since="2026-07-01" \
+  --until="2026-07-24"
+```
+
+Search all branches:
+
+```bash
+git log --all --author="Rajesh Singh" --oneline
+```
+
+Show file-change statistics:
+
+```bash
+git log --author="Rajesh Singh" --stat
+```
+
+Git treats the author and committer as separate identities. Search by committer when necessary:
+
+```bash
+git log --committer="Build Automation"
+```
+
+> Author searches may reveal duplicate identities if different email addresses or spelling variations were used. A `.mailmap` file can normalize how contributors appear in reports.
+
+***
+
+## 87. How do you find commits touching a specific file?
+
+Use:
+
+```bash
+git log -- <file>
+```
+
+Example:
+
+```bash
+git log -- src/payment-service.cs
+```
+
+Concise output:
+
+```bash
+git log --oneline -- src/payment-service.cs
+```
+
+Show the actual patches:
+
+```bash
+git log -p -- src/payment-service.cs
+```
+
+Follow the file across renames:
+
+```bash
+git log --follow -- src/payment-service.cs
+```
+
+Show change statistics:
+
+```bash
+git log --stat -- src/payment-service.cs
+```
+
+Search all references:
+
+```bash
+git log --all -- src/payment-service.cs
+```
+
+Search for changes involving a string in that file:
+
+```bash
+git log -S "PaymentTimeout" -p -- src/payment-service.cs
+```
+
+> `--follow` works best for a single path and Git’s rename detection is similarity-based, so major rewrites may make earlier history difficult to follow automatically.
+
+***
+
+## 88. What is `git daemon`?
+
+`git daemon` is a lightweight Git server that serves repositories using the native Git protocol.
+
+A basic example is:
+
+```bash
+git daemon \
+  --reuseaddr \
+  --base-path=/srv/git \
+  /srv/git
+```
+
+It commonly serves repositories through URLs such as:
+
+```text
+git://server.example.com/project.git
+```
+
+### Characteristics
+
+* Lightweight
+* Fast for Git object transfer
+* Suitable for simple read-only repository distribution
+* Limited authentication and authorization
+* No built-in pull-request workflow
+* No advanced enterprise governance
+* Traffic is not inherently protected like SSH or HTTPS
+
+Repositories may need an export marker:
+
+```bash
+touch /srv/git/project.git/git-daemon-export-ok
+```
+
+> `git daemon` is rarely the preferred choice for enterprise write access. GitHub, Azure Repos, GitLab, SSH, and HTTPS provide stronger identity, encryption, authorization, audit, and collaboration capabilities.
+
+***
+
+## 89. How do you set up a bare repository, and why?
+
+A bare repository contains Git objects and references but has no checked-out working directory.
+
+Create one:
+
+```bash
+git init --bare payment-service.git
+```
+
+A shared server location might be:
+
+```bash
+mkdir -p /srv/git
+cd /srv/git
+git init --bare payment-service.git
+```
+
+Add it as a remote:
+
+```bash
+git remote add origin ssh://git@server/srv/git/payment-service.git
+git push -u origin main
+```
+
+### Why use a bare repository?
+
+* It can act as a central Git repository.
+* Developers can push without interfering with a checked-out working tree.
+* Server-side hooks can be installed.
+* It is suitable for internal Git hosting and repository mirrors.
+
+Create a bare clone of an existing repository:
+
+```bash
+git clone --bare existing-repository payment-service.git
+```
+
+For a full mirror including all references:
+
+```bash
+git clone --mirror <repository-url> payment-service.git
+```
+
+> A normal repository should not usually be used as a shared push target because updating its checked-out branch can create working-tree inconsistencies.
+
+***
+
+## 90. What is the `index.lock` error, and how do you resolve it?
+
+Git creates `.git/index.lock` to prevent multiple processes from writing to the repository index simultaneously.
+
+A typical error is:
+
+```text
+fatal: Unable to create '.git/index.lock': File exists.
+```
+
+### Possible causes
+
+* Another Git command is currently running.
+* An IDE or Git client is performing an operation.
+* A previous Git process crashed.
+* A pipeline job was terminated.
+* Antivirus or filesystem tools are interfering.
+* Two automation jobs share the same workspace.
+
+### Safe resolution
+
+First, verify that no Git process is active.
+
+Linux:
+
+```bash
+ps -ef | grep git
+```
+
+Windows PowerShell:
+
+```powershell
+Get-Process git -ErrorAction SilentlyContinue
+```
+
+Inspect repository status:
+
+```bash
+git status
+```
+
+If no Git process is using the repository and the lock is stale, remove it:
+
+Linux:
+
+```bash
+rm -f .git/index.lock
+```
+
+PowerShell:
+
+```powershell
+Remove-Item .git\index.lock -Force
+```
+
+Then verify repository integrity:
+
+```bash
+git status
+git fsck
+```
+
+> Never remove `index.lock` while another Git operation is active. Doing so can corrupt the index or interrupt an important repository update.
+
+For CI/CD, allocate a separate workspace per job instead of allowing parallel jobs to use the same checkout.
+
+***
+
+## 91. How do you configure multiple remotes for one repository?
+
+Add additional remotes using distinct names:
+
+```bash
+git remote add origin git@github.com:company/payment-service.git
+git remote add upstream git@github.com:platform/payment-service.git
+```
+
+Verify:
+
+```bash
+git remote -v
+```
+
+Fetch from all remotes:
+
+```bash
+git fetch --all --prune
+```
+
+Fetch from a specific remote:
+
+```bash
+git fetch upstream
+```
+
+Push to a particular remote:
+
+```bash
+git push origin main
+```
+
+### Common use cases
+
+* Fork workflow
+* Migration between Git platforms
+* GitHub and Azure Repos replication
+* Read-only upstream with a writable fork
+* Disaster-recovery mirror
+* Separate fetch and push locations
+
+Configure a different push URL:
+
+```bash
+git remote set-url --add --push origin \
+  git@github.com:company/payment-service.git
+```
+
+Add another push destination:
+
+```bash
+git remote set-url --add --push origin \
+  git@secondary-server:company/payment-service.git
+```
+
+Review carefully:
+
+```bash
+git remote get-url --all origin
+git remote get-url --all --push origin
+```
+
+> Multi-remote replication must be designed carefully. Branch policies, pull requests, tags, permissions, Git LFS objects, hooks, and platform metadata may not automatically replicate with normal Git pushes.
+
+***
+
+## 92. How do you push tags to a remote?
+
+Push a specific tag:
+
+```bash
+git push origin v2.1.0
+```
+
+Push all local tags that are missing remotely:
+
+```bash
+git push origin --tags
+```
+
+Push annotated tags reachable from pushed commits:
+
+```bash
+git push origin --follow-tags
+```
+
+Delete a remote tag:
+
+```bash
+git push origin --delete v2.1.0
+```
+
+Alternative deletion syntax:
+
+```bash
+git push origin :refs/tags/v2.1.0
+```
+
+Verify remote tags:
+
+```bash
+git ls-remote --tags origin
+```
+
+### CI/CD recommendation
+
+Push official release tags individually:
+
+```bash
+git push origin v2.1.0
+```
+
+This reduces the chance of accidentally publishing local test or temporary tags.
+
+> Protect production release tags where the hosting platform supports tag-protection or immutable-release policies.
+
+***
+
+## 93. How do you list all tags?
+
+List local tags:
+
+```bash
+git tag -l
+```
+
+The shorter form also works:
+
+```bash
+git tag
+```
+
+Filter by pattern:
+
+```bash
+git tag -l "v2.*"
+```
+
+Sort by semantic version:
+
+```bash
+git tag -l --sort=-version:refname
+```
+
+Show tags with annotation subjects:
+
+```bash
+git tag -n
+```
+
+Show tags pointing to the current commit:
+
+```bash
+git tag --points-at HEAD
+```
+
+Find tags containing a commit:
+
+```bash
+git tag --contains <commit>
+```
+
+Display remote tags:
+
+```bash
+git ls-remote --tags origin
+```
+
+Refresh locally known tags:
+
+```bash
+git fetch origin --tags
+```
+
+> Local tag lists may not represent the latest remote state until tags have been fetched.
+
+***
+
+## 94. What is `git merge --squash`?
+
+`git merge --squash` combines the net changes from another branch and stages them in the current branch without creating a merge commit and without recording the source branch as a parent.
+
+```bash
+git switch main
+git merge --squash feature/payment-validation
+git commit -m "Add payment validation feature"
+```
+
+Suppose the feature branch contains five commits. A squash merge creates one new commit on `main` containing their combined changes.
+
+### Benefits
+
+* Keeps the target-branch history concise
+* Removes temporary or noisy feature commits
+* Provides one commit per feature or pull request
+* Makes simple feature rollback easier
+
+### Limitations
+
+* Does not preserve detailed branch topology.
+* The original feature commits remain only on the feature branch.
+* Git does not record that the branch was formally merged.
+* Repeated squash merges from a long-lived branch can be difficult to manage.
+
+> Squash merging works well with short-lived feature branches and pull requests where the target branch requires a clean, curated history.
+
+***
+
+## 95. How do you perform a shallow clone?
+
+Clone only the latest commit:
+
+```bash
+git clone --depth 1 https://github.com/company/payment-service.git
+```
+
+Clone a specific branch shallowly:
+
+```bash
+git clone \
+  --depth 1 \
+  --branch main \
+  --single-branch \
+  https://github.com/company/payment-service.git
+```
+
+Increase the available history:
+
+```bash
+git fetch --deepen=50
+```
+
+Convert to a full clone:
+
+```bash
+git fetch --unshallow
+```
+
+Check whether the repository is shallow:
+
+```bash
+git rev-parse --is-shallow-repository
+```
+
+### Benefits
+
+* Faster clone
+* Reduced network traffic
+* Less disk usage
+* Useful for some CI build jobs
+
+### Limitations
+
+A shallow clone may affect:
+
+* History-based version generation
+* `git blame`
+* `git bisect`
+* Merge-base calculations
+* Changelog generation
+* Security and compliance scanning
+* Operations requiring older commits or tags
+
+> Use the smallest depth that still satisfies the build, testing, versioning, and audit requirements.
+
+***
+
+## 96. What is the purpose of `git blame --show-email`?
+
+`git blame --show-email` displays the author’s email address instead of only the author’s name.
+
+```bash
+git blame --show-email src/payment-service.cs
+```
+
+Limit it to relevant lines:
+
+```bash
+git blame --show-email -L 50,80 src/payment-service.cs
+```
+
+### Use cases
+
+* Distinguish contributors with similar names
+* Identify duplicate author identities
+* Contact the relevant technical owner
+* Investigate commits created using an incorrect identity
+* Support audit and contribution analysis
+
+### Privacy and governance consideration
+
+Email addresses may be personal information. Use this output only for legitimate engineering, operational, or audit purposes and follow organizational privacy requirements.
+
+> Use blame information to find implementation context and expertise, not to assign personal fault.
+
+***
+
+## 97. How do you change the author of past commits?
+
+For the latest commit:
+
+```bash
+git commit --amend \
+  --author="Rajesh Singh <rajesh.singh@company.com>" \
+  --no-edit
+```
+
+For several recent commits, start an interactive rebase:
+
+```bash
+git rebase -i HEAD~5
+```
+
+Change `pick` to `edit` for each commit that requires correction:
+
+```text
+edit a1b2c3d Add payment validation
+pick b2c3d4e Add tests
+edit c3d4e5f Update configuration
+```
+
+When Git pauses:
+
+```bash
+git commit --amend \
+  --author="Rajesh Singh <rajesh.singh@company.com>" \
+  --no-edit
+
+git rebase --continue
+```
+
+Repeat until the rebase completes.
+
+An alternative is to set environment variables while amending:
+
+```bash
+GIT_COMMITTER_NAME="Rajesh Singh" \
+GIT_COMMITTER_EMAIL="rajesh.singh@company.com" \
+git commit --amend \
+  --author="Rajesh Singh <rajesh.singh@company.com>" \
+  --no-edit
+```
+
+### Important impact
+
+Every amended commit and its descendants receive new hashes. If the branch was pushed:
+
+```bash
+git push --force-with-lease
+```
+
+> Avoid rewriting shared or released history solely to correct cosmetic identity information. Coordinate the impact and preserve audit records where required.
+
+***
+
+## 98. What is the difference between `credential-store` and `credential-cache`?
+
+Both are Git credential helpers, but they store credentials differently.
+
+### Credential cache
+
+```bash
+git config --global credential.helper cache
+```
+
+Set a timeout:
+
+```bash
+git config --global credential.helper "cache --timeout=3600"
+```
+
+Characteristics:
+
+* Stores credentials temporarily in memory
+* Credentials expire after a configured period
+* Does not normally persist across restarts
+* More secure than plaintext persistent storage
+* Primarily available in Unix-like environments
+
+### Credential store
+
+```bash
+git config --global credential.helper store
+```
+
+Characteristics:
+
+* Stores credentials persistently on disk
+* Commonly writes to `~/.git-credentials`
+* Credentials are generally stored in plaintext
+* Survives restarts
+* Inappropriate for shared or sensitive systems
+
+Remove stored credentials by editing or securely removing the applicable credential file after confirming its location.
+
+### Preferred enterprise approach
+
+Use an operating-system-backed secure helper such as Git Credential Manager:
+
+```bash
+git config --global credential.helper manager
+```
+
+> `credential-cache` is temporary and memory-based. `credential-store` is persistent but normally plaintext. For enterprise systems, prefer Git Credential Manager, SSH keys, or a secure secrets-management integration.
+
+***
+
+## 99. How do you use `git worktree`, and what problem does it solve?
+
+`git worktree` allows multiple working directories to be attached to the same repository data. Each worktree can check out a different branch.
+
+This solves the problem of repeatedly stashing changes or cloning the repository multiple times when working on parallel branches.
+
+### Add another worktree
+
+From the primary repository:
+
+```bash
+git worktree add ../payment-hotfix hotfix/payment-timeout
+```
+
+Create a new branch and worktree:
+
+```bash
+git worktree add -b hotfix/payment-timeout \
+  ../payment-hotfix \
+  main
+```
+
+List worktrees:
+
+```bash
+git worktree list
+```
+
+Remove a worktree:
+
+```bash
+git worktree remove ../payment-hotfix
+```
+
+Clean stale worktree metadata:
+
+```bash
+git worktree prune
+```
+
+### Practical use cases
+
+* Develop a feature while investigating a production issue.
+* Maintain multiple supported release branches.
+* Run comparisons between versions.
+* Execute builds for separate branches.
+* Review a pull request without disturbing current work.
+* Test a hotfix while retaining uncommitted feature changes.
+
+### Important restriction
+
+The same branch normally cannot be checked out simultaneously in multiple worktrees.
+
+> Worktrees share Git objects, so they use less disk and network bandwidth than separate full clones while maintaining independent working directories and indexes.
+
+***
+
+## 100. What is `git submodule update --init --recursive` used for?
+
+This command initializes, fetches, and checks out the commits recorded for submodules, including nested submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+The options mean:
+
+* `update`: Check out the commit recorded by the parent repository.
+* `--init`: Initialize submodules that have not yet been initialized.
+* `--recursive`: Process nested submodules too.
+
+### Clone and initialize in one operation
+
+```bash
+git clone --recurse-submodules \
+  https://github.com/company/payment-service.git
+```
+
+If the repository was already cloned:
+
+```bash
+git submodule update --init --recursive
+```
+
+### Update submodule URLs after `.gitmodules` changes
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
+### Update submodules from their configured remote branches
+
+```bash
+git submodule update --remote --recursive
+```
+
+This is different from checking out the exact commits recorded by the parent repository. After a remote update, the parent repository must commit the new submodule references if they are intended to be shared.
+
+### CI/CD usage
+
+A pipeline checking out a repository with submodules must ensure:
+
+* Submodule checkout is enabled.
+* Credentials can access every submodule repository.
+* Nested submodules are handled.
+* The required SSH host keys or HTTPS credentials are available.
+* The exact referenced submodule commits still exist.
+
+> The parent repository records specific submodule commit IDs. Running `git submodule update --init --recursive` reproduces those defined dependency versions rather than automatically selecting each submodule’s latest commit.
+
+***
+
+# Senior DevOps Quick Revision
+
+## Authentication and credentials
+
+* Use Git Credential Manager or SSH keys for secure authentication.
+* Avoid plaintext credential storage.
+* Never embed tokens in Git URLs, scripts, or pipeline YAML.
+* Use separate service identities for CI/CD automation.
+
+## History and recovery
+
+* Use `git reflog` to recover commits after reset, amend, or rebase.
+* Use `git fsck` to inspect repository integrity and unreachable objects.
+* Create a recovery branch before performing destructive repair.
+* Rotate exposed secrets before rewriting Git history.
+
+## Repository maintenance
+
+* Use `git gc` for repository optimization when necessary.
+* Run `git clean -n` before deleting untracked content.
+* Resolve `index.lock` only after verifying that no Git process is active.
+* Use shallow clones only when the pipeline does not require full history.
+
+## Enterprise workflow
+
+* Protect release tags and critical branches.
+* Enforce pull-request policies in GitHub or Azure Repos.
+* Use `.gitattributes` for cross-platform line-ending consistency.
+* Store build artifacts outside source repositories.
+* Use Git LFS only for genuinely version-controlled large files.
+* Use worktrees for parallel branch activity.
+* Pin submodules to known commit IDs for reproducible builds.
 
