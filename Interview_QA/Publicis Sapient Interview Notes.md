@@ -659,3 +659,2903 @@ The diagram separates DNS lookup, application traffic, and routing configuration
 
 When troubleshooting, follow that same separation: **resolve the name, verify the network path, identify the traffic-handling component, inspect the workload, and validate its dependencies.**
 
+
+
+These responsibilities form a continuous engineering cycle:
+
+**Define the platform in code → deploy controlled changes → observe production → investigate failures → improve the design and automation.**
+
+For your Azure/AKS interview, you should be able to explain both the implementation and the operational decisions behind it.
+
+We’ll use an example platform with AKS, Application Gateway, private networking, a database, and GitHub Actions.
+
+**1. What implementing Infrastructure as Code actually means**
+
+Infrastructure as Code means describing infrastructure in version-controlled files and using automation to create and maintain it.
+
+Instead of manually creating a VNet, configuring subnets, and deploying AKS through the Azure portal, you declare their desired configuration.
+
+Terraform then compares:
+
+* **Configuration:** What you want.
+* **State:** Terraform’s recorded mapping of resources.
+* **Actual infrastructure:** What currently exists in Azure.
+
+It calculates the changes needed to reconcile them.
+
+The engineering value is not simply faster provisioning. It is also:
+
+* Reproducible environments.
+* Reviewable infrastructure changes.
+* Traceability to an owner and commit.
+* Consistent platform standards.
+* Detection of unexpected changes.
+* A repeatable foundation for recovery.
+
+Terraform does not continuously reconcile infrastructure by itself. A person, pipeline, or managed execution service must run it.
+
+**2. Understand Terraform’s main building blocks**
+
+| Concept     | Purpose                                  | Azure example                                        |
+| ----------- | ---------------------------------------- | ---------------------------------------------------- |
+| Provider    | Connects Terraform to a platform API     | AzureRM provider                                     |
+| Resource    | Declares an object Terraform manages     | VNet, subnet, AKS cluster                            |
+| Data source | Reads existing information               | An existing shared resource group                    |
+| Variable    | Supplies an input                        | Environment, location, address range                 |
+| Local value | Holds a reusable expression              | Common naming or tags                                |
+| Output      | Exposes a result                         | Subnet ID used by another component                  |
+| Module      | Groups resources behind an interface     | Reusable AKS platform module                         |
+| State       | Records resource mappings and attributes | Configuration address mapped to an Azure resource ID |
+| Backend     | Determines where state is stored         | Azure Blob Storage                                   |
+
+A module is useful when it packages a coherent capability with clear inputs, outputs, and ownership. Terraform supports local and remote module sources. [HashiCorp: Modules](https://developer.hashicorp.com/terraform/language/modules).
+
+**3. Start with architecture and ownership**
+
+Before writing Terraform, decide which resources belong together and who owns their lifecycle.
+
+For the example project:
+
+| Infrastructure area  | Resources                                        | Operational owner                     |
+| -------------------- | ------------------------------------------------ | ------------------------------------- |
+| Shared connectivity  | Hub network, central DNS, connectivity           | Network/platform team                 |
+| Application network  | Spoke VNet, subnets, routes                      | Platform team                         |
+| Kubernetes platform  | AKS, node pools, identities                      | Platform team                         |
+| Application delivery | Deployments, Services, application configuration | Application team through GitOps       |
+| Data services        | Database, backups, access configuration          | Data/application owners               |
+| Observability        | Collection settings, dashboards, alerts          | Shared platform and service ownership |
+
+This avoids two common problems:
+
+* One enormous Terraform state controls everything.
+* Several tools attempt to manage the same configuration.
+
+For example, Terraform can manage AKS infrastructure while ArgoCD manages application manifests. If ArgoCD owns a Deployment, an unrelated Terraform configuration should not also keep changing it.
+
+**4. Organize the Terraform repository**
+
+A practical structure could use these paths:
+
+| Path                     | Contents                                     |
+| ------------------------ | -------------------------------------------- |
+| `modules/network/`       | VNet, subnets, related outputs               |
+| `modules/aks/`           | Cluster and node-pool configuration          |
+| `modules/identity/`      | Identities and role assignments              |
+| `modules/observability/` | Diagnostic settings and monitoring resources |
+| `environments/dev/`      | Development root configuration               |
+| `environments/staging/`  | Staging root configuration                   |
+| `environments/prod/`     | Production root configuration                |
+
+Each environment calls reusable modules with its own settings.
+
+For example:
+
+* Development uses smaller capacity.
+* Production uses appropriate redundancy and headroom.
+* Production access is restricted separately.
+* The environments retain consistent application-facing interfaces.
+
+Use separate state and access boundaries where the lifecycle or risk warrants them. Different variable files alone do not isolate state.
+
+**5. Write declarative resources and dependencies**
+
+This illustrative Terraform fragment creates a resource group, VNet, and subnet. Provider configuration and authentication are assumed; this is not a complete production platform.
+
+```hcl
+variable "environment" {
+  type = string
+}
+
+variable "location" {
+  type = string
+}
+
+locals {
+  prefix = "orders-${var.environment}"
+
+  tags = {
+    Environment = var.environment
+    Owner       = "platform-team"
+    ManagedBy   = "Terraform"
+  }
+}
+
+resource "azurerm_resource_group" "platform" {
+  name     = "${local.prefix}-rg"
+  location = var.location
+  tags     = local.tags
+}
+
+resource "azurerm_virtual_network" "platform" {
+  name                = "${local.prefix}-vnet"
+  location            = azurerm_resource_group.platform.location
+  resource_group_name = azurerm_resource_group.platform.name
+  address_space       = ["10.20.0.0/16"]
+  tags                = local.tags
+}
+
+resource "azurerm_subnet" "aks_nodes" {
+  name                 = "aks-nodes"
+  resource_group_name  = azurerm_resource_group.platform.name
+  virtual_network_name = azurerm_virtual_network.platform.name
+  address_prefixes     = ["10.20.4.0/22"]
+}
+
+output "aks_node_subnet_id" {
+  value = azurerm_subnet.aks_nodes.id
+}
+```
+
+Notice the references:
+
+```hcl
+virtual_network_name = azurerm_virtual_network.platform.name
+```
+
+Terraform can infer that the subnet depends on the VNet. You normally do not need to add `depends_on` for a relationship already expressed through references.
+
+The sample address ranges must be checked against the organization’s existing networks and anticipated capacity.
+
+**6. Protect Terraform state**
+
+State is essential because it connects configuration addresses to actual Azure resources.
+
+For team use, Azure Blob Storage is a common backend. The AzureRM backend supports state locking using Azure Storage capabilities. Authentication to state storage is distinct from authorization to provision infrastructure. [HashiCorp: AzureRM backend](https://developer.hashicorp.com/terraform/language/backend/azurerm).
+
+An illustrative backend declaration:
+
+```hcl
+terraform {
+  backend "azurerm" {}
+}
+```
+
+Supply environment-specific non-secret backend settings during initialization:
+
+```bash
+terraform init \
+  -backend-config="storage_account_name=<state-account>" \
+  -backend-config="container_name=tfstate" \
+  -backend-config="key=prod/platform.tfstate" \
+  -backend-config="use_azuread_auth=true"
+```
+
+The storage account and container must already exist. Bootstrap them through a separately controlled process.
+
+For production:
+
+* Restrict access to the state container.
+* Enable appropriate recovery protection.
+* Keep state and plan files out of source control.
+* Control network access without preventing authorized runners from reaching storage.
+* Document recovery and lock-handling procedures.
+
+Marking a value `sensitive` does not automatically remove it from state. Terraform offers additional sensitive-data capabilities where supported, but state and plans must still be protected. [HashiCorp: Sensitive data](https://developer.hashicorp.com/terraform/language/manage-sensitive-data).
+
+**Practical failure:** Terraform can create Azure resources but cannot read its state.
+
+Possible explanation: the identity has management-plane permissions but lacks blob data-plane permissions, or the runner cannot reach the storage endpoint.
+
+**7. Build a controlled infrastructure pipeline**
+
+A useful pipeline has distinct validation, decision, execution, and verification stages.
+
+| Stage                         | Purpose                                     |
+| ----------------------------- | ------------------------------------------- |
+| Formatting                    | Keep configuration consistent               |
+| Validation                    | Detect invalid Terraform configuration      |
+| Linting and security analysis | Identify suspicious or undesirable patterns |
+| Policy checks                 | Enforce platform requirements               |
+| Plan                          | Show proposed infrastructure changes        |
+| Review                        | Evaluate risk and intended behavior         |
+| Apply                         | Execute the approved change                 |
+| Operational verification      | Confirm the platform actually works         |
+
+Basic commands:
+
+```bash
+terraform fmt -check -recursive
+terraform init
+terraform validate
+terraform plan -out=tfplan
+terraform show -no-color tfplan
+```
+
+After the required review:
+
+```bash
+terraform apply tfplan
+```
+
+A saved plan allows the pipeline to apply the reviewed proposal. Re-plan when it becomes stale or material conditions change. Plan files can contain sensitive information and should be treated accordingly. [HashiCorp: Terraform plan](https://developer.hashicorp.com/terraform/cli/commands/plan).
+
+For GitHub Actions, OIDC federation can provide short-lived Azure authentication. Constrain trust to the intended workflow context and grant the Azure identity only the required permissions. The GitHub `id-token: write` permission allows requesting an identity token; it does not itself grant Azure resource access. [GitHub: OIDC with Azure](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-azure).
+
+**What reviewers should inspect**
+
+A plan can be syntactically valid and still be operationally dangerous.
+
+Look for:
+
+* Unexpected deletion or replacement.
+* Expanded permissions.
+* Public exposure.
+* Network changes affecting connectivity.
+* Reduced capacity.
+* Changes to data retention or recovery.
+* Changes outside the intended scope.
+
+A green `terraform apply` means the infrastructure operations completed. Follow it with DNS, connectivity, identity, and application checks.
+
+**8. Handle drift, imports, refactoring, and failed applies**
+
+These distinguish production Terraform experience from basic provisioning knowledge.
+
+**Drift**
+
+An engineer changes a route in the Azure portal during an incident. Terraform configuration still declares the previous route.
+
+Decide whether the live change is:
+
+* An authorized improvement to capture in code.
+* A temporary mitigation to replace with a durable fix.
+* An unintended change to revert.
+
+Scheduled plans can detect differences, but they do not decide the correct business intent.
+
+**Imports**
+
+Importing associates an existing resource with a Terraform address. You must also ensure the configuration describes the intended resource settings. Review the resulting plan before applying anything. [HashiCorp: Import](https://developer.hashicorp.com/terraform/language/import).
+
+**Refactoring**
+
+Renaming a Terraform address can appear as deletion and creation unless you express the move appropriately:
+
+```hcl
+moved {
+  from = azurerm_resource_group.platform
+  to   = azurerm_resource_group.shared
+}
+```
+
+A moved block preserves the address relationship; it cannot make an incompatible resource-property change non-destructive. [HashiCorp: Refactoring modules](https://developer.hashicorp.com/terraform/language/modules/develop/refactoring).
+
+**Partial apply failure**
+
+Suppose Terraform creates a VNet but fails while creating AKS.
+
+The next step is to inspect:
+
+1. The error.
+2. Actual Azure resources.
+3. State mappings.
+4. The fresh plan after correcting the cause.
+
+Do not delete state to “start again.” Also, reverting a Git commit does not automatically undo all infrastructure effects. Some changes need forward fixes, migrations, or data restoration.
+
+**9. Automate platform operations beyond provisioning**
+
+Terraform is one part of platform automation.
+
+| Operation                       | Suitable mechanism               | What success means                                 |
+| ------------------------------- | -------------------------------- | -------------------------------------------------- |
+| Provision networks and clusters | Terraform pipeline               | Declared infrastructure exists and works           |
+| Deploy application versions     | CI plus GitOps                   | Intended artifact serves correct requests          |
+| Scale application replicas      | HPA or appropriate event scaling | Demand is handled within objectives                |
+| Add node capacity               | AKS scaling mechanisms           | Required pods can schedule                         |
+| Check certificate expiry        | Scheduled inventory automation   | Risks reach the right owner early                  |
+| Detect infrastructure drift     | Scheduled Terraform plans        | Differences are identified and evaluated           |
+| Validate backups                | Restore workflow                 | Restored data and application behavior pass checks |
+| Collect incident evidence       | Read-only diagnostic automation  | Responders obtain useful evidence quickly          |
+
+AKS Cluster Autoscaler evaluates node scaling using Kubernetes scheduling considerations. It is separate from application replica scaling. [Microsoft: AKS Cluster Autoscaler](https://learn.microsoft.com/en-us/azure/aks/cluster-autoscaler-overview).
+
+**Design automation to fail safely**
+
+For any operational automation, define:
+
+* Preconditions.
+* Scope.
+* Permissions.
+* Timeouts.
+* Retry limits.
+* Concurrency limits.
+* Verification.
+* Escalation when it cannot achieve the outcome.
+
+**Practical example: a stuck order worker**
+
+A weak automation restarts all workers whenever queue depth is high.
+
+A better automation:
+
+1. Confirms that processing progress has stopped.
+2. Checks whether the broker and database are healthy.
+3. Collects diagnostic evidence.
+4. Restarts one eligible worker.
+5. Verifies renewed progress.
+6. Stops after a bounded attempt if recovery fails.
+
+High queue depth may reflect a slow database. Restarting every worker can increase reconnect load and deepen the incident.
+
+**10. Troubleshoot production issues using hypotheses and evidence**
+
+Complex incidents often cross layers. A visible application failure may originate in networking, identity, storage, or a shared dependency.
+
+Begin with:
+
+* Which customer operation is failing?
+* When did it start?
+* Which regions, versions, or users are affected?
+* Is it an error, latency, correctness, or availability problem?
+* What changed?
+* What evidence would disprove the current hypothesis?
+
+Establish incident roles and communications while technical investigation proceeds. Clear coordination prevents conflicting changes and preserves an incident timeline. [Google SRE: Incident response](https://sre.google/workbook/incident-response/).
+
+Use a layer-by-layer investigation:
+
+| Layer              | Evidence                                               |
+| ------------------ | ------------------------------------------------------ |
+| Customer entry     | DNS results, connection errors, external probes        |
+| Gateway            | Access logs, backend health, TLS and routing           |
+| Kubernetes routing | Service selectors, EndpointSlices, readiness           |
+| Application        | Exceptions, traces, configuration, deployment version  |
+| Node resources     | Conditions, CPU, memory, disk, networking              |
+| Dependencies       | Database waits, connections, queue lag, API throttling |
+| Azure platform     | Quotas, provisioning failures, service health          |
+
+Avoid changing multiple unrelated settings simultaneously. You lose the ability to identify what affected the outcome.
+
+**11. Collect useful Kubernetes evidence**
+
+These are read-only diagnostic examples:
+
+```bash
+kubectl config current-context
+
+kubectl -n orders get deploy,pods,svc,endpointslices -o wide
+
+kubectl -n orders get events \
+  --sort-by=.metadata.creationTimestamp
+
+kubectl -n orders describe pod <pod>
+
+kubectl -n orders logs <pod> \
+  -c <container> --tail=200
+
+kubectl -n orders logs <pod> \
+  -c <container> --previous --tail=200
+
+kubectl describe node <node>
+
+kubectl -n orders top pods
+```
+
+Understand what each tells you:
+
+* **Events:** Scheduling, mounting, pulling, and other operational failures.
+* **Describe:** Conditions, configuration, and termination reasons.
+* **Previous logs:** Evidence from a container that restarted.
+* **Node conditions:** Pressure and health problems.
+* **Top:** Recent resource consumption, assuming metrics are available.
+
+Current utilization alone is insufficient. A short historical memory spike may explain an OOM even when the restarted container now uses little memory.
+
+**12. Worked incident: checkout latency rises after scaling**
+
+Assume these fictional observations:
+
+* Checkout p99 rises from 400 ms to 4 seconds.
+* Application CPU averages 40%.
+* HPA increases replicas from 10 to 30.
+* Database connections approach their limit.
+* Errors increase after the additional replicas start.
+
+**Step 1 — State the hypothesis**
+
+More replicas increased aggregate database connections, causing contention and waiting.
+
+**Step 2 — Verify**
+
+Check:
+
+* Connection-pool configuration per pod.
+* Active and waiting database connections.
+* Trace time spent waiting for a connection.
+* Database query and lock behavior.
+* Replica count and deployment timeline.
+
+Suppose each pod permits 50 connections:
+
+```text
+10 pods × 50 = 500 possible connections
+30 pods × 50 = 1,500 possible connections
+```
+
+If the database safely supports only 600 connections for this workload, scaling has increased contention.
+
+**Step 3 — Mitigate**
+
+Choose based on evidence:
+
+* Bound incoming demand.
+* Reduce unnecessary retries.
+* Adjust the connection budget.
+* Restore the previous compatible configuration if a change caused the issue.
+* Control replica growth while preserving sufficient serving capacity.
+
+Reducing replicas without controlling demand may overload the remaining pods, so consider the full request path.
+
+**Step 4 — Verify recovery**
+
+Look for:
+
+* Customer success returning.
+* Latency recovering.
+* Database wait time falling.
+* Backlog draining.
+* No duplicate order or payment side effects.
+
+**Step 5 — Prevent recurrence**
+
+Add:
+
+* A total connection-budget model.
+* Load tests that exercise autoscaling.
+* Dependency saturation alerts.
+* Safer defaults in the application chart.
+* Capacity limits tied to measured dependency behavior.
+
+This is how incident response becomes a platform improvement.
+
+**13. Drive performance improvements**
+
+Performance asks: **How efficiently and quickly does the service perform useful work?**
+
+Start with a measured baseline:
+
+* Request throughput.
+* p50, p95, and p99 latency.
+* Error fraction.
+* CPU and memory behavior.
+* Database and external-call duration.
+* Queue waiting.
+* Cost per successful transaction.
+
+Then identify the bottleneck.
+
+| Evidence                            | Possible explanation                     | Investigation                             |
+| ----------------------------------- | ---------------------------------------- | ----------------------------------------- |
+| High CPU and long computation spans | Expensive application work               | CPU profiling                             |
+| High latency with low CPU           | Waiting on locks, I/O, or dependencies   | Traces and wait metrics                   |
+| Repeated OOM termination            | Memory limit or growth problem           | Memory history and profiling              |
+| CPU throttling                      | CPU limit constrains execution           | Throttling metrics and workload tests     |
+| Database latency                    | Slow queries, locks, connection pressure | Query plans and database diagnostics      |
+| Queue growth                        | Processing rate below arrival rate       | Consumer throughput and dependency limits |
+
+Kubernetes requests influence scheduling; CPU limits can cause throttling, and memory-limit breaches can cause termination. Tune them using observed workload behavior. [Kubernetes: Resource management](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/).
+
+**Example improvement**
+
+A trace shows checkout performs three independent reads sequentially:
+
+```text
+Inventory: 120 ms
+Shipping estimate: 100 ms
+Customer profile: 80 ms
+```
+
+If they are truly independent, controlled parallel execution could reduce that portion of latency. But it also increases concurrent downstream work.
+
+Test the improvement under representative load and verify dependency capacity. Faster execution for one request does not always improve the whole system.
+
+**14. Drive scalability improvements**
+
+Scalability asks: **Can capacity grow with demand while service quality remains acceptable?**
+
+Evaluate:
+
+* How throughput changes as replicas increase.
+* Whether new pods can schedule.
+* Node-provisioning and application-startup delay.
+* Shared database and broker ceilings.
+* Partitioning and hot keys.
+* Quotas and IP capacity.
+* Recovery capacity after a failure.
+
+**Worked sizing example**
+
+Suppose one measured pod handles 100 requests per second within the latency target.
+
+For 2,000 requests per second:
+
+```text
+Simple minimum = 2,000 / 100 = 20 pods
+```
+
+If you target 70% of that measured throughput per pod:
+
+```text
+Required pods = ceil(2,000 / 70) = 29
+```
+
+This remains an estimate. It assumes the shared dependencies allow that throughput.
+
+**Queue example**
+
+If 500 messages arrive per second and consumers process 400:
+
+```text
+Backlog growth = 100 messages per second
+```
+
+Adding consumers helps only if parallel processing is possible and the dependency is not already saturated.
+
+If the restored processing rate becomes 600 per second, the backlog drains at only:
+
+```text
+600 - 500 = 100 messages per second
+```
+
+Distinguish total processing capacity from spare capacity available to recover backlog.
+
+**15. Drive reliability improvements**
+
+Reliability asks: **Does the service consistently deliver the required outcome, including during failures and changes?**
+
+Translate incident findings into durable controls:
+
+| Incident finding                         | Reliability improvement                            |
+| ---------------------------------------- | -------------------------------------------------- |
+| All replicas shared one failure domain   | Improve placement and surviving capacity           |
+| Bad releases affected all users          | Use staged rollout and customer-level verification |
+| Slow dependencies exhausted workers      | Bound deadlines, retries, and concurrency          |
+| Recovery needed undocumented steps       | Automate and rehearse the runbook                  |
+| Backups existed but restoration failed   | Add regular application-level restore tests        |
+| Alerts arrived after customer complaints | Improve customer-impact detection                  |
+| Manual infrastructure changes recurred   | Improve the supported workflow and drift handling  |
+
+Use SLOs and error-budget consumption to prioritize work. Burn-rate alerts identify how quickly the service is consuming its permitted failure budget. [Google SRE: Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/).
+
+A useful improvement proposal states:
+
+> “Connection exhaustion caused three checkout incidents. We will enforce a total connection budget and test scaling against it. Success means the platform handles the agreed peak without connection-related errors and maintains its latency objective.”
+
+That connects a recurring failure, an engineering change, and measurable evidence.
+
+**16. How to explain your approach in an interview**
+
+You can structure your answer like this:
+
+> “I define Azure infrastructure through reusable Terraform modules, with environment-specific state and access boundaries. Changes go through validation, policy checks, reviewed plans, controlled execution, and operational verification. I automate routine operations with clear ownership, bounded actions, and recovery checks.
+>
+> During production incidents, I establish customer impact, investigate the request path, and use metrics, logs, traces, and recent changes to test hypotheses. After mitigation, I convert the findings into improvements such as safer scaling, better resource sizing, connection budgets, deployment controls, or recovery automation. I validate those improvements against representative load and the service’s reliability objectives.”
+
+Prepare one real example for each part: **a Terraform change you designed, an operation you automated, a complex incident you diagnosed, and an improvement whose outcome you measured.**
+
+
+These responsibilities connect **understanding production behavior, delivering changes safely, and recovering quickly when something fails**.
+
+For this role, you should be able to design the full operating model—not just install monitoring tools or write a deployment pipeline.
+
+We’ll use an example throughout: an online ordering platform running on AKS, with checkout, payment, catalog, and order-processing services.
+
+**1. Understand monitoring, logging, tracing, and observability**
+
+Each capability answers a different question.
+
+| Capability    | Main question                                          | Example                                         |
+| ------------- | ------------------------------------------------------ | ----------------------------------------------- |
+| Monitoring    | Is the system meeting expected conditions?             | Checkout error rate exceeds its threshold       |
+| Metrics       | How much, how often, or how fast?                      | 2,000 requests/second; p99 latency of 900 ms    |
+| Logging       | What happened in a particular operation?               | A database connection attempt timed out         |
+| Tracing       | Where did a request spend time across services?        | Checkout waited 2 seconds for payment           |
+| Alerting      | Who needs to act, and how urgently?                    | Page the checkout on-call engineer              |
+| Observability | Can we explain the system’s behavior from its signals? | Identify why only one application version fails |
+
+OpenTelemetry provides instrumentation and collection concepts for signals such as metrics, logs, and traces. It is not, by itself, a complete storage and analysis backend. [OpenTelemetry signals](https://opentelemetry.io/docs/concepts/signals/).
+
+A production investigation typically moves between signals:
+
+1. A metric reveals increased checkout failures.
+2. A dashboard identifies the affected version and region.
+3. A trace shows database connection waiting.
+4. Correlated logs reveal connection-pool timeouts.
+5. Deployment history identifies the configuration change.
+
+No single signal necessarily explains the whole incident.
+
+**2. Design observability from customer journeys**
+
+Start with what customers need to accomplish.
+
+For the ordering platform:
+
+* Browse the catalog.
+* Add items to a basket.
+* Complete payment.
+* Receive an order confirmation.
+* Track order status.
+
+Then identify what successful behavior means.
+
+| Journey          | Useful indicators                                                 |
+| ---------------- | ----------------------------------------------------------------- |
+| Browse catalog   | Success ratio, latency, data freshness                            |
+| Checkout         | Correctly completed attempts, latency                             |
+| Payment          | Successful processing, duplicate prevention, reconciliation delay |
+| Order processing | Queue age, processing success, completion time                    |
+
+For example, HTTP 200 does not necessarily mean checkout succeeded. The response might contain a business failure, or the order might never reach the processing system.
+
+Define where measurements occur. Application metrics will miss failures that prevent requests from reaching the application, so combine them with gateway telemetry or external checks where necessary.
+
+**Practical design process**
+
+1. Identify critical journeys and dependencies.
+2. Define SLIs and SLOs.
+3. Specify required metrics, logs, and traces.
+4. Instrument applications and platform components.
+5. Configure collection, storage, access, and retention.
+6. Build dashboards and alerts.
+7. Inject controlled failures to verify detection and diagnosis.
+8. Maintain the monitoring system itself.
+
+The final step matters: a silent telemetry pipeline must not look like a perfectly healthy application.
+
+**3. Establish consistent telemetry fields**
+
+Signals become much more useful when they share identifiers.
+
+For the project, standardize:
+
+| Field                         | Purpose                               |
+| ----------------------------- | ------------------------------------- |
+| Service name                  | Identify the component                |
+| Environment                   | Separate production from test         |
+| Region or cluster             | Locate affected infrastructure        |
+| Application version           | Compare releases                      |
+| Trace ID                      | Correlate one request across services |
+| Operation or normalized route | Compare the same type of work         |
+| Outcome or error type         | Distinguish failure mechanisms        |
+
+A structured log might look like:
+
+```json
+{
+  "timestamp": "2026-09-10T10:15:30Z",
+  "level": "ERROR",
+  "service": "checkout",
+  "environment": "production",
+  "version": "1.8.4",
+  "trace_id": "example-trace-id",
+  "operation": "CreateOrder",
+  "error_type": "DatabaseConnectionTimeout",
+  "duration_ms": 2100
+}
+```
+
+Keep credentials, payment details, and unnecessary personal data out of telemetry.
+
+Also distinguish fields suitable for logs from labels suitable for metrics. A trace ID is useful in a log, but usually unsuitable as a metric label because it creates enormous numbers of distinct series.
+
+**4. Understand the role of each observability tool**
+
+The tools in the JD have overlapping capabilities. You do not need to collect every signal in every tool.
+
+| Tool          | Typical role in an enterprise platform                      |
+| ------------- | ----------------------------------------------------------- |
+| Prometheus    | Collect and query numerical time-series metrics             |
+| Grafana       | Visualize data from configured sources and support alerting |
+| Splunk        | Search and analyze operational events and logs              |
+| Dynatrace     | Investigate application performance and dependency behavior |
+| Azure Monitor | Monitor Azure resources and application telemetry           |
+
+A reasonable project design might use:
+
+* Prometheus-compatible metrics for Kubernetes and applications.
+* Grafana for operational dashboards.
+* Azure Monitor for Azure resource telemetry.
+* Dynatrace for application performance investigation.
+* Splunk for established enterprise log workflows.
+
+That is an illustrative division of responsibility. Choose based on existing platforms, cost, coverage, and operational ownership.
+
+Avoid five tools generating five separate pages for the same incident.
+
+**5. Prometheus: implement useful metrics**
+
+Prometheus collects metrics as time series with labels and supports queries through PromQL. A common collection pattern is scraping instrumented endpoints. Recording rules can precompute useful expressions, while alerting rules evaluate conditions. [Prometheus overview](https://prometheus.io/docs/introduction/overview/).
+
+Understand these metric types:
+
+| Type      | Behavior                            | Example            |
+| --------- | ----------------------------------- | ------------------ |
+| Counter   | Increases, with possible resets     | Requests processed |
+| Gauge     | Increases or decreases              | Active connections |
+| Histogram | Records an observation distribution | Request duration   |
+
+For services, apply **RED**:
+
+* **Rate:** How many requests arrive?
+* **Errors:** How many fail?
+* **Duration:** How long do they take?
+
+For resources, apply **USE**:
+
+* **Utilization:** How busy is the resource?
+* **Saturation:** How much work is waiting?
+* **Errors:** What resource failures occur?
+
+The following queries assume illustrative application metric names.
+
+Request rate:
+
+```promql
+sum(
+  rate(http_requests_total{
+    service="checkout",
+    environment="production"
+  }[5m])
+)
+```
+
+Server-error fraction:
+
+```promql
+sum(
+  rate(http_requests_total{
+    service="checkout",
+    environment="production",
+    status=~"5.."
+  }[5m])
+)
+/
+sum(
+  rate(http_requests_total{
+    service="checkout",
+    environment="production"
+  }[5m])
+)
+```
+
+Handle zero traffic and missing telemetry separately. This 5xx fraction is a diagnostic metric; it may not represent the complete business-success SLI.
+
+For a classic histogram, calculate fleet p99 from aggregated buckets:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(http_request_duration_seconds_bucket{
+      service="checkout",
+      environment="production"
+    }[5m])
+  )
+)
+```
+
+Do not average per-pod p99 values to obtain service p99. Histogram bucket selection also affects estimation quality. [Prometheus histograms](https://prometheus.io/docs/practices/histograms/).
+
+**Practical scenario**
+
+Average latency is 120 ms, but a subset of customers waits several seconds. Inspect the distribution and affected routes rather than relying on the average.
+
+Then correlate the slow requests with traces and dependency behavior.
+
+**6. Grafana: build dashboards that support decisions**
+
+Grafana queries configured data sources and presents panels, variables, and dashboards. It should not be assumed to store all the underlying telemetry itself. [Grafana fundamentals](https://grafana.com/docs/grafana/latest/fundamentals/).
+
+Build several views for different decisions.
+
+| Dashboard            | Intended user                   | Main content                                               |
+| -------------------- | ------------------------------- | ---------------------------------------------------------- |
+| Reliability overview | Service owners                  | SLO attainment, budget remaining, active incidents         |
+| Service operations   | On-call engineer                | Rate, errors, latency, dependencies, deployed version      |
+| AKS platform         | Platform engineer               | Node conditions, Pending pods, restarts, resource pressure |
+| Delivery             | Release/platform teams          | Workflow failures, deployment duration, sync health        |
+| Capacity             | Platform and application owners | Demand, saturation, limits, scaling headroom               |
+
+For a checkout operations dashboard, place panels in this order:
+
+1. Customer success and latency.
+2. Traffic and error-budget burn.
+3. Affected region and application version.
+4. Dependency latency and connection pressure.
+5. Pod and node diagnostics.
+
+Add deployment annotations and drill-down links.
+
+**Practical quality check:** Ask an engineer unfamiliar with the incident to identify the affected service and next diagnostic step. If they must search through 40 unrelated panels, redesign the dashboard.
+
+Use consistent units. A threshold of `500` means very different things when one panel displays milliseconds and another seconds.
+
+**7. Splunk: make logs searchable and correlated**
+
+Splunk’s Search Processing Language, or SPL, searches events and transforms results through a pipeline. Useful concepts include indexes, sourcetypes, field extraction, time filtering, `stats`, and `timechart`. [Splunk search language](https://help.splunk.com/en/splunk-enterprise/search/search-manual/9.4/search-overview/about-the-search-language).
+
+For example:
+
+```text
+index=orders sourcetype=checkout earliest=-30m
+| eval is_error=if(status>=500,1,0)
+| bin _time span=5m
+| stats count as requests
+        sum(is_error) as failures
+        by _time
+| eval error_pct=100.0*failures/requests
+```
+
+Assumptions:
+
+* Each record represents one request.
+* `status` is parsed correctly.
+* The selected events are not duplicated.
+
+To investigate one request:
+
+```text
+index=orders trace_id="example-trace-id" earliest=-30m
+| sort 0 _time
+| table _time service version level error_type message
+```
+
+**Practical scenario**
+
+Checkout reports database errors only for version `1.8.4`.
+
+Compare versions, error types, and timestamps. Check whether the new version changed connection settings or credentials. Logs should support a hypothesis that can be verified, rather than simply produce a long list of exceptions.
+
+Control ingestion volume and retention deliberately. Excessive debug logging can increase cost and obscure the useful evidence.
+
+**8. Dynatrace: investigate application and dependency performance**
+
+Application performance monitoring connects service behavior with requests and dependencies. Dynatrace provides application-observability capabilities for this investigation; available features depend on the deployed configuration and product offering. [Dynatrace application observability](https://docs.dynatrace.com/docs/observe/application-observability).
+
+For the project, ensure the telemetry identifies:
+
+* Checkout and payment services.
+* Application versions.
+* Kubernetes context.
+* Relevant downstream calls.
+* Errors and request duration.
+
+**Practical investigation**
+
+A dashboard shows checkout p99 increasing, but CPU is normal.
+
+Inspect representative slow traces:
+
+| Operation                 | Observed duration |
+| ------------------------- | ----------------: |
+| Checkout application work |             70 ms |
+| Inventory lookup          |             90 ms |
+| Payment call              |          2,100 ms |
+
+This points toward payment-path waiting, but further evidence is needed. Check:
+
+* Is the delay at the provider or in a local connection pool?
+* Are retries multiplying calls?
+* Is the problem limited to one region or version?
+* Do fast requests use a different path?
+
+Automated problem correlation can accelerate investigation. Treat its conclusions as hypotheses to verify against the request evidence.
+
+**9. Azure Monitor: connect Azure and application evidence**
+
+Azure Monitor covers Azure monitoring capabilities across metrics, logs, application telemetry, and related experiences. Application Insights supports application investigation, while Log Analytics provides log querying. [Azure Monitor overview](https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/overview).
+
+For the example platform, collect relevant:
+
+* Application Gateway diagnostics.
+* AKS telemetry.
+* Azure resource changes.
+* Application request and dependency telemetry.
+* Database metrics and diagnostics.
+
+An illustrative query for the workspace-based `AppRequests` table:
+
+```kusto
+AppRequests
+| where TimeGenerated > ago(30m)
+| summarize
+    ObservedRequests=count(),
+    ObservedFailures=countif(Success == false),
+    ObservedP95ms=percentile(DurationMs, 95)
+    by bin(TimeGenerated, 5m), AppRoleName
+| extend ObservedErrorPct =
+    100.0 * ObservedFailures / ObservedRequests
+```
+
+These are statistics over stored records. With sampled telemetry, they are not automatically accurate full-traffic totals or percentiles. Check the collection policy and schema before using the query for SLO accounting. The table includes fields such as `ItemCount` relevant to sampled-event representation. [Azure Monitor: AppRequests](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/apprequests).
+
+**Practical scenario**
+
+Application Gateway failures begin shortly after a network change.
+
+Correlate gateway diagnostics with resource-change evidence and application health. This helps distinguish application failure from a path that no longer reaches healthy backends.
+
+**10. Define reliability metrics and actionable alerts**
+
+A useful set includes:
+
+| Metric                 | Purpose                                           |
+| ---------------------- | ------------------------------------------------- |
+| Availability SLI       | Measure successful eligible operations            |
+| Latency SLI            | Measure operations meeting a latency threshold    |
+| Error-budget remaining | Show remaining permitted failures                 |
+| Burn rate              | Show how quickly the budget is being consumed     |
+| Detection time         | Measure delay before recognizing impact           |
+| Recovery time          | Measure delay before acceptable service returns   |
+| Alert actionability    | Measure whether pages lead to useful intervention |
+| Incident recurrence    | Reveal unresolved failure patterns                |
+
+For a 99.9% request-success SLO:
+
+```text
+Permitted bad fraction = 1 - 0.999 = 0.001
+```
+
+If the observed error fraction is 1%:
+
+```text
+Burn rate = 0.01 / 0.001 = 10
+```
+
+Multi-window burn-rate alerts combine sustained evidence with a shorter confirmation window. This helps detect ongoing budget consumption while reducing stale alerts after recovery. [Google SRE: Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/).
+
+An effective page includes:
+
+* Affected service and environment.
+* Customer-impact description.
+* Current evidence.
+* Owner.
+* Dashboard and runbook links.
+* Clear escalation behavior.
+
+Alertmanager supports grouping, deduplication, routing, silences, and inhibition. Those functions help prevent a shared dependency failure from producing hundreds of independent notifications. [Prometheus Alertmanager](https://prometheus.io/docs/alerting/latest/alertmanager/).
+
+Retain distinct monitoring for missing data. “No errors received” is ambiguous when collection itself has stopped.
+
+**11. Design CI/CD with GitHub Actions**
+
+Separate the responsibilities:
+
+* **Continuous integration:** Validate changes and produce trustworthy artifacts.
+* **Continuous delivery:** Keep validated changes ready for controlled release.
+* **Continuous deployment:** Automatically release qualifying changes under defined controls.
+* **GitOps:** Reconcile a running environment with declared, versioned desired state.
+
+A GitHub Actions workflow contains triggers, jobs, steps, dependencies, permissions, and runner selection. Reusable workflows can standardize common delivery tasks. [GitHub workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
+
+For the ordering project, design this workflow:
+
+| Stage             | Work performed                                 | Evidence                             |
+| ----------------- | ---------------------------------------------- | ------------------------------------ |
+| Pull request      | Tests, static checks, configuration validation | Test and review results              |
+| Trusted build     | Produce the container image                    | Image digest and source revision     |
+| Verification      | Scan and validate the artifact                 | Results tied to that digest          |
+| Publication       | Store the immutable artifact                   | Registry reference                   |
+| Promotion request | Update deployment configuration                | Reviewed Git change                  |
+| Deployment        | Reconcile the target environment               | Running revision and resource health |
+| Verification      | Exercise customer behavior                     | Synthetic checkout and SLO evidence  |
+
+**Build once and promote the same artifact.** Rebuilding separately for production can produce different bytes from those tested in staging.
+
+Use caching for speed, but do not treat a dependency cache as the authoritative release artifact.
+
+**12. Secure and support self-hosted runners**
+
+A runner executes workflow jobs. Self-hosted runners give control over the machine, installed tools, and network placement, while making you responsible for their operation. [GitHub self-hosted runners](https://docs.github.com/en/actions/concepts/runners/self-hosted-runners).
+
+They are useful when workflows must access private resources, such as a private Terraform backend.
+
+Design for:
+
+* Separate trust boundaries for different workloads.
+* Restricted repository access.
+* Minimal permissions.
+* Controlled outbound connectivity.
+* Patching and trusted machine images.
+* Clean job environments.
+* Central logs and capacity monitoring.
+
+Ephemeral runners reduce retained job state, but they do not make an overprivileged job safe.
+
+Use OIDC federation for short-lived Azure authentication where suitable. Configure trust for the actual expected workflow context and grant narrow Azure authorization. [GitHub OIDC with Azure](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-azure).
+
+**Support scenario: jobs remain queued**
+
+Investigate:
+
+1. Do runner labels match the workflow?
+2. Is the runner online and available?
+3. Does the repository have access to its runner group?
+4. Can the scaling mechanism provision workers?
+5. Are capacity limits or network restrictions blocking registration?
+
+**Support scenario: runner compromise**
+
+Isolate the runner, investigate credentials and artifacts exposed during the affected interval, and rebuild from a trusted basis. Deleting the machine does not establish that artifacts it produced are trustworthy.
+
+**13. Implement GitOps with ArgoCD**
+
+ArgoCD compares declared configuration with live Kubernetes resources and reconciles differences according to policy.
+
+Understand these separate states:
+
+* **Synced:** Desired and live configuration match under the comparison rules.
+* **Healthy:** Supported resource health checks report acceptable conditions.
+* **OutOfSync:** Differences exist.
+* **Degraded:** A resource reports an unhealthy condition.
+
+Automated sync, pruning, and self-healing are separate settings. Pruning permits removal of resources deleted from desired configuration; self-healing can reconcile live drift. [ArgoCD automated sync](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/).
+
+A practical repository arrangement:
+
+| Repository area          | Contents                                |
+| ------------------------ | --------------------------------------- |
+| Application source       | Code, tests, build workflow             |
+| Deployment configuration | Environment manifests and image digests |
+| Infrastructure           | Terraform configuration                 |
+
+An ArgoCD Application connects a configuration source to a destination cluster and namespace. AppProjects constrain permitted sources, destinations, and resource types. [ArgoCD projects](https://argo-cd.readthedocs.io/en/stable/user-guide/projects/).
+
+Sync hooks and waves can organize deployment operations. They do not eliminate the need for application dependency handling or careful database migration design. [ArgoCD sync waves](https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/).
+
+**Practical promotion**
+
+1. CI publishes checkout image digest A.
+2. A reviewed change selects A in staging.
+3. ArgoCD reconciles staging.
+4. Functional and reliability checks pass.
+5. Another reviewed change selects A in production.
+6. Production checks confirm customer behavior.
+
+ArgoCD synchronization alone does not provide every capability required for traffic-based canaries or automatic analysis. Add suitable rollout and routing mechanisms when needed.
+
+**14. Handle GitOps incidents correctly**
+
+**Case: Synced but checkout fails**
+
+The declared configuration may itself be wrong. Check application behavior, resource health, dependency access, and the deployed artifact.
+
+**Case: a manual fix keeps disappearing**
+
+ArgoCD self-healing may be restoring Git’s declared state. Coordinate emergency changes through the agreed process and reconcile the intended configuration back into Git.
+
+**Case: rollback does not restore service**
+
+The previous image may be incompatible with a new database schema or event format. Recovery must account for data and configuration compatibility.
+
+For a GitOps rollback, restore a known compatible desired revision and verify that reconciliation occurred. A Git revert is not proof of customer recovery.
+
+**15. Develop automation and self-healing**
+
+Automation executes repeatable operational work. Self-healing adds a feedback loop:
+
+```mermaid
+flowchart TD
+    O["Observe failure"] --> V["Check evidence and preconditions"]
+    V -->|"Recognized and safe"| A["Perform bounded action"]
+    V -->|"Uncertain or unsafe"| E["Escalate with evidence"]
+    A --> R["Verify customer recovery"]
+    R -->|"Recovered"| C["Record outcome and cooldown"]
+    R -->|"Not recovered"| E
+```
+
+Examples:
+
+| Condition                      | Possible response                   | Required constraint                               |
+| ------------------------------ | ----------------------------------- | ------------------------------------------------- |
+| Locally stuck process          | Restart the affected container      | Probe must detect a condition restart can fix     |
+| Sustained traffic growth       | Increase capacity                   | Respect dependency and infrastructure limits      |
+| Worker stops progressing       | Restart one eligible worker         | Check dependency health and preserve evidence     |
+| Defective release              | Restore compatible desired version  | Verify attribution and rollback compatibility     |
+| Approaching certificate expiry | Renew through the supported process | Confirm the application loads the new certificate |
+
+Kubernetes already provides some recovery mechanisms. Readiness controls traffic eligibility; liveness can trigger container restart; startup probes accommodate initialization. Their design determines whether they help or cause restart loops. [Kubernetes probes](https://kubernetes.io/docs/concepts/workloads/pods/probes/).
+
+For custom remediation, require:
+
+* An explicit recognized condition.
+* Scoped permissions.
+* Bounded actions and retries.
+* A concurrency limit.
+* A cooldown.
+* Evidence capture.
+* Verification and escalation.
+
+**Practical example: growing order queue**
+
+High queue depth alone should not trigger restarts.
+
+First determine whether:
+
+* Messages are still being processed.
+* Arrival rate exceeds processing capacity.
+* The broker is healthy.
+* The database is slowing consumers.
+* One worker has stopped making progress.
+
+If a healthy dependency supports all other workers and only one worker is stuck, a bounded restart may help. If the database is unavailable, restarting every worker may create a connection storm.
+
+**16. Measure how the design reduces MTTR**
+
+Define MTTR explicitly because organizations use it to mean repair, recovery, or resolution. For this example, measure from customer-impact onset until acceptable service is restored.
+
+Break recovery into stages:
+
+| Stage        | Improvement                                              |
+| ------------ | -------------------------------------------------------- |
+| Detection    | Customer-impact alerts                                   |
+| Engagement   | Correct ownership and routing                            |
+| Diagnosis    | Correlated metrics, logs, traces, and deployment history |
+| Mitigation   | Tested runbooks and bounded automation                   |
+| Verification | External checks and business-outcome evidence            |
+
+Illustrative incident comparison:
+
+| Stage        |     Before |      After |
+| ------------ | ---------: | ---------: |
+| Detection    |  8 minutes |  2 minutes |
+| Engagement   |  5 minutes |  2 minutes |
+| Diagnosis    | 20 minutes |  6 minutes |
+| Mitigation   | 10 minutes |  4 minutes |
+| Verification |  7 minutes |  3 minutes |
+| Total        | 50 minutes | 17 minutes |
+
+These are hypothetical results. To demonstrate a real improvement, compare similar incidents, retain timestamps, and inspect the distribution—not just one favorable average.
+
+Also measure automation success, incorrect remediations, repeated incidents, and operator effort. Faster recovery that creates data errors is not a successful outcome.
+
+**17. An integrated interview scenario**
+
+A checkout deployment increases database connections per pod. Traffic rises, replicas scale out, and database waiting increases.
+
+A strong operational response would be:
+
+1. An SLO alert identifies customer impact.
+2. Grafana shows the affected version and region.
+3. Dynatrace traces reveal database waiting.
+4. Splunk logs identify connection-pool timeouts.
+5. Azure Monitor supplies relevant database and infrastructure evidence.
+6. The team verifies that the configuration change caused the regression.
+7. A compatible configuration is restored through the deployment process.
+8. ArgoCD reconciles the intended state.
+9. Synthetic checkout and SLO metrics confirm recovery.
+10. Follow-up work adds connection-budget controls and scaling tests.
+
+For this principal-level role, leadership means **helping engineers make sound reliability decisions, coordinating teams around shared outcomes, and turning recurring operational problems into lasting improvements**.
+
+You should demonstrate how you build capability across teams while remaining technically involved.
+
+Consider an example: several application teams share an Azure/AKS platform. Releases sometimes cause outages, alerts are noisy, and incidents frequently require senior engineers to intervene.
+
+**1. Mentor engineers through practical work**
+
+Start by understanding each engineer’s current capability. Someone may write excellent Terraform but struggle to diagnose application latency. Another may handle incidents confidently but need help designing safe automation.
+
+Use a simple assessment:
+
+| Area               | What the engineer should demonstrate            |
+| ------------------ | ----------------------------------------------- |
+| SRE fundamentals   | Define a meaningful SLI, SLO, and error budget  |
+| Troubleshooting    | Form hypotheses and gather evidence             |
+| Reliability design | Recognize failure domains and dependency risks  |
+| Delivery           | Explain rollout, verification, and recovery     |
+| Automation         | Build bounded, observable operational workflows |
+| Incident response  | Communicate impact and coordinate recovery      |
+| Ownership          | Maintain runbooks and complete preventive work  |
+
+Assess through discussions and exercises rather than judging only years of experience.
+
+**Create a specific development goal**
+
+A weak goal is:
+
+> “Improve Kubernetes knowledge.”
+
+A useful goal is:
+
+> “Within four weeks, independently diagnose three common AKS workload failures, explain the evidence, and update the relevant runbooks.”
+
+The second goal establishes what the engineer will practise and how progress will be observed.
+
+**Use a gradual transfer of responsibility**
+
+1. **Demonstrate:** Investigate an issue while explaining your decisions.
+2. **Work together:** Let the engineer choose the next diagnostic step.
+3. **Observe:** Have the engineer lead while you provide support.
+4. **Delegate:** Give them ownership within an agreed scope.
+5. **Review:** Discuss decisions, evidence, and lessons afterward.
+
+The goal is an engineer who can reason independently, not someone who has memorized your commands.
+
+**2. Teach SRE principles through customer outcomes**
+
+Engineers often start with infrastructure health:
+
+> “All pods are Running, so the application is healthy.”
+
+Help them connect platform conditions to customer behavior:
+
+> “Can a customer complete checkout correctly and within the expected time?”
+
+Use a real service to teach:
+
+* **SLI:** What do we measure?
+* **SLO:** What target matters to users?
+* **Error budget:** How much failure is permitted?
+* **Alerting:** When does someone need to act?
+* **Toil:** Which repeated work should become an engineering improvement?
+
+**Practical mentoring exercise**
+
+Ask an engineer to define checkout availability.
+
+Then challenge the definition:
+
+* Does HTTP 200 always mean success?
+* What about requests that fail before reaching the application?
+* Are authentication failures included?
+* What happens when telemetry disappears?
+* Who owns the objective?
+* What action follows excessive error-budget consumption?
+
+Have them revise the specification until another engineer could implement the measurement consistently.
+
+This teaches that an SLO is an operating agreement supported by instrumentation, rather than just a dashboard percentage.
+
+**3. Teach troubleshooting as evidence-based reasoning**
+
+During investigations, ask questions that develop judgment:
+
+* What is the confirmed customer impact?
+* What are the competing explanations?
+* Which observation would distinguish them?
+* What changed recently?
+* What is the smallest useful mitigation?
+* How will we verify recovery?
+
+**Example: checkout latency rises**
+
+An engineer proposes increasing pod replicas.
+
+Instead of immediately accepting or rejecting the idea, ask:
+
+> “What evidence suggests application compute is the bottleneck?”
+
+They investigate and find:
+
+* CPU is moderate.
+* Database connection waiting is high.
+* More replicas create more database connections.
+
+The learning outcome is understanding why scaling can worsen a shared dependency bottleneck.
+
+After the incident, ask the engineer to document:
+
+1. Initial hypothesis.
+2. Evidence collected.
+3. Evidence that changed the hypothesis.
+4. Mitigation and its tradeoffs.
+5. Recovery checks.
+6. Preventive improvement.
+
+That record is more valuable than a list of commands without context.
+
+**4. Mentor reliability engineering through design reviews**
+
+Use design reviews to examine failure behavior before production.
+
+For an AKS-hosted service, discuss:
+
+| Design question                            | What it reveals                               |
+| ------------------------------------------ | --------------------------------------------- |
+| What happens when one pod fails?           | Replica and routing behavior                  |
+| What happens when one zone fails?          | Placement and surviving capacity              |
+| What happens when the database slows down? | Timeouts, concurrency, and backpressure       |
+| What happens when a request is retried?    | Idempotency and duplicate effects             |
+| What happens during deployment?            | Compatibility and rollout safety              |
+| What happens during recovery?              | Dependencies, data, and operational readiness |
+
+**Practical exercise: payment timeout**
+
+Ask an engineer to design recovery after a payment request times out.
+
+A simple retry might duplicate a charge. Have them explore:
+
+* Stable operation identifiers.
+* Idempotent handling.
+* Payment-status reconciliation.
+* Explicit pending states.
+* Audit evidence.
+
+This develops reliability thinking beyond “Kubernetes will restart it.”
+
+Give feedback on the reasoning, including alternatives and constraints, rather than only whether their design matches your preferred implementation.
+
+**5. Develop operational excellence through ownership**
+
+Operational excellence means services can be changed, diagnosed, supported, and recovered consistently.
+
+Give engineers ownership of a service’s operational needs:
+
+* Service description and dependencies.
+* SLOs and dashboards.
+* Actionable alerts.
+* Deployment and recovery procedures.
+* Capacity assumptions.
+* Access requirements.
+* Incident follow-ups.
+
+Pair less-experienced engineers with supported on-call or incident-shadowing opportunities. Increase responsibility as they demonstrate readiness; an unsupported production emergency is a poor training environment.
+
+**Make runbooks usable**
+
+A runbook should explain:
+
+* What the alert means.
+* How to confirm impact.
+* Which evidence to collect.
+* When each mitigation is appropriate.
+* When to stop and escalate.
+* How to verify recovery.
+
+Test it with someone who did not write it. If they cannot follow it successfully, improve the document or underlying tooling.
+
+**Measure mentoring outcomes**
+
+Look for:
+
+* Better hypotheses and diagnostic decisions.
+* More independent ownership.
+* Fewer avoidable escalations.
+* Better incident communication.
+* Higher-quality changes and runbooks.
+* Reduced recurrence of known mistakes.
+
+A lower escalation count alone is ambiguous: people might also be delaying necessary requests for help.
+
+**6. Collaborate by defining a shared reliability outcome**
+
+Cross-team work fails when each team optimizes only its own component.
+
+For example:
+
+* Engineering sees an application timeout.
+* Networking sees permitted routes.
+* Security sees compliant permissions.
+* Cloud engineering sees healthy Azure resources.
+
+Every team can report success while checkout remains unavailable.
+
+Start with a shared statement:
+
+> “Checkout must remain available during normal deployments and meet its agreed latency objective at peak demand.”
+
+Then identify the dependencies and responsibilities required to achieve it.
+
+| Team           | Primary contribution                             | Shared reliability work                                           |
+| -------------- | ------------------------------------------------ | ----------------------------------------------------------------- |
+| Engineering    | Application behavior and business correctness    | Probes, retries, connection limits, instrumentation               |
+| Security       | Identity, authorization, and security controls   | Safe access patterns, certificate rotation, incident containment  |
+| Cloud/platform | Azure infrastructure and Kubernetes operations   | Capacity, upgrades, deployment patterns, recovery                 |
+| Networking     | Connectivity, routing, DNS, and traffic controls | Reachability, ingress, egress, private access, network resilience |
+
+Exact ownership varies by organization. Agree on it explicitly rather than assuming it from team names.
+
+**7. Use shared evidence to resolve cross-team incidents**
+
+Consider a deployment where AKS pods cannot access Key Vault.
+
+Assign investigations by the actual request path:
+
+| Question                                        | Likely contributors         | Evidence                                           |
+| ----------------------------------------------- | --------------------------- | -------------------------------------------------- |
+| Does the hostname resolve correctly?            | Networking and platform     | DNS answer from the workload context               |
+| Can traffic reach the endpoint?                 | Networking and cloud        | Routes, filtering, connection tests                |
+| Can the workload obtain a token?                | Security and platform       | Federation configuration and authentication errors |
+| Is the identity authorized?                     | Security and resource owner | Role scope and denied operation                    |
+| Is the application using the intended identity? | Engineering                 | SDK configuration and application evidence         |
+
+A principal engineer coordinates these checks and maintains the overall picture.
+
+Avoid passing a ticket between teams with statements such as “our layer is fine.” Ask each team to provide evidence and identify the next boundary to investigate.
+
+After recovery, fix the underlying integration gap. That might mean adding an automated private-endpoint connectivity check to environment provisioning.
+
+**8. Resolve disagreements through options and tradeoffs**
+
+Suppose Security requests private access to a service, while Engineering worries that it will disrupt delivery.
+
+Structure the discussion:
+
+1. Establish the actual requirement.
+2. Describe current behavior and constraints.
+3. Identify feasible options.
+4. Compare reliability, security, delivery effort, cost, and supportability.
+5. Pilot the preferred option.
+6. Record the decision and remaining risks.
+
+An architecture decision record can capture:
+
+* Context.
+* Options considered.
+* Selected approach.
+* Consequences.
+* Owners.
+* Conditions that would trigger reconsideration.
+
+**Example**
+
+For private AKS deployment access, compare runner placement and connectivity options. Evaluate who maintains the runners, how access is restricted, and what happens when the runner environment fails.
+
+A technically valid design that nobody can operate reliably is incomplete.
+
+**9. Drive continuous improvement from evidence**
+
+Build a regular improvement cycle:
+
+**Observe → prioritize → implement → validate → standardize.**
+
+Use several sources of evidence:
+
+* Incident and postmortem findings.
+* Error-budget consumption.
+* Repeated support requests.
+* On-call interruptions.
+* Failed changes.
+* Capacity constraints.
+* Developer feedback.
+* Recovery exercises.
+
+Turn observations into explicit problem statements.
+
+Weak:
+
+> “We need better monitoring.”
+
+Stronger:
+
+> “Responders spend approximately 20 minutes identifying the affected dependency because logs and traces do not share request identifiers.”
+
+The stronger statement points toward a specific intervention and a measurable result.
+
+**Prioritize a reliability backlog**
+
+| Problem                                        | Proposed improvement                    | Evidence of success                                 |
+| ---------------------------------------------- | --------------------------------------- | --------------------------------------------------- |
+| Repeated database connection exhaustion        | Define and enforce connection budgets   | Peak-load test meets objectives without exhaustion  |
+| Deployment regressions affect every user       | Introduce staged release verification   | Regression detected before broad rollout            |
+| Manual setup creates inconsistent environments | Provide reusable infrastructure modules | New environments pass standard checks               |
+| Restore procedures are unreliable              | Automate and rehearse restores          | Recovery and data-integrity targets demonstrated    |
+| Alerts produce little useful action            | Review routing and alert conditions     | Fewer non-actionable pages without missed incidents |
+
+Prioritize using customer impact, recurrence, risk, effort, and dependencies. Do not let the loudest request automatically become the highest priority.
+
+**10. Validate improvements before declaring success**
+
+Suppose you introduce a new alert.
+
+Installing the rule is implementation, not evidence of improvement.
+
+Verify:
+
+* It detects the intended failure.
+* It reaches the correct owner.
+* The message supports action.
+* It resolves appropriately.
+* Missing telemetry is handled.
+* It does not create unacceptable noise.
+
+Similarly:
+
+* A new backup requires a restore test.
+* A new autoscaler requires load and recovery testing.
+* A new deployment process requires failure and rollback exercises.
+* A new platform template requires successful use by another team.
+
+When reviewing results, compare similar workloads and incident types. A faster recovery from an easy incident does not prove a general improvement in incident response.
+
+**11. Encourage adoption of modern platform practices**
+
+Adoption improves when the platform makes useful work easier.
+
+Treat application teams as platform users. Ask:
+
+* Which setup tasks take the most time?
+* Which failures repeatedly require platform support?
+* Which approvals or handoffs cause avoidable delay?
+* Which controls are difficult to implement correctly?
+* Which existing tools already work well?
+
+Then build a supported standard path for common needs.
+
+For the Azure/AKS project, that could include:
+
+| Capability            | What the platform provides                       |
+| --------------------- | ------------------------------------------------ |
+| Infrastructure        | Versioned Terraform modules                      |
+| Application packaging | Supported Helm chart patterns                    |
+| CI                    | Reusable GitHub Actions workflows                |
+| Deployment            | Documented ArgoCD onboarding                     |
+| Identity              | A supported workload-identity pattern            |
+| Observability         | Standard telemetry fields and starter dashboards |
+| Reliability           | SLO templates and readiness guidance             |
+| Operations            | Tested runbooks and diagnostic tools             |
+
+The platform should include documentation, support ownership, and upgrade guidance—not just repositories containing code.
+
+**12. Introduce changes through pilots and feedback**
+
+A practical adoption sequence is:
+
+1. Select one willing application team.
+2. Understand its actual requirements.
+3. Build the smallest useful platform capability.
+4. Help the team use it in a representative environment.
+5. Observe difficulties and revise the design.
+6. Document the supported approach.
+7. Expand to other teams.
+8. Maintain a clear exception and migration process.
+
+**Example: adopting GitOps**
+
+Start with a suitable service and establish:
+
+* Who can change deployment configuration.
+* How artifacts are promoted.
+* How drift is handled.
+* How emergency changes work.
+* How recovery is verified.
+* Who supports the controller and repositories.
+
+Only expand after the first team can operate the workflow confidently.
+
+Do not equate adoption with installation. A team that has ArgoCD installed but bypasses it for every important deployment has not adopted a sustainable operating model.
+
+**13. Measure both platform and organizational outcomes**
+
+Useful measures include:
+
+| Outcome              | Possible measure                                           |
+| -------------------- | ---------------------------------------------------------- |
+| Easier onboarding    | Time until a team completes its first supported deployment |
+| Reliable delivery    | Changes requiring remediation                              |
+| Faster diagnosis     | Time spent locating the failure mechanism                  |
+| Less toil            | Repeated manual hours per month                            |
+| Better self-service  | Successful operations completed without intervention       |
+| Reliability          | SLO attainment and recurring customer-impact incidents     |
+| Adoption             | Teams actively using and maintaining supported patterns    |
+| Developer experience | Feedback about usability and unresolved friction           |
+
+Balance metrics. Increased deployment frequency is not automatically good if change failures rise. Reduced support tickets are not automatically good if teams are blocked and have stopped asking.
+
+**14. A practical first 90 days**
+
+| Period     | Focus                                               | Concrete outputs                                                                           |
+| ---------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Days 1–30  | Understand people, services, and recurring problems | Capability assessment, ownership map, incident themes, prioritized backlog                 |
+| Days 31–60 | Mentor through practical improvements               | Paired investigations, one SLO pilot, improved runbooks, one automation                    |
+| Days 61–90 | Validate and expand successful patterns             | Failure-exercise results, pilot feedback, reusable platform capability, next-quarter goals |
+
+Use regular mentoring sessions, service-reliability reviews, and cross-team working sessions. Keep each meeting tied to decisions, evidence, or development goals.
+
+**15. How to present this in an interview**
+
+A strong answer can follow this structure:
+
+> “I mentor engineers through real service ownership, paired investigations, design reviews, and progressively delegated responsibility. I focus on customer outcomes, evidence-based troubleshooting, and safe operational decisions.
+>
+> Across Engineering, Security, Cloud, and Networking, I establish shared reliability objectives and explicit ownership. During incidents, I coordinate investigations using evidence from each layer. Afterward, I turn contributing causes into a prioritized improvement backlog.
+>
+> For platform adoption, I start with developer pain points, pilot a supported pattern with one team, measure the result, and improve it before expanding. I judge success through independent ownership, fewer recurring incidents, reduced toil, and easier delivery.”
+
+Support this with a real example showing **who you helped, what changed in their decisions or behavior, how teams worked together, and what measurable outcome followed**.
+
+These responsibilities mean **owning service reliability from design through daily operations, incidents, recovery, and continuous improvement**.
+
+For a principal engineer, the expectation is that you can explain:
+
+* What reliability the business needs.
+* How the platform measures and achieves it.
+* How teams respond when it fails.
+* How incidents lead to lasting improvements.
+* How delivery continues without taking uncontrolled risks.
+
+The scenarios below are realistic, illustrative DevOps projects—not claims about a particular company.
+
+**1. Start with a reference project**
+
+Imagine an online retail platform with:
+
+| Component           | Implementation                                              |
+| ------------------- | ----------------------------------------------------------- |
+| Customer entry      | DNS and Application Gateway with WAF                        |
+| Application compute | AKS running catalog, checkout, and payment services         |
+| Infrastructure      | Terraform                                                   |
+| Delivery            | GitHub Actions and ArgoCD                                   |
+| Data                | Managed database, cache, and message broker                 |
+| Observability       | Prometheus, Grafana, Azure Monitor, and application tracing |
+| Recovery            | Secondary-region infrastructure and tested data recovery    |
+
+During normal operations, the platform handles 300 requests per second. During a promotion, it may receive 3,000 requests per second.
+
+Your job is to ensure that customers can complete orders successfully, even during traffic growth, deployments, and some infrastructure failures.
+
+A healthy AKS control plane alone does not establish that outcome.
+
+---
+
+**2. Champion SRE practices across the organization**
+
+“Champion SRE” means helping teams adopt a consistent way to measure reliability, make risk decisions, and improve operations.
+
+It involves changing everyday engineering behavior.
+
+**Scenario: five teams operate differently**
+
+Suppose:
+
+* One team monitors only CPU.
+* Another has hundreds of alerts.
+* A third cannot reliably roll back releases.
+* Incident response depends on two senior engineers.
+* Nobody can state how much customer-facing downtime occurred last month.
+
+Start by establishing a common minimum operating standard.
+
+| Standard                | Evidence required                                  |
+| ----------------------- | -------------------------------------------------- |
+| Named service ownership | Engineering owner and escalation route             |
+| Reliability objectives  | Defined SLIs, SLOs, and review process             |
+| Useful observability    | Customer-impact dashboard and diagnostic telemetry |
+| Controlled delivery     | Reviewed changes and verified deployment behavior  |
+| Incident readiness      | Severity criteria, roles, and tested runbooks      |
+| Recovery readiness      | Restore procedures and exercise results            |
+| Continuous improvement  | Owned, prioritized preventive work                 |
+
+Apply these standards according to service criticality. A payment service and an internal reporting tool do not necessarily need identical objectives.
+
+**How to introduce the standard**
+
+1. Select one important service with a willing team.
+2. Establish its current reliability and operational problems.
+3. Implement a small set of improvements.
+4. Measure the outcome.
+5. Publish reusable templates and examples.
+6. Expand based on demonstrated value.
+
+For example, a checkout team might introduce customer-success metrics, a useful incident runbook, and a staged deployment process. Other teams can then adopt that pattern.
+
+The objective is better decisions and outcomes—not merely completing a checklist.
+
+---
+
+**3. Define SLIs, SLOs, and error budgets**
+
+These concepts turn reliability into something teams can measure and act on.
+
+| Concept      | Meaning                                       | Example                                                    |
+| ------------ | --------------------------------------------- | ---------------------------------------------------------- |
+| SLI          | A measurement of service behavior             | Fraction of eligible checkout attempts completed correctly |
+| SLO          | A target for that measurement over a window   | At least 99.9% success over rolling 30 days                |
+| Error budget | Permitted unsuccessful behavior under the SLO | 0.1% of eligible attempts                                  |
+| SLA          | An agreement that may include consequences    | Contractual availability commitment                        |
+
+SLOs should reflect meaningful user outcomes and influence engineering priorities. Teams also need an agreed policy for acting on the results. [Google SRE: Implementing SLOs](https://sre.google/workbook/implementing-slos/).
+
+**Define the measurement precisely**
+
+For checkout, document:
+
+* Which attempts are eligible.
+* What counts as success.
+* Where the measurement is collected.
+* How retries are counted.
+* Which exclusions apply.
+* How missing telemetry is handled.
+* Who owns the measurement.
+
+For example, a response returning HTTP 200 with an unsuccessful business outcome should not automatically count as a successful order.
+
+Similarly, counting only application requests may miss customers who cannot reach the gateway.
+
+**Worked availability example**
+
+Suppose the completed measurement window contains:
+
+```text
+Eligible checkout attempts = 2,000,000
+Failed eligible attempts  = 600
+Successful attempts       = 1,999,400
+```
+
+Then:
+
+```text
+Availability SLI
+= 1,999,400 / 2,000,000
+= 99.97%
+```
+
+For a 99.9% SLO:
+
+```text
+Allowed failed attempts
+= 2,000,000 × 0.001
+= 2,000
+```
+
+Therefore:
+
+```text
+Budget consumed = 600 / 2,000 = 30%
+Budget remaining = 1,400 failed attempts
+```
+
+For a rolling window, totals and remaining budget change continuously as events enter and leave the window.
+
+**Define more than availability**
+
+A service can succeed eventually while being frustratingly slow.
+
+Illustrative objectives might be:
+
+| Journey               | Objective                                                                   |
+| --------------------- | --------------------------------------------------------------------------- |
+| Checkout availability | 99.9% of eligible attempts complete correctly                               |
+| Checkout latency      | 99% of eligible attempts complete correctly within 800 ms                   |
+| Order processing      | 99.5% of accepted orders reach the next processing stage within two minutes |
+| Catalog freshness     | 99% of eligible reads use data no older than the agreed threshold           |
+
+Define each denominator and measurement window explicitly.
+
+**Request-based versus time-based availability**
+
+A time-based 99.9% objective over exactly 30 days allows:
+
+```text
+30 × 24 × 60 × 0.001 = 43.2 minutes
+```
+
+A request-based budget cannot generally be converted into minutes because traffic is not uniform.
+
+Ten minutes of failure during a major sale can affect far more users than ten minutes overnight.
+
+---
+
+**4. Manage the error budget as a decision mechanism**
+
+An error budget is useful when it changes what the team does.
+
+An illustrative policy:
+
+| Condition                        | Operating response                             |
+| -------------------------------- | ---------------------------------------------- |
+| Budget healthy                   | Normal delivery with established controls      |
+| Budget burning rapidly           | Investigate and mitigate active impact         |
+| Repeated significant consumption | Prioritize the dominant failure mechanism      |
+| Budget exhausted                 | Restrict risky changes under the agreed policy |
+| Urgent security or recovery fix  | Use a documented exception path                |
+
+The policy should be agreed before a release dispute or outage.
+
+**Scenario: launch versus reliability**
+
+A team wants to launch a promotion feature, but checkout has exhausted its budget through repeated database connection incidents.
+
+As the principal engineer:
+
+1. Explain the customer impact and supporting evidence.
+2. Identify whether the launch increases the same risk.
+3. Evaluate a narrower rollout or feature flag.
+4. Prioritize the connection-budget fix.
+5. Apply the established policy with product and engineering owners.
+6. Record any exception and its accountable decision-maker.
+
+Do not change the SLO just to make the release appear acceptable.
+
+**Burn-rate example**
+
+For a 99.9% SLO:
+
+```text
+Permitted error fraction = 0.001
+Observed error fraction = 0.01
+Burn rate = 0.01 / 0.001 = 10
+```
+
+The service is consuming budget at ten times the sustainable rate. Multi-window alerts can distinguish sustained, ongoing impact from short or recovered spikes. [Google SRE: Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/).
+
+---
+
+**5. Improve availability, scalability, performance, and resilience**
+
+These terms are related but answer different questions.
+
+| Property     | Question                                                 |
+| ------------ | -------------------------------------------------------- |
+| Availability | Can users successfully use the service now?              |
+| Performance  | How quickly and efficiently does it perform useful work? |
+| Scalability  | Can capacity increase with demand?                       |
+| Resilience   | Can it withstand and recover from disruption?            |
+
+**Scenario A: improve availability**
+
+Checkout has three replicas, but all run on one node.
+
+A node failure removes all serving instances.
+
+Improvements:
+
+* Distribute replicas across nodes and appropriate zones.
+* Maintain surviving capacity.
+* Use readiness checks that reflect traffic eligibility.
+* Test graceful termination during updates.
+* Identify single points of failure in dependencies.
+
+Verify the improvement through a controlled node-failure exercise and customer-path checks.
+
+Three replicas provide little protection when they share the same failure domain.
+
+**Scenario B: improve performance**
+
+Checkout p99 rises to four seconds while average CPU remains moderate.
+
+Traces show most time waiting for database connections.
+
+Possible improvements:
+
+* Reduce unnecessary database calls.
+* Tune queries and indexes based on evidence.
+* Bound connection pools.
+* Remove excessive retries.
+* Cache suitable data with an explicit freshness requirement.
+
+Re-run the same representative load test. Check correctness, dependency load, and cost alongside latency.
+
+**Scenario C: improve scalability**
+
+HPA creates more checkout replicas, but throughput stops increasing.
+
+Possible causes include:
+
+* Database saturation.
+* Node-capacity constraints.
+* Queue partition limits.
+* A serialized application operation.
+* External API throttling.
+
+Scaling is a system-wide property. More pods cannot overcome every shared bottleneck.
+
+**Scenario D: improve resilience**
+
+The recommendation service becomes unavailable.
+
+A resilient shopping application continues catalog browsing and checkout while temporarily omitting recommendations.
+
+For essential dependencies, use appropriate deadlines, bounded retries, backpressure, and explicit degraded behavior. Payment processing also needs idempotency and reconciliation because a timeout does not prove that a charge failed.
+
+---
+
+**6. Reduce operational toil**
+
+Toil is repetitive operational work that scales with service growth and produces little enduring improvement. Identifying and reducing it creates time for engineering. [Google SRE: Eliminating toil](https://sre.google/workbook/eliminating-toil/).
+
+Examples include:
+
+* Manually creating similar environments.
+* Repeatedly collecting the same incident evidence.
+* Restarting a known stuck worker.
+* Checking certificates by hand.
+* Repeatedly correcting the same configuration drift.
+
+**Quantify the problem**
+
+Suppose engineers perform a manual environment setup 20 times monthly, taking 45 minutes each:
+
+```text
+20 × 45 minutes = 900 minutes = 15 hours per month
+```
+
+If automation requires 30 hours to build, nominal time payback is two months before maintenance costs.
+
+Also consider avoided errors, reduced waiting, and interruption cost.
+
+**Scenario: environment provisioning**
+
+Before:
+
+* Engineers create resources manually.
+* Network settings differ.
+* Monitoring is sometimes omitted.
+* Application teams wait for platform support.
+
+Improvement:
+
+1. Create reusable Terraform modules.
+2. Validate inputs and policy.
+3. Provide a controlled execution workflow.
+4. Run post-provisioning connectivity and identity checks.
+5. Publish clear outputs and ownership.
+6. Measure successful self-service use.
+
+Provisioning speed matters, but consistent working environments are the stronger outcome.
+
+**Self-healing example**
+
+A worker stops making progress.
+
+A safe remediation workflow:
+
+1. Confirms processing has actually stopped.
+2. Checks broker and database health.
+3. Collects logs and diagnostic state.
+4. Restarts one eligible instance.
+5. Verifies renewed progress.
+6. Stops or escalates if recovery fails.
+
+Add retry limits, cooldowns, and concurrency controls.
+
+High queue depth alone should not trigger fleet-wide restarts. A slow database could be the real cause, and reconnecting every worker may worsen it.
+
+**Proactive monitoring**
+
+Monitor leading risks such as:
+
+* Certificate expiry.
+* Storage growth.
+* Address and quota headroom.
+* Backup failures.
+* Increasing queue age.
+* Unsustainable connection growth.
+
+A forecast should trigger a useful action with an owner—not simply another dashboard.
+
+---
+
+**7. Lead incident response**
+
+Incident management aims to restore acceptable service while controlling additional risk.
+
+Establish severity based on customer impact. The exact labels are organization-specific.
+
+| Example severity | Illustrative impact                                          |
+| ---------------- | ------------------------------------------------------------ |
+| Critical         | Widespread checkout failure or serious correctness risk      |
+| High             | Significant degradation or a major affected customer segment |
+| Moderate         | Limited impact with a working alternative                    |
+
+Assign roles appropriate to incident size:
+
+* **Incident commander:** Coordinates decisions and priorities.
+* **Technical responders:** Investigate and mitigate.
+* **Communications owner:** Provides clear updates.
+* **Timeline recorder:** Preserves actions and evidence.
+
+During smaller incidents, one person may fill multiple roles. Clear responsibilities and coordination remain important. [Google SRE: Incident response](https://sre.google/workbook/incident-response/).
+
+**Worked incident: sale-day checkout failures**
+
+At 10:00, checkout errors rise after a configuration release.
+
+| Time  | Observation or action                                        |
+| ----- | ------------------------------------------------------------ |
+| 10:00 | Customer failures begin                                      |
+| 10:02 | SLO alert fires                                              |
+| 10:04 | Incident declared and roles assigned                         |
+| 10:07 | New replicas and database connections correlate with failure |
+| 10:10 | Responders confirm connection-pool waiting                   |
+| 10:14 | Compatible configuration restored                            |
+| 10:18 | Customer success and latency recover                         |
+| 10:25 | Backlog and transaction checks confirm stability             |
+
+The timeline is illustrative.
+
+**Your decisions as incident lead**
+
+* Pause unrelated changes that could complicate investigation.
+* State confirmed impact separately from hypotheses.
+* Assign focused investigations.
+* Select a mitigation supported by evidence.
+* Avoid several simultaneous uncontrolled changes.
+* Verify customer recovery and data correctness.
+
+A status update might say:
+
+> “Checkout has elevated failures since 10:00 UTC. Catalog browsing remains available. We have identified database connection pressure and are validating a configuration recovery. The next update is at 10:20 UTC.”
+
+Do not announce recovery solely because pods are Running.
+
+---
+
+**8. Conduct RCA and blameless postmortems**
+
+RCA explains how the failure occurred. A postmortem also examines impact, detection, response, and improvements.
+
+Many incidents have several contributing conditions. “The engineer made a mistake” does not explain why the system allowed one change to create widespread failure.
+
+A blameless review examines the information, assumptions, and controls present at the time while retaining clear ownership of improvements. [Google SRE: Postmortem culture](https://sre.google/sre-book/postmortem-culture/).
+
+**Continue the checkout incident**
+
+The analysis finds:
+
+| Category           | Finding                                                          |
+| ------------------ | ---------------------------------------------------------------- |
+| Trigger            | A release increased per-pod database connections                 |
+| Amplifier          | Autoscaling increased aggregate connections further              |
+| Missing protection | No total connection budget                                       |
+| Test gap           | Tests did not exercise scaling against realistic database limits |
+| Detection gap      | Database saturation was not clearly visible                      |
+| Response gap       | Runbook did not explain the scaling/dependency interaction       |
+
+The causal explanation is stronger than “database overloaded.”
+
+**Write actionable follow-ups**
+
+| Action                             | Owner               | Verification                            |
+| ---------------------------------- | ------------------- | --------------------------------------- |
+| Define aggregate connection limits | Application team    | Peak-load test                          |
+| Add connection-wait telemetry      | Observability owner | Controlled saturation exercise          |
+| Improve release checks             | Delivery team       | Bad configuration detected in staging   |
+| Update incident runbook            | Service owner       | Another engineer completes the exercise |
+| Review similar services            | Platform lead       | Documented findings and actions         |
+
+Set due dates and priorities. Track completion and effectiveness.
+
+A completed ticket that does not reduce the failure risk is not a successful preventive action.
+
+---
+
+**9. Develop disaster recovery, backup, and business continuity**
+
+These concepts cover different scopes.
+
+| Concept             | Purpose                                                       |
+| ------------------- | ------------------------------------------------------------- |
+| High availability   | Continue service through expected component failures          |
+| Backup              | Preserve recoverable copies of data                           |
+| Disaster recovery   | Restore service after major disruption                        |
+| Business continuity | Keep essential business functions operating during disruption |
+| RTO                 | Target restoration time                                       |
+| RPO                 | Target maximum data loss measured in time                     |
+
+Recovery planning must connect technology with business requirements and dependencies. [Microsoft: Business continuity, HA, and DR](https://learn.microsoft.com/en-us/azure/reliability/concept-business-continuity-high-availability-disaster-recovery).
+
+**Scenario: a regional outage**
+
+Assume the business proposes:
+
+```text
+RTO = 30 minutes
+RPO = 5 minutes
+```
+
+These are targets to design and test—not guarantees created by deploying another AKS cluster.
+
+The recovery platform needs:
+
+* Required infrastructure and capacity.
+* Deployable application images.
+* Compatible configuration.
+* Working identities and secrets.
+* Recoverable database state.
+* Message-processing and reconciliation procedures.
+* DNS or traffic-routing changes.
+* Monitoring and operator access.
+
+Multi-region AKS architecture requires coordination across clusters and their dependencies. [Microsoft: Multi-region AKS](https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/containers/aks-multi-region/aks-multi-cluster).
+
+**Illustrative recovery exercise**
+
+1. Establish impact and declare recovery.
+2. Determine which database state is authoritative.
+3. Check replication status and potential data loss.
+4. Restore or promote the recovery data service.
+5. Verify application configuration and identity.
+6. Confirm recovery capacity.
+7. Shift traffic.
+8. Test complete orders and payment reconciliation.
+9. Record actual recovery time and data loss.
+10. Plan failback separately.
+
+Prevent conflicting writers where the data design requires one authority.
+
+**Backup is not the same as replication**
+
+Replication may reproduce accidental deletion or corrupted data.
+
+Therefore, test scenarios such as:
+
+* Region unavailable.
+* Database accidentally deleted.
+* Bad application update corrupts records.
+* Credentials required for recovery are inaccessible.
+
+Each may need a different recovery approach.
+
+**Restore verification**
+
+A successful backup job is only one piece of evidence.
+
+A meaningful restore test:
+
+* Restores to an isolated target.
+* Checks expected records and integrity.
+* Connects the application.
+* Exercises business operations.
+* Measures elapsed time.
+* Records missing steps or dependencies.
+
+**Business continuity example**
+
+During an outage, support teams may need an approved way to view recent order status and communicate delays.
+
+That requires accessible procedures, roles, and communications. Do not invent an unsafe fallback that accepts payments or orders without reliable reconciliation.
+
+---
+
+**10. Conduct capacity planning**
+
+Capacity planning estimates what the service needs under normal demand, peaks, failures, and maintenance.
+
+Consider:
+
+* Request volume and concurrency.
+* Payload and transaction mix.
+* CPU and memory.
+* Database connections and throughput.
+* Queue processing.
+* Storage growth.
+* Network and outbound connection limits.
+* Quotas and IP addresses.
+* Scale-out and startup delay.
+
+**Worked example: peak checkout demand**
+
+Suppose a representative test shows one pod handles 150 requests per second while meeting latency requirements.
+
+For 3,000 requests per second:
+
+```text
+Minimum at measured throughput
+= 3,000 / 150
+= 20 pods
+```
+
+If the design targets 70% of that measured throughput per pod:
+
+```text
+Required pods
+= ceil(3,000 / (150 × 0.70))
+= 29 pods
+```
+
+Now include zone-failure tolerance.
+
+With 45 pods evenly distributed across three zones, losing one zone leaves 30 pods:
+
+```text
+30 × 150 × 0.70 = 3,150 requests per second
+```
+
+Under these simplified assumptions, that exceeds the 3,000-request target.
+
+But verify:
+
+* Nodes can host those replicas.
+* Remaining zones have the required capacity.
+* The database can sustain the load.
+* Routing distributes traffic correctly.
+* Real workload behavior matches the test.
+
+Arithmetic provides a planning estimate; a failure-under-load exercise provides stronger evidence.
+
+**Use several test types**
+
+| Test               | Purpose                                     |
+| ------------------ | ------------------------------------------- |
+| Load               | Validate expected demand                    |
+| Stress             | Discover limits and failure behavior        |
+| Spike              | Test sudden demand changes                  |
+| Soak               | Find long-duration leaks or degradation     |
+| Failure under load | Verify remaining capacity during disruption |
+
+A test against a health endpoint does not represent a real checkout transaction.
+
+---
+
+**11. Perform reliability assessments and operational risk reviews**
+
+A reliability assessment asks whether the service can meet its objectives.
+
+Review:
+
+* Architecture and failure domains.
+* Dependency behavior.
+* Deployment compatibility.
+* Observability.
+* Capacity evidence.
+* Data recovery.
+* Runbooks and ownership.
+* Previously unresolved incident findings.
+
+An operational risk review records what could go wrong and how the organization will handle it.
+
+| Risk                      | Consequence                           | Control or improvement               | Owner             |
+| ------------------------- | ------------------------------------- | ------------------------------------ | ----------------- |
+| Limited subnet headroom   | Scaling or upgrades fail              | Capacity review and address plan     | Platform          |
+| Untested database restore | Recovery exceeds target               | Scheduled restore exercise           | Data owner        |
+| Unbounded retries         | Dependency overload spreads           | Retry and deadline policy            | Engineering       |
+| Shared credentials        | Access failures or excessive exposure | Scoped identity and rotation process | Security/platform |
+| One expert knows recovery | Delayed incident handling             | Tested runbook and paired exercises  | Service owner     |
+
+Use qualitative or numerical scoring to support prioritization, but recognize that scores are estimates.
+
+A review should produce decisions: fix, mitigate, accept with an accountable owner, or postpone the change.
+
+---
+
+**12. Distinguish Incident, Problem, Change, and Release Management**
+
+These processes work together but serve different purposes.
+
+| Process             | Main purpose                                   | Checkout example                                   |
+| ------------------- | ---------------------------------------------- | -------------------------------------------------- |
+| Incident management | Restore service                                | Recover from current connection exhaustion         |
+| Problem management  | Eliminate recurring or latent causes           | Address the recurring connection-budget weakness   |
+| Change management   | Evaluate and control modification risk         | Review the proposed pool and scaling configuration |
+| Release management  | Coordinate delivery of a version or capability | Promote the tested checkout update                 |
+
+**Incident management**
+
+Focus on impact, coordination, mitigation, communication, and recovery verification.
+
+The service may be restored using a temporary workaround.
+
+**Problem management**
+
+After three similar incidents, create a problem record covering the shared cause.
+
+Investigate:
+
+* Why the issue recurs.
+* Which services are exposed.
+* What temporary workaround exists.
+* What permanent improvement is required.
+* How effectiveness will be verified.
+
+Closing an incident does not mean its underlying problem has been solved.
+
+**Change management**
+
+Match controls to risk.
+
+Illustrative categories:
+
+* **Standard:** Repeatable, understood, and pre-authorized under an established procedure.
+* **Normal:** Evaluated through the organization’s change process.
+* **Emergency:** Expedited to address urgent impact, with recorded ownership and follow-up.
+
+Automation can enforce required tests, environment controls, and evidence. Not every routine change needs a large manual meeting.
+
+**Release management**
+
+Coordinate artifact versions, configuration, migrations, rollout stages, and customer enablement.
+
+Deployment and release can be separate. A feature may be deployed but remain disabled until verification is complete.
+
+Progressive exposure and health checks can reduce the number of users affected by a defective release. [Microsoft: Safe deployment practices](https://learn.microsoft.com/en-us/azure/well-architected/operational-excellence/safe-deployments).
+
+**Scenario: a database schema change**
+
+Use a compatible sequence:
+
+1. Add the new optional schema element.
+2. Deploy code that works during the transition.
+3. Observe behavior.
+4. Migrate existing data if required.
+5. Retire the old behavior later.
+6. Remove obsolete schema only after compatibility is confirmed.
+
+Rolling back an image is insufficient if the database was changed incompatibly.
+
+---
+
+**13. Bring the responsibilities together in one project story**
+
+For the retail platform, a coherent SRE improvement project could be:
+
+1. Establish service ownership and customer-facing SLOs.
+2. Baseline failures, latency, toil, and recovery capability.
+3. Identify database connection exhaustion as a major recurring risk.
+4. Define connection and capacity budgets.
+5. Add representative scaling and failure tests.
+6. Improve dashboards and budget-burn alerts.
+7. Introduce controlled deployment and recovery procedures.
+8. Automate routine diagnostics and safe operational tasks.
+9. Run restore and regional-recovery exercises.
+10. Review outcomes and remaining risks with engineering and business owners.
+
+The evidence you present should include:
+
+* SLO specifications.
+* Before-and-after operational measurements.
+* Load and failure-test results.
+* Incident timelines and postmortems.
+* Recovery exercise results.
+* Owned improvement actions.
+
+In an interview, explain **the customer problem, your decisions, the tradeoffs, how the teams executed the work, and the evidence that reliability improved**. Keep illustrative scenarios separate from your own project experience.
+
+
+As a **cloud architect**, you decide how the platform meets business requirements, tolerates failures, controls access, and recovers. As a **cloud engineer**, you implement those decisions, automate operations, diagnose failures, and prove that the platform works.
+
+The distinction is useful, but the responsibilities overlap:
+
+| Area        | Cloud architect focuses on                | Cloud engineer focuses on                               |
+| ----------- | ----------------------------------------- | ------------------------------------------------------- |
+| Reliability | Failure tolerance and recovery objectives | Configuration, testing, and operational evidence        |
+| Networking  | Connectivity and isolation design         | Routes, DNS, security rules, and troubleshooting        |
+| Compute     | Service selection and capacity strategy   | Provisioning, scaling, patching, and upgrades           |
+| Security    | Identity boundaries and access model      | Role assignments, federation, rotation, and diagnostics |
+| Operations  | Ownership and operating standards         | Monitoring, incidents, automation, and maintenance      |
+
+The following scenarios use a **fictional retail ordering platform on Azure**. They represent realistic engineering situations rather than documented incidents at a named company.
+
+**1. Disaster recovery and business continuity**
+
+Start with the business consequences of failure.
+
+For an ordering platform, ask:
+
+* How long can checkout remain unavailable?
+* Can previously accepted orders be lost?
+* Can catalog browsing continue while checkout is unavailable?
+* What happens if payment succeeds but order creation fails?
+* Who decides to invoke regional recovery?
+
+These answers determine the architecture.
+
+**Understand the terms**
+
+| Term                | Meaning                                     | Example                                    |
+| ------------------- | ------------------------------------------- | ------------------------------------------ |
+| High availability   | Maintain service through expected failures  | Continue serving after a worker node fails |
+| Disaster recovery   | Restore service after major disruption      | Recover from a regional outage             |
+| Backup              | Preserve recoverable data copies            | Restore accidentally deleted orders        |
+| Business continuity | Maintain essential business functions       | Support customers while systems recover    |
+| RTO                 | Target time to restore service              | Checkout restored within 30 minutes        |
+| RPO                 | Target maximum data loss, expressed in time | At most five minutes of data loss          |
+
+Business continuity includes people, communications, and processes as well as infrastructure. Recovery requirements should be negotiated with business owners and tested against the complete workload. [Microsoft: Business continuity, HA, and DR](https://learn.microsoft.com/en-us/azure/reliability/concept-business-continuity-high-availability-disaster-recovery).
+
+**Choose a recovery strategy**
+
+| Strategy           | Design                                                   | Main tradeoff                                           |
+| ------------------ | -------------------------------------------------------- | ------------------------------------------------------- |
+| Backup and restore | Recreate infrastructure and restore data                 | Lower standby cost, potentially longer recovery         |
+| Pilot light        | Keep essential recovery components available             | More preparation required before serving traffic        |
+| Warm standby       | Maintain a functioning environment with reduced capacity | Faster recovery, ongoing cost and scaling dependency    |
+| Active-active      | Multiple regions serve traffic                           | More complex routing, consistency, and failure handling |
+
+These labels describe architectural patterns. They do not establish an RTO by themselves.
+
+**Practical scenario: the primary region becomes unavailable**
+
+Assume the proposed objectives are:
+
+```text
+RTO: 30 minutes
+RPO: 5 minutes
+```
+
+The secondary region contains AKS, networking, access configuration, and a supported data-recovery arrangement.
+
+As the architect, identify the full recovery dependency chain:
+
+* Application images.
+* Database state.
+* Message broker and processing state.
+* Secrets and identities.
+* DNS and traffic management.
+* Network access to external services.
+* Sufficient compute capacity.
+* Monitoring and operator access.
+
+Multi-region AKS requires coordinated regional infrastructure and dependencies; a second cluster alone does not establish recoverability. [Microsoft: Multi-region AKS architecture](https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/containers/aks-multi-region/aks-multi-cluster).
+
+As the engineer, execute a tested sequence:
+
+1. Confirm customer impact and invoke the recovery process.
+2. Establish the authoritative data state.
+3. Assess replication lag or available recovery points.
+4. Prevent conflicting writes where the design requires one writer.
+5. Promote or restore the data service.
+6. Validate application configuration and identity access.
+7. Confirm serving capacity.
+8. Shift traffic through the selected routing mechanism.
+9. Test complete orders and payment reconciliation.
+10. Record actual recovery time and data loss.
+
+**Worked recovery measurement**
+
+Suppose impact starts at 14:00 and the recovered service accepts verified orders at 14:24.
+
+Actual restoration time is 24 minutes, assuming those are the agreed measurement boundaries.
+
+If the latest complete recovered transaction sequence ends at 13:58, the recovered data is two minutes behind the failure point. Validate that conclusion using transaction evidence, not just a replication-status indicator.
+
+For payments, even a small data gap may require reconciliation with the provider.
+
+**Backup scenario: accidental deletion**
+
+An engineer accidentally deletes order records. Replication propagates the deletion to the secondary region.
+
+Regional failover will not recover the deleted records.
+
+Instead:
+
+* Restore to an appropriate earlier point in an isolated target.
+* Verify data integrity.
+* Identify valid transactions created after that point.
+* Plan reconciliation and controlled restoration.
+* Test the application against the recovered data.
+
+AKS Backup can protect supported Kubernetes resources and persistent-volume data, subject to its supported configurations and recovery capabilities. It does not replace separate recovery planning for an external managed database. [Microsoft: AKS Backup](https://learn.microsoft.com/en-us/azure/backup/azure-kubernetes-service-backup-overview).
+
+**Business continuity scenario**
+
+During recovery, customer support may need approved access to recent order status and a clear customer-update process. Warehouse teams may need rules about which already-confirmed orders they can continue processing.
+
+Avoid creating an emergency workflow that accepts payments without reliable transaction tracking.
+
+---
+
+**2. Microsoft Azure at an expert level**
+
+“Expert-level Azure” means connecting services into an operable platform and defending the tradeoffs. Knowing portal steps is only one part of that capability.
+
+**Design the organizational foundation**
+
+Azure landing zones address governance, security, connectivity, and workload environments. They distinguish shared platform capabilities from environments owned by workload teams. [Microsoft: Azure landing zones](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/landing-zone/).
+
+For the project, establish:
+
+* Subscription and resource-group boundaries.
+* Production and non-production access.
+* Shared networking and DNS ownership.
+* Policy and naming requirements.
+* Cost allocation and ownership tags.
+* Monitoring and incident routing.
+* Infrastructure delivery and recovery access.
+
+**Understand control-plane and data-plane permissions**
+
+Creating a resource and using its contents are different operations.
+
+For example, an identity might be able to manage a storage account but lack permission to read blobs. A workload might reach Key Vault successfully but receive an authorization error when requesting a secret.
+
+Troubleshoot separately:
+
+1. Can the client reach the endpoint?
+2. Can it acquire the correct token?
+3. Is the token issued for the intended identity and audience?
+4. Does that identity have the required permission at the correct scope?
+
+**Practical scenario: development works, production fails**
+
+The application retrieves secrets in development using a developer’s broad permissions. In production, its workload identity receives a denial.
+
+The architectural problem is an inconsistent identity model.
+
+The engineering response is to identify the production principal, verify federation and role scope, and test the required operation. Broadly granting Owner access would conceal the real requirement and expand risk.
+
+AKS workload identity connects Kubernetes service-account identity with Microsoft Entra authentication through federated trust. Resource authorization must still be configured. [Microsoft: AKS workload identity](https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview).
+
+**Make architecture reviewable**
+
+For major decisions, record:
+
+* Business requirement.
+* Options considered.
+* Selected approach.
+* Failure behavior.
+* Security and cost implications.
+* Operational owner.
+* Conditions that would trigger reconsideration.
+
+For example, selecting a managed application service instead of AKS may reduce operational burden when Kubernetes-specific capabilities are unnecessary. An architect should justify the platform choice for the workload.
+
+---
+
+**3. Azure Kubernetes Service**
+
+AKS provides a managed Kubernetes control plane and compute for containerized workloads. Nodes run application pods; node pools group compute with common characteristics.
+
+AKS supports different operating modes and node-management approaches. Your application still needs appropriate configuration, capacity, dependency handling, and operational ownership. [Microsoft: AKS core concepts](https://learn.microsoft.com/en-us/azure/aks/core-aks-concepts).
+
+**Architectural decisions**
+
+For a production cluster, decide:
+
+* Public or private control-plane connectivity.
+* Network and pod-addressing model.
+* Ingress integration.
+* System and application node-pool strategy.
+* Workload identity.
+* Availability-zone placement.
+* Scaling limits.
+* Upgrade and maintenance approach.
+* Persistent-data ownership.
+* Monitoring and recovery design.
+
+Use a reference architecture as a starting point, then adapt it to actual requirements. [Microsoft: AKS baseline architecture](https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/containers/aks/baseline-aks).
+
+**Engineering implementation**
+
+Configure the application’s:
+
+* Replicas and placement.
+* Readiness, startup, and liveness behavior.
+* CPU and memory requests.
+* Appropriate limits.
+* Graceful termination.
+* Deployment availability controls.
+* Autoscaling.
+* Dependency timeouts and connection budgets.
+
+**Practical scenario: upgrade stalls**
+
+An AKS node-pool upgrade cannot progress.
+
+Potential causes include:
+
+* A disruption budget allows no eligible eviction.
+* Replacement pods cannot schedule.
+* Insufficient address space for temporary nodes.
+* Subscription quota.
+* Capacity unavailable for the selected VM size.
+* A workload that never becomes ready.
+
+Investigate the specific constraint. Do not remove all disruption controls merely to make the upgrade continue.
+
+For future maintenance, test representative workloads, reserve surge capacity, and verify customer behavior throughout the change.
+
+**Practical scenario: more replicas do not help**
+
+HPA requests more pods, but they remain Pending.
+
+Cluster Autoscaler can evaluate additional node capacity when pods cannot schedule, subject to its configuration and infrastructure constraints. It is a separate mechanism from application replica scaling. [Microsoft: AKS Cluster Autoscaler](https://learn.microsoft.com/en-us/azure/aks/cluster-autoscaler-overview).
+
+Check scheduling events, node-pool limits, requested resources, placement rules, quota, and address availability.
+
+---
+
+**4. VNets, subnets, DNS, and NSGs**
+
+A useful troubleshooting distinction is:
+
+| Question                                  | Responsible mechanism          |
+| ----------------------------------------- | ------------------------------ |
+| What destination does this name identify? | DNS                            |
+| Which path reaches it?                    | Routing                        |
+| Is traffic allowed?                       | Security controls              |
+| Is the destination accepting work?        | Service and application health |
+
+One successful check does not prove the others.
+
+**VNets and subnets**
+
+A VNet provides Azure private networking. Subnets divide its address space and support resource placement and network configuration. VNets can connect to other networks using supported connectivity mechanisms. [Microsoft: Virtual Network overview](https://learn.microsoft.com/en-us/azure/virtual-network/virtual-networks-overview).
+
+An illustrative address plan:
+
+| Network area               | Example        |
+| -------------------------- | -------------- |
+| Production VNet            | `10.20.0.0/16` |
+| Application Gateway subnet | `10.20.0.0/24` |
+| AKS node subnet            | `10.20.4.0/22` |
+| Private-endpoint subnet    | `10.20.8.0/24` |
+
+These are examples, not universal sizing recommendations.
+
+Account for corporate-network overlap, pod-network choices, growth, private endpoints, and upgrades.
+
+Azure reserves addresses within subnets, so total CIDR address count is not the same as usable resource capacity. Subnets also do not correspond directly to availability zones. [Microsoft: Virtual Network FAQ](https://learn.microsoft.com/en-us/azure/virtual-network/virtual-networks-faq).
+
+**Practical scenario: overlapping address ranges**
+
+Azure and the corporate network both use the same private range. Hybrid connectivity now has ambiguous destinations.
+
+The architect should prevent overlap through coordinated address planning. If discovered later, evaluate renumbering or a carefully designed translation approach, including the operational complexity.
+
+**DNS**
+
+For private access, the workload must resolve the service name through the intended DNS path.
+
+Azure Private DNS zones and their VNet links support private name-resolution scenarios. [Microsoft: Azure Private DNS](https://learn.microsoft.com/en-us/azure/dns/private-dns-overview).
+
+**Practical scenario: private database works from a VM but not AKS**
+
+Check from the failing workload context:
+
+```bash
+kubectl -n orders exec <pod> -- cat /etc/resolv.conf
+kubectl -n orders exec <pod> -- nslookup <database-hostname>
+```
+
+These assume the image contains the utilities.
+
+Compare:
+
+* Returned addresses.
+* The resolver used.
+* CoreDNS behavior.
+* Upstream forwarding.
+* Private-zone links.
+* DNS reachability.
+
+If the name resolves correctly, continue to transport, TLS, and identity checks.
+
+**NSGs**
+
+NSGs use prioritized rules to permit or deny traffic. Lower numerical priority has higher precedence, and NSGs are stateful. Effective subnet and interface controls must be considered together. [Microsoft: NSGs](https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview).
+
+**Practical scenario: application timeout after a rule change**
+
+A restrictive rule blocks traffic needed between the gateway and backend.
+
+As the engineer:
+
+1. Identify source, destination, protocol, and port.
+2. Inspect effective rules.
+3. Check routing and other controls.
+4. Apply a narrowly scoped correction.
+5. Verify from the actual request path.
+6. Reconcile the correction into infrastructure code.
+
+Opening every port to every source may restore connectivity while introducing a larger problem.
+
+---
+
+**5. Azure Application Gateway**
+
+Application Gateway is commonly used for HTTP-aware routing, TLS handling, and WAF integration. Its main components include frontend addresses, listeners, routing rules, backend pools, backend settings, and health probes.
+
+Current documentation also describes TCP/TLS proxy capabilities, so avoid defining it as exclusively Layer 7. For this project, focus on its web-application role. [Microsoft: Application Gateway components](https://learn.microsoft.com/en-us/azure/application-gateway/application-gateway-components).
+
+**Example design**
+
+| Requirement                  | Configuration concept                       |
+| ---------------------------- | ------------------------------------------- |
+| Accept HTTPS for the shop    | Listener and certificate                    |
+| Route `/catalog` separately  | Path-based routing                          |
+| Reach checkout instances     | Backend pool                                |
+| Use HTTPS to the backend     | Backend settings and certificate validation |
+| Exclude unavailable backends | Health probes                               |
+| Inspect web requests         | WAF policy                                  |
+
+**Architect’s decisions**
+
+Determine:
+
+* Where TLS terminates.
+* Whether backend traffic is encrypted.
+* Whether an additional regional or global entry layer is necessary.
+* How health checks represent useful service.
+* How routing changes are owned.
+* How the chosen AKS ingress integration works.
+
+Do not assume Application Gateway alone implements the complete regional traffic-failover design.
+
+**Practical scenario: 502 after a release**
+
+Checkout changes its listening port, but the gateway’s effective backend configuration retains the old port.
+
+Investigate:
+
+1. Which component emitted the error?
+2. What does backend health report?
+3. Are host, path, port, and protocol correct?
+4. Is the backend listening?
+5. Is the network path permitted?
+6. If encrypted, does backend TLS validation succeed?
+
+Correct the owning configuration and verify checkout externally.
+
+**Practical scenario: WAF blocks legitimate checkout**
+
+A new WAF policy rejects a valid request payload.
+
+Inspect the matched rule and request context. Use a narrow reviewed adjustment rather than disabling the entire WAF. Re-test both the affected application behavior and the intended protection.
+
+---
+
+**6. Azure Load Balancer**
+
+Azure Load Balancer distributes transport-layer flows across backend instances. Important concepts include frontend IP configuration, backend pools, health probes, and load-balancing rules. Public and internal configurations support different connectivity needs. [Microsoft: Azure Load Balancer](https://learn.microsoft.com/en-us/azure/load-balancer/load-balancer-overview).
+
+**Compare the common use cases**
+
+| Requirement                            | Typical starting point                                |
+| -------------------------------------- | ----------------------------------------------------- |
+| TCP/UDP flow distribution              | Azure Load Balancer                                   |
+| HTTP hostname or path routing          | Application Gateway                                   |
+| WAF inspection                         | Application Gateway WAF or another suitable WAF layer |
+| Internal transport endpoint            | Internal Load Balancer                                |
+| Global HTTP entry and regional routing | Evaluate an appropriate global service                |
+
+Selection depends on the entire requirement, not only one product feature.
+
+**Practical scenario: private TCP service**
+
+A legacy processing service runs on several VMs and listens on a custom TCP port.
+
+The architect chooses an internal load-balancing design. The engineer configures backend membership, the forwarding rule, the probe, and network access.
+
+If clients cannot connect, inspect:
+
+* Frontend address and port.
+* Backend membership.
+* Probe health.
+* Application listener.
+* NSGs and routes.
+* Whether failures affect only new or also established connections.
+
+A successful TCP probe proves a narrower condition than a completed business transaction. Add application-level monitoring where needed.
+
+**Practical scenario: uneven utilization**
+
+One backend is much busier than another.
+
+Transport flow distribution does not guarantee equal CPU usage. Long-lived connections and unequal request workloads can create imbalance.
+
+Inspect connection patterns and application behavior before assuming the load balancer is malfunctioning.
+
+---
+
+**7. Azure VM Scale Sets**
+
+VMSS provides coordinated management of multiple VMs, including scaling and lifecycle capabilities. It supplies compute; it does not automatically make application state, transactions, or recovery correct. [Microsoft: VMSS overview](https://learn.microsoft.com/en-us/azure/virtual-machine-scale-sets/overview).
+
+**Architectural decisions**
+
+Determine:
+
+* VM sizes and operating images.
+* Failure-domain distribution.
+* Scaling signals and limits.
+* Startup and warm-up time.
+* Image and patching process.
+* Session and durable-state handling.
+* Quota and supply assumptions.
+
+For a stateless API, instances should be replaceable without losing essential business state.
+
+**Practical scenario: a traffic spike arrives before scale-out finishes**
+
+A service scales out only after CPU rises, but new instances require several minutes to initialize. Customers experience failures before additional capacity becomes useful.
+
+Possible improvements:
+
+* Maintain justified minimum headroom.
+* Reduce startup time.
+* Use scheduled preparation for known events.
+* Select signals that reflect growing demand.
+* Bound admission during overload.
+* Verify downstream capacity.
+
+Test the complete scaling response, not merely whether VM count increased.
+
+**VMSS underneath AKS**
+
+AKS node pools commonly use VMSS, although other node-pool implementations also exist. For AKS-owned compute, use supported AKS lifecycle and scaling controls instead of introducing competing independent changes to underlying resources. [Microsoft: AKS node-pool concepts](https://learn.microsoft.com/en-us/azure/aks/core-aks-concepts).
+
+An architect should understand the underlying compute while preserving clear control ownership.
+
+---
+
+**8. Azure Monitor and cloud operations**
+
+Azure Monitor brings together Azure metrics, logs, application telemetry, alerting, and related monitoring experiences. Collection configuration, permissions, schemas, and retention determine what evidence is available. [Microsoft: Azure Monitor overview](https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/overview).
+
+**Design monitoring around decisions**
+
+| Layer    | Useful evidence                                           |
+| -------- | --------------------------------------------------------- |
+| Customer | Checkout success and latency                              |
+| Gateway  | Errors, backend health, request patterns                  |
+| AKS      | Scheduling failures, readiness, restarts, node conditions |
+| Compute  | Resource pressure and provisioning failures               |
+| Database | Query latency, connections, storage, replication          |
+| Network  | DNS, connectivity, filtering, outbound constraints        |
+| Delivery | Application version and infrastructure changes            |
+
+Build dashboards that allow movement from customer impact to diagnostic detail.
+
+For example:
+
+1. Checkout success falls.
+2. The affected region is identified.
+3. Gateway telemetry confirms backend failures.
+4. AKS events reveal Pending pods.
+5. Azure provisioning evidence reveals quota exhaustion.
+
+That sequence connects application symptoms with the cloud-level cause.
+
+**Service Health versus Resource Health**
+
+Azure Service Health provides information about relevant service incidents, maintenance, and advisories. Resource Health focuses on the health of individual resources.
+
+Use these alongside your workload telemetry. A platform-status signal does not replace a customer-path test. [Microsoft: Azure Service Health](https://learn.microsoft.com/en-us/azure/service-health/overview).
+
+**Daily cloud operations**
+
+Typical responsibilities include:
+
+* Investigating active incidents.
+* Reviewing failed deployments and provisioning.
+* Monitoring capacity, quotas, and cost anomalies.
+* Checking certificate and credential lifecycle.
+* Reviewing backup and restore evidence.
+* Planning updates and maintenance.
+* Detecting unexplained infrastructure drift.
+* Maintaining runbooks and ownership.
+
+Automate repetitive checks, but ensure failures in the automation are visible.
+
+**Practical scenario: monitoring disappears during the outage**
+
+The application and its only monitoring components share the failed region.
+
+Design monitoring and recovery access so a major workload failure does not remove all diagnostic visibility. Decide which telemetry, alerts, and operational records must remain available independently.
+
+---
+
+**9. How to demonstrate architect-level ownership**
+
+For this project, produce concrete evidence:
+
+| Deliverable                          | What it demonstrates                   |
+| ------------------------------------ | -------------------------------------- |
+| Architecture decision records        | Why the design was selected            |
+| Address and connectivity plan        | How components communicate             |
+| Identity model                       | Who and what can access resources      |
+| Terraform and deployment workflows   | How the design is reproduced           |
+| Capacity and failure tests           | Whether the platform meets demand      |
+| Recovery runbook and exercise report | Whether RTO and RPO are achievable     |
+| Operational dashboards               | How customer impact is detected        |
+| Incident and improvement records     | How the platform becomes more reliable |
+
+In an interview, use one connected story:
+
+> “I translated the business recovery and availability requirements into a regional Azure/AKS design, including data, identity, networking, and capacity dependencies. I implemented it through controlled infrastructure and delivery workflows, then validated it through load, failure, and restore exercises. During production issues, I used evidence from the customer path through Azure resources to identify the failing boundary and verify recovery.”
+
+Then substantiate the story with your actual decisions, tradeoffs, and measured results.
