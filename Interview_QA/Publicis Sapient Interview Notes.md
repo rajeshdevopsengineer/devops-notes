@@ -3558,4 +3558,1427 @@ In an interview, use one connected story:
 
 > “I translated the business recovery and availability requirements into a regional Azure/AKS design, including data, identity, networking, and capacity dependencies. I implemented it through controlled infrastructure and delivery workflows, then validated it through load, failure, and restore exercises. During production issues, I used evidence from the customer path through Azure resources to identify the failing boundary and verify recovery.”
 
-Then substantiate the story with your actual decisions, tradeoffs, and measured results.
+These skills cover the lifecycle of a containerized application: **package it with Docker, deploy it through Helm, operate it on Kubernetes, expose it through an ingress implementation, and maintain capacity and reliability as it changes.**
+
+We’ll use a realistic example: a retail platform running catalog, checkout, and order-processing services on AKS. The scenarios are illustrative.
+
+**1. Kubernetes administration: understand what you operate**
+
+Kubernetes maintains a declared desired state.
+
+For example, you declare:
+
+> “Run six checkout replicas, expose them through a Service, and replace unhealthy instances.”
+
+Kubernetes controllers continuously work toward that state.
+
+| Component         | Responsibility                               |
+| ----------------- | -------------------------------------------- |
+| API server        | Accepts Kubernetes API requests              |
+| etcd              | Stores cluster configuration and state       |
+| Scheduler         | Selects nodes for eligible, unscheduled pods |
+| Controllers       | Reconcile desired and observed state         |
+| Kubelet           | Manages assigned workloads on each node      |
+| Container runtime | Runs containers                              |
+
+In AKS, Azure manages the control plane. You still need to understand these components to distinguish application, scheduling, node, and platform failures. [Kubernetes components](https://kubernetes.io/docs/concepts/overview/components/).
+
+**Know the main workload objects**
+
+| Object      | Purpose                                             | Project example                                 |
+| ----------- | --------------------------------------------------- | ----------------------------------------------- |
+| Pod         | Runs one or more closely related containers         | A checkout instance                             |
+| Deployment  | Manages replicated, replaceable application pods    | Checkout API                                    |
+| StatefulSet | Provides stable identity and storage associations   | A stateful workload requiring those properties  |
+| DaemonSet   | Runs agents on eligible nodes                       | Node-level telemetry agent                      |
+| Job         | Runs finite work                                    | A controlled data-processing task               |
+| CronJob     | Creates Jobs on a schedule                          | Periodic reconciliation                         |
+| Service     | Provides stable access to selected backends         | Internal checkout endpoint                      |
+| Namespace   | Organizes resources and scopes many policies        | `orders`                                        |
+| ConfigMap   | Holds non-secret configuration                      | Feature settings                                |
+| Secret      | Holds sensitive configuration under access controls | Credentials where this mechanism is appropriate |
+
+A StatefulSet does not automatically implement database replication, backups, or disaster recovery. A namespace does not automatically provide complete tenant isolation.
+
+**Your administration responsibilities**
+
+Typical work includes:
+
+* Managing access and service accounts.
+* Maintaining workload configuration.
+* Reviewing node and pod health.
+* Managing quotas and resource policies.
+* Validating storage and networking.
+* Supporting deployments and maintenance.
+* Maintaining observability and runbooks.
+* Planning upgrades and recovery.
+
+For a shared platform, establish who owns infrastructure, cluster configuration, and application resources. Avoid Terraform, GitOps controllers, and manual scripts repeatedly overwriting one another.
+
+---
+
+**2. Kubernetes troubleshooting: investigate the failing layer**
+
+Start with the customer symptom:
+
+* Is the application unreachable?
+* Does it return errors?
+* Is it slow?
+* Does it produce incorrect results?
+* Is the issue limited to a version, node, region, or route?
+
+Then inspect the relevant Kubernetes objects. Kubernetes troubleshooting guidance separates pod, Service, termination, and runtime investigations. [Troubleshooting applications](https://kubernetes.io/docs/tasks/debug/debug-application/).
+
+A useful diagnostic sequence is:
+
+```bash
+kubectl config current-context
+
+kubectl -n orders get deploy,pods,svc,endpointslices -o wide
+
+kubectl -n orders get events \
+  --sort-by=.metadata.creationTimestamp
+
+kubectl -n orders describe pod <pod>
+
+kubectl -n orders logs <pod> \
+  -c <container> --tail=200
+
+kubectl -n orders logs <pod> \
+  -c <container> --previous --tail=200
+
+kubectl get nodes
+kubectl describe node <node>
+```
+
+The `--previous` option is useful when a container has restarted and a previous instance’s logs are available.
+
+**Scenario A: pods remain Pending**
+
+Possible reasons:
+
+* Insufficient requested CPU or memory capacity.
+* Taints without matching tolerations.
+* Affinity or topology constraints.
+* Unavailable persistent storage.
+* Namespace quota.
+* Node-pool growth blocked by Azure constraints.
+
+Example: a pod requests 10 GiB of memory, but no eligible node has that much allocatable memory available.
+
+Adding several small nodes may not help. The pod must fit on one eligible node.
+
+**What you do:** Read scheduling events, identify the exact constraint, and address it through the owning configuration.
+
+**Scenario B: CrashLoopBackOff**
+
+This indicates repeated container failures with restart backoff; it is not the underlying cause.
+
+Investigate:
+
+* Previous logs.
+* Exit code and termination reason.
+* Startup command.
+* Required configuration.
+* File permissions.
+* Probe failures.
+* Dependency initialization.
+
+Example: the new image expects `DATABASE_HOST`, but the chart supplies `DB_HOST`. Correcting the configuration is more useful than restarting nodes.
+
+**Scenario C: OOMKilled**
+
+The container was terminated because of an out-of-memory condition.
+
+Compare:
+
+* Configured memory limits.
+* Historical memory consumption.
+* Startup peaks.
+* Load patterns.
+* Application memory retention.
+* Node pressure.
+
+Raising the limit can be a temporary mitigation, but it may only delay a leak’s recurrence.
+
+**Scenario D: pods are Running, but the Service fails**
+
+Check:
+
+* Service selectors.
+* Pod labels.
+* EndpointSlices.
+* Readiness.
+* Service port and `targetPort`.
+* Application listening address.
+* Network policies.
+
+Example: the Deployment uses `app: checkout-v2`, while the Service still selects `app: checkout`.
+
+The application instances may be healthy, but the Service selects none of them.
+
+**Scenario E: persistent volume will not attach**
+
+Inspect the PVC, storage class, pod events, access mode, topology requirements, and existing attachments.
+
+A workload may be scheduled somewhere incompatible with its volume constraints. Deleting storage objects without understanding their lifecycle can put data at risk.
+
+---
+
+**3. Configure probes and termination correctly**
+
+| Probe     | Question                                                |
+| --------- | ------------------------------------------------------- |
+| Startup   | Has initialization completed?                           |
+| Readiness | Can this instance accept its intended traffic?          |
+| Liveness  | Is this instance in a condition where restart may help? |
+
+Readiness affects traffic eligibility; liveness can trigger restart. A startup probe allows bounded initialization before the other probes become active. [Kubernetes probes](https://kubernetes.io/docs/concepts/workloads/pods/probes/).
+
+**Practical scenario: database outage causes restart storms**
+
+Every checkout pod’s liveness probe checks the database.
+
+When the database slows down, all pods restart, creating additional connection attempts and losing useful diagnostic state.
+
+Improve the design by separating local process health from dependency behavior. Decide carefully whether dependency failure should affect readiness; removing every backend can also have consequences.
+
+**Graceful shutdown**
+
+During termination, the application should:
+
+1. Stop accepting new work appropriately.
+2. Finish or safely relinquish existing work.
+3. Close connections.
+4. Exit within the configured grace period.
+
+For an order worker, make sure an interrupted message is handled without losing work or duplicating unintended side effects.
+
+---
+
+**4. Docker: package the application consistently**
+
+Docker tools build and run container images.
+
+| Term          | Meaning                                                |
+| ------------- | ------------------------------------------------------ |
+| Dockerfile    | Build instructions                                     |
+| Image         | Packaged filesystem and execution configuration        |
+| Container     | A running instance of an image                         |
+| Registry      | Stores and distributes images                          |
+| Volume        | Storage managed outside the container’s writable layer |
+| Build context | Files available to the build                           |
+
+Containers typically share the host kernel rather than each booting a complete guest operating system. [Docker overview](https://docs.docker.com/get-started/docker-overview/).
+
+Modern Kubernetes does not require Docker Engine on every node. Docker-built compatible images can run through Kubernetes container runtimes such as containerd.
+
+**What makes a good production image**
+
+* Only necessary runtime dependencies.
+* A suitable, maintained base image.
+* Reproducible dependency selection.
+* No embedded credentials.
+* Appropriate non-root execution.
+* Predictable startup and shutdown.
+* Clear stdout/stderr logging.
+* An immutable deployment reference.
+
+Multi-stage builds separate compilation tools from the runtime image. A `.dockerignore` reduces unwanted build-context content. Base-image updates require a deliberate rebuild and validation process. [Docker build practices](https://docs.docker.com/build/building/best-practices/).
+
+**Practical commands**
+
+Assuming an existing project with a Dockerfile and an application listening on port 8080:
+
+```bash
+docker build -t checkout:study .
+
+docker run --rm \
+  --name checkout-study \
+  -p 127.0.0.1:8080:8080 \
+  checkout:study
+```
+
+From another terminal:
+
+```bash
+docker logs checkout-study
+docker inspect checkout-study
+docker stats checkout-study
+```
+
+**Scenario: works locally, fails in AKS**
+
+Investigate differences in:
+
+* CPU architecture.
+* Environment variables.
+* User and filesystem permissions.
+* Working directory.
+* Available files.
+* Resource limits.
+* Network and identity access.
+* Startup command.
+
+A common networking mistake is binding the application only to `127.0.0.1` inside the container. Other pods and routing components normally need it listening on the appropriate container interface, often `0.0.0.0`.
+
+**Scenario: a restart loses uploaded files**
+
+The application stored important files in the container’s writable layer.
+
+Choose durable storage appropriate to the application. Container replacement should not destroy business data.
+
+---
+
+**5. Helm: package and configure Kubernetes deployments**
+
+Helm packages Kubernetes resources into **charts**.
+
+A chart commonly contains:
+
+| File or directory    | Purpose                          |
+| -------------------- | -------------------------------- |
+| `Chart.yaml`         | Chart metadata and dependencies  |
+| `values.yaml`        | Default configuration            |
+| `templates/`         | Kubernetes manifest templates    |
+| `values.schema.json` | Optional input-schema validation |
+| `charts/`            | Chart dependencies               |
+
+The chart version and application version have different meanings: changing a chart does not necessarily mean changing the application image. [Helm charts](https://helm.sh/docs/topics/charts/).
+
+**Practical example**
+
+A values file could contain:
+
+```yaml
+replicaCount: 3
+
+service:
+  port: 80
+  targetPort: 8080
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+```
+
+A Deployment template might use:
+
+```yaml
+spec:
+  replicas: {{ .Values.replicaCount }}
+```
+
+Staging and production can use different values while sharing the chart.
+
+**Validate the rendered result**
+
+```bash
+helm lint ./checkout-chart
+
+helm template checkout ./checkout-chart \
+  --namespace orders \
+  -f values-staging.yaml > rendered.yaml
+
+kubectl apply --dry-run=server -f rendered.yaml
+```
+
+The last command requires appropriate cluster access. It validates server admission, not performance or business correctness.
+
+**Scenario: production fails after a chart change**
+
+The application now listens on 8081, but production values still select 8080.
+
+Investigate:
+
+1. The intended values.
+2. The actual rendered manifest.
+3. The live Service and Deployment.
+4. The application listener.
+5. End-to-end request behavior.
+
+Reviewing only the template is insufficient because environment overrides affect the final resources.
+
+**Helm with ArgoCD**
+
+When ArgoCD uses a Helm chart, Helm is used to render manifests while ArgoCD manages application reconciliation. This differs from operating the workload as a conventional Helm-managed release. [ArgoCD Helm integration](https://argo-cd.readthedocs.io/en/stable/user-guide/helm/).
+
+Choose the owning delivery mechanism and use it consistently. A direct Helm rollback may not represent the intended recovery path for an ArgoCD-managed application.
+
+---
+
+**6. Ingress controllers: expose applications**
+
+An **Ingress resource** declares HTTP/HTTPS routing intent. An **ingress controller** implements that intent using its supported proxy or cloud integration.
+
+Creating an Ingress object alone does not necessarily create working routing. Kubernetes documentation also identifies Gateway API as the newer direction for traffic-routing capabilities. [Kubernetes Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/).
+
+For example:
+
+| Request                     | Intended backend       |
+| --------------------------- | ---------------------- |
+| `shop.example.com/catalog`  | Catalog Service        |
+| `shop.example.com/checkout` | Checkout Service       |
+| `admin.example.com`         | Administration Service |
+
+Understand:
+
+* Controller selection and `IngressClass`.
+* Host and path matching.
+* Backend Service and port.
+* TLS certificates.
+* Controller-specific annotations.
+* Timeout and request-size behavior.
+* WAF or authentication integration.
+* Actual network reachability.
+
+**Current support consideration**
+
+The community **Ingress NGINX** project’s retirement date was March 2026, after which its announced policy provides no further releases or security fixes. This refers to that specific project, not every product using NGINX. For new platform work, select a maintained implementation or supported Gateway API approach. [Kubernetes retirement announcement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/).
+
+**Scenario: 404 from the ingress layer**
+
+Possible explanations:
+
+* Hostname does not match.
+* Path does not match.
+* Wrong ingress class.
+* Controller did not accept the resource.
+* A default backend handled the request.
+
+Find which component generated the response and inspect effective routing.
+
+**Scenario: 502 or 504**
+
+Check:
+
+* Backend health and readiness.
+* Service selector and endpoints.
+* Port and protocol.
+* Network path.
+* TLS/SNI configuration.
+* Application and dependency response time.
+
+Do not assume increasing a timeout fixes the cause. It may simply keep failing requests waiting longer.
+
+**Scenario: controller migration**
+
+Inventory existing behavior before migration:
+
+* Rewrites.
+* Redirects.
+* Authentication.
+* TLS.
+* Large uploads.
+* WebSockets.
+* Client-IP handling.
+* Timeouts.
+
+Deploy and test the replacement, compare behavior with representative requests, shift traffic in a controlled way, and retain a recovery path.
+
+An annotation used by one implementation may have no equivalent effect in another.
+
+---
+
+**7. Scaling: distinguish pods, resources, and nodes**
+
+| Mechanism            | What changes                                   | Typical purpose                     |
+| -------------------- | ---------------------------------------------- | ----------------------------------- |
+| HPA                  | Replica count                                  | Respond to application demand       |
+| VPA                  | Resource sizing recommendations or adjustments | Improve CPU/memory sizing           |
+| Cluster Autoscaler   | Node capacity                                  | Make room for schedulable workloads |
+| Event-driven scaling | Replicas based on external demand              | Process queues or events            |
+
+**Horizontal Pod Autoscaler**
+
+HPA evaluates configured metrics and adjusts replicas. With a CPU utilization target, usage is commonly assessed relative to resource requests.
+
+A simplified calculation is:
+
+```text
+Desired replicas
+= ceil(current replicas × current metric / target metric)
+```
+
+If four pods average 90% CPU utilization against a 60% target:
+
+```text
+ceil(4 × 90 / 60) = 6 replicas
+```
+
+Actual behavior also includes metric availability, stabilization, tolerances, and configured limits. [Kubernetes HPA](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/).
+
+**Cluster Autoscaler**
+
+Additional replicas may require additional nodes. AKS Cluster Autoscaler evaluates node scaling using scheduling considerations and node-pool constraints. [AKS Cluster Autoscaler](https://learn.microsoft.com/en-us/azure/aks/cluster-autoscaler-overview).
+
+Check quota, address capacity, VM availability, and node-pool limits. Scaling cannot resolve an impossible placement constraint.
+
+**Scenario: more pods make checkout slower**
+
+Each pod permits 50 database connections.
+
+```text
+10 pods: up to 500 connections
+30 pods: up to 1,500 connections
+```
+
+If the database cannot support that workload, additional replicas increase waiting and failures.
+
+Scale the complete service within its dependency limits. Use connection budgets, admission controls, and realistic load tests.
+
+**Event-processing scenario**
+
+A queue receives 500 messages per second, while consumers process 400. Backlog grows by 100 per second.
+
+Additional consumers help only if partitions, ordering, and dependencies permit parallelism. Monitor queue age and recovery rate, not just replica count.
+
+---
+
+**8. Upgrade clusters with an operational plan**
+
+Separate:
+
+* Application upgrades.
+* Helm chart and configuration changes.
+* Kubernetes version upgrades.
+* Node-image updates.
+* Add-on and networking changes.
+
+These have different compatibility and recovery risks.
+
+For AKS, review supported upgrade paths, workload compatibility, surge capacity, maintenance settings, and disruption behavior. Do not assume downgrading Kubernetes is a routine recovery option. [AKS upgrade guidance](https://learn.microsoft.com/en-us/azure/aks/upgrade-options).
+
+**Before an upgrade**
+
+Verify:
+
+1. Deprecated or removed API usage.
+2. Controller, policy, storage, and networking compatibility.
+3. Representative staging behavior.
+4. Healthy replicas and appropriate distribution.
+5. Node quota and subnet headroom.
+6. Disruption and rollout settings.
+7. Recovery procedures.
+8. Customer-level monitoring.
+
+**PodDisruptionBudgets**
+
+A PDB limits eligible voluntary evictions. It does not prevent all outages, and Deployment updates have their own rollout controls. An overly restrictive PDB can block maintenance. [Kubernetes disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/).
+
+**Scenario: upgrade cannot drain a node**
+
+A three-replica application has a PDB requiring all three replicas to remain available.
+
+Investigate whether the requirement is intentional and whether additional healthy capacity can support maintenance. Correct the design through the owning configuration rather than blindly bypassing controls.
+
+During the upgrade, verify request success, latency, scheduling, and dependency behavior. A successful infrastructure operation does not establish application recovery.
+
+---
+
+**9. Performance tuning: measure before changing**
+
+Start with the service’s bottleneck.
+
+| Symptom               | Evidence to collect                     | Possible direction                        |
+| --------------------- | --------------------------------------- | ----------------------------------------- |
+| High CPU              | Profiles and per-container metrics      | Reduce expensive computation              |
+| High latency, low CPU | Traces, locks, I/O and dependency waits | Remove waiting or contention              |
+| Memory growth         | Profiles and historical usage           | Fix retention or size appropriately       |
+| CPU throttling        | Limit and throttling metrics            | Reassess CPU limits and workload behavior |
+| Slow startup          | Image pull and initialization timing    | Reduce image size and startup work        |
+| Queue growth          | Arrival and useful processing rates     | Address consumer or dependency capacity   |
+| Node pressure         | Node conditions and resource history    | Improve placement or node sizing          |
+
+Requests influence scheduling. CPU limits can cause throttling, while memory-limit violations can result in termination. Size using measured behavior, including startup and peak demand. [Kubernetes resource management](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/).
+
+**Practical tuning cycle**
+
+1. Establish a baseline.
+2. Identify a bottleneck using evidence.
+3. Make one justified change.
+4. Repeat representative testing.
+5. Compare latency, throughput, errors, and resource cost.
+6. Test relevant failure conditions.
+7. Record the result and limitations.
+
+**Example**
+
+A checkout API performs repeated identical catalog reads. Caching suitable data reduces database work and improves latency.
+
+Validate cache freshness, invalidation, memory use, and behavior after a cache failure. A performance improvement should not introduce incorrect pricing or a new uncontrolled dependency.
+
+**10. A practical project exercise**
+
+**Infrastructure as Code and automation mean managing cloud infrastructure through repeatable, reviewable engineering workflows.** As a cloud or DevOps engineer, your responsibility includes creating infrastructure, changing it safely, detecting unexpected changes, recovering from failures, and eventually retiring it.
+
+For your Azure DevOps/SRE preparation, understand these four areas together:
+
+| Area                                    | Main question                                                   | Example                                                        |
+| --------------------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------- |
+| **Terraform**                           | How do we describe and manage the required infrastructure?      | Define an Azure VNet, AKS cluster, and managed identities      |
+| **Platform automation**                 | How do we make operational tasks repeatable?                    | Automatically onboard an application team                      |
+| **Infrastructure provisioning**         | How do we create a working environment?                         | Build networking, compute, access, and monitoring              |
+| **Infrastructure lifecycle management** | How do we safely operate and change that environment over time? | Upgrade AKS, handle drift, migrate resources, and decommission |
+
+The examples below use a hypothetical **Orders platform** running on Azure Kubernetes Service.
+
+---
+
+**1. Infrastructure as Code: the foundation**
+
+Imagine your team needs development, staging, and production environments containing:
+
+* Azure networking and private DNS.
+* AKS clusters.
+* Container registries.
+* Managed identities and role assignments.
+* Monitoring and alerting.
+* Database connectivity.
+
+If engineers configure each environment manually, differences accumulate:
+
+* Staging has a DNS link that production lacks.
+* One subnet permits traffic that another blocks.
+* Production has a manually added role assignment.
+* Nobody knows why a particular setting exists.
+
+Infrastructure as Code, or **IaC**, expresses the intended configuration in files that you can version, review, validate, and execute.
+
+For example:
+
+```hcl
+resource "azurerm_resource_group" "platform" {
+  name     = "rg-orders-dev"
+  location = "eastus"
+
+  tags = {
+    environment = "dev"
+    application = "orders"
+    owner       = "platform-team"
+  }
+}
+```
+
+This declares the desired resource group.
+
+Your repository also records:
+
+* Who changed it.
+* Why they changed it.
+* What reviewers approved.
+* Which configuration produced the current environment.
+
+**Practical scenario**
+
+A security team requires all new environments to include an owner tag and approved network configuration.
+
+You add these requirements to a reusable module and validation pipeline. New environments receive the standard automatically, while existing environments receive a reviewed upgrade.
+
+The engineering benefit is consistent implementation and traceable change.
+
+---
+
+**2. Terraform: how it works**
+
+Terraform is a declarative infrastructure management tool.
+
+You describe the desired infrastructure. Terraform uses providers to interact with services such as Azure and determines the actions required to reach that configuration.
+
+Three things are central:
+
+| Element                   | Meaning                                                        |
+| ------------------------- | -------------------------------------------------------------- |
+| **Configuration**         | What your code says should exist                               |
+| **State**                 | Terraform’s mapping between code addresses and managed objects |
+| **Actual infrastructure** | What currently exists in Azure                                 |
+
+Suppose your code defines a subnet, and someone changes its configuration through the Azure portal.
+
+During planning, Terraform normally reads current resource information and evaluates the difference against your configuration.
+
+You then decide whether to restore the declared configuration or update the code to adopt the change.
+
+Terraform state establishes the relationship between a resource address, such as `azurerm_subnet.aks`, and its Azure resource ID. Protect that mapping and avoid manually editing state JSON. [Terraform state documentation](https://developer.hashicorp.com/terraform/language/state)
+
+**Important operational distinction:** ordinary Terraform CLI execution does not continuously reconcile infrastructure. Your pipeline or scheduled workflow must invoke it.
+
+---
+
+**3. Terraform building blocks you must understand**
+
+| Concept     | Purpose                                      | Azure example                 |
+| ----------- | -------------------------------------------- | ----------------------------- |
+| Provider    | Implements interactions with an external API | AzureRM provider              |
+| Resource    | Manages an infrastructure object             | VNet, subnet, AKS cluster     |
+| Data source | Reads information about an existing object   | Shared resource group         |
+| Variable    | Supplies an input                            | Environment or address range  |
+| Local value | Calculates or consolidates expressions       | Naming prefix and common tags |
+| Output      | Exposes a result                             | Subnet ID                     |
+| Module      | Groups reusable configuration                | Standard network module       |
+| Backend     | Determines where state is stored             | Azure Blob Storage            |
+
+**Provider**
+
+```hcl
+provider "azurerm" {
+  features {}
+
+  subscription_id = var.subscription_id
+}
+```
+
+The provider requires authentication and authorization to perform its work.
+
+A provider configuration and a state backend configuration serve different purposes. Access to Azure resources does not automatically imply access to the state storage account.
+
+**Variable**
+
+```hcl
+variable "environment" {
+  type = string
+
+  validation {
+    condition = contains(
+      ["dev", "staging", "prod"],
+      var.environment
+    )
+
+    error_message = "Use dev, staging, or prod."
+  }
+}
+```
+
+Validation catches an unsupported input before it becomes part of a deployment.
+
+**Local value**
+
+```hcl
+locals {
+  name_prefix = "orders-${var.environment}"
+
+  common_tags = {
+    environment = var.environment
+    application = "orders"
+    managed_by  = "terraform"
+  }
+}
+```
+
+Locals reduce repeated expressions and keep naming consistent.
+
+**Data source**
+
+```hcl
+data "azurerm_resource_group" "shared" {
+  name = "rg-shared-network"
+}
+```
+
+This reads the resource group. It does not transfer management of that resource group to this configuration.
+
+**Output**
+
+```hcl
+output "aks_subnet_id" {
+  value = azurerm_subnet.aks.id
+}
+```
+
+Another deployment layer can consume this identifier without hardcoding it.
+
+---
+
+**4. Practical Terraform example: provisioning Azure networking**
+
+The following excerpt creates a resource group, VNet, and subnet. Authentication and version constraints belong in the surrounding root configuration.
+
+```hcl
+variable "environment" {
+  type = string
+}
+
+variable "location" {
+  type    = string
+  default = "eastus"
+}
+
+resource "azurerm_resource_group" "platform" {
+  name     = "rg-orders-${var.environment}"
+  location = var.location
+}
+
+resource "azurerm_virtual_network" "platform" {
+  name                = "vnet-orders-${var.environment}"
+  location            = azurerm_resource_group.platform.location
+  resource_group_name = azurerm_resource_group.platform.name
+
+  address_space = ["10.40.0.0/16"]
+}
+
+resource "azurerm_subnet" "aks" {
+  name                 = "snet-aks"
+  resource_group_name  = azurerm_resource_group.platform.name
+  virtual_network_name = azurerm_virtual_network.platform.name
+
+  address_prefixes = ["10.40.1.0/24"]
+}
+```
+
+The references establish dependencies:
+
+* The VNet references the resource group.
+* The subnet references the VNet.
+* Terraform can order those operations accordingly.
+
+Use explicit `depends_on` when a real dependency is not represented by an ordinary reference. Adding it everywhere makes dependency relationships broader and less precise.
+
+**Architectural consideration**
+
+The example address ranges are illustrative. Before implementing them, evaluate:
+
+* Existing corporate and peered network ranges.
+* AKS networking mode.
+* Maximum node count.
+* Upgrade surge capacity.
+* Private endpoint requirements.
+* Future expansion.
+
+Terraform can provision an unsuitable design just as consistently as a suitable one. Design review remains essential.
+
+---
+
+**5. The Terraform execution workflow**
+
+A typical workflow is:
+
+```bash
+terraform init
+terraform fmt -check -recursive
+terraform validate
+terraform plan -out=tfplan
+terraform show tfplan
+terraform apply tfplan
+```
+
+| Command        | What you should understand                                          |
+| -------------- | ------------------------------------------------------------------- |
+| `init`         | Initializes the backend and installs required dependencies          |
+| `fmt -check`   | Checks formatting                                                   |
+| `validate`     | Checks configuration consistency; does not prove Azure connectivity |
+| `plan`         | Calculates proposed changes                                         |
+| `show`         | Displays the saved plan                                             |
+| `apply tfplan` | Executes the saved plan                                             |
+
+A plan can propose creation, modification, deletion, or replacement. **Replacement deserves particular attention because it can involve destroying an existing object.**
+
+Applying the saved plan connects execution to the reviewed proposal. It does not guarantee that every cloud operation will succeed: permissions, quotas, service conditions, or infrastructure may change. [Terraform plan documentation](https://developer.hashicorp.com/terraform/cli/commands/plan)
+
+**Practical scenario: an unexpected replacement**
+
+An engineer changes a property expecting an in-place update. Terraform instead proposes replacing a critical resource.
+
+Before proceeding:
+
+1. Identify the property causing replacement.
+2. Determine the effect on attached resources and data.
+3. Check whether the existing service can remain available.
+4. Design migration or traffic cutover if needed.
+5. Define recovery conditions.
+
+A successful plan review considers service impact, not just syntax.
+
+---
+
+**6. State management in a team**
+
+For a team, use a protected remote backend.
+
+An illustrative Azure backend configuration is:
+
+```hcl
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-platform-state"
+    storage_account_name = "exampletfstate123"
+    container_name       = "tfstate"
+    key                  = "orders/dev/network.tfstate"
+
+    use_azuread_auth = true
+  }
+}
+```
+
+The referenced storage account and container must already exist. Create them through a separate bootstrap process.
+
+The Azure backend supports state locking through Azure Blob Storage capabilities. Locking helps prevent concurrent writers from modifying the same state. [Azure backend documentation](https://developer.hashicorp.com/terraform/language/backend/azurerm)
+
+**Practical scenario: two simultaneous pipelines**
+
+Two engineers merge changes affecting the same production state.
+
+Use both:
+
+* Pipeline concurrency control to serialize deployments.
+* Backend locking to protect state writes.
+
+If a lock remains after a failed job, investigate whether an operation is still active before unlocking it.
+
+**State security**
+
+State and saved plans can contain sensitive information.
+
+For example:
+
+```hcl
+variable "database_password" {
+  type      = string
+  sensitive = true
+}
+```
+
+`sensitive = true` redacts normal display. It does **not** automatically prevent storage in state.
+
+Terraform also supports mechanisms for omitting certain ephemeral or write-only values, subject to Terraform version, provider support, and usage restrictions. [Sensitive data documentation](https://developer.hashicorp.com/terraform/language/manage-sensitive-data)
+
+---
+
+**7. Modules: reusable infrastructure with a clear interface**
+
+A module groups related resources behind inputs and outputs.
+
+For your Orders platform, possible modules include:
+
+| Module                  | Responsibility                              |
+| ----------------------- | ------------------------------------------- |
+| Network                 | VNets, subnets, network associations        |
+| AKS                     | Cluster and node-pool configuration         |
+| Identity                | Managed identities and scoped permissions   |
+| Monitoring              | Diagnostic settings and alert configuration |
+| Application environment | Compose the approved building blocks        |
+
+An illustrative module call:
+
+```hcl
+module "network" {
+  source = "../../modules/network"
+
+  environment = "dev"
+  location    = "eastus"
+  vnet_cidr   = "10.40.0.0/16"
+
+  subnets = {
+    aks              = "10.40.1.0/24"
+    private_endpoints = "10.40.2.0/24"
+  }
+}
+```
+
+A useful module has a clear purpose and understandable inputs. Avoid modules with dozens of unrelated switches that make every deployment behave differently. [Terraform module documentation](https://developer.hashicorp.com/terraform/language/modules/develop)
+
+**Using `for_each`**
+
+Within the network module:
+
+```hcl
+resource "azurerm_subnet" "this" {
+  for_each = var.subnets
+
+  name                 = each.key
+  address_prefixes     = [each.value]
+  resource_group_name  = azurerm_resource_group.this.name
+  virtual_network_name = azurerm_virtual_network.this.name
+}
+```
+
+The resource identities use meaningful keys:
+
+```text
+azurerm_subnet.this["aks"]
+azurerm_subnet.this["private_endpoints"]
+```
+
+This is useful when resources have distinct identities. Changing a key changes the Terraform address, so a rename needs deliberate migration handling. [Terraform `for_each` documentation](https://developer.hashicorp.com/terraform/language/meta-arguments/for_each)
+
+**Project scenario**
+
+Five application teams need an approved private network pattern.
+
+The platform team maintains the module. Application teams select supported inputs. A module update is tested in development and staging before production adoption.
+
+This creates reuse without removing change control.
+
+---
+
+**8. Environment separation and deployment boundaries**
+
+Development and production need clear separation in:
+
+* State.
+* Credentials and permissions.
+* Configuration.
+* Deployment controls.
+* Potential impact of mistakes.
+
+An example structure:
+
+| Root configuration     | State key                     |
+| ---------------------- | ----------------------------- |
+| Development networking | `orders/dev/network.tfstate`  |
+| Development AKS        | `orders/dev/aks.tfstate`      |
+| Production networking  | `orders/prod/network.tfstate` |
+| Production AKS         | `orders/prod/aks.tfstate`     |
+
+Separate infrastructure according to ownership, dependencies, and change frequency.
+
+For example, a shared production network may support many applications. It should not be destroyed as part of removing one application environment.
+
+Avoid excessive fragmentation too: hundreds of tiny states can create difficult coordination and dependency problems.
+
+**Practical rule:** choose boundaries that let a team make a coherent change while limiting unintended impact.
+
+---
+
+**9. Infrastructure provisioning: producing a usable environment**
+
+Provisioning includes more than creating an AKS resource.
+
+For the Orders platform, a complete provisioning process covers:
+
+| Stage                 | What gets established                                 | Verification                          |
+| --------------------- | ----------------------------------------------------- | ------------------------------------- |
+| Requirements          | Region, capacity, availability and connectivity needs | Design review                         |
+| Networking            | VNets, subnets, routing and DNS                       | Name resolution and connectivity      |
+| Identity              | Deployment and workload identities                    | Required operations succeed           |
+| Compute               | AKS and node pools                                    | Nodes ready and workloads schedulable |
+| Dependencies          | Registry and database access                          | Image pull and application connection |
+| Observability         | Logs, metrics and alerts                              | Telemetry arrives                     |
+| Application readiness | Runtime configuration and routing                     | Customer transaction completes        |
+
+**Scenario: Terraform succeeds, application fails**
+
+Terraform creates:
+
+* AKS.
+* A private database endpoint.
+* A private DNS zone.
+
+However, the required VNet link is missing.
+
+The application cannot resolve the expected private address.
+
+Your investigation should establish:
+
+1. Which name the application resolves.
+2. Which address DNS returns.
+3. Whether the querying network can use the private DNS zone.
+4. Whether traffic can reach the resulting address.
+5. Whether authentication works after connectivity succeeds.
+
+The fix is a reviewed DNS configuration change followed by an application transaction check.
+
+**Provisioning is complete when the intended service works, not merely when `terraform apply` exits successfully.**
+
+---
+
+**10. Platform automation: automating recurring engineering work**
+
+Platform automation covers workflows around the infrastructure.
+
+Examples include:
+
+* Onboarding application teams.
+* Creating temporary environments.
+* Registering dashboards and alerts.
+* Checking certificate expiration.
+* Detecting configuration drift.
+* Scheduling approved maintenance.
+* Collecting incident evidence.
+* Cleaning up expired resources.
+
+Terraform is one component of this system.
+
+| Tool or mechanism        | Typical responsibility                         |
+| ------------------------ | ---------------------------------------------- |
+| Terraform                | Provision and manage cloud resources           |
+| GitHub Actions           | Coordinate validation and deployment workflows |
+| Python, Bash, PowerShell | Implement operational tasks and integrations   |
+| Helm                     | Package Kubernetes configuration               |
+| Argo CD                  | Reconcile Git-defined Kubernetes applications  |
+| Azure APIs and CLI       | Perform service-specific operations            |
+
+**Define ownership carefully.** If Terraform and another controller continuously manage the same property, they may repeatedly overwrite each other.
+
+For example, decide how Terraform’s configuration and AKS autoscaling share responsibility for a node pool. Do not have an unrelated script continually force a fixed node count.
+
+---
+
+**11. Practical platform automation: application onboarding**
+
+Suppose a developer requests an environment for a new service.
+
+The request supplies:
+
+```yaml
+application: order-history
+environment: dev
+owner: commerce-team
+data_classification: internal
+```
+
+An onboarding workflow can:
+
+1. Validate required information.
+2. Select an approved platform template.
+3. Generate configuration.
+4. Open a pull request.
+5. Run Terraform validation and planning.
+6. Provision approved resources.
+7. Configure the Kubernetes application through GitOps.
+8. Verify image pulls, routing, telemetry, and a sample transaction.
+9. Return environment details to the team.
+
+The generated pull request makes the proposed environment reviewable before creation.
+
+**What makes this good automation?**
+
+* Repeating the request does not create duplicates.
+* Failures report the affected stage.
+* Partial completion is recorded.
+* A retry resumes safely.
+* Temporary environments have an owner and expiry.
+* The workflow verifies its result.
+
+Measure improvements through environment lead time, failure rate, and manual intervention required. Use observed values rather than assumed savings.
+
+---
+
+**12. Terraform in a CI/CD pipeline**
+
+A practical pipeline separates validation, planning, deployment, and verification.
+
+| Phase            | Example checks or actions                                        |
+| ---------------- | ---------------------------------------------------------------- |
+| Pull request     | Formatting, validation, security checks, module tests            |
+| Trusted planning | Generate a plan for the exact candidate revision                 |
+| Review           | Inspect replacements, deletions, permissions and cost impact     |
+| Deployment       | Apply the approved saved plan                                    |
+| Verification     | Test connectivity, telemetry, and customer behavior              |
+| Evidence         | Record revision, plan, results and relevant resource identifiers |
+
+Protect plan artifacts because they can contain sensitive values.
+
+Do not give untrusted pull-request code production credentials.
+
+For GitHub Actions and Azure, OpenID Connect can exchange a trusted workflow identity for short-lived Azure access. The federated trust must match the intended repository and workflow context, and the Azure identity still needs appropriately scoped permissions. [GitHub’s Azure OIDC documentation](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-azure)
+
+**Scenario: stale plan**
+
+A production plan is reviewed, but another deployment modifies the same state before it is applied.
+
+Generate a new plan and review the resulting changes. Approval of an earlier proposal should not silently authorize a different proposal.
+
+---
+
+**13. Automation should be idempotent and bounded**
+
+**Idempotency** means repeated execution achieves the intended result without introducing duplicates or unnecessary changes.
+
+For example:
+
+* “Ensure this role assignment exists” is suitable.
+* “Create another role assignment on every execution” is not.
+
+For an operational task, define:
+
+| Requirement         | Example                                               |
+| ------------------- | ----------------------------------------------------- |
+| Scope               | One named environment                                 |
+| Preconditions       | Environment has an approved expiry and no active hold |
+| Concurrency control | Only one cleanup run per environment                  |
+| Retry policy        | Retry transient API errors a limited number of times  |
+| Completion check    | Confirm targeted resources are gone                   |
+| Audit record        | Record resources, outcome and errors                  |
+
+**Self-healing scenario**
+
+An alert reports a growing worker queue.
+
+A useful automation first checks:
+
+* Whether the dependency is slow.
+* Whether workers are healthy.
+* Whether replica limits have been reached.
+* Whether increasing concurrency is safe.
+
+Blindly restarting every worker can increase retries while leaving the actual dependency problem unchanged.
+
+Use Terraform for infrastructure changes. Avoid treating it as the default mechanism for every rapid application recovery action.
+
+---
+
+**14. Infrastructure lifecycle management**
+
+Lifecycle management covers infrastructure from creation through retirement.
+
+| Lifecycle stage | Engineering responsibility                      |
+| --------------- | ----------------------------------------------- |
+| Design          | Define requirements and dependencies            |
+| Provision       | Create the environment                          |
+| Validate        | Demonstrate functional readiness                |
+| Operate         | Monitor capacity, access and reliability        |
+| Change          | Modify configuration safely                     |
+| Upgrade         | Maintain supported software and providers       |
+| Recover         | Restore service after failure                   |
+| Retire          | Remove infrastructure and residual dependencies |
+
+**Day 2 operations** are especially important in interviews. An engineer who can create a cluster must also explain how they upgrade it, handle failures, and remove it safely.
+
+---
+
+**15. Detecting and resolving infrastructure drift**
+
+Drift is a difference between declared configuration and actual infrastructure.
+
+A scheduled workflow can run:
+
+```bash
+terraform plan -detailed-exitcode
+```
+
+The exit codes are:
+
+| Code | Meaning                |
+| ---- | ---------------------- |
+| `0`  | No proposed changes    |
+| `1`  | Planning error         |
+| `2`  | Proposed changes exist |
+
+Handle code `2` as a detected difference, rather than a failed Terraform execution. [Terraform plan documentation](https://developer.hashicorp.com/terraform/cli/commands/plan)
+
+**Scenario: emergency NSG change**
+
+During an incident, an engineer adds a network rule through the portal.
+
+After service restoration:
+
+1. Identify the rule and incident justification.
+2. Determine whether it should remain.
+3. Update code if the change is valid.
+4. Otherwise restore the approved configuration.
+5. Verify the affected application path.
+
+Automatically reverting every detected change can undo a valid incident mitigation. Classify the change before remediation.
+
+---
+
+**16. Importing existing infrastructure**
+
+Existing infrastructure often predates Terraform.
+
+An import block connects an existing object to a Terraform resource address:
+
+```hcl
+import {
+  to = azurerm_resource_group.platform
+
+  id = "/subscriptions/SUBSCRIPTION_ID/resourceGroups/rg-orders-prod"
+}
+```
+
+You also need the corresponding resource configuration.
+
+A careful adoption process is:
+
+1. Inventory the resource and its dependencies.
+2. Confirm which team owns it.
+3. Describe the intended configuration.
+4. Import it into the correct state.
+5. Review the plan.
+6. Resolve unintended changes before applying.
+
+Import does not prove that your configuration matches every important property. [Terraform import documentation](https://developer.hashicorp.com/terraform/language/import)
+
+**Scenario**
+
+A manually created production network must become Terraform-managed.
+
+Adopt it in small, understood groups. Avoid combining ownership transfer with a major network redesign in the same change.
+
+---
+
+**17. Refactoring infrastructure without recreating it**
+
+Renaming a Terraform resource changes its address.
+
+Suppose:
+
+```text
+azurerm_virtual_network.old
+```
+
+becomes:
+
+```text
+azurerm_virtual_network.platform
+```
+
+A `moved` block records the relationship:
+
+```hcl
+moved {
+  from = azurerm_virtual_network.old
+  to   = azurerm_virtual_network.platform
+}
+```
+
+Terraform can then interpret the address change as a refactor rather than treating the old and new addresses as unrelated objects. Inspect the plan to verify the result. [Terraform refactoring documentation](https://developer.hashicorp.com/terraform/language/modules/develop/refactoring)
+
+**Remember the distinction:**
+
+* **Import:** bring an existing object under a Terraform address.
+* **Move:** change the address of an already managed object.
+
+---
+
+**18. Lifecycle controls and their limits**
+
+Terraform offers resource lifecycle controls:
+
+| Setting                 | Purpose                                                       | Limitation                                                                          |
+| ----------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `create_before_destroy` | Create a replacement before deleting the old resource         | Requires sufficient capacity and compatible naming/dependencies                     |
+| `prevent_destroy`       | Reject a planned destruction while the rule applies           | Does not protect against external deletion or removal of the resource configuration |
+| `ignore_changes`        | Delegate specified property changes to another owner          | Can hide unwanted changes if used broadly                                           |
+| `replace_triggered_by`  | Replace a resource when specified managed dependencies change | Requires careful impact review                                                      |
+
+These settings influence Terraform’s behavior; they do not provide application-level failover or data migration. [Terraform lifecycle reference](https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle)
+
+**Practical example**
+
+Creating a replacement database before deleting the original does not move the original database’s data or switch application connections safely.
+
+You still need replication or restore, validation, cutover, and a recovery strategy.
+
+---
+
+**19. Upgrades, partial failures, and recovery**
+
+**Provider and module upgrades**
+
+Treat dependency upgrades as changes requiring testing.
+
+* Upgrade deliberately.
+* Inspect the lock-file difference.
+* Test representative environments.
+* Review infrastructure plans.
+* Promote through environments.
+
+The `.terraform.lock.hcl` file records provider selections and checksums. It does not lock remote module versions; specify module versions or immutable source references separately. [Terraform dependency lock documentation](https://developer.hashicorp.com/terraform/language/files/dependency-lock)
+
+**Partial apply failure**
+
+Suppose Terraform creates the network successfully, but AKS provisioning fails because of quota.
+
+Terraform apply is not an all-or-nothing transaction.
+
+Investigate:
+
+1. Which resources were created.
+2. Which operations failed.
+3. What state recorded.
+4. Whether Azure is still processing a request.
+5. What a new plan proposes after fixing the cause.
+
+Do not delete state simply because an apply failed.
+
+**Recovery from a harmful change**
+
+Reverting Git is only the beginning. The reverted configuration produces another infrastructure change that must be planned and assessed.
+
+For a harmful firewall rule, recovery may be a straightforward configuration restoration.
+
+For deleted data, recovery may require restoring a backup and reconnecting the application.
+
+**A Terraform state backup restores management information; it does not restore application data.**
+
+---
+
+**20. Testing infrastructure properly**
+
+Use several levels of verification:
+
+| Test level                | What it establishes                                        |
+| ------------------------- | ---------------------------------------------------------- |
+| Formatting and validation | Configuration is consistently written and internally valid |
+| Module tests              | Inputs and expected configuration behavior are correct     |
+| Policy checks             | The proposal meets organizational rules                    |
+| Deployment tests          | Azure can create the intended resources                    |
+| Integration tests         | Components communicate correctly                           |
+| Customer checks           | The business operation succeeds                            |
+| Recovery exercises        | Service can be restored within the intended conditions     |
+
+Terraform’s test framework supports assertions and plan/apply test runs. Apply-based tests can create actual resources, so use a disposable environment with appropriate cleanup. [Terraform testing documentation](https://developer.hashicorp.com/terraform/language/tests)
+
+For your Orders platform, useful acceptance checks include:
+
+* AKS nodes become ready.
+* A workload pulls its image.
+* Private dependency names resolve correctly.
+* The worker reaches its dependency.
+* An order is accepted and completed.
+* Metrics and traces arrive.
+* The previous compatible configuration can be restored.
+
+---
+
+**21. Decommissioning is part of the job**
+
+Removing infrastructure requires dependency awareness.
+
+Before retiring an environment:
+
+1. Confirm its owner and that it is no longer required.
+2. Identify retained data and backup requirements.
+3. Check consumers of its DNS, network, identities, and services.
+4. Review the destroy plan.
+5. Remove the approved resources.
+6. Verify that residual access and billable resources are addressed.
+
+For a disposable environment:
+
+```bash
+terraform plan -destroy -out=destroy.tfplan
+terraform show destroy.tfplan
+terraform apply destroy.tfplan
+```
+
+**Scenario**
+
+A temporary test environment is no longer needed, but its resource group contains a shared registry.
+
+A broad resource-group deletion would affect other teams. Correct ownership and state boundaries should make that dependency visible before deletion.
+
+---
+
+**22. How to explain this in an interview**
+
+A strong answer connects implementation to operational outcomes:
+
+> “I use Terraform modules to define approved Azure infrastructure patterns, with separate deployment identities and state boundaries for environments. Changes pass through validation, plan review, and controlled deployment. After provisioning, I verify DNS, connectivity, workload access, telemetry, and customer transactions. I also manage drift, provider upgrades, imports, refactoring, recovery, and decommissioning. Platform automation coordinates these workflows and records evidence so repeated operations are reliable and traceable.”
+
+Support that explanation with an actual project example:
+
+| Interview question                        | Evidence to discuss                                       |
+| ----------------------------------------- | --------------------------------------------------------- |
+| How did you make provisioning repeatable? | Module inputs, pipeline stages, environment checks        |
+| How did you protect production?           | State boundaries, scoped access, reviewed plans           |
+| How did you handle drift?                 | Detected change, investigation, reconciliation            |
+| How did you recover from failure?         | Actual resources/state, mitigation, customer verification |
+| How did automation reduce toil?           | Measured manual steps, lead time, or intervention rate    |
+| How did you manage lifecycle changes?     | Upgrade, migration, rollback, and retirement procedures   |
+
+The strongest preparation is to practise one complete cycle: **provision an environment, verify it, introduce a controlled change, diagnose a failure, recover customer service, and retire the environment with evidence.**
