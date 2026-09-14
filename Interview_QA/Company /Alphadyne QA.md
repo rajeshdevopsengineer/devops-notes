@@ -1249,3 +1249,867 @@ The recurring theme in your answers should be:
 > **I don't only deploy an application. I design for security, availability, observability, rollback, automation, and operational support.**
 
 That is the level interviewers typically expect from a **5-year DevOps/SRE candidate**.
+
+For this Alphadyne assessment, the MCQs are mostly straightforward. The Azure Terraform task is the part where they will check whether you understand **networking relationships**, not just Terraform syntax.
+
+## 1. Likely MCQ answers
+
+| Question                                                        | Expected answer                                     | What to say if asked                                                                                |
+| --------------------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Tool to automate deployment/configuration of VMs and containers | **Ansible**                                         | Ansible is configuration management/automation. Terraform is primarily infrastructure provisioning. |
+| Module to install nginx using Ansible                           | **`ansible.builtin.package`**                       | Or `apt` for Ubuntu/Debian and `dnf`/`yum` for RHEL-family systems.                                 |
+| Module to ensure a package is installed                         | **`ansible.builtin.package` with `state: present`** | Generic cross-platform package module.                                                              |
+| Kubernetes object that ensures pods maintain desired state      | **Deployment**                                      | Deployment manages ReplicaSets, which maintain the requested replicas.                              |
+| Monitor disk reads/writes                                       | **`iostat`**                                        | `iostat -xz 1` is a strong troubleshooting command. `iotop` gives per-process I/O.                  |
+| Where to put a developer's SSH public key                       | **`~/.ssh/authorized_keys`**                        | Under the target user's home directory.                                                             |
+| Where user passwords are stored on modern Linux                 | **`/etc/shadow`**                                   | `/etc/passwd` stores account metadata; password hashes are normally in `/etc/shadow`.               |
+
+For nginx, this is valid Ansible:
+
+```yaml
+- name: Install nginx
+  ansible.builtin.package:
+    name: nginx
+    state: present
+```
+
+On Ubuntu you could specifically use:
+
+```yaml
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: yes
+```
+
+`ansible.builtin.apt` manages apt packages, while `package` is the generic abstraction. ([Ansible Documentation][1])
+
+### Kubernetes question — important distinction
+
+If the exact MCQ says:
+
+> Which Kubernetes object ensures that a required number of Pods are always running?
+
+Answer:
+
+**Deployment/ReplicaSet**.
+
+If it says:
+
+> How do you guarantee CPU and memory for a Pod?
+
+Answer:
+
+```yaml
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "1"
+    memory: "1Gi"
+```
+
+If it asks about namespace-wide resource restrictions, that's **ResourceQuota/LimitRange**.
+
+---
+
+# Azure Terraform Coding Task
+
+I would first explain the architecture:
+
+```text
+                         Internet
+                            |
+                            |
+                    Public IP - LB
+                            |
+                    Azure Load Balancer
+                            |
+                  +---------+---------+
+                  |                   |
+              App VM 1             App VM 2
+                  |                   |
+                  +--------+----------+
+                           |
+                    App Subnet
+                     10.0.1.0/24
+                           |
+                           |
+                       DB VM
+                           |
+                     DB Subnet
+                     10.0.2.0/24
+
+
+Administrator
+     |
+ Internet
+     |
+ Bastion Public IP
+     |
+ Azure Bastion
+     |
+ AzureBastionSubnet
+  10.0.0.0/26
+     |
+     +------ SSH -----> App VMs / DB VM
+```
+
+The important security point is:
+
+**The application and database VMs do not need public IP addresses.**
+
+Only:
+
+```text
+Azure Load Balancer
+Azure Bastion
+```
+
+receive public IPs.
+
+Azure Bastion requires a dedicated subnet named exactly `AzureBastionSubnet`; for current non-Developer deployments, it should be at least `/26`. A public Bastion deployment uses a Standard, static public IP. ([Terraform Registry][2])
+
+---
+
+## `providers.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+
+  subscription_id = var.subscription_id
+}
+```
+
+---
+
+## `variables.tf`
+
+```hcl
+variable "subscription_id" {
+  type      = string
+  sensitive = true
+}
+
+variable "location" {
+  type    = string
+  default = "East US"
+}
+
+variable "admin_username" {
+  type    = string
+  default = "azureadmin"
+}
+
+variable "admin_password" {
+  type      = string
+  sensitive = true
+}
+```
+
+For the assessment, password authentication is used because it was specifically requested.
+
+In production, I would generally prefer SSH keys/identity-based access. Also, AzureRM stores VM password arguments in Terraform state, so state security becomes important. ([Terraform Registry][3])
+
+---
+
+# `main.tf`
+
+## Resource group
+
+```hcl
+resource "azurerm_resource_group" "rg" {
+  name     = "rg-alphadyne-demo"
+  location = var.location
+}
+```
+
+---
+
+## VNet
+
+```hcl
+resource "azurerm_virtual_network" "vnet" {
+  name                = "alphadyne-vnet"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  address_space = [
+    "10.0.0.0/16"
+  ]
+}
+```
+
+Architecture:
+
+```text
+VNet
+10.0.0.0/16
+```
+
+---
+
+## Bastion subnet
+
+The subnet name must be exactly:
+
+```text
+AzureBastionSubnet
+```
+
+```hcl
+resource "azurerm_subnet" "bastion" {
+  name                 = "AzureBastionSubnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+
+  address_prefixes = [
+    "10.0.0.0/26"
+  ]
+}
+```
+
+---
+
+## Application subnet
+
+```hcl
+resource "azurerm_subnet" "application" {
+  name                 = "application-subnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+
+  address_prefixes = [
+    "10.0.1.0/24"
+  ]
+}
+```
+
+---
+
+## Database subnet
+
+```hcl
+resource "azurerm_subnet" "database" {
+  name                 = "database-subnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+
+  address_prefixes = [
+    "10.0.2.0/24"
+  ]
+}
+```
+
+So we now have:
+
+```text
+10.0.0.0/16
+     |
+     +-- AzureBastionSubnet
+     |      10.0.0.0/26
+     |
+     +-- application-subnet
+     |      10.0.1.0/24
+     |
+     +-- database-subnet
+            10.0.2.0/24
+```
+
+---
+
+# Application NSG
+
+Allow web traffic through the Load Balancer and SSH from Bastion.
+
+```hcl
+resource "azurerm_network_security_group" "app" {
+  name                = "app-nsg"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  security_rule {
+    name                       = "Allow-HTTP"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "Internet"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "Allow-Bastion-SSH"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = "10.0.0.0/26"
+    destination_address_prefix = "*"
+  }
+}
+```
+
+Associate it:
+
+```hcl
+resource "azurerm_subnet_network_security_group_association" "app" {
+  subnet_id                 = azurerm_subnet.application.id
+  network_security_group_id = azurerm_network_security_group.app.id
+}
+```
+
+---
+
+# Database NSG
+
+Only application servers should access the database.
+
+Assuming PostgreSQL:
+
+```hcl
+resource "azurerm_network_security_group" "db" {
+  name                = "db-nsg"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  security_rule {
+    name                       = "Allow-App-Postgres"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "5432"
+    source_address_prefix      = "10.0.1.0/24"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "Allow-Bastion-SSH"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = "10.0.0.0/26"
+    destination_address_prefix = "*"
+  }
+}
+```
+
+Associate:
+
+```hcl
+resource "azurerm_subnet_network_security_group_association" "db" {
+  subnet_id                 = azurerm_subnet.database.id
+  network_security_group_id = azurerm_network_security_group.db.id
+}
+```
+
+---
+
+# Application NICs
+
+Let's create **two application VMs** so that the Load Balancer has multiple backends.
+
+```hcl
+resource "azurerm_network_interface" "app" {
+  count = 2
+
+  name                = "app-nic-${count.index + 1}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  ip_configuration {
+    name = "app-ipconfig-${count.index + 1}"
+
+    subnet_id = azurerm_subnet.application.id
+
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+```
+
+Notice there is **no `public_ip_address_id`**.
+
+Therefore the VMs stay private.
+
+---
+
+# Database NIC
+
+```hcl
+resource "azurerm_network_interface" "db" {
+  name                = "db-nic"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  ip_configuration {
+    name = "db-ipconfig"
+
+    subnet_id = azurerm_subnet.database.id
+
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+```
+
+---
+
+# Application VMs
+
+```hcl
+resource "azurerm_linux_virtual_machine" "app" {
+  count = 2
+
+  name                = "app-vm-${count.index + 1}"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  size                = "Standard_B2s"
+
+  admin_username = var.admin_username
+  admin_password = var.admin_password
+
+  disable_password_authentication = false
+
+  network_interface_ids = [
+    azurerm_network_interface.app[count.index].id
+  ]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts-gen2"
+    version   = "latest"
+  }
+
+  custom_data = base64encode(<<-EOF
+    #!/bin/bash
+    apt-get update
+    apt-get install -y nginx
+
+    echo "Hello from app-vm-${count.index + 1}" \
+      > /var/www/html/index.html
+
+    systemctl enable nginx
+    systemctl restart nginx
+  EOF
+  )
+}
+```
+
+This creates:
+
+```text
+app-vm-1
+app-vm-2
+```
+
+Both have:
+
+```text
+Private IP only
+Ubuntu
+Nginx
+Port 80
+```
+
+A Linux VM is attached to Azure networking through its `network_interface_ids`. ([Terraform Registry][3])
+
+---
+
+# Database VM
+
+```hcl
+resource "azurerm_linux_virtual_machine" "db" {
+  name                = "db-vm"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  size                = "Standard_B2s"
+
+  admin_username = var.admin_username
+  admin_password = var.admin_password
+
+  disable_password_authentication = false
+
+  network_interface_ids = [
+    azurerm_network_interface.db.id
+  ]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts-gen2"
+    version   = "latest"
+  }
+}
+```
+
+Again:
+
+```text
+No public IP
+```
+
+---
+
+# Azure Bastion public IP
+
+```hcl
+resource "azurerm_public_ip" "bastion" {
+  name                = "bastion-pip"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  allocation_method = "Static"
+  sku               = "Standard"
+}
+```
+
+---
+
+# Azure Bastion Host
+
+```hcl
+resource "azurerm_bastion_host" "bastion" {
+  name                = "alphadyne-bastion"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  sku = "Standard"
+
+  ip_configuration {
+    name = "bastion-ipconfig"
+
+    subnet_id = azurerm_subnet.bastion.id
+
+    public_ip_address_id = azurerm_public_ip.bastion.id
+  }
+}
+```
+
+The flow becomes:
+
+```text
+Administrator
+     |
+     v
+Azure Bastion
+     |
+     v
+Private App/DB VMs
+```
+
+Therefore there is no requirement to expose SSH:
+
+```text
+VM Public IP -> None
+```
+
+Microsoft's current Terraform example follows the same pattern: a dedicated Bastion subnet, Standard public IP, and Bastion IP configuration referencing both. ([Microsoft Learn][4])
+
+---
+
+# Load Balancer public IP
+
+```hcl
+resource "azurerm_public_ip" "lb" {
+  name                = "lb-public-ip"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  allocation_method = "Static"
+  sku               = "Standard"
+}
+```
+
+---
+
+# Azure Load Balancer
+
+```hcl
+resource "azurerm_lb" "app" {
+  name                = "app-lb"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  sku = "Standard"
+
+  frontend_ip_configuration {
+    name = "public-frontend"
+
+    public_ip_address_id = azurerm_public_ip.lb.id
+  }
+}
+```
+
+---
+
+# Backend Pool
+
+```hcl
+resource "azurerm_lb_backend_address_pool" "app" {
+  name            = "app-backend-pool"
+  loadbalancer_id = azurerm_lb.app.id
+}
+```
+
+The backend pool represents:
+
+```text
+app-vm-1
+app-vm-2
+```
+
+Current AzureRM supports a dedicated load-balancer backend-address-pool resource. ([Terraform Registry][5])
+
+---
+
+# Associate both application NICs with the Load Balancer
+
+```hcl
+resource "azurerm_network_interface_backend_address_pool_association" "app" {
+  count = 2
+
+  network_interface_id = azurerm_network_interface.app[count.index].id
+
+  ip_configuration_name = "app-ipconfig-${count.index + 1}"
+
+  backend_address_pool_id = azurerm_lb_backend_address_pool.app.id
+}
+```
+
+This relationship is:
+
+```text
+Load Balancer
+      |
+Backend Pool
+      |
+ +----+----+
+ |         |
+NIC 1     NIC 2
+ |         |
+VM 1      VM 2
+```
+
+Azure provides a dedicated NIC-to-backend-pool association resource for this purpose. ([Terraform Registry][6])
+
+---
+
+# Health Probe
+
+The Load Balancer must know whether each application VM is healthy.
+
+```hcl
+resource "azurerm_lb_probe" "http" {
+  name            = "http-health-probe"
+  loadbalancer_id = azurerm_lb.app.id
+
+  protocol     = "Http"
+  port         = 80
+  request_path = "/"
+}
+```
+
+Conceptually:
+
+```text
+Load Balancer
+     |
+GET /
+     |
+app-vm-1 -> Healthy
+app-vm-2 -> Healthy
+```
+
+If one server stops responding, traffic is sent to the healthy backend.
+
+---
+
+# Load Balancer Rule
+
+```hcl
+resource "azurerm_lb_rule" "http" {
+  name = "http-rule"
+
+  loadbalancer_id = azurerm_lb.app.id
+
+  protocol = "Tcp"
+
+  frontend_port = 80
+  backend_port  = 80
+
+  frontend_ip_configuration_name = "public-frontend"
+
+  backend_address_pool_ids = [
+    azurerm_lb_backend_address_pool.app.id
+  ]
+
+  probe_id = azurerm_lb_probe.http.id
+}
+```
+
+Traffic flow:
+
+```text
+User
+ |
+Public IP :80
+ |
+Azure Load Balancer
+ |
+Backend Pool
+ |
++----------+----------+
+|                     |
+App VM 1 :80       App VM 2 :80
+```
+
+This backend-pool + health-probe + rule structure is also the pattern Microsoft documents for Terraform load-balancer deployments. ([Microsoft Learn][4])
+
+---
+
+# Outputs
+
+```hcl
+output "load_balancer_public_ip" {
+  value = azurerm_public_ip.lb.ip_address
+}
+
+output "bastion_dns_name" {
+  value = azurerm_bastion_host.bastion.dns_name
+}
+
+output "application_private_ips" {
+  value = [
+    for nic in azurerm_network_interface.app :
+    nic.private_ip_address
+  ]
+}
+
+output "database_private_ip" {
+  value = azurerm_network_interface.db.private_ip_address
+}
+```
+
+After:
+
+```bash
+terraform apply
+```
+
+you could get conceptually:
+
+```text
+load_balancer_public_ip = "20.x.x.x"
+
+application_private_ips = [
+  "10.0.1.4",
+  "10.0.1.5"
+]
+
+database_private_ip = "10.0.2.4"
+```
+
+Then:
+
+```text
+http://20.x.x.x
+```
+
+would return something like:
+
+```text
+Hello from app-vm-1
+```
+
+or:
+
+```text
+Hello from app-vm-2
+```
+
+depending on which backend receives the request.
+
+---
+
+# Commands to execute it
+
+```bash
+az login
+```
+
+Set your subscription:
+
+```bash
+az account set --subscription "<subscription-id>"
+```
+
+Then:
+
+```bash
+terraform init
+```
+
+```bash
+terraform fmt
+```
+
+```bash
+terraform validate
+```
+
+```bash
+terraform plan
+```
+
+```bash
+terraform apply
+```
+
+Microsoft's Terraform guidance follows the same `init → plan → apply` workflow. ([Microsoft Learn][4])
+
+## How to explain the entire task in 30 seconds
+
+> I created one VNet with separate Bastion, application, and database subnets. The application and database VMs have only private NICs, so they're not directly exposed to the internet. Azure Bastion provides secure administrative access to those private VMs. I created a public Standard Load Balancer with two application VMs in its backend pool, along with a health probe and load-balancing rule. The database subnet only allows database traffic from the application subnet. Public IPs are only assigned where required—to the Load Balancer and Azure Bastion.
+
+That explanation demonstrates **Terraform + Azure networking + security + availability**, which is what the coding exercise is really testing.
+
+[1]: https://docs.ansible.com/projects/ansible/latest/collections/ansible/builtin/apt_module.html?utm_source=chatgpt.com "ansible.builtin.apt module – Manages apt-packages — Ansible Community Documentation"
+[2]: https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/bastion_host.html?utm_source=chatgpt.com "azurerm_bastion_host | Resources | hashicorp/azurerm | Terraform | Terraform Registry"
+[3]: https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/linux_virtual_machine?utm_source=chatgpt.com "azurerm_linux_virtual_machine | Resources | hashicorp/azurerm | Terraform | Terraform Registry"
+[4]: https://learn.microsoft.com/zh-cn/azure/load-balancer/quickstart-load-balancer-standard-internal-terraform "快速入门：创建内部负载均衡器 - Terraform - Azure Load Balancer | Microsoft Learn"
+[5]: https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/lb_backend_address_pool?utm_source=chatgpt.com "azurerm_lb_backend_address_pool | Resources | hashicorp/azurerm | Terraform | Terraform Registry"
+[6]: https://registry.terraform.io/providers/hashicorp/Azurerm/4.28.0/docs/resources/network_interface_backend_address_pool_association?utm_source=chatgpt.com "azurerm_network_interface_backend_address_pool_association | Resources | hashicorp/azurerm | Terraform | Terraform Registry"
+
