@@ -1700,3 +1700,781 @@ kubectl describe pod POD_NAME -n apps
 ```
 
 A Service selector mismatch can be accepted by the API but produce no useful backends. A Deployment selector/template mismatch is rejected, and an existing Deployment’s selector is immutable. For managed Pods, correct the controller’s Pod template so future replicas receive the intended labels. [Deployment selector rules](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#label-selector-updates)
+
+
+
+Below are detailed answers to all 21 questions, in the same order. For ambiguous questions, I’ve explained the likely meanings and the distinction an interviewer would expect you to make.
+
+**1. What is the difference between a NAT Gateway and an Internet Gateway?**
+
+An **Internet Gateway (IGW)** enables communication between a VPC and the internet. A **public NAT Gateway** allows resources with private IPv4 addresses to initiate outbound internet connections.
+
+For the common public, zonal NAT Gateway configuration:
+
+| Aspect                  | Internet Gateway                                       | Public NAT Gateway                                                         |
+| ----------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------- |
+| Placement               | Attached to the VPC                                    | Created in a public subnet                                                 |
+| Main purpose            | Internet connectivity for publicly addressed resources | Outbound connectivity for private resources                                |
+| IPv4 addressing         | Resource needs a public IPv4 address or EIP            | Private resources do not need public IPv4 addresses                        |
+| New inbound connections | Possible when routing and security rules permit        | Internet hosts cannot initiate connections to private resources through it |
+| Route-table target      | Public subnet routes to the IGW                        | Private subnet routes to the NAT Gateway                                   |
+| Internet dependency     | Provides internet attachment                           | Requires an IGW for internet access                                        |
+
+Typical IPv4 routes:
+
+```text
+Private subnet:  0.0.0.0/0 → NAT Gateway
+Public subnet:   0.0.0.0/0 → Internet Gateway
+```
+
+A private application server can therefore download updates through NAT without becoming directly reachable from the internet.
+
+An IGW does not override security groups or network ACLs. For IPv6 outbound-only internet access, an **egress-only internet gateway** is another option. Private NAT Gateways serve different connectivity scenarios and do not provide internet access through an IGW. [AWS Internet Gateway documentation](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html), [NAT Gateway documentation](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html)
+
+---
+
+**2. If a Pod is Pending, what are your troubleshooting steps?**
+
+First determine whether the Pod **has not been scheduled** or **has been scheduled but cannot initialize**. The Pending phase can include both situations. [Kubernetes Pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+
+Start with:
+
+```bash
+kubectl get pod POD_NAME -n apps -o wide
+
+kubectl describe pod POD_NAME -n apps
+
+kubectl get events -n apps \
+  --field-selector involvedObject.name=POD_NAME \
+  --sort-by=.metadata.creationTimestamp
+```
+
+Check node assignment:
+
+```bash
+kubectl get pod POD_NAME -n apps \
+  -o jsonpath='{.spec.nodeName}{"\n"}'
+```
+
+If no node is assigned, investigate the scheduler’s events:
+
+| Finding                              | What to check                                                             |
+| ------------------------------------ | ------------------------------------------------------------------------- |
+| `Insufficient cpu` or memory         | Pod requests versus node allocatable capacity and existing requests       |
+| Untolerated taint                    | Node taints and workload tolerations                                      |
+| Affinity mismatch                    | Node labels, node selectors, affinity, topology constraints               |
+| Unbound PVC                          | StorageClass, provisioner, volume availability and topology               |
+| Nodes unavailable                    | Ready condition, cordoning, node failures                                 |
+| Too many Pods                        | Node Pod capacity and CNI limits                                          |
+| Scheduling gates or custom scheduler | Whether scheduling is intentionally delayed or the scheduler is available |
+
+Useful commands:
+
+```bash
+kubectl get nodes
+kubectl describe node NODE_NAME
+kubectl get pvc -n apps
+kubectl describe pvc PVC_NAME -n apps
+```
+
+**Low actual CPU usage does not prove scheduling capacity exists.** Scheduling normally considers resource requests.
+
+If a node is assigned, investigate:
+
+* `ErrImagePull` or `ImagePullBackOff`: image name, registry access, credentials.
+* `FailedMount`: missing Secrets, ConfigMaps, or storage problems.
+* `FailedCreatePodSandBox`: CNI, IP allocation, or runtime problems.
+* Init-container failures: inspect that container’s status and logs.
+
+```bash
+kubectl logs POD_NAME -n apps -c INIT_CONTAINER_NAME
+```
+
+Fix the reported cause, then verify readiness and events. Repeatedly deleting the Pod usually recreates the same problem. [Kubernetes Pod troubleshooting](https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/)
+
+---
+
+**3. What is the difference between secondary RDS and read-only RDS?**
+
+“Secondary RDS” usually means the standby in a **traditional Multi-AZ DB instance deployment**. “Read-only RDS” usually means a **read replica**.
+
+For RDS MySQL:
+
+| Aspect                  | Multi-AZ standby                     | Read replica                                   |
+| ----------------------- | ------------------------------------ | ---------------------------------------------- |
+| Primary purpose         | Availability and failover            | Read scaling                                   |
+| Replication             | Synchronous                          | Asynchronous                                   |
+| Application read access | Standby is not available for reads   | Applications can query its endpoint            |
+| Failure handling        | Managed automatic failover           | Promotion is a separate operation              |
+| Location                | Different AZ                         | Same Region or another Region, where supported |
+| Data freshness          | Synchronous replication relationship | Replication lag is possible                    |
+
+Use a Multi-AZ standby to improve availability. Use read replicas for reporting, analytics, and other read-heavy workloads.
+
+**The deployment type matters:** RDS Multi-AZ **DB clusters** have readable reader instances, unlike traditional single-standby Multi-AZ DB instance deployments. Aurora has its own architecture as well. [Multi-AZ DB instances](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html), [RDS read replicas](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html)
+
+---
+
+**4. Have you built RDS yourself, or only managed it?**
+
+This is an experience-verification question. Explain your actual ownership.
+
+In this context, “built RDS” normally means **provisioned and configured the managed database**, rather than installed the database engine on an EC2 server.
+
+| If you provisioned RDS                            | If you operated existing RDS                                 |
+| ------------------------------------------------- | ------------------------------------------------------------ |
+| Created Terraform or CloudFormation configuration | Monitored availability, connections, storage and performance |
+| Configured subnet groups and security groups      | Investigated incidents                                       |
+| Selected engine, instance class and storage       | Managed maintenance and upgrades                             |
+| Configured encryption, backups and Multi-AZ       | Tested restores and failover                                 |
+| Established monitoring and access                 | Tuned configuration with the database team                   |
+
+For a strong answer, describe one real implementation or incident:
+
+* What you personally changed.
+* Why that change was necessary.
+* How you tested it.
+* What the outcome was.
+
+If you only operated existing databases, say that clearly and explain the depth of your operational responsibility.
+
+---
+
+**5. How would you configure RDS so that only one user can access it at a time?**
+
+First clarify what **“one user”** means:
+
+| Requirement                                                    | Appropriate control                          |
+| -------------------------------------------------------------- | -------------------------------------------- |
+| Only one approved database account may access application data | Database accounts, grants and authentication |
+| That account may have only one concurrent connection           | Database account connection limit            |
+| Only one human may use an application at a time                | Application session or lease control         |
+
+For an ordinary RDS MySQL account, limit simultaneous connections:
+
+```sql
+ALTER USER 'app_user'@'%'
+WITH MAX_USER_CONNECTIONS 1;
+```
+
+Use the actual existing `user` and `host` account values. This limits simultaneous connections for that account; it does not limit all other database accounts. [MySQL account resource limits](https://dev.mysql.com/doc/refman/8.4/en/user-resources.html)
+
+Important distinctions:
+
+* Security groups restrict network access, not concurrent database sessions.
+* IAM authentication establishes identity; it does not enforce this connection limit.
+* A connection pool can serve multiple application users through one database connection.
+* Setting global `max_connections = 1` is not a reliable design for “one human user” and can interfere with operational access.
+
+For exclusive human access, use application-level admission control and preserve required administrative access.
+
+---
+
+**6. Where would you set up RDS—or configure that restriction?**
+
+This follow-up can refer to either **network placement** or **where the connection limit is configured**.
+
+For network placement, a typical production arrangement is:
+
+* RDS in private subnets.
+* A DB subnet group covering at least two Availability Zones for a normal regional deployment.
+* Public accessibility disabled.
+* An RDS security group permitting the database port from approved application sources.
+* Administrative access through an approved private network or managed access path.
+
+The database still needs valid authentication and database permissions. [RDS in a VPC](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_VPC.WorkingWithRDSInstanceinaVPC.html)
+
+For configuration:
+
+| Setting                      | Where it belongs                                   |
+| ---------------------------- | -------------------------------------------------- |
+| VPC and subnet placement     | RDS connectivity configuration and DB subnet group |
+| Allowed network sources      | Security groups                                    |
+| Database users and grants    | SQL statements executed against the database       |
+| Per-account connection limit | SQL, such as `ALTER USER`                          |
+| Engine-wide parameters       | RDS parameter group                                |
+
+Therefore, the `MAX_USER_CONNECTIONS` example is executed using a database client with appropriate privileges. It is not a security-group setting.
+
+---
+
+**7. How do you upgrade RDS MySQL from “7.0” to 8.0 or above?**
+
+First verify the engine and version. **For standard RDS MySQL, the likely intended starting version is 5.7.**
+
+AWS documents these major-version paths:
+
+```text
+MySQL 5.7 → MySQL 8.0 → MySQL 8.4
+```
+
+Do not assume that a direct jump across intermediate major versions is supported. [RDS MySQL major upgrades](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_UpgradeDBInstance.MySQL.Major.html)
+
+The process is:
+
+1. **Identify the current engine and version.**
+
+   ```bash
+   aws rds describe-db-instances \
+     --db-instance-identifier app-db \
+     --query 'DBInstances[0].{Engine:Engine,Version:EngineVersion}' \
+     --output table
+   ```
+
+2. **Check valid upgrade targets for that exact version and Region.**
+
+   Replace `CURRENT_VERSION` with the returned version:
+
+   ```bash
+   aws rds describe-db-engine-versions \
+     --engine mysql \
+     --engine-version CURRENT_VERSION \
+     --query 'DBEngineVersions[0].ValidUpgradeTarget[].EngineVersion' \
+     --output table
+   ```
+
+3. **Run compatibility checks.** Review upgrade prechecks, SQL compatibility, authentication, drivers, parameter changes and instance-class support.
+
+4. **Test a restored production copy.** Validate application behavior, query plans and performance against a baseline.
+
+5. **Prepare recovery.** Confirm backups, create a pre-upgrade snapshot, and document the restore and cutover procedure.
+
+6. **Select the deployment approach.** Use an in-place upgrade during an agreed window, or evaluate RDS Blue/Green Deployments for the supported engine/version combination.
+
+7. **Upgrade and validate.** Confirm connectivity, application transactions, errors, latency, replication and monitoring.
+
+Valid targets change over time, so use the API or console rather than hard-coding a supposedly current target. [Finding RDS upgrade targets](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_UpgradeDBInstance.MySQL.html)
+
+A traditional Multi-AZ deployment does **not** make a major upgrade automatically downtime-free. Blue/Green can reduce the interruption, but switchover still needs planning. After a successful upgrade, rollback is not simply an engine downgrade; restoration and reconciliation of subsequent writes may be necessary. [RDS Blue/Green Deployments](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
+
+---
+
+**8. How do users in one AWS account access resources in another account?**
+
+A common solution is **cross-account role assumption**.
+
+Assume:
+
+* Account A contains the user’s federated role.
+* Account B contains the resources.
+
+Configure three things:
+
+1. A role in Account B with permissions for the required resources.
+2. A trust policy on that role allowing the approved identity from Account A.
+3. Permission in Account A to call `sts:AssumeRole` on the destination role.
+
+Example destination-role trust policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::111111111111:role/PlatformEngineers"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+The caller’s policy must allow:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "sts:AssumeRole",
+  "Resource": "arn:aws:iam::222222222222:role/ResourceAccessRole"
+}
+```
+
+The assumed role receives temporary credentials. Relevant resource policies, KMS policies, permissions boundaries and organizational controls can further restrict access.
+
+For human users, federation through IAM Identity Center is commonly used instead of distributing long-lived access keys. [AWS cross-account role tutorial](https://docs.aws.amazon.com/IAM/latest/UserGuide/tutorial_cross-account-with-roles.html)
+
+---
+
+**9. What about connectivity between the VPCs?**
+
+**IAM authorization does not create a network path.** Private resources also need network connectivity.
+
+| Option                             | Appropriate use                                                  |
+| ---------------------------------- | ---------------------------------------------------------------- |
+| VPC peering                        | Direct connectivity between a small number of VPCs               |
+| Transit Gateway                    | Routed connectivity across many VPCs and accounts                |
+| PrivateLink                        | Exposing a particular service without general VPC-to-VPC routing |
+| VPN or Direct Connect architecture | Connectivity from corporate or external networks                 |
+
+For cross-account VPC peering:
+
+1. Create and accept the peering connection.
+2. Ensure the CIDRs do not overlap.
+3. Add routes in both directions.
+4. Allow the application port in security groups.
+5. Check network ACLs, including return traffic.
+6. Configure DNS resolution as needed.
+
+Example:
+
+| VPC                       | Destination    | Route target       |
+| ------------------------- | -------------- | ------------------ |
+| Account A: `10.10.0.0/16` | `10.20.0.0/16` | Peering connection |
+| Account B: `10.20.0.0/16` | `10.10.0.0/16` | Peering connection |
+
+VPC peering is not transitive. For larger routed networks, Transit Gateway is usually easier to manage. [VPC peering](https://docs.aws.amazon.com/vpc/latest/peering/what-is-vpc-peering.html), [Transit Gateway](https://docs.aws.amazon.com/vpc/latest/tgw/what-is-transit-gateway.html)
+
+PrivateLink provides service-oriented connectivity rather than a general network connection. Also, peering the VPCs does not connect an engineer’s laptop to either VPC; that laptop needs its own access path. [AWS PrivateLink](https://docs.aws.amazon.com/vpc/latest/privatelink/privatelink-share-your-services.html)
+
+---
+
+**10. How do you migrate an EC2 instance to another Region?**
+
+You generally **recreate the workload in the destination Region**. You cannot change an existing instance’s Region.
+
+For an EBS-backed instance, a common approach is:
+
+1. Inventory disks, networking, IAM profile, secrets and application dependencies.
+2. Prepare application-consistent data capture.
+3. Create an AMI.
+4. Wait until the AMI is available.
+5. Copy it to the destination Region.
+6. Launch a new instance with destination-region networking and configuration.
+7. Validate it, synchronize remaining data if required, then switch traffic.
+
+Create an AMI:
+
+```bash
+aws ec2 create-image \
+  --region us-east-1 \
+  --instance-id i-0123456789abcdef0 \
+  --name application-migration
+```
+
+AMI creation normally includes a reboot unless requested otherwise. Avoid assuming a no-reboot image provides application-consistent data. [Creating an EBS-backed AMI](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/creating-an-ami-ebs.html)
+
+After it becomes available, copy it:
+
+```bash
+aws ec2 copy-image \
+  --region eu-west-1 \
+  --source-region us-east-1 \
+  --source-image-id ami-SOURCE_ID \
+  --name application-migration-copy
+```
+
+Wait for the destination AMI before launching.
+
+The AMI does not recreate your entire environment. Reconfigure destination subnets, security groups, instance profile, load balancing, monitoring and regional secrets. Check destination KMS permissions for encrypted storage.
+
+Instance IDs, ENIs and Elastic IPs do not move across Regions. Instance-store data requires separate handling. For low downtime, use ongoing replication and a planned cutover rather than relying only on a point-in-time image. [Copying AMIs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/CopyingAMIs.html)
+
+---
+
+**11. EC2 creation fails with “IP address exceeded.” How do you troubleshoot it?**
+
+Start with the **exact AWS error code**, because several different limits can produce similar descriptions.
+
+| Error                               | Likely cause                                          | Typical remedy                                             |
+| ----------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------- |
+| `InsufficientFreeAddressesInSubnet` | Subnet has insufficient free private IPs              | Use another subnet or reclaim genuinely unused allocations |
+| `AddressLimitExceeded`              | Elastic IP allocation quota reached                   | Release unused EIPs or request a quota increase            |
+| `PrivateIpAddressLimitExceeded`     | Too many private IPs on an ENI for that instance type | Adjust the ENI/IP configuration or instance type           |
+
+These are separate limits. Increasing the Elastic IP quota does not resolve an exhausted private subnet. [EC2 error codes](https://docs.aws.amazon.com/ec2/latest/devguide/errors-overview.html)
+
+Check subnet capacity:
+
+```bash
+aws ec2 describe-subnets \
+  --subnet-ids subnet-0123456789abcdef0 \
+  --query 'Subnets[0].{CIDR:CidrBlock,FreeIPs:AvailableIpAddressCount}' \
+  --output table
+```
+
+Inspect allocations:
+
+```bash
+aws ec2 describe-network-interfaces \
+  --filters Name=subnet-id,Values=subnet-0123456789abcdef0 \
+  --query 'NetworkInterfaces[].{ID:NetworkInterfaceId,Status:Status,Description:Description}' \
+  --output table
+```
+
+Remember that EC2, load balancers, VPC endpoints, RDS and Kubernetes networking can all consume subnet addresses.
+
+For an ordinary AWS IPv4 subnet, five addresses are reserved. A `/28` therefore has 11 usable addresses. [Subnet sizing](https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html)
+
+Stopping an EC2 instance does not release its private IP allocation. Remove only resources or addresses confirmed to be unused. [EC2 IP addressing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html)
+
+---
+
+**12. Can you extend a subnet CIDR after creating it?**
+
+**No. An existing IPv4 subnet CIDR cannot be enlarged in place.**
+
+For example, you cannot change an existing subnet from:
+
+```text
+10.0.1.0/28
+```
+
+to:
+
+```text
+10.0.1.0/24
+```
+
+The normal solution is to create a new, non-overlapping subnet with sufficient capacity and place or recreate workloads there.
+
+If the VPC has no suitable unused address space, associate an eligible **secondary CIDR block with the VPC**, then create subnets from it. This adds address space to the VPC; it does not resize the existing subnet. [AWS VPC FAQs](https://aws.amazon.com/vpc/faqs/), [Managing VPC CIDR blocks](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cidr-blocks.html)
+
+Also, an existing EC2 instance cannot simply have its primary network interface moved into the new subnet. Typically, launch a replacement instance and migrate the workload.
+
+---
+
+**13. Will instances in the new subnet communicate with the old instances?**
+
+**Yes, normally, if both subnets are in the same VPC and network controls allow it.**
+
+VPC route tables have local routes for the VPC’s associated CIDR blocks. Adding a secondary VPC CIDR also adds the corresponding local route.
+
+For example:
+
+| Destination    | Target  |
+| -------------- | ------- |
+| `10.0.0.0/16`  | `local` |
+| `10.20.0.0/16` | `local` |
+
+An instance in `10.20.1.0/24` can communicate with an instance in `10.0.1.0/24` using their private IP addresses.
+
+Check:
+
+* Security-group ingress and egress.
+* Network ACLs and return traffic.
+* Host firewalls and listening ports.
+* Any custom routing through inspection appliances.
+
+A NAT Gateway or IGW is not required for ordinary private communication inside the same VPC. If the new subnet belongs to a different VPC, establish peering, Transit Gateway, or another suitable connection. [VPC CIDR routing](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cidr-blocks.html)
+
+---
+
+**14. What are the different Terraform provisioners?**
+
+The commonly used provisioners are:
+
+| Provisioner   | Purpose                            | Execution location                                             |
+| ------------- | ---------------------------------- | -------------------------------------------------------------- |
+| `local-exec`  | Runs a local command               | The machine or CI runner running Terraform                     |
+| `remote-exec` | Runs commands on a remote resource | Target machine, typically through SSH or WinRM                 |
+| `file`        | Copies files or directories        | Transfers from Terraform’s execution environment to the target |
+
+Example:
+
+```hcl
+resource "terraform_data" "example" {
+  provisioner "local-exec" {
+    command = "echo Provisioning step completed"
+  }
+}
+```
+
+By default, provisioners run during creation, rather than on every apply. Destruction-time execution can be configured with `when = destroy`.
+
+Use provisioners sparingly because Terraform cannot fully model the effects of arbitrary scripts. Prefer provider-managed resources, instance initialization through `user_data`/cloud-init, machine images, or configuration-management tools where appropriate.
+
+A **provider** integrates Terraform with an API; a **provisioner** runs imperative operations around a resource’s lifecycle. [Terraform provisioners](https://developer.hashicorp.com/terraform/language/provisioners)
+
+---
+
+**15. How do you remove a Terraform state lock?**
+
+First determine whether the lock belongs to an active Terraform operation.
+
+1. Read the lock’s ID, owner, operation and timestamp.
+2. Check running CI jobs and other operators.
+3. Confirm the correct backend and workspace.
+4. Force-unlock only when the lock is stale and no writer remains active.
+
+For a stale lock:
+
+```bash
+terraform force-unlock LOCK_ID
+```
+
+If another legitimate operation is running, wait for the lock instead:
+
+```bash
+terraform plan -lock-timeout=5m
+```
+
+`force-unlock` removes the state lock; it does not delete infrastructure. Its behavior depends on the backend, and it cannot release a local state lock held by another process. [Terraform force-unlock](https://developer.hashicorp.com/terraform/cli/commands/force-unlock)
+
+Do not confuse these operations:
+
+* `terraform state rm` removes a resource’s state binding; it does not unlock state.
+* `.terraform.lock.hcl` records provider dependency selections; it is not the state lock.
+* `-lock=false` disables protection and is not the normal solution to contention.
+
+Current S3 backends support locking with `use_lockfile = true`; DynamoDB-based locking is deprecated. [Terraform S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3)
+
+---
+
+**16. How do you manage an EC2 instance created in the console using Terraform?**
+
+**Import the instance into Terraform state and define matching configuration.**
+
+First configure the correct AWS provider, account, Region and backend. Then describe the existing instance accurately:
+
+```hcl
+resource "aws_instance" "existing" {
+  ami                    = "ami-ACTUAL_AMI"
+  instance_type          = "t3.small"
+  subnet_id              = "subnet-ACTUAL_SUBNET"
+  vpc_security_group_ids = ["sg-ACTUAL_GROUP"]
+
+  tags = {
+    Name = "existing-application"
+  }
+}
+
+import {
+  to = aws_instance.existing
+  id = "i-0123456789abcdef0"
+}
+```
+
+The values must match the actual instance; these are placeholders.
+
+Run:
+
+```bash
+terraform init
+terraform plan -out=import.tfplan
+```
+
+Review the plan. For a pure adoption, expect an import without unintended updates, replacement or deletion.
+
+Then:
+
+```bash
+terraform apply import.tfplan
+terraform plan
+```
+
+Import associates the existing object with the resource address. It does not create another EC2 instance. [Importing an existing resource](https://developer.hashicorp.com/terraform/language/import/single-resource)
+
+The traditional CLI workflow is also available:
+
+```bash
+terraform import aws_instance.existing i-0123456789abcdef0
+```
+
+That command does not write the resource configuration for you. With an import block and no corresponding resource block, configuration generation is available:
+
+```bash
+terraform plan -generate-config-out=generated.tf
+```
+
+Review generated configuration before applying it. Associated resources such as security groups and separately managed volumes may need their own imports. Avoid managing the same remote object from multiple independent state files. [Import configuration generation](https://developer.hashicorp.com/terraform/language/import/generating-configuration)
+
+---
+
+**17. “…resources in Terraform”—what should you explain?**
+
+The question is incomplete, so I’m interpreting it as asking about Terraform resources.
+
+A **resource block** describes an object whose lifecycle Terraform manages:
+
+```hcl
+resource "aws_security_group" "application" {
+  name        = "application-sg"
+  description = "Application security group"
+  vpc_id      = var.vpc_id
+}
+```
+
+Here:
+
+* `aws_security_group` is the resource type.
+* `application` is its local name.
+* `aws_security_group.application` is its Terraform address.
+* The AWS provider implements its create, read, update and delete behavior.
+
+Common resource features include:
+
+| Feature      | Purpose                                               |
+| ------------ | ----------------------------------------------------- |
+| `count`      | Create instances indexed numerically                  |
+| `for_each`   | Create instances identified by stable keys            |
+| `depends_on` | Declare dependencies not expressed through references |
+| `lifecycle`  | Configure lifecycle behavior                          |
+| `provider`   | Select a provider configuration or alias              |
+
+A resource can represent infrastructure already adopted through import; it does not necessarily represent something Terraform originally created.
+
+If the missing question concerned `null_resource`, also understand the built-in `terraform_data` resource, which supports lifecycle-driven operations without representing a cloud object. [Terraform resources](https://developer.hashicorp.com/terraform/language/resources)
+
+---
+
+**18. What are the different Kubernetes Service types?**
+
+Kubernetes has four Service `type` values:
+
+| Type           | Purpose                                                     |
+| -------------- | ----------------------------------------------------------- |
+| `ClusterIP`    | Provides a virtual IP primarily for cluster-internal access |
+| `NodePort`     | Exposes the Service on a port on eligible nodes             |
+| `LoadBalancer` | Requests a load balancer from an installed implementation   |
+| `ExternalName` | Provides a DNS alias to another DNS name                    |
+
+Additional points:
+
+* `ClusterIP` is the default.
+* The default NodePort range is `30000–32767`, though it is configurable.
+* A LoadBalancer can be public or private depending on its configuration and implementation.
+* ExternalName uses DNS aliasing; it does not proxy traffic.
+
+A **headless Service** is configured with:
+
+```yaml
+spec:
+  clusterIP: None
+```
+
+It does not allocate the usual Service virtual IP and can expose backend addresses through DNS. It is commonly used with StatefulSets.
+
+**Ingress and Gateway API are not Service types.** They define routing resources implemented by compatible controllers. [Kubernetes Services](https://kubernetes.io/docs/concepts/services-networking/service/)
+
+---
+
+**19. In a multi-cloud environment, how do you prevent a Pod from going to a particular node?**
+
+Use **required node affinity** to exclude the node.
+
+For example, place this under a Deployment’s `spec.template.spec`:
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: NotIn
+              values:
+                - worker-03
+```
+
+Use the actual hostname label value, which may differ from the Node object’s name:
+
+```bash
+kubectl get nodes --show-labels
+```
+
+For cloud-based placement, use your chosen node labels, such as `example.com/cloud`, and express allowed or excluded values.
+
+Important distinctions:
+
+* `required...` enforces scheduling eligibility.
+* `preferred...` expresses a preference and cannot guarantee exclusion.
+* Node affinity evaluates node labels.
+* Pod anti-affinity evaluates the placement of other Pods.
+* `IgnoredDuringExecution` does not automatically evict an existing Pod when labels change.
+
+A taint can repel **all Pods without a matching toleration** from a node, which is broader than excluding one particular workload.
+
+If “multi-cloud” means several separate clusters, placement rules apply independently within each cluster. A normal Kubernetes scheduler does not schedule across those independent clusters. [Node affinity documentation](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+
+---
+
+**20. What is a PVC?**
+
+A **PersistentVolumeClaim (PVC)** is a namespaced request for persistent storage.
+
+* A **PV** represents storage available to the cluster.
+* A **PVC** requests capacity and access characteristics.
+* A **StorageClass** identifies provisioning behavior.
+
+Example, assuming `application-storage` is an existing StorageClass:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: application-data
+  namespace: apps
+spec:
+  storageClassName: application-storage
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+A Pod references it:
+
+```yaml
+spec:
+  containers:
+    - name: application
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: application-data
+```
+
+Access modes include:
+
+| Mode               | Meaning                                                          |
+| ------------------ | ---------------------------------------------------------------- |
+| `ReadWriteOnce`    | Read/write from one node; potentially multiple Pods on that node |
+| `ReadOnlyMany`     | Read-only from multiple nodes                                    |
+| `ReadWriteMany`    | Read/write from multiple nodes                                   |
+| `ReadWriteOncePod` | Read/write from one Pod, with supported CSI storage              |
+
+Storage survives ordinary Pod replacement. Deleting the PVC can trigger backing-volume deletion depending on the PV’s reclaim policy. [PersistentVolume documentation](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
+
+A Pending PVC is not always broken: `WaitForFirstConsumer` deliberately delays binding or provisioning until workload placement is known. [StorageClass binding behavior](https://kubernetes.io/docs/concepts/storage/storage-classes/)
+
+---
+
+**21. If Terraform import handles existing resources, why do we need data sources?**
+
+**Import adopts an existing resource for management. A data source reads information without taking over its lifecycle.**
+
+| Aspect                                      | Imported managed resource        | Data source                             |
+| ------------------------------------------- | -------------------------------- | --------------------------------------- |
+| Configuration                               | `resource` block                 | `data` block                            |
+| Purpose                                     | Manage the object                | Reference its attributes                |
+| Can Terraform update it?                    | Yes, according to configuration  | Not through the data source             |
+| Can destroying the configuration delete it? | Managed-resource destruction can | Data-source removal does not            |
+| Typical owner                               | This Terraform configuration     | Another team, state, or external system |
+
+For example, a networking team owns a shared VPC. Your application configuration needs its ID but should not manage the VPC:
+
+```hcl
+data "aws_vpc" "shared" {
+  id = "vpc-0123456789abcdef0"
+}
+
+resource "aws_security_group" "application" {
+  name   = "application-sg"
+  vpc_id = data.aws_vpc.shared.id
+}
+```
+
+This configuration manages the security group while only reading the VPC.
+
+Data-source results can be recorded in state, so **being present in state does not automatically mean Terraform owns the underlying resource’s lifecycle**. Changes in read attributes can also affect plans for dependent managed resources. [Terraform data sources](https://developer.hashicorp.com/terraform/language/data-sources)
+
+Choose **import** when this configuration should manage the existing object. Choose a **data source** when it only needs to discover or reference that object. [Terraform import overview](https://developer.hashicorp.com/terraform/language/import)
