@@ -1535,3 +1535,603 @@ In AWS, distinguish service-provided metrics from guest metrics requiring an age
 
 Prepare one real incident showing how an alert led to correlated evidence, a root cause, a corrective action, and verified recovery.
 
+
+Below are detailed answers for the **Deloitte interview questions for approximately four years of experience**. The project and incident examples are illustrative—adapt them to work you have actually done.
+
+**1. The web application is inaccessible, but EC2 is running. What are the major reasons?**
+
+An EC2 instance being **running** only confirms its lifecycle state. The application process, network path, load balancer, or database can still be failing.
+
+I would troubleshoot from the client toward the application:
+
+| Layer            | Possible problem                                                | What I would check                                                     |
+| ---------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| DNS              | Incorrect record, stale IP, expired domain                      | Does the hostname resolve to the expected load balancer or address?    |
+| Network          | Security group, route, or network ACL blocking traffic          | Is the application port reachable through the intended path?           |
+| Load balancer    | Incorrect listener rule, target port, or health check           | Target health, listener configuration, and health-check failure reason |
+| TLS              | Expired certificate or hostname mismatch                        | Certificate validity, hostname, and certificate chain                  |
+| Operating system | Full disk, exhausted memory, or host firewall                   | Resource usage, system logs, and firewall rules                        |
+| Application      | Process stopped, startup failure, or wrong listening address    | Service status, listening ports, and application logs                  |
+| Dependencies     | Database failure, exhausted connection pool, or unavailable API | Dependency connectivity and application errors                         |
+
+For example:
+
+```bash
+# From a client
+dig +short app.example.com
+curl -v --connect-timeout 5 https://app.example.com/health
+
+# On the EC2 instance
+sudo ss -lntp
+sudo systemctl status nginx
+sudo journalctl -u nginx --since "15 minutes ago"
+
+# Test the application locally; use its actual port
+curl -v http://127.0.0.1:8080/health
+
+df -h
+df -i
+free -m
+```
+
+The results narrow the investigation:
+
+* **Local request fails:** investigate the application, host, and dependencies.
+* **Local request succeeds but external access fails:** investigate the listening address, network, proxy, and load balancer.
+* **Connection refused:** the connection reached something that rejected it, commonly because no process is listening.
+* **Timeout:** investigate dropped traffic, routing, or an unresponsive service.
+* **HTTP error:** inspect the response source and logs; the load balancer and application can generate different errors.
+
+With an ALB, I check that the instance security group permits traffic **from the ALB security group** on the target port. Health-check paths and expected response codes must also match the application. An ALB-generated 503 can indicate no registered targets or targets in an unused state. [AWS ALB troubleshooting](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html)
+
+A strong interview answer ends with: **“I correlate the failure with recent changes and verify recovery through the actual user-facing URL.”**
+
+**2. What measures would you take to reduce infrastructure cost by 20%?**
+
+I would establish a baseline, identify specific savings opportunities, and validate that the changes preserve the application’s performance and availability.
+
+**First, understand the spending.** Review several weeks of billing and utilization data, grouped by account, service, environment, and application. Cost Optimization Hub consolidates recommendations and accounts for overlapping opportunities and existing discounts. [AWS Cost Optimization Hub](https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-hub.html)
+
+Then prioritize changes:
+
+| Area            | Action                                                       | What must be checked                                        |
+| --------------- | ------------------------------------------------------------ | ----------------------------------------------------------- |
+| EC2             | Right-size consistently underused instances                  | Peak CPU, memory, network, and application latency          |
+| Non-production  | Schedule shutdown outside working hours                      | Working schedules, dependencies, and restart requirements   |
+| EKS             | Correct excessive resource requests and consolidate nodes    | Scheduling capacity, disruption budgets, and workload peaks |
+| EBS             | Remove confirmed unused volumes; assess gp2-to-gp3 migration | Ownership, retention, required IOPS, and throughput         |
+| S3 and logs     | Apply suitable retention and lifecycle policies              | Retrieval needs and retention obligations                   |
+| Networking      | Investigate NAT and cross-AZ transfer charges                | Traffic paths and the availability consequences of changes  |
+| Purchasing      | Apply Savings Plans or reservations to stable usage          | Commitment coverage after rightsizing                       |
+| Batch workloads | Use Spot where interruption is acceptable                    | Retry, checkpointing, and fallback behavior                 |
+
+I would implement low-risk changes first and purchase commitments after understanding the optimized baseline.
+
+For an **illustrative $10,000 monthly bill**, a proposed savings plan might be:
+
+| Change                                  | Estimated monthly saving |
+| --------------------------------------- | -----------------------: |
+| Right-size compute                      |                     $800 |
+| Schedule non-production resources       |                     $500 |
+| Storage cleanup and optimization        |                     $300 |
+| Reduce unnecessary logging and transfer |                     $200 |
+| Additional commitment discounts         |                     $200 |
+| **Total**                               |         **$2,000 — 20%** |
+
+These estimates must avoid double-counting. For example, the same instance cannot contribute its full original cost to both shutdown savings and rightsizing savings.
+
+Finally, compare actual spending and cost per business transaction against the baseline, while monitoring latency and availability. AWS’s cost principles emphasize matching consumption to demand and measuring business efficiency. [AWS cost optimization principles](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/design-principles.html)
+
+**3. Write a Terraform configuration for EC2 with an EBS volume attached.**
+
+The following `main.tf` creates an EC2 instance, a separate encrypted data volume, and the attachment. It assumes an existing subnet, security group, and suitable AMI.
+
+```hcl
+terraform {
+  required_version = ">= 1.5, < 2.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+variable "aws_region" {
+  type    = string
+  default = "ap-south-1"
+}
+
+variable "ami_id" {
+  type        = string
+  description = "AMI compatible with the instance type in this region"
+}
+
+variable "subnet_id" {
+  type        = string
+  description = "Existing subnet for the instance"
+}
+
+variable "security_group_ids" {
+  type        = list(string)
+  description = "Security groups from the subnet's VPC"
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.small"
+}
+
+resource "aws_instance" "app" {
+  ami                         = var.ami_id
+  instance_type               = var.instance_type
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = var.security_group_ids
+  associate_public_ip_address = false
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = 20
+    encrypted   = true
+  }
+
+  tags = {
+    Name        = "app-server"
+    Environment = "dev"
+  }
+}
+
+resource "aws_ebs_volume" "data" {
+  availability_zone = aws_instance.app.availability_zone
+  size              = 50
+  type              = "gp3"
+  encrypted         = true
+
+  tags = {
+    Name        = "app-data"
+    Environment = "dev"
+  }
+}
+
+resource "aws_volume_attachment" "data" {
+  device_name = "/dev/sdf"
+  volume_id   = aws_ebs_volume.data.id
+  instance_id = aws_instance.app.id
+}
+
+output "instance_id" {
+  value = aws_instance.app.id
+}
+
+output "data_volume_id" {
+  value = aws_ebs_volume.data.id
+}
+```
+
+Supply actual values in `terraform.tfvars`:
+
+```hcl
+ami_id             = "ami-REPLACE_WITH_VALID_ID"
+subnet_id          = "subnet-REPLACE_WITH_VALID_ID"
+security_group_ids = ["sg-REPLACE_WITH_VALID_ID"]
+```
+
+Then:
+
+```bash
+terraform init
+terraform fmt
+terraform validate
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+The points to explain in an interview are:
+
+* **The volume and instance must be in the same Availability Zone.** Referencing the instance’s AZ ensures this. [AWS EBS attachment requirements](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-attaching-volume.html)
+* References establish Terraform dependencies; an explicit `depends_on` is unnecessary here.
+* The separate data volume is managed using `aws_ebs_volume` and `aws_volume_attachment`. Avoid combining this approach with inline `ebs_block_device` management on the same instance. [Terraform volume attachment documentation](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/volume_attachment)
+* **Attaching a volume does not create or mount a filesystem.** Configure that separately after identifying the device and checking whether it already contains data. On Nitro instances, the operating system commonly exposes EBS disks as NVMe devices. [Making an EBS volume available for use](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-using-volumes.html)
+* A separately managed volume still needs a deliberate backup and deletion policy; Terraform can delete it during destruction.
+
+**4. How would you achieve zero downtime during an EKS cluster upgrade?**
+
+I would treat uninterrupted application traffic as the objective. Achieving it depends on the application’s redundancy, dependency availability, and ability to shut down gracefully.
+
+My approach has five parts.
+
+**Prepare the application and capacity.**
+
+Run sufficient replicas across nodes and Availability Zones. Configure readiness probes, graceful termination, load-balancer connection draining, and appropriate client retries.
+
+Make sure the cluster can temporarily accommodate replacement nodes and rescheduled pods. Check subnet IP availability, EC2 quotas, and instance capacity.
+
+**Validate compatibility before upgrading.**
+
+Review EKS upgrade insights, removed Kubernetes APIs, admission webhooks, controllers, and add-ons such as VPC CNI, CoreDNS, kube-proxy, and the EBS CSI driver. Exercise the upgrade in a representative test environment and follow supported version transitions. [EKS upgrade guidance](https://docs.aws.amazon.com/eks/latest/userguide/update-cluster.html)
+
+**Protect workloads during node maintenance.**
+
+For an application with three replicas, an example PDB is:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: payments
+```
+
+This restricts voluntary evictions so that two healthy matching pods remain. It does not protect against every failure or guarantee application availability. A PDB requiring all replicas to remain available can block node draining. [Kubernetes disruption budgets](https://kubernetes.io/docs/tasks/run-application/configure-pdb/)
+
+**Upgrade the control plane, then update workers and compatible add-ons.**
+
+Follow the version-specific prerequisites; some add-ons may require preparation before the control-plane upgrade.
+
+For workers, use a managed rolling update with suitable spare capacity or introduce a replacement node group. Verify new nodes are Ready, then drain old nodes gradually while respecting PDBs.
+
+If draining fails, investigate the blocker. Forcing eviction can interrupt the application. AWS documents both node update behavior and `PodEvictionFailure` conditions. [EKS managed node updates](https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html)
+
+For application Deployment updates, `maxUnavailable: 0` and a positive `maxSurge` can help preserve capacity, but these settings govern Deployment rollouts; node draining uses eviction and PDB behavior.
+
+**Verify and retain a recovery option.**
+
+Monitor synthetic transactions, error rate, latency, healthy targets, and pending pods throughout the upgrade. Keep old worker capacity until replacements are proven healthy.
+
+Current AWS documentation supports rolling an eligible EKS control plane back **one minor version within seven days** of an in-place upgrade. Eligibility and compatibility checks apply, and worker nodes and add-ons may need separate preparation. It is not a database or application-data restore. [EKS rollback requirements](https://docs.aws.amazon.com/eks/latest/userguide/rollback-cluster.html)
+
+**5. Have you written automation for cost optimization?**
+
+Use a project you have actually implemented. An illustrative example is **automated identification and cleanup of unused EBS volumes**.
+
+The workflow could be:
+
+1. Run an inventory job daily across approved accounts and Regions.
+2. Identify unattached volumes and collect owner tags, size, type, and identifiers.
+3. Track how long each volume has continuously remained unattached.
+4. Apply ownership and retention rules before cleanup.
+5. Record actions and compare realized savings with the billing baseline.
+
+Here is a small Python example that reports currently unattached volumes in one Region:
+
+```python
+import csv
+import sys
+
+import boto3
+
+region = sys.argv[1]
+session = boto3.Session(region_name=region)
+
+ec2 = session.client("ec2")
+account_id = session.client("sts").get_caller_identity()["Account"]
+
+writer = csv.writer(sys.stdout)
+writer.writerow([
+    "account_id", "region", "volume_id",
+    "size_gib", "volume_type", "owner"
+])
+
+paginator = ec2.get_paginator("describe_volumes")
+
+for page in paginator.paginate(
+    Filters=[{"Name": "status", "Values": ["available"]}]
+):
+    for volume in page["Volumes"]:
+        tags = {
+            tag["Key"]: tag["Value"]
+            for tag in volume.get("Tags", [])
+        }
+
+        writer.writerow([
+            account_id,
+            region,
+            volume["VolumeId"],
+            volume["Size"],
+            volume["VolumeType"],
+            tags.get("Owner", "UNASSIGNED")
+        ])
+```
+
+Example execution using an already authenticated AWS session:
+
+```bash
+python unused_ebs.py ap-south-1 > unused-ebs.csv
+```
+
+The SDK supports filtering by volume state and paginating results. [Boto3 DescribeVolumes](https://docs.aws.amazon.com/boto3/latest/reference/services/ec2/client/describe_volumes.html)
+
+For production, extend this with scheduled execution, cross-account roles, centralized reports, and failure logging.
+
+Two details demonstrate operational experience:
+
+* **A volume’s creation time is not its detachment time.** Track the first observed unattached state and reset that tracking if it becomes attached again.
+* An unattached volume may contain required recovery data. Cleanup must use ownership and retention information.
+
+The report identifies candidates; reviewed cleanup produces the savings.
+
+**6. What Terraform file structure would you use for VPC and EKS?**
+
+I would separate reusable modules from the configurations that instantiate them in each environment.
+
+| Location             | Purpose                                                           |
+| -------------------- | ----------------------------------------------------------------- |
+| `modules/vpc/`       | Reusable VPC, subnet, routing, and networking resources           |
+| `modules/eks/`       | Reusable EKS cluster, node groups, IAM, and related configuration |
+| `live/dev/network/`  | Development network root configuration                            |
+| `live/dev/eks/`      | Development EKS root configuration                                |
+| `live/prod/network/` | Production network root configuration                             |
+| `live/prod/eks/`     | Production EKS root configuration                                 |
+
+Inside a module:
+
+| File           | Contents                            |
+| -------------- | ----------------------------------- |
+| `main.tf`      | Resources and child-module calls    |
+| `variables.tf` | Inputs and validation               |
+| `outputs.tf`   | Values exposed to callers           |
+| `versions.tf`  | Terraform and provider requirements |
+| `README.md`    | Usage and assumptions               |
+
+A root configuration also usually includes `providers.tf`, `backend.tf`, and environment-specific input values.
+
+For example, the VPC module might expose:
+
+```hcl
+output "vpc_id" {
+  value = aws_vpc.this.id
+}
+
+output "private_subnet_ids" {
+  value = aws_subnet.private[*].id
+}
+```
+
+The EKS configuration consumes the VPC ID and private subnet IDs as inputs.
+
+My main design decisions would be:
+
+* **Separate production and development state and access.**
+* Store state in a protected remote backend with locking and recovery capability.
+* Separate network and cluster state when their ownership or change lifecycles justify it.
+* Pass outputs between configurations through a controlled mechanism.
+* Commit provider lock files and constrain module versions.
+* Keep credentials and sensitive state out of source control.
+
+File names primarily organize the code. Terraform evaluates the configuration files within a module together; naming a file `vpc.tf` does not create a separate execution stage.
+
+**7. How would you count running EC2 instances and attached EBS volumes across 50–60 AWS accounts?**
+
+I would use centralized inventory with cross-account authorization. Individual console sessions are unnecessary.
+
+There are two useful approaches.
+
+**Approach A: AWS Config organization aggregator**
+
+If AWS Config already records the required resources, configure an organization aggregator in the central account. It can aggregate configuration information across accounts and Regions. The source accounts still need appropriate recording enabled. [AWS Config aggregation](https://docs.aws.amazon.com/config/latest/developerguide/aggregate-data.html)
+
+Example advanced queries:
+
+```sql
+SELECT accountId, awsRegion, COUNT(*)
+WHERE resourceType = 'AWS::EC2::Instance'
+  AND configuration.state.name = 'running'
+GROUP BY accountId, awsRegion
+```
+
+```sql
+SELECT accountId, awsRegion, COUNT(*)
+WHERE resourceType = 'AWS::EC2::Volume'
+  AND configuration.state = 'in-use'
+GROUP BY accountId, awsRegion
+```
+
+This is convenient for repeated reporting, but the results reflect recorded configuration and may lag live service state. AWS Config supports aggregation queries but does not support SQL joins. [AWS Config advanced queries](https://docs.aws.amazon.com/config/latest/developerguide/querying-AWS-resources.html)
+
+**Approach B: AWS Organizations, STS, and service APIs**
+
+For a direct inventory job:
+
+1. List the organization’s active accounts.
+2. Assume a dedicated read-only inventory role in each account.
+3. Enumerate the applicable enabled Regions.
+4. Paginate `DescribeInstances`, filtering for running instances.
+5. Paginate `DescribeVolumes` and examine volume states and attachments.
+6. Aggregate results by account and Region.
+7. Save timestamped results centrally, such as in S3 for reporting.
+
+The target role needs permissions such as `ec2:DescribeInstances`, `ec2:DescribeVolumes`, and `ec2:DescribeRegions`. Its trust policy permits the central inventory role to assume it. The central role also needs permission to call `sts:AssumeRole`. [AWS STS AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html)
+
+Deploy the target roles consistently, for example through CloudFormation StackSets. Use pagination, retries, bounded concurrency, and explicit reporting of inaccessible accounts.
+
+For account enumeration, use the current `State` field rather than building new code around the deprecated `Status` field. [Organizations ListAccounts](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListAccounts.html)
+
+**Clarify what “attached EBS count” means:**
+
+* Unique volumes in use.
+* Individual attachment relationships.
+* Only volumes attached to running instances.
+
+These differ: stopped instances can retain attached volumes, and supported Multi-Attach volumes can have multiple attachments. To count only volumes attached to running instances, match attachment `InstanceId` values against the running-instance inventory and deduplicate volume IDs.
+
+An account that failed inventory must be reported as **failed or unavailable**, never silently counted as zero.
+
+**8. What are `terraform init` and `terraform refresh`?**
+
+| Command             | Purpose                                          | Effect                                                              |
+| ------------------- | ------------------------------------------------ | ------------------------------------------------------------------- |
+| `terraform init`    | Prepare a working directory                      | Initializes the backend and installs required providers and modules |
+| `terraform refresh` | Synchronize state with observed remote resources | Updates Terraform state; the command is deprecated                  |
+
+Run `terraform init` after cloning a configuration or when initialization must reflect changed dependencies or backend settings:
+
+```bash
+terraform init
+```
+
+It prepares Terraform to work with the configuration; it does not provision the declared EC2 instances or networks. Re-running it is normal. `terraform init -upgrade` requests dependency upgrades within configured constraints. [Terraform init documentation](https://developer.hashicorp.com/terraform/cli/commands/init)
+
+`terraform refresh` reads resources already managed by Terraform and updates state to reflect their observed attributes. It does not rewrite configuration files or import unrelated resources.
+
+The preferred reviewable workflow is:
+
+```bash
+terraform plan -refresh-only -out=refresh.tfplan
+
+# Review the displayed changes before applying the saved plan
+terraform apply refresh.tfplan
+```
+
+Alternatively:
+
+```bash
+terraform apply -refresh-only
+```
+
+The older `terraform refresh` effectively performs an automatically approved refresh-only apply, which removes the opportunity to review the state changes first. Ordinary plans already refresh managed resources by default. [Terraform refresh documentation](https://developer.hashicorp.com/terraform/cli/commands/refresh)
+
+For example, if someone changes a managed resource’s tag through the console, refresh-only records the observed tag in state. The HCL still expresses the desired tag, so a subsequent normal plan can propose restoring it.
+
+**9. How do you integrate SonarQube into a Jenkins pipeline?**
+
+The integration needs Jenkins configuration, a scanner execution, and a quality-gate decision.
+
+**Configure the connection.**
+
+* Install the SonarQube Scanner for Jenkins plugin.
+* Create a suitably scoped SonarQube analysis token.
+* Store it in Jenkins as a secret-text credential.
+* Configure the SonarQube server URL and credential under Jenkins system settings.
+* Ensure the build agent can reach SonarQube. [SonarQube Jenkins setup](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/ci-integration/jenkins-integration/global-setup)
+
+**Generate test results and analyze the code.**
+
+For a Maven application, run the build, tests, and scanner inside `withSonarQubeEnv`. The project must separately configure its coverage tool, such as JaCoCo; SonarQube consumes coverage reports rather than generating coverage itself.
+
+An example Jenkinsfile is:
+
+```groovy
+pipeline {
+    agent none
+
+    options {
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Build, test and analyze') {
+            agent {
+                label 'java-build'
+            }
+
+            steps {
+                checkout scm
+
+                withSonarQubeEnv('sonarqube-prod') {
+                    sh '''
+                        ./mvnw -B clean verify sonar:sonar \
+                          -Dsonar.projectKey=payments
+                    '''
+                }
+            }
+        }
+
+        stage('Quality gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    script {
+                        def gate = waitForQualityGate()
+
+                        if (gate.status != 'OK') {
+                            error(
+                                "SonarQube quality gate failed: " +
+                                gate.status
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+This assumes that the agent has the required Java environment, the repository contains the Maven wrapper, and the POM configures the scanner and coverage tooling. The wrapper supplies the configured SonarQube connection environment. [Adding analysis to a Jenkins job](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/ci-integration/jenkins-integration/add-analysis-to-job)
+
+**Configure the quality-gate callback.**
+
+SonarQube needs a webhook pointing to:
+
+```text
+https://jenkins.example.com/sonarqube-webhook/
+```
+
+Configure webhook-secret verification and allow SonarQube to reach this endpoint. `waitForQualityGate` waits for server-side analysis completion without holding a build agent. A successful scanner upload alone does not mean the quality gate passed. [SonarQube pipeline quality gates](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/ci-integration/jenkins-integration/pipeline-pause)
+
+Place release and deployment stages after the gate. Explain the actual policy your team uses—for example, thresholds for new-code coverage, duplication, and security findings.
+
+**10. What major Kubernetes issue have you resolved?**
+
+Choose a real incident and explain **impact, evidence, mitigation, root cause, and prevention**.
+
+An illustrative EKS incident is **new pods failing to start because the VPC CNI could not allocate IP addresses**.
+
+**Situation and impact**
+
+During a deployment, existing pods continued serving traffic, but replacement pods remained in `ContainerCreating`. Available replicas decreased, slowing the rollout and putting application capacity at risk.
+
+**Investigation**
+
+Start with:
+
+```bash
+kubectl get pods -n payments -o wide
+
+kubectl describe pod <pod-name> -n payments
+
+kubectl get events -n payments \
+  --sort-by=.metadata.creationTimestamp
+
+kubectl get pods -n kube-system \
+  -l k8s-app=aws-node -o wide
+
+kubectl logs -n kube-system <aws-node-pod-on-affected-node> \
+  -c aws-node --since=30m
+```
+
+Suppose pod events show `FailedCreatePodSandBox`, and CNI logs show IP allocation failures. Check:
+
+* Available IP addresses in the affected subnets.
+* Instance ENI and IP-address limits.
+* VPC CNI configuration and warm IP allocation.
+* Whether failures are concentrated in particular nodes or Availability Zones.
+
+A useful distinction is that these pods may already be scheduled to nodes. That differs from scheduler `FailedScheduling` events caused by insufficient CPU or memory.
+
+**Mitigation**
+
+Pause the rollout to preserve healthy capacity. Restore usable IP capacity through an appropriate network expansion or replacement node capacity in subnets with sufficient addresses, then verify that new pods become Ready.
+
+Adding nodes to an already exhausted subnet will not solve the underlying shortage. AWS documents subnet planning, additional IP space, and CNI configuration as parts of addressing IP exhaustion. [EKS IP address optimization](https://docs.aws.amazon.com/eks/latest/best-practices/ip-opt.html)
+
+**Permanent correction**
+
+Improve subnet capacity planning and add alerts for available addresses, pod startup failures, and rollout stalls. Account for temporary capacity needed during upgrades and deployments.
+
+Prefix delegation may improve per-node pod density, but it still requires subnet space and contiguous `/28` IPv4 blocks. It does not create additional addresses inside an exhausted subnet. [EKS prefix delegation guidance](https://docs.aws.amazon.com/eks/latest/best-practices/prefix-mode-linux.html)
+
+When describing the result, use your actual measurements: affected services, recovery time, availability impact, and the preventive changes you implemented.
+
