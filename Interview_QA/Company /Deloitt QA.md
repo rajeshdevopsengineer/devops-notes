@@ -616,3 +616,922 @@ Useful log fields include:
 For archived logs, use a predictable account/Region/date prefix, appropriate access controls, and a defined retention policy.
 
 **An EBS snapshot is not an ordinary object in a customer-managed S3 bucket.** The recovery data stays in its managed backup storage; execution and audit logs can be stored separately in CloudWatch Logs and S3.
+
+Below are answers to all **28 Deloitte questions**, at a level suitable for a **5-year DevOps interview**. For experience-based questions, adapt the examples to work you have actually done.
+
+**1. How do you migrate a Git repository from GitHub to GitLab while preserving commit history?**
+
+A Git migration transfers the commit graph and repository references without rewriting existing commits.
+
+The process is:
+
+1. Inventory branches, tags, Git LFS objects, submodules, and any custom references.
+2. Create an **empty destination repository** without an initial README or other commit.
+3. Confirm source read access and destination push access.
+4. Coordinate a write freeze for the final migration.
+5. Transfer branches, tags, and their history.
+6. Validate the destination.
+7. Reconfigure permissions, integrations, and developer remotes.
+
+For a branch-and-tag migration:
+
+```bash
+git clone --bare git@github.com:source-team/payments.git
+cd payments.git
+
+git remote add target git@gitlab.com:target-team/payments.git
+
+git push target 'refs/heads/*:refs/heads/*'
+git push target 'refs/tags/*:refs/tags/*'
+```
+
+A bare clone contains repository data without a working directory. Existing commit IDs, authors, and timestamps remain unchanged. [Git clone documentation](https://git-scm.com/docs/git-clone)
+
+For a complete reference mirror, `git clone --mirror` and `git push --mirror` are alternatives. **Mirror pushing can overwrite or delete destination references**, so use it deliberately with an appropriate destination. Hosting-provider-specific references may also need special handling.
+
+If Git LFS is used:
+
+```bash
+git lfs fetch --all origin
+git lfs push --all target
+```
+
+LFS file contents require separate transfer from the Git pointers. [Repository duplication and LFS migration](https://docs.github.com/en/repositories/creating-and-managing-repositories/duplicating-a-repository)
+
+Validate branch and tag object IDs, perform a fresh clone, and run the build. Then update:
+
+* Default branch and branch protections.
+* Jenkins repository URLs and webhooks.
+* Credentials and CI variables.
+* Submodule URLs where needed.
+* Developer remote URLs.
+
+Issues, pull requests, comments, and CI settings are platform data. Use an appropriate importer where these are required; GitLab’s GitHub importer supports additional project metadata. [GitLab GitHub migration](https://docs.gitlab.com/user/project/import/github/)
+
+---
+
+**2. What is the difference between `git fetch` and `git pull`?**
+
+| Command     | Behavior                                                                        |
+| ----------- | ------------------------------------------------------------------------------- |
+| `git fetch` | Downloads objects and updates remote-tracking references                        |
+| `git pull`  | Fetches changes and integrates a selected remote branch into the current branch |
+
+A normal fetch does not change your checked-out branch or working files:
+
+```bash
+git fetch --prune origin
+
+git log --oneline HEAD..origin/main
+git diff HEAD origin/main
+```
+
+Use fetch when you want to **inspect incoming changes before integrating them**. [Git fetch documentation](https://git-scm.com/docs/git-fetch)
+
+Pull combines fetching with integration. Depending on options and configuration, integration may fast-forward, merge, or rebase.
+
+For routine updates where you expect no divergence:
+
+```bash
+git switch main
+git pull --ff-only origin main
+```
+
+`--ff-only` refuses the operation if updating would require reconciling divergent history.
+
+Use:
+
+* **Fetch:** Before reviewing differences, resolving divergence, or preparing a merge.
+* **Pull:** When you intentionally want to update your current branch immediately.
+
+Be careful with rebasing commits that other developers already depend on, because rebase rewrites commit history. [Git pull documentation](https://git-scm.com/docs/git-pull)
+
+---
+
+**3. What is Git cherry-pick, and how do you use it?**
+
+Cherry-pick applies the changes introduced by selected commits to your current branch, normally creating new commits.
+
+A common use is backporting a production fix without merging all changes from another branch.
+
+```bash
+git fetch origin
+git switch release/1.2
+
+git cherry-pick -x a1b2c3d
+```
+
+`-x` records the original commit reference in the new commit message, helping trace backports.
+
+For multiple commits:
+
+```bash
+git cherry-pick COMMIT_A COMMIT_B COMMIT_C
+```
+
+Apply them in dependency order. A fix may depend on earlier changes even if it applies without a textual conflict.
+
+If conflicts occur:
+
+```bash
+git status
+
+# Edit and resolve the affected files.
+
+git add path/to/resolved-file
+git cherry-pick --continue
+```
+
+To cancel:
+
+```bash
+git cherry-pick --abort
+```
+
+The new commit normally has a different SHA because it belongs to a different history. Cherry-pick transfers selected changes; it does not merge the entire source branch. [Git cherry-pick documentation](https://git-scm.com/docs/git-cherry-pick)
+
+---
+
+**4. How do you handle merge conflicts? Do you check source or target history?**
+
+**Check both histories and their common ancestor.** You need to understand what each side intended.
+
+For a normal merge into `main`:
+
+```bash
+git fetch origin
+git switch main
+git merge --ff-only origin/main
+git merge origin/feature/payments
+```
+
+If conflicts occur:
+
+```bash
+git status
+
+git log --left-right --oneline \
+  HEAD...MERGE_HEAD -- path/to/file
+```
+
+During the unresolved merge, Git can expose three versions:
+
+```bash
+git show :1:path/to/file   # Common ancestor
+git show :2:path/to/file   # Current branch: ours
+git show :3:path/to/file   # Incoming branch: theirs
+```
+
+Then:
+
+1. Read the conflicting changes and relevant commit messages.
+2. Determine the correct combined behavior.
+3. Resolve the file and remove conflict markers.
+4. Run relevant tests.
+5. Stage the resolution and complete the merge.
+
+```bash
+git add path/to/file
+git merge --continue
+```
+
+To cancel:
+
+```bash
+git merge --abort
+```
+
+Start from a clean working tree so existing uncommitted changes do not complicate recovery.
+
+Avoid blindly accepting “ours” or “theirs.” Also, their interpretation during a rebase can differ from a normal merge. [Git merge documentation](https://git-scm.com/docs/git-merge)
+
+---
+
+**5. What CI/CD tools do you use?**
+
+Explain the toolchain by responsibility rather than listing product names.
+
+| Responsibility               | Example                                |
+| ---------------------------- | -------------------------------------- |
+| Source control               | GitHub or GitLab                       |
+| Pipeline orchestration       | Jenkins                                |
+| Application build            | Maven, Gradle, npm                     |
+| Testing and analysis         | Application test frameworks, SonarQube |
+| Container build and scanning | Docker/BuildKit, Trivy                 |
+| Artifact storage             | ECR or an artifact repository          |
+| Infrastructure provisioning  | Terraform                              |
+| Configuration management     | Ansible                                |
+| Kubernetes deployment        | Helm or a GitOps controller            |
+
+For an AWS application, a coherent example is: Jenkins builds and tests the application, creates an image, publishes it to ECR, and deploys the approved image to EKS.
+
+Be prepared to explain where you implemented gates, managed credentials, handled failures, and verified deployments.
+
+---
+
+**6. How do you connect a new Jenkins installation to GitHub? Are webhooks enough?**
+
+**Webhooks trigger builds; they do not complete repository access or Jenkins configuration.**
+
+For Git access, the common transports are:
+
+* **HTTPS:** Using suitable token-based credentials.
+* **SSH:** Using an SSH key and verified host keys.
+
+GitHub App authentication is also available through supported Jenkins integrations. [Jenkins Git plugin](https://plugins.jenkins.io/git/), [GitHub Branch Source](https://plugins.jenkins.io/github-branch-source/)
+
+A complete setup includes:
+
+1. **Prepare Jenkins and its agents.** Install required Pipeline, Git, and GitHub integration plugins. Ensure Git and build tools exist where checkout/build commands execute.
+
+2. **Establish network access.** Jenkins needs GitHub API access; checkout agents need access to the repository through the chosen transport.
+
+3. **Configure credentials.** Store credentials in Jenkins and reference credential IDs. Scope access to the required repositories and operations.
+
+4. **Create the job.** Configure Pipeline from SCM or a Multibranch Pipeline, repository URL, credentials, branch discovery, and Jenkinsfile path.
+
+5. **Validate repository access.** Confirm checkout succeeds using the actual job configuration.
+
+6. **Configure triggering.** For the GitHub plugin, a common webhook endpoint is:
+
+```text
+https://jenkins.example.com/github-webhook/
+```
+
+GitHub must be able to reach the configured webhook receiver. A Jenkins server accessible only through `localhost` or an isolated private network cannot receive GitHub.com deliveries without additional connectivity or an approved relay.
+
+7. **Test a push event.** Inspect GitHub’s delivery response and Jenkins’s resulting checkout/build.
+
+Configure HTTPS and supported webhook validation. [Jenkins GitHub integration](https://plugins.jenkins.io/github/)
+
+Triggering choices include webhooks, SCM polling, manual execution, schedules, and API/upstream jobs. There is therefore no single “number of connection methods”: repository authentication and build triggering are separate choices.
+
+---
+
+**7. What stages do you define in a pipeline?**
+
+Stages represent meaningful groups of work. A typical application pipeline contains:
+
+| Stage                   | Purpose                                                |
+| ----------------------- | ------------------------------------------------------ |
+| Checkout                | Obtain the intended source revision                    |
+| Validate                | Check configuration, formatting, and basic correctness |
+| Build                   | Compile/package the application                        |
+| Unit tests              | Validate isolated application behavior                 |
+| Security/quality checks | Evaluate code, dependencies, and secrets               |
+| Image/package creation  | Produce the deployable artifact                        |
+| Publish                 | Store the versioned artifact                           |
+| Deploy to test          | Install in a validation environment                    |
+| Integration/smoke tests | Check dependencies and important user paths            |
+| Production promotion    | Deploy the approved artifact                           |
+| Verification            | Check rollout health and application behavior          |
+
+Stages can execute sequentially or in parallel. Conditions such as `when` can restrict execution, while an `input` step can introduce an approval.
+
+For example, pull requests may run validation stages, while production deployment is restricted to approved release revisions. [Jenkins Pipeline syntax](https://www.jenkins.io/doc/book/pipeline/syntax/)
+
+---
+
+**8. Can more than two stages run at the same time?**
+
+Yes. Jenkins supports multiple parallel branches.
+
+Assuming the repository contains the referenced scripts:
+
+```groovy
+pipeline {
+    agent none
+
+    options {
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Quality checks') {
+            parallel {
+                stage('Unit tests') {
+                    agent { label 'linux' }
+                    steps {
+                        checkout scm
+                        sh './ci/unit-tests.sh'
+                    }
+                }
+
+                stage('Lint') {
+                    agent { label 'linux' }
+                    steps {
+                        checkout scm
+                        sh './ci/lint.sh'
+                    }
+                }
+
+                stage('Security checks') {
+                    agent { label 'linux' }
+                    steps {
+                        checkout scm
+                        sh './ci/security-checks.sh'
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Actual simultaneous execution depends on available agents, executors, and other resource constraints. With insufficient executor capacity, some branches wait.
+
+Parallelize independent work and isolate workspaces or output paths. A deployment must still wait for the artifacts and checks it depends on.
+
+You can configure fail-fast behavior to stop sibling branches when one fails. [Jenkins parallel stages](https://www.jenkins.io/doc/book/pipeline/syntax/#parallel)
+
+---
+
+**9. Have you written Groovy from scratch? What is Declarative Pipeline versus Scripted Pipeline?**
+
+For the experience question, describe a specific implementation: its inputs, logic, failure handling, credentials, and testing. Examples include a reusable deployment function, shared-library step, or pipeline generator.
+
+| Aspect              | Declarative Pipeline               | Scripted Pipeline               |
+| ------------------- | ---------------------------------- | ------------------------------- |
+| Typical structure   | `pipeline { ... }`                 | Often `node { ... }`            |
+| Style               | Structured Pipeline DSL            | More direct Groovy control flow |
+| Organization        | Prescribed sections and directives | More flexible organization      |
+| Completion handling | `post` conditions                  | Often `try/catch/finally`       |
+| Custom logic        | Can use `script` blocks            | Groovy logic throughout         |
+| Typical benefit     | Consistency and readability        | Flexibility for complex flows   |
+
+Both are Groovy-based and use Jenkins Pipeline steps. Declarative Pipeline is not YAML.
+
+A Scripted example:
+
+```groovy
+node('linux') {
+    stage('Checkout') {
+        checkout scm
+    }
+
+    stage('Build') {
+        sh './ci/build.sh'
+    }
+}
+```
+
+Choose based on maintainability and complexity; both support reusable libraries and sophisticated workflows. [Jenkins Pipeline overview](https://www.jenkins.io/doc/book/pipeline/)
+
+---
+
+**10. What is the difference between EKS and ECS?**
+
+| Aspect                | EKS                                         | ECS                                     |
+| --------------------- | ------------------------------------------- | --------------------------------------- |
+| Orchestrator          | Managed Kubernetes                          | AWS-native container orchestration      |
+| Workload unit         | Pod                                         | Task                                    |
+| Configuration         | Kubernetes resources, Helm, Kubernetes APIs | Task definitions, services, AWS APIs    |
+| Ecosystem             | Kubernetes controllers, operators, tooling  | AWS-native integrations                 |
+| Compute               | Includes EC2-based capacity and Fargate     | Includes EC2-based capacity and Fargate |
+| Operational knowledge | Kubernetes concepts and lifecycle           | ECS concepts and AWS integration        |
+
+AWS manages the orchestration control plane in both services, but compute and workload responsibilities depend on the selected operating model. Both offer additional managed compute options. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html), [Amazon ECS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html)
+
+Choose EKS when Kubernetes APIs, operators, tooling, or organizational standardization are important.
+
+ECS can suit teams wanting AWS-integrated container orchestration without adopting Kubernetes.
+
+Kubernetes compatibility can improve portability, but applications using AWS-specific services and integrations still require migration work.
+
+---
+
+**11. What are the prerequisites for EKS with two worker nodes and X Pods?**
+
+For a standard EKS cluster with EC2 workers, check:
+
+1. **Permissions:** A provisioning identity, cluster role, node role, and appropriate access configuration.
+2. **Networking:** A suitable VPC and cluster subnets in at least two AZs, with sufficient available IP addresses.
+3. **Connectivity:** Nodes must reach the API endpoint and required services, including image registries.
+4. **Compute:** Supported instance types, AMIs, capacity availability, and EC2 quotas.
+5. **Add-ons:** Appropriate networking, DNS, and Service networking components.
+6. **Administration:** AWS CLI, kubectl, and the chosen provisioning tool.
+7. **Workload requirements:** CPU/memory requests, storage, architecture, placement constraints, and availability targets.
+
+Private nodes may use NAT or appropriate VPC endpoints for their dependencies. [EKS creation prerequisites](https://docs.aws.amazon.com/eks/latest/userguide/create-cluster.html), [EKS networking requirements](https://docs.aws.amazon.com/eks/latest/userguide/network-reqs.html)
+
+**Two nodes do not guarantee capacity for an arbitrary number of Pods.**
+
+For example, 20 Pods requesting `250m` CPU each require **5 requested vCPUs**, before system workloads. Two 2-vCPU nodes cannot accommodate that demand.
+
+Also account for:
+
+* Node allocatable resources rather than raw instance capacity.
+* DaemonSets and platform components.
+* Per-node Pod limits.
+* VPC CNI address availability.
+* Capacity during node failure or maintenance.
+
+Instance networking limits and CNI configuration can constrain Pod density even when CPU and memory remain available. [EKS instance selection](https://docs.aws.amazon.com/eks/latest/userguide/choosing-instance-type.html)
+
+---
+
+**12. With multiple Pods, how do you manage load balancing? Do you always need an ALB?**
+
+**For normal internal traffic, use a Kubernetes Service. An ALB is not required simply because multiple Pods exist.**
+
+For Pods labeled `app: payments` and listening on port 8080:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments
+spec:
+  type: ClusterIP
+  selector:
+    app: payments
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+The Service provides a stable internal address and DNS name. Kubernetes tracks its endpoints, and the Service networking implementation forwards traffic to eligible backend Pods.
+
+Readiness influences which endpoints normally receive traffic. Do not assume equal distribution of every HTTP request: persistent connections can keep requests on one backend. [Kubernetes Services](https://kubernetes.io/docs/concepts/services-networking/service/)
+
+For external access:
+
+* An **ALB** is appropriate for HTTP/HTTPS routing through the relevant AWS controller integration.
+* An **NLB** can provide network-level access, commonly through a controller-managed `LoadBalancer` Service.
+
+With ALB IP targets, traffic can reach Pod IPs directly. With instance targets, it reaches node ports before being forwarded to Pods. [EKS ALB integration](https://docs.aws.amazon.com/eks/latest/userguide/alb-ingress.html)
+
+The decision depends on the traffic source and required routing behavior—not the number of Pods alone.
+
+---
+
+**13. When do you use ALB versus NLB?**
+
+| Requirement                    | ALB                                              | NLB                                                   |
+| ------------------------------ | ------------------------------------------------ | ----------------------------------------------------- |
+| Operating layer                | Application layer, L7                            | Network/transport layer, L4                           |
+| Typical traffic                | HTTP/HTTPS                                       | TCP, UDP, TLS and other supported protocols           |
+| Host/path routing              | Supported                                        | Does not inspect HTTP paths for routing               |
+| Static frontend IP requirement | Normally addressed through its DNS endpoint      | Static addresses per enabled AZ; optional EIPs        |
+| TLS termination                | Supported                                        | Supported with TLS listeners                          |
+| Typical example                | Route `/api` and `/orders` to different services | Expose a TCP service or satisfy fixed-IP requirements |
+
+Use **ALB** when application-aware routing is needed—for example, several web services sharing one entry point. [ALB documentation](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)
+
+Use **NLB** when transport-level behavior, supported non-HTTP protocols, or static frontend addresses are important. A TCP listener can also pass TLS through to the backend. [NLB documentation](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/introduction.html)
+
+Do not choose solely by “more traffic means NLB.” Evaluate protocol, routing, connection behavior, and integration requirements.
+
+---
+
+**14. Tomcat listens on port 8080. How do you expose it on port 9090?**
+
+If 9090 is the **host port**, publish it to container port 8080:
+
+```bash
+docker build -t tomcat-app:1.0 .
+
+docker run -d \
+  --name tomcat-app \
+  -p 9090:8080 \
+  tomcat-app:1.0
+```
+
+The mapping is:
+
+```text
+HOST_PORT:CONTAINER_PORT
+```
+
+Tomcat continues listening on 8080 inside the container. Clients connect to the Docker host on 9090.
+
+Verify:
+
+```bash
+docker port tomcat-app
+curl http://localhost:9090/
+```
+
+`EXPOSE 8080` documents the intended container port; it does not publish that port. [Docker port publishing](https://docs.docker.com/get-started/docker-concepts/running-containers/publishing-ports/)
+
+If Tomcat itself must listen on **9090 inside the container**, change its connector configuration and publish the corresponding port. Changing `EXPOSE` alone does not reconfigure Tomcat.
+
+---
+
+**15. What is the use of Helm charts?**
+
+A Helm chart packages Kubernetes resource templates and default configuration.
+
+It helps you:
+
+* Deploy related resources together.
+* Reuse templates across environments.
+* Supply configuration through values.
+* Manage dependencies.
+* Version deployment packages.
+* Track and upgrade installed releases.
+
+A **chart** is the package; a **release** is an installed instance of that chart.
+
+```bash
+helm upgrade --install payments ./payments \
+  --namespace dev \
+  --create-namespace \
+  -f values-dev.yaml \
+  --wait
+```
+
+The same chart can be deployed with different values for development and production. [Helm charts](https://helm.sh/docs/topics/charts/)
+
+Helm release rollback restores the recorded Kubernetes configuration; it does not automatically reverse database migrations or external side effects.
+
+---
+
+**16. What have you worked on in Linux?**
+
+Organize the answer around operational responsibilities.
+
+| Area                   | Examples to discuss                          |
+| ---------------------- | -------------------------------------------- |
+| Users and permissions  | Service accounts, groups, ownership, sudo    |
+| Processes and services | `ps`, `top`, `systemctl`, `journalctl`       |
+| Storage                | Filesystems, mounts, `df`, `du`, inode usage |
+| Networking             | `ip`, `ss`, DNS checks, `curl`               |
+| Software management    | Package repositories, installation, upgrades |
+| Automation             | Bash scripts, cron, Ansible                  |
+| Troubleshooting        | CPU, memory, disk, network, startup failures |
+
+Commands are useful, but an incident demonstrates depth.
+
+For example, when investigating a full filesystem:
+
+1. Check filesystem and inode usage.
+2. Locate the directories consuming space.
+3. Examine log rotation.
+4. Check for deleted files still held open by processes.
+5. Correct the cause and verify recovery.
+
+Similarly, for a failed service, inspect its unit status, journal, configuration, permissions, and dependencies. [systemctl manual](https://man7.org/linux/man-pages/man1/systemctl.1.html)
+
+---
+
+**17. Which command shows the number of CPU cores?**
+
+For processing units available to the current process:
+
+```bash
+nproc
+```
+
+For CPU topology:
+
+```bash
+lscpu
+```
+
+For detailed CPU, core, and socket mapping:
+
+```bash
+lscpu -e=CPU,CORE,SOCKET,ONLINE
+```
+
+**Logical CPUs and physical cores are different.** Simultaneous multithreading can expose multiple logical CPUs per physical core.
+
+`nproc` reports available processing units and can reflect execution constraints. `lscpu` provides topology information, but a VM’s reported topology may describe virtual CPUs rather than the physical host. [nproc manual](https://man7.org/linux/man-pages/man1/nproc.1.html), [lscpu manual](https://man7.org/linux/man-pages/man1/lscpu.1.html)
+
+---
+
+**18. What is a cron job, and how is it used?**
+
+Cron schedules commands at specified times.
+
+Manage a user’s schedule with:
+
+```bash
+crontab -e
+crontab -l
+```
+
+Example: run a backup script every day at 02:00:
+
+```cron
+0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1
+```
+
+The five scheduling fields are:
+
+1. Minute.
+2. Hour.
+3. Day of month.
+4. Month.
+5. Day of week.
+
+A user crontab runs commands as that user. System crontabs and files under `/etc/cron.d` include an additional username field.
+
+Operational considerations include:
+
+* Use explicit paths and the required environment.
+* Confirm execution and log-file permissions.
+* Check the configured timezone.
+* Capture failures.
+* Prevent overlapping executions where necessary.
+
+Cron starts a command on schedule; it does not guarantee that the command succeeds. [Cron table manual](https://man7.org/linux/man-pages/man5/crontab.5.html)
+
+---
+
+**19. How do you check the size of a particular file in Linux?**
+
+Human-readable file size:
+
+```bash
+ls -lh /path/to/file
+```
+
+Exact logical size in bytes:
+
+```bash
+stat -c '%n: %s bytes' /path/to/file
+```
+
+Allocated disk usage:
+
+```bash
+du -h /path/to/file
+```
+
+Total directory usage:
+
+```bash
+du -sh /path/to/directory
+```
+
+The distinction matters for sparse files: their logical size can be much larger than the disk space allocated to them. [stat manual](https://man7.org/linux/man-pages/man1/stat.1.html), [du manual](https://man7.org/linux/man-pages/man1/du.1.html)
+
+---
+
+**20. What installations have you performed on Linux?**
+
+Typical DevOps installation work includes:
+
+* Git, JDK, Maven, and application dependencies.
+* Jenkins agents.
+* NGINX or Apache.
+* Docker or containerd where appropriate.
+* AWS CLI, kubectl, Helm, and Terraform.
+* Monitoring and logging agents.
+
+Explain the complete lifecycle: choose a trusted repository, install a suitable version, configure the software, manage its service, verify functionality, and automate updates.
+
+For example, on Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install nginx
+
+sudo nginx -t
+sudo systemctl enable --now nginx
+
+systemctl status nginx
+```
+
+Installing a package is only one step. A stronger answer explains configuration validation, service permissions, networking, log inspection, and repeatable automation. [Ubuntu package management](https://ubuntu.com/server/docs/how-to/software/package-management/)
+
+---
+
+**21. Have you worked on Ansible automation?**
+
+Useful examples to describe include:
+
+* Installing and configuring packages.
+* Managing users, groups, and SSH keys.
+* Deploying application configuration.
+* Managing services.
+* Installing monitoring agents.
+* Rolling application updates or patching.
+
+A typical design uses:
+
+* Inventories for target environments.
+* Roles for reusable configuration.
+* Variables for environment differences.
+* Templates for generated files.
+* Handlers for actions triggered by changes.
+* Protected secret storage.
+
+For example, an NGINX role could install the package, render and validate configuration, start the service, and reload it only when configuration changes.
+
+```bash
+ansible-playbook -i inventory.ini site.yml --check
+ansible-playbook -i inventory.ini site.yml --limit staging
+```
+
+Check mode support depends on the tasks and modules involved.
+
+Explain **idempotency**: rerunning suitable tasks should converge on the desired state without repeatedly making unnecessary changes. Not every arbitrary shell command is automatically idempotent. [Ansible playbooks](https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_intro.html)
+
+---
+
+**22. What have you done with Terraform in AWS?**
+
+A strong answer describes both the infrastructure and how you managed changes.
+
+An example project might provision:
+
+* VPCs, subnets, routes, and gateways.
+* Security groups and IAM roles.
+* EC2 launch templates and Auto Scaling groups.
+* Load balancers and target groups.
+* EKS clusters and node groups.
+* RDS, S3, and supporting encryption configuration.
+
+Then explain the workflow:
+
+1. Define reusable modules.
+2. Separate environments appropriately.
+3. Pin provider/module versions.
+4. Run formatting and validation.
+5. Review the plan.
+6. Apply the approved change.
+7. Verify the resulting service.
+
+```bash
+terraform init
+terraform validate
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+Terraform tracks resource relationships through state, so state access and concurrent changes require careful management. [Terraform overview](https://developer.hashicorp.com/terraform/intro)
+
+For an S3 backend, current Terraform supports native locking with:
+
+```hcl
+use_lockfile = true
+```
+
+DynamoDB-based locking is deprecated in the current S3 backend documentation. Protect the state bucket and enable suitable recovery/versioning controls. [Terraform S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3)
+
+---
+
+**23. What is the difference between Terraform and CloudFormation templates?**
+
+| Aspect            | Terraform                                      | CloudFormation                                           |
+| ----------------- | ---------------------------------------------- | -------------------------------------------------------- |
+| Primary scope     | Many platforms through providers               | AWS-focused, with extension support                      |
+| Configuration     | HCL or JSON                                    | YAML or JSON                                             |
+| Resource tracking | Terraform state in a configured backend        | AWS-managed stack state                                  |
+| Change preview    | `terraform plan`                               | Change sets                                              |
+| Reuse             | Modules                                        | Nested stacks, modules, and related mechanisms           |
+| Execution         | Terraform CLI or managed automation            | CloudFormation service                                   |
+| Failure behavior  | May leave successfully applied partial changes | Supports stack rollback, depending on operation/settings |
+
+Both describe desired infrastructure and manage dependencies. [Terraform overview](https://developer.hashicorp.com/terraform/intro), [CloudFormation overview](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/Welcome.html)
+
+CloudFormation change sets show proposed stack changes before execution. [CloudFormation change sets](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-updating-stacks-changesets.html)
+
+Avoid saying CloudFormation can only ever manage AWS resource types: its registry supports third-party and custom extensions. Terraform nevertheless offers a broad provider-based model across platforms. [CloudFormation registry](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/registry.html)
+
+Choose based on the environment, existing tooling, governance, team skills, and resource support.
+
+---
+
+**24. What resources are needed to expose an EC2 application to the internet?**
+
+Assuming IPv4, a basic direct-access design needs:
+
+1. A VPC.
+2. A subnet.
+3. An internet gateway attached to the VPC.
+4. A subnet route table with `0.0.0.0/0` pointing to that gateway.
+5. An EC2 instance with a public IPv4 address or Elastic IP.
+6. Security-group rules permitting the intended application traffic.
+7. Compatible network ACL and host-firewall rules.
+8. An application listening on the correct interface and port.
+
+A subnet’s internet route alone does not give an instance a public IPv4 address. [VPC internet gateway behavior](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html)
+
+For a production web application, a common design is:
+
+| Component                     | Purpose                                               |
+| ----------------------------- | ----------------------------------------------------- |
+| Public subnets across two AZs | Host the internet-facing ALB                          |
+| Internet gateway              | Internet connectivity                                 |
+| ALB listener and target group | Accept requests and select healthy targets            |
+| ACM certificate               | HTTPS                                                 |
+| Private application subnets   | Host EC2 instances                                    |
+| Auto Scaling group            | Maintain and scale application capacity               |
+| Security groups               | Allow ALB-to-application traffic on the required port |
+| DNS record                    | Provide the application’s domain name                 |
+
+The application instances can receive traffic from the ALB without having public IP addresses. [AWS public-load-balancer/private-server example](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-example-private-subnets-nat.html)
+
+A NAT gateway is an option for private instances needing outbound IPv4 internet access. **It is not required merely to receive application requests through the ALB.** Appropriate VPC endpoints can provide private access to supported AWS dependencies.
+
+---
+
+**25. What is Transit Gateway?**
+
+AWS Transit Gateway is a regional routing hub for connecting VPCs and supported network attachments, including connections to on-premises networks.
+
+It helps avoid managing a large mesh of individual VPC peering connections. [Transit Gateway overview](https://docs.aws.amazon.com/vpc/latest/tgw/what-is-transit-gateway.html)
+
+For communication between two attached VPCs:
+
+* Their relevant subnet route tables need routes to the Transit Gateway.
+* Transit Gateway route tables need routes to the destination attachments.
+* Return routes and security controls must permit the traffic.
+
+Two concepts matter:
+
+* **Association:** Selects the Transit Gateway route table used for traffic arriving from an attachment.
+* **Propagation:** Adds an attachment’s reachable prefixes to selected Transit Gateway route tables.
+
+Separate routing tables can implement different connectivity policies, such as production, development, and shared-services networks. [Transit Gateway route tables](https://docs.aws.amazon.com/vpc/latest/tgw/tgw-route-tables.html)
+
+Attaching VPCs alone does not complete the end-to-end routing configuration.
+
+---
+
+**26. What are the top five technologies you are good at?**
+
+Choose five you can defend with concrete examples. A possible list for this interview is:
+
+| Technology | Evidence to prepare                                       |
+| ---------- | --------------------------------------------------------- |
+| AWS        | A networking or infrastructure design you implemented     |
+| Kubernetes | A deployment and a difficult troubleshooting incident     |
+| Jenkins    | A pipeline or shared-library implementation               |
+| Terraform  | Reusable modules, state management, and a reviewed change |
+| Linux      | A service, network, or resource troubleshooting example   |
+
+You can substitute Ansible, Git, or observability if those better represent your strengths.
+
+For each technology, prepare a short explanation of **what you owned, one difficult problem, how you solved it, and the outcome**. Avoid selecting a tool only because it appears frequently in job descriptions.
+
+---
+
+**27. Explain Kubernetes architecture at a high level.**
+
+Kubernetes consists of a **control plane** and **worker nodes**.
+
+```mermaid
+flowchart TD
+    Client["kubectl or CI/CD"] --> API["API server"]
+    API <--> State["etcd"]
+    Scheduler["Scheduler"] <--> API
+    Controllers["Controllers"] <--> API
+    API <--> Kubelet["Kubelet on each worker"]
+    Kubelet --> Runtime["Container runtime"]
+    Runtime --> Pods["Application Pods"]
+```
+
+The major responsibilities are:
+
+* **API server:** Accepts Kubernetes API requests.
+* **etcd:** Stores cluster state.
+* **Scheduler:** Selects nodes for unscheduled Pods.
+* **Controllers:** Reconcile desired and actual state.
+* **Kubelet:** Manages assigned workloads on a node.
+* **Container runtime:** Runs containers.
+
+Networking also needs a CNI implementation and Service networking, commonly through kube-proxy or an alternative implementation. CoreDNS supplies cluster DNS.
+
+When you create a Deployment, controllers create the required Pods, the scheduler assigns nodes, and kubelets arrange for the containers to run.
+
+The API server coordinates cluster operations; normal application requests do not pass through it. [Kubernetes architecture](https://kubernetes.io/docs/concepts/architecture/)
+
+---
+
+**28. What have you done with monitoring solutions?**
+
+Explain what you collected, which problems you detected, and how monitoring changed operational decisions.
+
+An example stack is:
+
+| Requirement                        | Example implementation                                 |
+| ---------------------------------- | ------------------------------------------------------ |
+| Infrastructure/application metrics | Prometheus and CloudWatch                              |
+| Dashboards                         | Grafana or CloudWatch dashboards                       |
+| Alert routing                      | Alertmanager or CloudWatch alarms                      |
+| Centralized logs                   | CloudWatch Logs, Loki, or an Elasticsearch-based stack |
+| Distributed traces                 | OpenTelemetry with a tracing backend                   |
+
+Prometheus collects and queries time-series metrics. Alertmanager groups, deduplicates, and routes alerts. [Prometheus overview](https://prometheus.io/docs/introduction/overview/), [Alertmanager](https://prometheus.io/docs/alerting/latest/alertmanager/)
+
+Useful work to describe includes:
+
+* Instrumenting application metrics.
+* Collecting host and container metrics.
+* Building dashboards for deployments and dependencies.
+* Centralizing logs with useful correlation fields.
+* Defining alerts, ownership, and runbooks.
+* Testing alert delivery.
+* Reviewing noisy or unactionable alerts.
+
+For user-facing services, cover **latency, traffic, errors, and saturation**. CPU utilization alone does not establish whether customers are receiving a reliable service. [Google SRE monitoring guidance](https://sre.google/sre-book/monitoring-distributed-systems/)
+
+In AWS, distinguish service-provided metrics from guest metrics requiring an agent or another collector. CloudWatch supports metrics, alarms, logs, and agent-based collection. [CloudWatch overview](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html)
+
+Prepare one real incident showing how an alert led to correlated evidence, a root cause, a corrective action, and verified recovery.
+
