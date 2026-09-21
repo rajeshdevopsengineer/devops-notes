@@ -1,0 +1,617 @@
+JENKINS, AZURE PIPELINES, AND AWS CI/CD INTERVIEW QUESTIONS
+================================================================================================
+
+Source: interview questions company wise.rtf
+Extracted: 134 numbered prompts, with 11 nested follow-ups.
+Organization: 37 named companies plus the source group "Others".
+
+Includes Jenkins, Azure Pipelines/Azure DevOps, AWS CodePipeline, CodeBuild,
+CodeDeploy/appspec.yml, CodeCommit, and direct comparisons/integrations.
+General CI/CD and build/deployment questions are in the companion file
+cicd_build_deployment_questions.txt.
+
+Questions are grouped by company and labeled by topic. Wording and spelling
+have been lightly cleaned; no answers have been added. Repeated source
+entries are retained. Counts refer to numbered prompts, not unique questions
+or every individual subquestion. Scenario follow-ups and coding requirements
+remain attached to their original question.
+
+[Context] marks a platform or scenario inferred from nearby questions.
+[Relevant portion] marks the relevant part of a mixed source question.
+[Unclear] and [Missing material] mark gaps in the supplied text.
+
+TOPIC INDEX
+------------------------------------------------------------------------------------------------
+AWS CI/CD services: 5 prompts
+Question numbers: 42, 57, 58, 77, 130
+
+Azure Pipelines / Azure DevOps: 42 prompts
+Question numbers: 7, 15, 34, 35, 36, 43, 44, 45, 46, 52, 62, 63, 64, 68, 69, 70, 87, 88, 89, 90, 91,
+  92, 93, 94, 95, 102, 103, 104, 109, 114, 115, 116, 117, 118, 123, 124, 125, 126, 127, 128, 129,
+  131
+
+Jenkins: 80 prompts
+Question numbers: 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+  25, 26, 27, 28, 29, 30, 31, 32, 33, 37, 38, 47, 48, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 66,
+  67, 71, 72, 73, 74, 75, 76, 78, 79, 80, 81, 82, 83, 84, 85, 86, 96, 97, 98, 99, 100, 101, 106,
+  107, 108, 110, 111, 112, 113, 119, 120, 122, 132, 133
+
+Jenkins / AWS CI/CD: 2 prompts
+Question numbers: 121, 134
+
+Jenkins / Argo CD: 1 prompt
+Question numbers: 105
+
+Jenkins / Azure Pipelines: 3 prompts
+Question numbers: 39, 40, 41
+
+Jenkins / GitHub Actions: 1 prompt
+Question numbers: 65
+
+COMPANY INDEX
+------------------------------------------------------------------------------------------------
+Alphadyne: 1 prompt (question 1)
+Belcan: 5 prompts (questions 2-6)
+Blue Yonder: 1 prompt (question 7)
+CGI: 6 prompts (questions 8-13)
+CTS (Cognizant): 1 prompt (question 14)
+Capgemini: 1 prompt (question 15)
+Cisco: 4 prompts (questions 16-19)
+Deloitte: 14 prompts (questions 20-33)
+EPAM: 3 prompts (questions 34-36)
+Flentas: 2 prompts (questions 37-38)
+HCL: 4 prompts (questions 39-42)
+Hexaware: 4 prompts (questions 43-46)
+Infosys: 1 prompt (question 47)
+Intact Green Services: 4 prompts (questions 48-51)
+JPMorgan: 2 prompts (questions 52-53)
+Koerber Pharma: 1 prompt (question 54)
+LTIMindtree: 6 prompts (questions 55-60)
+Marsh McLennan: 1 prompt (question 61)
+NUOS INFO Systems: 2 prompts (questions 62-63)
+Nextturn: 4 prompts (questions 64-67)
+Nice: 3 prompts (questions 68-70)
+Nitor Infotech: 4 prompts (questions 71-74)
+Orion Innovation: 1 prompt (question 75)
+Others: 22 prompts (questions 76-97)
+Perfios: 1 prompt (question 98)
+Publicis Global Delivery: 1 prompt (question 99)
+Rapidsoft: 2 prompts (questions 100-101)
+RelevantZ: 3 prompts (questions 102-104)
+SAP: 1 prompt (question 105)
+Sigmoid: 3 prompts (questions 106-108)
+Sonata Software: 1 prompt (question 109)
+Sony: 2 prompts (questions 110-111)
+SquareOps: 2 prompts (questions 112-113)
+Synechron: 9 prompts (questions 114-122)
+TCS: 8 prompts (questions 123-130)
+Volkswagen Group Digital: 1 prompt (question 131)
+Wipro: 1 prompt (question 132)
+ZopSmart: 2 prompts (questions 133-134)
+
+================================================================================================
+Alphadyne
+================================================================================================
+
+1. [Jenkins] How do you configure a multibranch pipeline in Jenkins? What problems does it solve, and
+    why is it preferred over a normal SCM pipeline?
+
+
+================================================================================================
+Belcan
+================================================================================================
+
+2. [Jenkins] Write a Jenkins pipeline.
+
+3. [Jenkins] [Context] What is the purpose of the agent, post-conditions, and environment blocks in a
+    pipeline?
+
+4. [Jenkins] How do you take a complete backup of Jenkins, including jobs, configurations, and
+    authentication settings?
+
+5. [Jenkins] What are the different ways to trigger a Jenkins pipeline?
+
+6. [Jenkins] You have five Jenkins jobs. How would you give other users view-only access?
+
+
+================================================================================================
+Blue Yonder
+================================================================================================
+
+7. [Azure Pipelines / Azure DevOps] How do you integrate SonarQube and Snyk into an Azure pipeline?
+
+
+================================================================================================
+CGI
+================================================================================================
+
+8. [Jenkins] [Context] How did you reduce a pipeline from 1 hour to 20 minutes?
+
+9. [Jenkins] [Context] Write a checkout stage with Git credentials.
+
+10. [Jenkins] [Context] If everyone needs to use variables, what approach would you use?
+
+11. [Jenkins] How do you call variables in a Jenkins pipeline?
+
+12. [Jenkins] What is a Jenkins agent?
+
+13. [Jenkins] [Context] Explain CI/CD in depth and write out the stages in detail.
+
+
+================================================================================================
+CTS (Cognizant)
+================================================================================================
+
+14. [Jenkins] [Unclear] How would you automatically trigger pipeline B in Jenkins after pipeline B? (The
+    source repeats pipeline B; the intended upstream pipeline is unclear.)
+
+
+================================================================================================
+Capgemini
+================================================================================================
+
+15. [Azure Pipelines / Azure DevOps] How do you pass variables to an Azure pipeline, and how do you
+    parameterize the pipeline?
+
+
+================================================================================================
+Cisco
+================================================================================================
+
+16. [Jenkins] Explain how you would set up a multi-branch Jenkins pipeline for a GitHub repository.
+
+17. [Jenkins] How would you implement dynamic stages in a Jenkinsfile based on environment variables?
+
+18. [Jenkins] [Missing material] [Relevant portion] Explain a Jenkinsfile. (The source lists Jenkinsfile
+    as a topic without further requirements.)
+
+19. [Jenkins] [Unclear] Explain Jenkins pipeline setup for Kubernetes. If a pod is repeatedly
+    restarting, what troubleshooting steps would you follow? (The source combines these topics without
+    clearly specifying their relationship.)
+
+
+================================================================================================
+Deloitte
+================================================================================================
+
+20. [Jenkins] Explain the CI/CD workflow you follow and the kind of pipeline you use. How do you define
+    and invoke pipelines in Jenkins?
+
+21. [Jenkins] What are shared libraries in Jenkins, and how are they written and defined?
+
+22. [Jenkins] What kind of applications do you deploy using Jenkins pipelines, and what deployment tools
+    do you use?
+
+23. [Jenkins] If the Jenkins pipeline runs but the build doesn’t happen, what possible issues could be
+    causing it?
+
+24. [Jenkins] Describe your typical deployment flow and CI/CD workflow. What stages do you define in
+    your Jenkins pipeline, and how do you ensure full quality checks during deployment?
+
+25. [Jenkins] How do you use Jenkins shared libraries? Explain their typical structure and how they are
+    integrated into your Jenkinsfiles.
+
+26. [Jenkins] You have a new Jenkins installation and need to connect it to GitHub. What configuration
+    steps are required, and what connection methods are available? Can webhooks establish communication
+    immediately, or are prerequisite activities needed?
+
+27. [Jenkins] [Context] What are the different stages in a pipeline?
+
+28. [Jenkins] [Context] Can more than two stages run at the same time?
+
+29. [Jenkins] [Context] Have you written Groovy scripts from scratch? What is a declarative pipeline,
+    and how does it differ from a scripted pipeline?
+
+30. [Jenkins] You have a new Jenkins installation and need to connect it to GitHub. What configuration
+    steps are required, and what connection methods are available? Can webhooks establish communication
+    immediately, or are prerequisite activities needed?
+
+31. [Jenkins] [Context] What are the different stages in a pipeline?
+
+32. [Jenkins] [Context] Can more than two stages run at the same time?
+
+33. [Jenkins] [Context] Have you written Groovy scripts from scratch? What is a declarative pipeline,
+    and how does it differ from a scripted pipeline?
+
+
+================================================================================================
+EPAM
+================================================================================================
+
+34. [Azure Pipelines / Azure DevOps] [Context] How do you write variables in a pipeline?
+
+35. [Azure Pipelines / Azure DevOps] [Context] How do you use Terraform in a pipeline?
+
+36. [Azure Pipelines / Azure DevOps] [Context] What is the difference between classic and YAML
+    pipelines?
+
+
+================================================================================================
+Flentas
+================================================================================================
+
+37. [Jenkins] [Context] How will you pass secrets from AWS Secrets Manager to the pipeline?
+
+38. [Jenkins] [Context] Do you commit the tfvars file to Git? These parameters need to be filled in
+    while the pipeline runs. How do you manage this in Jenkins?
+
+
+================================================================================================
+HCL
+================================================================================================
+
+39. [Jenkins / Azure Pipelines] How do you integrate Azure Key Vault into Jenkins or Azure Pipelines?
+
+40. [Jenkins / Azure Pipelines] [Context] Where do you write the code or YAML file for a pipeline?
+
+41. [Jenkins / Azure Pipelines] [Unclear] [Context] After validating pipeline changes, how do you
+    schedule the pipeline for the stage/main branch? (The source is unclear about the intended
+    scheduling operation.)
+
+42. [AWS CI/CD services] [Unclear] Can you reuse the same build specification used in AWS CodeBuild?
+    (The source does not specify the intended reuse scenario.)
+
+
+================================================================================================
+Hexaware
+================================================================================================
+
+43. [Azure Pipelines / Azure DevOps] [Context] Write the overall structure of a YAML CI/CD pipeline.
+
+44. [Azure Pipelines / Azure DevOps] [Context] How do you set approvals in a CD pipeline?
+
+45. [Azure Pipelines / Azure DevOps] [Context] How do you move code from one environment to another?
+
+46. [Azure Pipelines / Azure DevOps] What is a variable group in Azure DevOps?
+
+
+================================================================================================
+Infosys
+================================================================================================
+
+47. [Jenkins] What are Jenkins and Ansible?
+
+
+================================================================================================
+Intact Green Services
+================================================================================================
+
+48. [Jenkins] Have you encountered memory issues in a Jenkins pipeline? How would you troubleshoot them?
+
+49. [Jenkins] [Context] Can you use a pod as a Jenkins agent? What are the drawbacks?
+
+50. [Jenkins] What are the different types of Jenkins pipelines?
+
+51. [Jenkins] [Context] What are the advantages of a multibranch pipeline?
+
+
+================================================================================================
+JPMorgan
+================================================================================================
+
+52. [Azure Pipelines / Azure DevOps] How do you ensure secure and dynamic secret rotation in Azure
+    DevOps pipelines?
+
+53. [Jenkins] Jenkins jobs are randomly failing at the artifact upload step. What layers would you
+    check?
+
+
+================================================================================================
+Koerber Pharma
+================================================================================================
+
+54. [Jenkins] Which Jenkins plugins have you used for CI/CD on AWS?
+
+
+================================================================================================
+LTIMindtree
+================================================================================================
+
+55. [Jenkins] A Jenkins pipeline has five stages, and the fifth stage contains a syntax error. What
+    happens when you run the pipeline?
+
+56. [Jenkins] [Context] What are the main differences between scripted and declarative pipelines?
+
+57. [AWS CI/CD services] Explain the AWS CodeCommit workflow.
+
+58. [AWS CI/CD services] What is appspec.yml used for?
+
+59. [Jenkins] How do you deploy a Python application to AWS using a Jenkins pipeline?
+
+60. [Jenkins] Your Jenkins pipeline on AWS takes a long time to run. How would you troubleshoot it?
+
+
+================================================================================================
+Marsh McLennan
+================================================================================================
+
+61. [Jenkins] How do you manage credentials in Jenkins?
+
+
+================================================================================================
+NUOS INFO Systems
+================================================================================================
+
+62. [Azure Pipelines / Azure DevOps] How do you assess Azure DevOps migration readiness and plan the
+    transition?
+
+63. [Azure Pipelines / Azure DevOps] How would you use Azure DevOps REST API to apply a security policy
+    to all repos programmatically?
+
+
+================================================================================================
+Nextturn
+================================================================================================
+
+64. [Azure Pipelines / Azure DevOps] Explain variable groups, environment variables, and secrets in
+    Azure DevOps.
+
+65. [Jenkins / GitHub Actions] Compare Jenkins and GitHub Actions.
+
+66. [Jenkins] If the Jenkins controller (master) goes down, how would you troubleshoot and restore it?
+
+67. [Jenkins] In a Jenkins pipeline, at which stage would you publish or push artifacts/images to Nexus
+    or Artifactory—pre-build, build, or post-build? Why?
+
+
+================================================================================================
+Nice
+================================================================================================
+
+68. [Azure Pipelines / Azure DevOps] What is the advantage of using a YAML file over classic build
+    pipelines in Azure DevOps?
+
+69. [Azure Pipelines / Azure DevOps] [Context] What additional advantages of YAML pipelines have you
+    experienced personally?
+
+70. [Azure Pipelines / Azure DevOps] [Context] Have you integrated Azure Key Vault into your pipelines
+    or branches in a project?
+
+
+================================================================================================
+Nitor Infotech
+================================================================================================
+
+71. [Jenkins] Explain shared libraries in Jenkins.
+
+72. [Jenkins] How is caching implemented in Jenkins in your project?
+
+73. [Jenkins] Which Jenkins version are you currently using?
+
+74. [Jenkins] [Context] How have you implemented parallelism in your pipelines?
+
+
+================================================================================================
+Orion Innovation
+================================================================================================
+
+75. [Jenkins] How would you store secrets in a Jenkins pipeline?
+
+
+================================================================================================
+Others
+================================================================================================
+
+76. [Jenkins] [Context] Explain declarative and scripted pipelines.
+
+77. [AWS CI/CD services] Do you use Dockerfiles? Do you build your container images using AWS CodeBuild?
+
+78. [Jenkins] Which type of Jenkinsfile do you use? Write an example Jenkinsfile.
+
+79. [Jenkins] What work have you done with Jenkins?
+
+80. [Jenkins] How do you integrate SonarQube with Jenkins?
+
+81. [Jenkins] How do you authenticate Jenkins to push Docker images to a registry?
+
+82. [Jenkins] Jenkins is failing to push a Docker image to the registry. How do you troubleshoot?
+
+83. [Jenkins] Explain the stages of a Jenkinsfile.
+
+84. [Jenkins] Write examples of both declarative and scripted Jenkins pipeline syntax.
+
+85. [Jenkins] How can you create a new copy of an existing Jenkins job?
+
+86. [Jenkins] What is the difference between Continuous Delivery and Continuous Deployment, and how do
+    you implement them in Jenkins?
+
+87. [Azure Pipelines / Azure DevOps] [Context] What is the difference between build artifacts and
+    pipeline artifacts? Which is better?
+
+88. [Azure Pipelines / Azure DevOps] [Context] Explain the pipeline steps to automatically move a file
+    from Azure Blob Storage to Google Cloud Storage.
+
+89. [Azure Pipelines / Azure DevOps] [Context] If a team member deletes a pipeline, how would you
+    recreate it and prevent the scenario in the future?
+
+90. [Azure Pipelines / Azure DevOps] What is the difference between a stakeholder and an administrator
+    in Azure DevOps?
+
+91. [Azure Pipelines / Azure DevOps] [Context] How would you build one or a small number of reusable
+    pipeline templates for 50 different applications?
+
+92. [Azure Pipelines / Azure DevOps] [Context] What command or pipeline syntax is used to reference the
+    output variable of a previous stage in the current stage?
+
+93. [Azure Pipelines / Azure DevOps] [Context] How is sensitive data managed in pipelines?
+
+94. [Azure Pipelines / Azure DevOps] How are authentication and networking established between an Azure
+    DevOps pipeline and Azure Key Vault?
+
+95. [Azure Pipelines / Azure DevOps] How are pipeline logs stored in Azure DevOps?
+
+96. [Jenkins] How do you copy jobs from one Jenkins worker node to another?
+
+97. [Jenkins] How do you set up communication between Jenkins and Kubernetes?
+
+
+================================================================================================
+Perfios
+================================================================================================
+
+98. [Jenkins] [Context] Do you use separate pipelines for three environments, or one pipeline for all of
+    them? Explain your approach and write a Groovy script with build, test, and deploy stages.
+
+
+================================================================================================
+Publicis Global Delivery
+================================================================================================
+
+99. [Jenkins] [Unclear] How does authentication work in a Jenkins pipeline accessing AWS with a
+    particular login, "if you have 1 logout"? (The quoted condition is unclear in the source.)
+
+
+================================================================================================
+Rapidsoft
+================================================================================================
+
+100. [Jenkins] A Jenkins CI/CD pipeline has failed. How would you investigate?
+
+101. [Jenkins] How do you store sensitive information, such as passwords, in Jenkins?
+
+
+================================================================================================
+RelevantZ
+================================================================================================
+
+102. [Azure Pipelines / Azure DevOps] Which Azure DevOps tools have you used, and where do you store the
+    output of the CI pipeline?
+
+103. [Azure Pipelines / Azure DevOps] Which steps do you create in an Azure pipeline?
+
+104. [Azure Pipelines / Azure DevOps] How do you store secrets in Azure DevOps?
+
+
+================================================================================================
+SAP
+================================================================================================
+
+105. [Jenkins / Argo CD] Why do you want to use Argo CD over Jenkins?
+
+
+================================================================================================
+Sigmoid
+================================================================================================
+
+106. [Jenkins] What is a publisher in Jenkins?
+
+107. [Jenkins] What are executors in Jenkins, and how do they work internally?
+
+108. [Jenkins] How did you configure SonarQube in your Jenkins CI pipeline? What quality gates did you
+    use, and how did you set code-coverage thresholds using the developers' test reports?
+
+
+================================================================================================
+Sonata Software
+================================================================================================
+
+109. [Azure Pipelines / Azure DevOps] How do you build a CI/CD pipeline in Azure DevOps?
+
+
+================================================================================================
+Sony
+================================================================================================
+
+110. [Jenkins] How would you configure Jenkins to run a pipeline only after N commits have been pushed?
+
+111. [Jenkins] How do you secure Jenkins pipelines?
+
+
+================================================================================================
+SquareOps
+================================================================================================
+
+112. [Jenkins] A repository has three branches: dev, staging, and prod. How do you ensure that pushing
+    to staging triggers only the staging deployment?
+    - Would you use separate pipelines or a single pipeline?
+    - How would you use branch conditions?
+    - How would you use environment variables?
+    - How would you use webhooks?
+    - Should the pipeline constantly check the repository?
+    - What type of Jenkins job is best for this scenario?
+
+113. [Jenkins] If a Jenkins job starts but gets stuck, how do you debug?
+    - Check console logs?
+    - Node resources?
+    - Agent logs?
+    - External API calls?
+    - When do you restart agent?
+
+
+================================================================================================
+Synechron
+================================================================================================
+
+114. [Azure Pipelines / Azure DevOps] Share your screen and write the structure of an Azure pipeline.
+
+115. [Azure Pipelines / Azure DevOps] How do you store credentials in Azure Pipelines?
+
+116. [Azure Pipelines / Azure DevOps] What is Azure Artifacts?
+
+117. [Azure Pipelines / Azure DevOps] [Context] What are self-hosted and Microsoft-hosted agents?
+
+118. [Azure Pipelines / Azure DevOps] [Context] What is the difference between Docker CMD and
+    ENTRYPOINT? How do you configure SonarQube with Azure?
+
+119. [Jenkins] What is Blue Ocean in Jenkins?
+
+120. [Jenkins] How do you configure Flask in Jenkins? Explain the procedure.
+
+121. [Jenkins / AWS CI/CD] How does an AWS CodePipeline differ from a Jenkins pipeline? Can you give an
+    example of when you would choose one over the other?
+
+122. [Jenkins] Can you explain how you would deploy a Kubernetes application using Jenkins? What plugins
+    or tools would you use?
+
+
+================================================================================================
+TCS
+================================================================================================
+
+123. [Azure Pipelines / Azure DevOps] What are deployment groups in Azure DevOps?
+
+124. [Azure Pipelines / Azure DevOps] [Context] How do you configure approvals in a pipeline?
+
+125. [Azure Pipelines / Azure DevOps] [Context] What is the difference between Microsoft-hosted and
+    self-hosted agents?
+
+126. [Azure Pipelines / Azure DevOps] [Context] Explain how the pipeline is triggered across different
+    environments.
+
+127. [Azure Pipelines / Azure DevOps] [Context] After a developer works on the code, what steps must the
+    developer and DevOps engineer take to run the pipeline?
+
+128. [Azure Pipelines / Azure DevOps] [Context] What is the difference between classic and YAML
+    pipelines?
+
+129. [Azure Pipelines / Azure DevOps] [Context] Explain the pipeline steps for an Angular, Java, or .NET
+    application.
+
+130. [AWS CI/CD services] [Missing material] Explain the AWS architecture shown in the diagram,
+    involving CodePipeline, CodeBuild, CodeDeploy, CloudFormation, and CloudWatch. [The referenced
+    diagram is not present in the attached text.]
+
+
+================================================================================================
+Volkswagen Group Digital
+================================================================================================
+
+131. [Azure Pipelines / Azure DevOps] Which other Azure DevOps services would you like to learn?
+
+
+================================================================================================
+Wipro
+================================================================================================
+
+132. [Jenkins] A Jenkins deployment pipeline fails in production but works in dev. How would you
+    troubleshoot and fix it?
+
+
+================================================================================================
+ZopSmart
+================================================================================================
+
+133. [Jenkins] Write a declarative pipeline for a Jenkins server.
+
+134. [Jenkins / AWS CI/CD] You use the open-source Jenkins server. Which AWS service could you use to
+    implement a CI/CD pipeline?
