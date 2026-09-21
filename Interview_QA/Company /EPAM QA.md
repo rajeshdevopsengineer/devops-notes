@@ -857,3 +857,741 @@ How it works:
 `grep` returns `1` when it finds no matches. The script treats that as normal while preserving actual command failures.
 
 I verified mixed-case and overlapping matches, filenames containing spaces, empty input, no matches, missing files, and missing arguments.
+
+
+Below are detailed answers for the **EPAM AWS DevOps Engineer interview set**. Commands use illustrative resource names and IDs.
+
+**1. What is the difference between ALB and NLB?**
+
+| Aspect            | Application Load Balancer—ALB                          | Network Load Balancer—NLB                                                                     |
+| ----------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| Primary layer     | Layer 7: application                                   | Layer 4: transport                                                                            |
+| Common protocols  | HTTP and HTTPS, including WebSocket and gRPC support   | TCP, TLS, UDP, and other supported transport protocols                                        |
+| Routing decisions | Hostname, URL path, headers, and other HTTP conditions | Transport connections and flows                                                               |
+| Addressing        | DNS name; underlying IP addresses can change           | Static addresses per enabled Availability Zone; optional Elastic IPs for internet-facing IPv4 |
+| TLS               | HTTPS termination                                      | TLS termination or TCP forwarding for TLS passthrough                                         |
+| Typical use       | Websites, APIs, microservices                          | TCP/UDP applications, static-IP requirements, transport-level workloads                       |
+| AWS WAF           | Direct integration                                     | No direct WAF association                                                                     |
+
+Use an **ALB** when requests to `/orders` and `/payments` must reach different application target groups. Use an **NLB** when exposing a TCP application or when clients require stable IP addresses. [ALB overview](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html), [NLB overview](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/introduction.html)
+
+Both support health checks. NLB also supports security groups; an older interview answer claiming that it never supports them is incorrect. The creation-time restriction is discussed in question 14.
+
+**2. What is the purpose of a VPC endpoint? Give a use case.**
+
+A VPC endpoint provides private connectivity to supported services or resources without requiring that traffic to use an internet gateway or NAT gateway.
+
+Two common endpoint types are:
+
+| Type               | How it works                                                                                  | Common example                                                      |
+| ------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Gateway endpoint   | Adds service-prefix routes to selected VPC route tables                                       | S3 or DynamoDB                                                      |
+| Interface endpoint | Provides endpoint network interfaces with private addresses; applications connect through DNS | Secrets Manager, Systems Manager, and many other supported services |
+
+Gateway endpoints do not use AWS PrivateLink. Interface endpoints do. Additional endpoint types support other connectivity patterns. [VPC endpoint concepts](https://docs.aws.amazon.com/vpc/latest/privatelink/concepts.html)
+
+**Example:** An EC2 application in a private subnet needs to retrieve files from S3.
+
+I would:
+
+1. Create an S3 gateway endpoint.
+2. Associate the application subnet’s route table.
+3. Configure the endpoint policy for the required buckets.
+4. Give the application’s IAM role the required S3 permissions.
+5. Apply any required bucket-policy restrictions.
+6. Test access from the application.
+
+This can avoid NAT processing for that S3 traffic. An endpoint provides connectivity; it does not replace IAM authorization. [Gateway endpoints](https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html)
+
+**3. Can you obtain AMI details from a snapshot?**
+
+**Sometimes, by finding an accessible AMI that references the snapshot.** A snapshot itself is not a complete AMI metadata record.
+
+For an EBS-backed AMI, its block-device mappings contain snapshot IDs. Search those mappings in the snapshot’s Region:
+
+```bash
+aws ec2 describe-images \
+  --region ap-south-1 \
+  --owners self \
+  --filters \
+    "Name=block-device-mapping.snapshot-id,Values=snap-0123456789abcdef0" \
+  --query 'Images[].{AMI:ImageId,Name:Name,State:State}'
+```
+
+`--owners self` limits this search to your account’s AMIs. Results depend on Region, permissions, and image visibility. [DescribeImages filters](https://docs.aws.amazon.com/cli/latest/reference/ec2/describe-images.html)
+
+Limitations:
+
+* A snapshot can exist without an AMI referencing it.
+* An AMI can be deregistered while its snapshots remain.
+* A copied snapshot might not preserve a discoverable relationship to the original AMI.
+* A snapshot’s description can provide clues, but should not be treated as authoritative inventory.
+
+A suitable snapshot containing a bootable root volume can also be used to register a **new** AMI with the required boot and platform settings. An arbitrary data-volume snapshot does not become bootable merely by registering it.
+
+**4. How do you monitor load-balancer health using AWS services?**
+
+Use **CloudWatch** for ongoing monitoring and **target health information** for diagnosis.
+
+For an ALB, useful metrics include:
+
+| Metric                      | What it helps detect                  |
+| --------------------------- | ------------------------------------- |
+| `HealthyHostCount`          | Available backend capacity            |
+| `UnHealthyHostCount`        | Failing health checks                 |
+| `TargetResponseTime`        | Backend latency                       |
+| `HTTPCode_ELB_5XX_Count`    | Errors generated by the load balancer |
+| `HTTPCode_Target_5XX_Count` | Errors returned by applications       |
+| `RequestCount`              | Traffic volume                        |
+
+Build dashboards and alarms with appropriate dimensions, statistics, and evaluation periods. For example, alert when healthy capacity falls below the application’s availability requirement. [ALB CloudWatch metrics](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-cloudwatch-metrics.html)
+
+Inspect individual targets:
+
+```bash
+aws elbv2 describe-target-health \
+  --target-group-arn "<target-group-arn>"
+```
+
+Check reason codes such as failed connections, timeouts, and response-code mismatches.
+
+For NLBs, monitor protocol-appropriate metrics such as active flows, healthy targets, and TCP reset counts. [NLB CloudWatch metrics](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-cloudwatch-metrics.html)
+
+Finally, use an external or synthetic application check. A healthy target does not prove that a complete customer transaction succeeds.
+
+**5. What are the different types of instance profiles?**
+
+The term needs clarification: in IAM, an **instance profile is a container for an IAM role that EC2 uses**.
+
+AWS does not define standard profile categories such as “compute profile” or “memory profile.” Those usually refer to instance families.
+
+You create profiles according to workload permissions, for example:
+
+| Example profile        | Associated role’s purpose                                   |
+| ---------------------- | ----------------------------------------------------------- |
+| Application profile    | Read particular S3 objects and retrieve application secrets |
+| Operations profile     | Support Systems Manager management                          |
+| Image-building profile | Permit required image-build operations and logging          |
+
+An instance profile contains **one IAM role**. That role can have multiple policies. An EC2 instance can have one associated instance profile, while the same profile can be used by multiple instances.
+
+Applications obtain temporary role credentials through the supported AWS credential mechanisms, avoiding embedded long-lived access keys. [IAM instance profiles](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2_instance-profiles.html)
+
+**6. What is the difference between an AMI and a snapshot?**
+
+| Aspect                 | AMI                                                                                   | EBS snapshot                                              |
+| ---------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| Purpose                | Describe an image from which EC2 instances can launch                                 | Preserve the contents of an EBS volume at a point in time |
+| Contains or references | Boot metadata, architecture, block-device mappings, and—for EBS-backed AMIs—snapshots | Volume data                                               |
+| Typical operation      | Launch an instance                                                                    | Restore an EBS volume                                     |
+| Common use             | Standardized application or operating-system images                                   | Backup and recovery                                       |
+| Relationship           | Can reference multiple snapshots                                                      | Can be referenced by an AMI                               |
+
+An EBS snapshot is incremental in storage, but it contains the information needed to restore its point-in-time volume state. [EBS snapshots](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-snapshots.html)
+
+An AMI does not reproduce an entire deployment’s VPC, security groups, IAM configuration, load balancer, and scaling policies. Those should be captured separately, usually in infrastructure code. [Amazon Machine Images](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/AMIs.html)
+
+**7. The team changes the AMI in an ASG launch template. How do you ensure the new version is deployed correctly?**
+
+**Creating a launch-template version does not replace existing instances.**
+
+I would use a controlled rolling **Instance Refresh**:
+
+1. Validate the AMI in a test instance or environment.
+2. Create an explicit, numbered launch-template version referencing the approved AMI.
+3. Start Instance Refresh with that version as its desired configuration.
+4. Configure healthy-capacity limits, warmup, and sufficient temporary capacity.
+5. Use checkpoints or a bake period to validate the rollout.
+6. Check application health, error rates, latency, and actual user transactions.
+7. Confirm that the active fleet uses the intended AMI and launch-template version. [Instance Refresh behavior](https://docs.aws.amazon.com/autoscaling/ec2/userguide/instance-refresh-overview.html)
+
+For example, inspect the instances’ AMIs:
+
+```bash
+aws ec2 describe-instances \
+  --filters \
+    "Name=tag:aws:autoscaling:groupName,Values=web-asg" \
+    "Name=instance-state-name,Values=running" \
+  --query \
+    'Reservations[].Instances[].{Instance:InstanceId,AMI:ImageId}'
+```
+
+Configure automatic rollback with suitable CloudWatch alarms where supported. Rollback requires an explicit desired configuration, and previous launch-template references must use numbered versions rather than `$Latest` or `$Default`.
+
+If the ASG was already changed before the refresh began, verify the rollback target: the pre-refresh configuration may already reference the new AMI. [Instance Refresh rollback](https://docs.aws.amazon.com/autoscaling/ec2/userguide/instance-refresh-rollback.html)
+
+**8. Is `170.90.00.9/0` public or private?**
+
+First, normalize the notation carefully. The spaces and leading-zero octet in the original example can cause strict parsers to reject it. Assuming the intended address is **`170.90.0.9/0`**:
+
+* The address `170.90.0.9` is in public address space, outside RFC 1918 private ranges.
+* The prefix `/0` represents **all IPv4 addresses**.
+* Its canonical network is `0.0.0.0/0`.
+
+Therefore, distinguish the **individual address** from the **network prefix**:
+
+| Item         | Meaning                                                    |
+| ------------ | ---------------------------------------------------------- |
+| `170.90.0.9` | Individual address outside private address space           |
+| `0.0.0.0/0`  | All IPv4 destinations, including public and private ranges |
+
+A `/0` route is commonly used as a default route. It does not make an individual resource publicly reachable.
+
+**9. How do you determine whether an IPv4 address is public or private?**
+
+First check whether it belongs to an RFC 1918 private range:
+
+| CIDR             | Address range                   |
+| ---------------- | ------------------------------- |
+| `10.0.0.0/8`     | `10.0.0.0`–`10.255.255.255`     |
+| `172.16.0.0/12`  | `172.16.0.0`–`172.31.255.255`   |
+| `192.168.0.0/16` | `192.168.0.0`–`192.168.255.255` |
+
+Not every `172.x.x.x` or `192.x.x.x` address is private. [RFC 1918](https://www.rfc-editor.org/rfc/rfc1918.html)
+
+Then check special-purpose ranges. For example:
+
+* `127.0.0.0/8`: loopback.
+* `169.254.0.0/16`: link-local.
+* `100.64.0.0/10`: shared address space.
+* Other ranges are reserved for documentation, multicast, or special uses.
+
+**Outside RFC 1918 does not automatically mean ordinary public unicast space.** Consult the IANA registry when classification is unclear. Reachability is a separate issue controlled by routing and security. [IANA IPv4 special-purpose registry](https://www.iana.org/assignments/iana-ipv4-special-registry/)
+
+**10. Is `192.90.90.88/12` private or a host address?**
+
+These describe different properties: a host address can be public or private.
+
+For this example:
+
+| Property                  | Value            |
+| ------------------------- | ---------------- |
+| Address                   | `192.90.90.88`   |
+| Private RFC 1918 address? | No               |
+| Network                   | `192.80.0.0/12`  |
+| Subnet mask               | `255.240.0.0`    |
+| Broadcast address         | `192.95.255.255` |
+
+`192.90.90.88` has host bits set within that `/12` network. It is not the network address.
+
+The private `192` range is specifically `192.168.0.0/16`; the entire `192.0.0.0/8` range is not private. I verified the subnet calculation programmatically.
+
+**11. What is Transit Gateway in AWS?**
+
+Transit Gateway—TGW—is a regional routing hub that connects VPCs and other networks, including VPN and Direct Connect connectivity.
+
+A typical setup requires:
+
+1. Create the TGW.
+2. Create attachments for the participating networks.
+3. Associate attachments with TGW route tables.
+4. Configure route propagation or static routes.
+5. Add routes in VPC subnet route tables for remote networks through the TGW.
+6. Configure return routing and security controls.
+
+Two concepts matter:
+
+* **Association:** selects the TGW route table used for traffic arriving from an attachment.
+* **Propagation:** adds an attachment’s advertised routes to selected TGW route tables.
+
+An attachment can associate with one TGW route table and propagate to multiple tables. This enables network segmentation instead of automatically allowing every attached VPC to communicate. [How Transit Gateway works](https://docs.aws.amazon.com/vpc/latest/tgw/how-transit-gateways-work.html)
+
+**12. After connecting VPCs through TGW, how do you block A-to-B and B-to-C traffic?**
+
+Use **TGW route-table segmentation**, optionally with explicit blackhole routes.
+
+Assume:
+
+* A: `10.10.0.0/16`
+* B: `10.20.0.0/16`
+* C: `10.30.0.0/16`
+
+For complete isolation between A–B and B–C, while preserving A–C communication:
+
+| Incoming attachment’s table | Destination A | Destination B | Destination C |
+| --------------------------- | ------------- | ------------- | ------------- |
+| RT-A, associated with A     | —             | Blackhole     | Attachment C  |
+| RT-B, associated with B     | Blackhole     | —             | Blackhole     |
+| RT-C, associated with C     | Attachment A  | Blackhole     | —             |
+
+Implementation steps:
+
+1. Create and associate the route tables.
+2. Disable unwanted automatic propagation into them.
+3. Add only permitted routes.
+4. Add blackhole routes where explicit drops are useful.
+5. Check VPC routes, return paths, and alternate connectivity.
+
+AWS supports TGW blackhole routes that discard matching traffic. [TGW blackhole routes](https://docs.aws.amazon.com/vpc/latest/tgw/tgw-create-static-route.html)
+
+Cover every relevant CIDR, and check for more-specific routes that could override a broader routing decision.
+
+TGW routing is destination-based and is not a stateful firewall. If the requirement concerns ports, applications, or connection initiation while permitting responses, combine routing with security groups or appropriate firewall inspection.
+
+**13. How can an EC2 instance in a private subnet receive inbound traffic?**
+
+For a public web application, place an **internet-facing load balancer in public subnets** and register the private EC2 instance as a target.
+
+The request path is:
+
+1. The client reaches the public ALB.
+2. The ALB connects to the instance’s private address.
+3. The application returns its response through that connection.
+
+Configure:
+
+* Public subnet routing for the ALB.
+* An HTTPS listener and target group.
+* ALB security-group rules for permitted clients.
+* Instance security-group rules allowing the application port **from the ALB security group**.
+* Working health checks.
+
+The EC2 instance does not require a public IP. [ALB security-group configuration](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-update-security-groups.html)
+
+Other requirements use different paths:
+
+* Corporate access: VPN or Direct Connect, potentially through an internal load balancer.
+* Administration: Systems Manager Session Manager can provide access without opening inbound SSH. [Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html)
+
+A NAT gateway is not the mechanism for unsolicited inbound access.
+
+**14. How would you apply tight security to a load balancer?**
+
+I would configure security at the network, TLS, application, and operational layers:
+
+* Expose only required listeners and ports.
+* Use HTTPS with ACM certificates and an appropriate TLS policy.
+* Restrict source networks where the application’s audience allows it.
+* Permit backend traffic only from the load balancer’s security group.
+* Protect HTTP applications with suitable WAF rules.
+* Use application authentication or supported ALB authentication features.
+* Enable logs and alarms for failures and suspicious activity.
+* Restrict IAM permissions for modifying listeners, certificates, and rules.
+* If CloudFront fronts the application, prevent clients from bypassing its origin protections.
+
+For NLBs, associate security groups **when creating the load balancer**. An NLB created without security groups cannot have them added later. [NLB security groups](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-security-groups.html)
+
+AWS WAF can protect supported HTTP entry points such as ALBs and CloudFront distributions; it cannot attach directly to an NLB. [WAF-supported resources](https://docs.aws.amazon.com/waf/latest/developerguide/how-aws-waf-works-resources.html)
+
+**15. Can different subpages use multiple load balancers?**
+
+Yes, but the design depends on whether you mean **subdomains** or **URL paths**.
+
+| Requirement                                     | Suitable design                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------- |
+| `shop.example.com` and `admin.example.com`      | Separate DNS records can point to different load balancers          |
+| `example.com/shop` and `example.com/admin`      | One ALB can route paths to different target groups                  |
+| One hostname with paths served by separate ALBs | CloudFront can route different cache behaviors to different origins |
+
+For a single ALB:
+
+| Rule       | Destination                 |
+| ---------- | --------------------------- |
+| `/api/*`   | API target group            |
+| `/admin/*` | Administration target group |
+| Default    | Frontend target group       |
+
+Listener rules support HTTP-aware routing. [ALB listener rules](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-rules.html)
+
+DNS does not see the URL path, so Route 53 cannot independently route `/api` and `/admin` under the same hostname. Use an HTTP-aware routing layer for that requirement.
+
+**16. What is EC2 user data?**
+
+User data supplies initialization instructions when an instance launches.
+
+Typical tasks include:
+
+* Installing software.
+* Writing configuration.
+* Starting services.
+* Registering the instance with management systems.
+* Retrieving application configuration.
+
+Example for Amazon Linux 2023, assuming package-repository access:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+dnf install -y nginx
+
+printf '%s\n' 'Application is healthy' \
+  > /usr/share/nginx/html/index.html
+
+systemctl enable --now nginx
+```
+
+For typical Linux cloud-init configurations, user-data scripts run as root during the initial boot, rather than automatically on every reboot.
+
+Useful troubleshooting commands:
+
+```bash
+sudo cloud-init status --long
+sudo tail -n 100 /var/log/cloud-init-output.log
+sudo journalctl -u cloud-final
+```
+
+Keep scripts repeatable where practical, and retrieve secrets using the instance role instead of embedding passwords in user data.
+
+For fast ASG launches, preinstall substantial dependencies into the AMI and keep boot-time configuration small. [EC2 user data](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html)
+
+**17. How do you extract critical information from VPC Flow Logs?**
+
+Start with an operational question, such as:
+
+* Which traffic is being rejected?
+* Which hosts send the most data?
+* Are unexpected systems accessing sensitive ports?
+* Is the expected source reaching the intended interface?
+* Are log-delivery gaps present?
+
+Useful fields include source and destination addresses, ports, protocol, action, bytes, packets, interface ID, timestamps, and log status. Packet-level address fields help investigate traffic passing through intermediate devices. [Flow-log fields](https://docs.aws.amazon.com/vpc/latest/userguide/flow-log-records.html)
+
+With CloudWatch Logs Insights and discovered VPC Flow Log fields:
+
+```sql
+filter action = "REJECT"
+| stats count(*) as flowRecords,
+        sum(bytes) as totalBytes
+  by srcAddr, dstAddr, dstPort
+| sort flowRecords desc
+| limit 20
+```
+
+For a particular IP:
+
+```sql
+fields @timestamp, srcAddr, dstAddr, dstPort, action, bytes
+| filter srcAddr = "10.20.1.10" or dstAddr = "10.20.1.10"
+| sort @timestamp desc
+| limit 100
+```
+
+Custom formats may require explicit parsing. [CloudWatch query examples](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax-examples.html)
+
+Flow records aggregate traffic; their count is not necessarily a connection or request count. Correlate results with security rules, application logs, and the expected network design.
+
+**18. What is the difference between Fargate and EKS worker nodes?**
+
+Within EKS, the comparison is between **Fargate-backed pods** and **EC2-backed worker nodes**. Fargate is a compute option, not an alternative to the Kubernetes API.
+
+| Aspect                | EKS on Fargate                                | EKS on EC2 workers                                     |
+| --------------------- | --------------------------------------------- | ------------------------------------------------------ |
+| Host management       | AWS manages underlying compute                | Responsibilities depend on the node-management model   |
+| Capacity              | Allocated for eligible pods                   | Shared across pods on instances                        |
+| Scheduling selection  | Fargate profiles select namespaces and labels | Kubernetes scheduling onto eligible nodes              |
+| DaemonSets            | Unsupported                                   | Supported                                              |
+| Privileged containers | Unsupported                                   | Possible when permitted                                |
+| GPU workloads         | Unsupported                                   | Supported with appropriate instances and software      |
+| EBS volumes for pods  | Unsupported                                   | Supported through appropriate CSI configuration        |
+| Control               | Less host-level control                       | More flexibility over instances and node configuration |
+
+Fargate can suit workloads that fit its capabilities and benefit from reduced host administration. EC2 workers suit workloads requiring specialized hardware, host agents, particular storage, or greater compute control.
+
+Evaluate workload compatibility, utilization, and operational requirements. EKS Fargate can use supported EFS configurations, but that does not make it equivalent to EC2 storage support. [EKS Fargate considerations](https://docs.aws.amazon.com/eks/latest/userguide/fargate.html)
+
+**19. How do you update an EKS cluster?**
+
+I would use a staged upgrade process:
+
+1. Review the target version, upgrade insights, and deprecated APIs.
+2. Check controllers, admission webhooks, CRDs, and add-on compatibility.
+3. Test in a representative non-production environment.
+4. Confirm backups, recovery procedures, subnet IP capacity, and spare compute.
+5. Prepare required add-ons and worker-version prerequisites.
+6. Upgrade the control plane **one minor version at a time**.
+7. Update worker nodes and add-ons in the tested, compatible sequence.
+8. Drain old workers gradually while respecting disruption budgets.
+9. Verify application transactions, DNS, networking, storage, and observability.
+
+Use sufficient replicas, topology distribution, readiness checks, graceful shutdown, and appropriate PDBs to preserve application availability during worker replacement. Do not assume a control-plane upgrade automatically updates every node and add-on. [EKS upgrade process](https://docs.aws.amazon.com/eks/latest/userguide/update-cluster.html)
+
+Current AWS documentation supports rolling eligible control planes back one minor version within **seven days** of an in-place upgrade. Compatibility and eligibility conditions apply; worker nodes and add-ons need separate consideration. [EKS rollback requirements](https://docs.aws.amazon.com/eks/latest/userguide/rollback-cluster.html)
+
+**20. ASG launches instances, but terminates them during their two-to-three-minute initialization. How do you prevent this?**
+
+First inspect **ASG activity history** and target-health reasons. Determine whether the termination is caused by failed health checks, scale-in, Spot interruption, or another event.
+
+If healthy instances are being replaced because the application is still starting, configure these controls appropriately:
+
+| Control                   | Purpose                                                                                               |
+| ------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Health-check grace period | Gives a newly InService instance time before initialization-related health failures cause replacement |
+| Default instance warmup   | Stabilizes scaling decisions while new capacity starts contributing useful metrics                    |
+| Launch lifecycle hook     | Holds an instance in `Pending:Wait` until bootstrap completes                                         |
+| Warm pool or prebuilt AMI | Reduces time needed to provide usable capacity                                                        |
+
+Example:
+
+```bash
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name web-asg \
+  --health-check-grace-period 300 \
+  --default-instance-warmup 300
+```
+
+The values are illustrative; use measured startup time plus health-check stabilization.
+
+**Warmup does not replace the health-check grace period.** They control different behavior. Also, grace periods do not suppress every failure—for example, an instance leaving the EC2 running state can still be replaced. [Health-check grace period](https://docs.aws.amazon.com/autoscaling/ec2/userguide/health-check-grace-period.html), [instance warmup](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-default-instance-warmup.html)
+
+For complex initialization, complete the launch lifecycle action only after bootstrap succeeds. [ASG lifecycle hooks](https://docs.aws.amazon.com/autoscaling/ec2/userguide/lifecycle-hooks.html)
+
+**21. Traffic is high every day from 5 PM to 8 PM. How would you configure ASG?**
+
+Use **scheduled scaling** to prepare capacity before the peak, and retain dynamic scaling for variations.
+
+Example using `Asia/Kolkata`:
+
+```bash
+aws autoscaling put-scheduled-update-group-action \
+  --auto-scaling-group-name web-asg \
+  --scheduled-action-name prepare-evening-peak \
+  --recurrence "55 16 * * *" \
+  --time-zone "Asia/Kolkata" \
+  --min-size 10 \
+  --desired-capacity 10 \
+  --max-size 30
+```
+
+Restore the lower baseline after the peak:
+
+```bash
+aws autoscaling put-scheduled-update-group-action \
+  --auto-scaling-group-name web-asg \
+  --scheduled-action-name restore-normal-baseline \
+  --recurrence "5 20 * * *" \
+  --time-zone "Asia/Kolkata" \
+  --min-size 2 \
+  --desired-capacity 2 \
+  --max-size 30
+```
+
+These capacities are illustrative. Determine them through load testing, allow sufficient startup time, and account for active requests or queued work before reducing capacity.
+
+ASG recurring schedules use five-field cron expressions and support named time zones. Use the business’s actual time zone rather than relying on the default UTC behavior. [Scheduled scaling](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-scheduled-scaling.html)
+
+**22. Can one VPC have CIDR blocks from both the `172` and `192` series?**
+
+**The complete CIDRs matter.**
+
+A VPC supports multiple IPv4 CIDR blocks, but AWS imposes association restrictions.
+
+If you mean combining:
+
+* `172.20.0.0/16`, from the private `172.16.0.0/12` range, and
+* `192.168.0.0/16`, from the other private range,
+
+**AWS’s documented association restrictions prohibit that combination in one VPC.**
+
+A permitted example, assuming no other conflicts, is:
+
+```text
+Primary:   172.20.0.0/16
+Secondary: 172.21.0.0/16
+```
+
+Both belong to the same permitted private range and do not overlap.
+
+Also check:
+
+* Existing routes and connected-network overlap.
+* CIDR association quotas.
+* Allowed IPv4 block sizes.
+* Whether additional subnets need to be created.
+
+Adding a secondary CIDR does not enlarge an existing subnet. AWS adds a corresponding local route when the CIDR is associated. [VPC CIDR association restrictions](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cidr-blocks.html)
+
+**23. How do you customize AWS WAF?**
+
+Configure a web ACL with managed rules and application-specific rules.
+
+Typical customizations include:
+
+| Requirement                                    | Rule approach                                            |
+| ---------------------------------------------- | -------------------------------------------------------- |
+| Block known unwanted sources                   | IP sets                                                  |
+| Protect login endpoints from excessive traffic | Rate-based rule scoped to login paths                    |
+| Detect common injection patterns               | Suitable managed rules or custom inspection              |
+| Restrict administrative URLs                   | Path conditions combined with approved-source conditions |
+| Inspect application-specific headers           | Header or regex matching                                 |
+| Apply different behavior to selected traffic   | Rule scope and logical conditions                        |
+
+A practical deployment process is:
+
+1. Define the protected application and expected traffic.
+2. Add suitable managed rules.
+3. Add narrowly scoped custom rules.
+4. Set priorities deliberately.
+5. Evaluate new rules in **Count** mode.
+6. Review false positives and tune.
+7. Enable blocking or other appropriate actions.
+8. Monitor logs and metrics.
+
+An early terminating Allow rule can bypass later inspection, so exceptions must be carefully scoped. [WAF rules](https://docs.aws.amazon.com/waf/latest/developerguide/waf-rules.html)
+
+Use the correct regional or CloudFront scope and test changes before enforcement. [WAF configuration guidance](https://docs.aws.amazon.com/waf/latest/developerguide/web-acl.html)
+
+**24. How would you configure CloudFront?**
+
+CloudFront distributes content through edge locations and can cache responses to reduce origin traffic and latency.
+
+For a website with static assets and an API:
+
+| Path        | Origin              | Typical caching approach                                                    |
+| ----------- | ------------------- | --------------------------------------------------------------------------- |
+| `/static/*` | S3                  | Cache versioned assets                                                      |
+| `/api/*`    | ALB or API endpoint | Disable caching initially, or design it carefully around response semantics |
+
+Configuration steps:
+
+1. Create the distribution and origins.
+2. Configure ordered cache behaviors and the default behavior.
+3. Define cache keys, TTLs, and origin-request forwarding.
+4. Require or redirect viewers to HTTPS.
+5. Configure the custom domain and certificate.
+6. Add Route 53 alias records.
+7. Configure origin access restrictions, WAF, logging, and monitoring.
+8. Test cache hits, misses, authentication, and error handling. [CloudFront cache behaviors](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DownloadDistValuesCacheBehavior.html)
+
+For a private S3 origin, use **Origin Access Control—OAC** and an appropriately restricted bucket policy. OAC applies to supported S3 bucket origins, not S3 website endpoints. [Restricting S3 origin access](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html)
+
+For viewer HTTPS with an ACM certificate, request or import the certificate in **`us-east-1`**. [CloudFront certificate requirements](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cnames-and-https-requirements.html)
+
+Avoid sharing cached authenticated responses between users through an incorrectly designed cache policy.
+
+**25. What is EC2 Image Builder?**
+
+EC2 Image Builder automates the creation, testing, and distribution of AMIs and container images.
+
+Its main building blocks include:
+
+| Component                    | Purpose                                                          |
+| ---------------------------- | ---------------------------------------------------------------- |
+| Recipe                       | Base image and selected build components                         |
+| Build components             | Install, patch, and configure software                           |
+| Test components              | Validate the resulting image                                     |
+| Infrastructure configuration | Build-instance settings, IAM, networking, and logging            |
+| Distribution configuration   | Destination Regions, accounts, and related distribution settings |
+| Pipeline/workflow            | Coordinate and schedule the process                              |
+
+Example use case:
+
+A pipeline starts from an approved Linux image, installs the application runtime and monitoring agent, applies configuration, tests startup, and distributes the approved AMI.
+
+The deployment pipeline then references that AMI in a new launch-template version and performs a controlled rollout.
+
+This reduces boot-time work and produces repeatable images. Image Builder can validate images before distribution; application deployment still needs its own rollout controls. [EC2 Image Builder](https://docs.aws.amazon.com/imagebuilder/latest/userguide/what-is-image-builder.html)
+
+**26. What are the different types of EC2 instances?**
+
+Instance families are designed around different resource requirements.
+
+| Category                   | Example family prefixes | Typical use                                              |
+| -------------------------- | ----------------------- | -------------------------------------------------------- |
+| General purpose            | M, T                    | Application servers and balanced workloads               |
+| Compute optimized          | C                       | CPU-intensive processing                                 |
+| Memory optimized           | R, X                    | Memory-intensive databases and analytics                 |
+| Storage optimized          | I, D                    | High local-storage throughput or IOPS                    |
+| Accelerated computing      | G, P, Inf, Trn          | Graphics, machine learning, and specialized acceleration |
+| High-performance computing | Hpc                     | Suitable scientific and engineering workloads            |
+
+T-family instances are burstable, so CPU-credit behavior matters.
+
+Choose using measured requirements: memory, CPU, architecture, EBS bandwidth, network performance, local storage, and workload compatibility—not CPU count alone. [EC2 instance types](https://docs.aws.amazon.com/ec2/latest/instancetypes/instance-types.html)
+
+Instance families, IAM instance profiles, and purchasing options such as Spot are separate concepts.
+
+**27. If VPC Flow Logs are stored in S3, how do you inspect them?**
+
+For occasional inspection, retrieve an individual log object and open it using a tool compatible with its format and compression.
+
+For regular analysis, use **Athena**:
+
+1. Define a table matching the flow-log schema and S3 layout.
+2. Register it in the catalog.
+3. Configure partitions or partition projection.
+4. Grant the required S3, catalog, query-output, and applicable KMS access.
+5. Run SQL queries filtered to relevant accounts, Regions, and dates.
+
+Example, assuming these columns and a `yyyy/MM/dd` day partition:
+
+```sql
+SELECT
+    srcaddr,
+    dstaddr,
+    dstport,
+    action,
+    COUNT(*) AS flow_records,
+    SUM(bytes) AS total_bytes
+FROM vpc_flow_logs
+WHERE day = '2026/09/21'
+  AND (
+      srcaddr = '10.20.1.10'
+      OR dstaddr = '10.20.1.10'
+  )
+GROUP BY srcaddr, dstaddr, dstport, action
+ORDER BY total_bytes DESC
+LIMIT 50;
+```
+
+Match the schema to the actual configured fields. Use partition filters to limit scans; suitable Parquet delivery can also improve analytical efficiency. [Athena VPC Flow Log queries](https://docs.aws.amazon.com/athena/latest/ug/vpc-flow-logs-partition-projection.html)
+
+**28. How would you configure API Gateway?**
+
+First select the API product based on requirements:
+
+* **HTTP API:** commonly suitable for straightforward HTTP or Lambda integrations.
+* **REST API:** supports additional capabilities such as usage plans, request validation, direct WAF integration, and private API endpoints.
+* **WebSocket API:** supports persistent bidirectional messaging. [HTTP versus REST APIs](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-vs-rest.html)
+
+For an HTTP API backed by Lambda:
+
+1. Create the API.
+2. Define routes, such as `GET /orders` and `POST /orders`.
+3. Create and attach the Lambda integration.
+4. Grant API Gateway permission to invoke the function.
+5. Configure appropriate authorization.
+6. Configure required CORS behavior.
+7. Deploy to a stage.
+8. Configure a custom domain, certificate, and DNS.
+9. Enable access logs, metrics, and appropriate throttling.
+10. Test successful requests, invalid inputs, unauthorized requests, and backend failures.
+
+For private backends, use a supported VPC Link integration—for example, to an internal ALB. A private backend integration does not by itself make the API’s client-facing endpoint private. [HTTP API private integrations](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-private.html)
+
+API keys support identification and usage-management functions; they should not replace proper user authentication and authorization.
+
+**29. What is the difference between private and public IP addresses?**
+
+For conventional IPv4 networking:
+
+| Aspect                  | Private address                                 | Public address                                  |
+| ----------------------- | ----------------------------------------------- | ----------------------------------------------- |
+| Typical address space   | RFC 1918 ranges                                 | Publicly allocated address space                |
+| Uniqueness              | Can be reused in separate networks              | Must be globally coordinated for public routing |
+| Public internet routing | Not directly routed as private space            | Can participate in public routing               |
+| Typical use             | Internal application and database communication | Public-facing network endpoints                 |
+
+A public IP does not automatically make a service accessible. Routing, security groups, NACLs, listeners, and application behavior still matter.
+
+In AWS, direct EC2 IPv4 internet connectivity ordinarily requires the appropriate public-address mapping and internet-gateway route, with security controls permitting the traffic.
+
+AWS also uses “private IP” for an interface’s VPC-side address even when the VPC uses a non-RFC-1918 CIDR. Keep address classification separate from AWS interface terminology and actual reachability. [VPC addressing considerations](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cidr-blocks.html)
+
+**30. What is the difference between Spot and Reserved Instances?**
+
+| Aspect             | Spot Instances                                           | Reserved Instances—RIs                                           |
+| ------------------ | -------------------------------------------------------- | ---------------------------------------------------------------- |
+| Basic model        | Use available spare EC2 capacity                         | Receive a billing discount for matching usage under a commitment |
+| Commitment         | No RI-style one- or three-year commitment                | Typically one or three years                                     |
+| Availability       | Depends on available Spot capacity                       | Capacity reservation depends on RI scope                         |
+| Interruption       | AWS can reclaim capacity                                 | No Spot-reclamation behavior                                     |
+| Typical workload   | Retryable jobs, batch processing, fault-tolerant workers | Predictable baseline usage                                       |
+| Main consideration | Tolerate interruption and capacity variation             | Avoid paying for a commitment that is underused                  |
+
+An RI is primarily a **billing construct**, not a different hardware instance family. A **regional RI does not reserve capacity**; a qualifying **zonal RI reserves capacity in its specified Availability Zone**. [Reserved Instances overview](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-reserved-instances.html), [regional and zonal scope](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/reserved-instances-scope.html)
+
+Spot workloads should tolerate replacement through retries, checkpointing, and suitable instance diversification. Stop/terminate interruption notices generally provide two minutes; hibernation starts immediately rather than providing that two-minute interval. [Spot interruption notices](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-instance-termination-notices.html)
+
+A common design maintains dependable baseline capacity with applicable commitment discounts and uses Spot for additional work that can tolerate interruption.
+
