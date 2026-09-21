@@ -2404,3 +2404,1075 @@ For signatures, I would verify the expected identity and issuer, or the approved
 Deployment would reference an immutable image digest. Vulnerability exceptions would be explicit, scoped, and time limited.
 
 After deployment, new vulnerabilities would trigger reassessment and rebuilds from controlled sources. A valid signature establishes authenticity and integrity; ongoing vulnerability management establishes whether that artifact remains acceptable to run.
+
+I’m assuming **Azure** for the cloud questions and **Azure DevOps** for the pipeline questions. I’ve combined the repeated Terraform questions.
+
+**1. How would you integrate runtime threat detection into Kubernetes using Falco or Sysdig?**
+
+Runtime threat detection identifies suspicious activity after a workload starts running—for example, an unexpected shell, sensitive-file access, or an unusual process.
+
+For a Falco implementation, I would:
+
+1. **Deploy sensors:** Install Falco through Helm as a DaemonSet on supported Linux nodes. Select a supported event driver, commonly modern eBPF, after checking kernel compatibility.
+2. **Establish coverage:** Verify that every eligible node has a healthy sensor, including newly autoscaled nodes.
+3. **Enable detection rules:** Start with maintained rules, then add application-specific detections.
+4. **Add context:** Include cluster, namespace, workload, container, process, and image information in alerts.
+5. **Forward alerts:** Send structured events through Falcosidekick to the organization’s incident-management or SIEM platform. [Falco Kubernetes deployment](https://falco.org/docs/getting-started/falco-kubernetes-quickstart/), [Falco alert forwarding](https://falco.org/docs/concepts/outputs/forwarding/)
+
+Useful detections include:
+
+* An interactive shell appearing in a production payment container.
+* Unexpected writes to system directories.
+* Package installation inside an immutable application container.
+* Processes or connections outside the workload’s expected behavior.
+
+I would initially run detections in alert-only mode, investigate false positives, and make exceptions narrowly scoped and version controlled.
+
+For response, I would preserve evidence, investigate the workload identity, and use a tested isolation or credential-revocation procedure. Falco detection alone does not automatically block every suspicious action.
+
+With Sysdig, I would follow the same coverage, tuning, alerting, and response process using its supported integrations. I would monitor the detection system itself: missing agents, dropped events, processing latency, and resource overhead.
+
+---
+
+**2. What are Azure Availability Sets?**
+
+An **Availability Set** groups Azure virtual machines so Azure can distribute them across different hardware and maintenance boundaries.
+
+| Concept       | Purpose                                                                  |
+| ------------- | ------------------------------------------------------------------------ |
+| Fault domain  | Separates VMs across groups that can share power and networking hardware |
+| Update domain | Separates VMs into groups for planned maintenance                        |
+
+For example, two application VMs placed in different fault domains are less likely to fail together because of a shared hardware problem.
+
+Availability Sets support up to **three fault domains and twenty update domains**, subject to the applicable platform and regional configuration. During planned maintenance, Azure processes one update domain at a time. [Azure Availability Sets](https://learn.microsoft.com/en-us/azure/virtual-machines/availability-set-overview)
+
+An Availability Set does not replicate the application or balance traffic automatically. You still need multiple application instances, a load balancer where appropriate, and a suitable data-availability design.
+
+**Availability Zones provide a different boundary:** they separate infrastructure across physically distinct locations within a region. Availability Sets do not provide the same protection against a datacenter-level outage.
+
+---
+
+**3. You have five interrelated domains. How would you handle them?**
+
+Assuming this means **five related application or DNS domains**, I would separate DNS, traffic routing, authentication, and application dependencies.
+
+For example:
+
+```text
+www.example.com
+api.example.com
+admin.example.com
+payments.example.com
+reports.example.com
+```
+
+I would configure:
+
+* **DNS:** Records pointing each hostname to its intended entry point.
+* **Routing:** Host-based routing through Azure Application Gateway or Azure Front Door, depending on regional or global requirements.
+* **TLS:** Certificates covering the relevant hostnames.
+* **Authentication:** Shared identity through an identity provider when single sign-on is required.
+* **Service communication:** Private backend connections, explicit authorization, timeouts, and dependency monitoring.
+* **Browser access:** Explicit CORS rules where one origin calls another.
+
+A wildcard certificate for `*.example.com` does not cover five unrelated domain names or every deeper subdomain.
+
+If “domains” means **Active Directory domains**, the discussion changes to forests, DNS resolution, trusts, and cross-domain authorization. That distinction is worth clarifying in the interview.
+
+---
+
+**4. A Pod is in CrashLoopBackOff, but logs are empty. How would you troubleshoot?**
+
+`CrashLoopBackOff` means a container repeatedly terminates and Kubernetes is delaying subsequent restart attempts.
+
+I would begin with:
+
+```bash
+kubectl -n prod describe pod POD_NAME
+
+kubectl -n prod get pod POD_NAME -o yaml
+
+kubectl -n prod logs POD_NAME \
+  -c CONTAINER_NAME --previous --timestamps
+
+kubectl -n prod get events \
+  --field-selector involvedObject.name=POD_NAME \
+  --sort-by=.lastTimestamp
+```
+
+**Check the previous container instance.** The currently restarting instance may have produced nothing, while `--previous` exposes logs from the last terminated instance.
+
+Then inspect termination details:
+
+```bash
+kubectl -n prod get pod POD_NAME \
+  -o jsonpath='{.status.containerStatuses[*].lastState.terminated}'
+```
+
+I would investigate:
+
+| Evidence                           | Possible explanation                                                                 |
+| ---------------------------------- | ------------------------------------------------------------------------------------ |
+| `OOMKilled`                        | Container exceeded its memory allowance                                              |
+| Exit code 137                      | SIGKILL; investigate OOM and other causes                                            |
+| Exit code 139                      | Segmentation fault                                                                   |
+| Exit code 0 with repeated restarts | A short-running command is configured as a continuously running workload             |
+| Probe-failure events               | Startup or liveness configuration is causing restarts                                |
+| Runtime startup error              | Invalid command, permissions, missing executable, or incompatible image architecture |
+
+Empty logs can also mean the application writes to a file, buffers output, or fails before logging starts.
+
+I would check init containers separately, verify configuration and mounted files, and inspect node/runtime logs if the failure occurs below the application.
+
+For an image without debugging tools, an ephemeral debug container can help inspect networking. An isolated copy of the Pod with an adjusted startup command can help investigate initialization problems. [Kubernetes Pod debugging](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/), [Pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+
+---
+
+**5. How would you configure a monitoring solution?**
+
+I would start with **what users need the application to do**, then select the signals needed to detect failures.
+
+For an API, this usually includes availability, request latency, error rate, throughput, and dependency health.
+
+My design would cover:
+
+| Layer          | Examples                                                          |
+| -------------- | ----------------------------------------------------------------- |
+| Infrastructure | CPU, memory, disk, network, node availability                     |
+| Kubernetes     | Pending Pods, restarts, unavailable replicas, scheduling failures |
+| Application    | Request rate, errors, latency, queue depth                        |
+| Dependencies   | Database connections, replication lag, external API failures      |
+| Business       | Successful payments, completed orders, failed transactions        |
+
+I would collect metrics, structured logs, and traces, linking them through service names, release identifiers, and trace IDs.
+
+For AKS, one option is Azure Monitor managed Prometheus for metrics, Container Insights for container logs, and Grafana for dashboards. [Azure Kubernetes monitoring](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/kubernetes-monitoring-overview)
+
+Alerts should identify actionable symptoms, have an owner and runbook, and avoid paging for every brief resource spike.
+
+Finally, I would test the entire path by deliberately generating a safe test condition and verifying collection, alert evaluation, notification, and recovery.
+
+---
+
+**6. What are probes in Kubernetes?**
+
+Probes are checks that the kubelet performs against containers.
+
+| Probe     | Question it answers                                             | Result of repeated failure                     |
+| --------- | --------------------------------------------------------------- | ---------------------------------------------- |
+| Startup   | Has the application finished starting?                          | Container restart, subject to restart policy   |
+| Liveness  | Is the application functioning well enough to continue running? | Container restart, subject to restart policy   |
+| Readiness | Can the application receive traffic now?                        | Pod becomes unready for normal Service routing |
+
+A startup probe prevents liveness and readiness checks from running until startup succeeds.
+
+Example container configuration:
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /health/startup
+    port: 8080
+  periodSeconds: 10
+  failureThreshold: 30
+
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 2
+```
+
+The application must implement these endpoints. The startup configuration gives approximately five minutes for initialization.
+
+Kubernetes supports HTTP, TCP, command-based, and gRPC probes.
+
+I would keep liveness focused on whether restarting the application can help. Making liveness fail whenever a shared database is briefly unavailable can cause unnecessary restarts across the entire application. [Kubernetes probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+
+---
+
+**7. How would you deploy ten Pods on all nodes at the same time?**
+
+The answer depends on the intended Pod count:
+
+| Requirement                     | Approach                                                               |
+| ------------------------------- | ---------------------------------------------------------------------- |
+| Ten Pods total                  | Deployment with `replicas: 10`                                         |
+| One Pod on every eligible node  | DaemonSet                                                              |
+| Ten Pods on every eligible node | Ten distinct DaemonSets, or a controller designed for that requirement |
+| Ten Pods spread across nodes    | Deployment with topology-spread constraints                            |
+
+A DaemonSet normally maintains **one Pod per eligible node**. It does not have a `replicas: 10` setting. Eligibility depends on node selection, taints, tolerations, and other scheduling constraints. [Kubernetes DaemonSets](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/)
+
+For ten total replicas, I would use topology spreading with `kubernetes.io/hostname` when distribution across nodes matters.
+
+Ten total Pods cannot cover more than ten nodes.
+
+Also, Kubernetes does not guarantee that all containers start at precisely the same instant. If the application needs coordinated execution, it needs an application-level synchronization mechanism or an appropriate batch-processing system.
+
+---
+
+**8. What does Terraform taint mean?**
+
+A tainted resource is marked in Terraform state as requiring replacement.
+
+Historically:
+
+```bash
+terraform taint azurerm_linux_virtual_machine.app
+```
+
+This marks the resource immediately; the replacement occurs during a subsequent apply.
+
+The `terraform taint` command is deprecated. The preferred approach is to request replacement in a reviewed plan:
+
+```bash
+terraform plan \
+  -replace='azurerm_linux_virtual_machine.app' \
+  -out=tfplan
+
+terraform apply tfplan
+```
+
+This keeps the replacement decision visible in the plan before execution. [Terraform taint and replacement](https://developer.hashicorp.com/terraform/cli/commands/taint)
+
+A typical use case is replacing a VM whose internal configuration has become unreliable even though its infrastructure arguments have not changed.
+
+`terraform untaint` removes an existing taint marker; it does not repair the underlying resource.
+
+Terraform taint concerns resource replacement. Kubernetes node taints concern Pod scheduling and eviction.
+
+---
+
+**9. What Terraform meta-arguments exist apart from `count` and `for_each`?**
+
+The main ones are:
+
+| Meta-argument | Purpose                                                 |
+| ------------- | ------------------------------------------------------- |
+| `count`       | Creates instances indexed by number                     |
+| `for_each`    | Creates instances identified by map keys or set members |
+| `depends_on`  | Declares dependencies Terraform cannot infer            |
+| `provider`    | Selects a provider configuration for a resource         |
+| `providers`   | Passes provider configurations into a child module      |
+| `lifecycle`   | Changes resource lifecycle behavior                     |
+
+Important `lifecycle` rules include:
+
+* `create_before_destroy`: Attempts to create the replacement before removing the previous resource.
+* `prevent_destroy`: Rejects planned destruction while the relevant configuration is present.
+* `ignore_changes`: Excludes specified attribute changes from update planning.
+* `replace_triggered_by`: Requests replacement when specified related changes occur.
+
+For example:
+
+```hcl
+resource "azurerm_resource_group" "important" {
+  name     = "rg-important"
+  location = "eastus"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+```
+
+`prevent_destroy` is a Terraform planning safeguard; it does not prevent someone from deleting the resource directly through Azure.
+
+Current Terraform documentation also includes `action_trigger` within `lifecycle` for invoking provider-defined actions. Availability depends on the Terraform and provider versions. [Terraform meta-arguments](https://developer.hashicorp.com/terraform/language/meta-arguments), [Lifecycle rules](https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle)
+
+---
+
+**10. Can `for_each` be used together with other iteration mechanisms?**
+
+**You cannot use `count` and `for_each` on the same resource or module block.**
+
+You can, however:
+
+* Use `count` in one resource and `for_each` in another.
+* Use `for_each` on a module and on resources inside that module.
+* Use a `for` expression to construct the map consumed by `for_each`.
+* Use a nested `dynamic` block with its own `for_each`.
+* Chain one resource’s instances into another resource’s `for_each`.
+
+Example:
+
+```hcl
+locals {
+  environments = ["dev", "qa", "prod"]
+}
+
+resource "azurerm_resource_group" "environment" {
+  for_each = toset(local.environments)
+
+  name     = "rg-${each.key}"
+  location = "eastus"
+}
+```
+
+Resource `for_each` accepts a map or a set of strings. Its instance keys must be known during planning; those keys cannot depend on an ID that will only be generated during apply. [Terraform `for_each`](https://developer.hashicorp.com/terraform/language/meta-arguments/for_each)
+
+---
+
+**11. What is fine-tuning in AI?**
+
+Fine-tuning adapts a pretrained model by training it further on data relevant to a task.
+
+For example, a company might train a model on carefully reviewed incident descriptions and their classifications so it produces more consistent incident categories.
+
+Fine-tuning updates model parameters, or a smaller set of trainable adapter parameters. Parameter-efficient methods can reduce the amount of training required compared with updating the entire model. [Hugging Face fine-tuning](https://huggingface.co/docs/transformers/training)
+
+A practical process is:
+
+1. Define the target behavior and evaluation criteria.
+2. Establish a baseline using the existing model.
+3. Prepare high-quality training examples.
+4. Separate training, validation, and test data.
+5. Train and compare against the baseline.
+6. Check for overfitting and regressions.
+7. Deploy gradually and monitor results.
+
+Fine-tuning is useful for repeatable task behavior, style, or output consistency. For frequently changing company documentation, retrieval-based approaches are often more suitable than repeatedly retraining the model.
+
+---
+
+**12. Two sites connected through a site-to-site VPN lose connectivity. How do you troubleshoot?**
+
+I would first distinguish between **a tunnel that is down** and **a tunnel that is established but not carrying the expected traffic**.
+
+My troubleshooting sequence would be:
+
+1. **Establish scope:** Determine which networks, directions, and applications are affected. Check recent changes.
+2. **Check the underlying connection:** Verify ISP connectivity and whether either VPN endpoint’s public IP changed. Failed ping alone does not prove a VPN gateway is down.
+3. **Inspect tunnel status:** Check IKE and IPsec security associations and failure messages on both peers.
+4. **Validate authentication and negotiation:** Check the pre-shared key or certificates and compatible encryption, integrity, DH/PFS, and lifetime settings.
+5. **Check firewall handling:** Verify IKE UDP 500, NAT-T UDP 4500, and ESP where applicable.
+6. **Verify routing:** Inspect local routes, Azure route tables, BGP advertisements, traffic selectors, and overlapping address ranges.
+7. **Check the destination:** Confirm NSGs, host firewalls, and application listeners permit the traffic.
+8. **Investigate partial failures:** MTU/MSS problems can allow small requests while breaking larger transfers.
+
+In Azure, I would inspect VPN Gateway diagnostics and use Network Watcher troubleshooting or packet capture where appropriate. [Azure site-to-site VPN troubleshooting](https://learn.microsoft.com/en-us/azure/vpn-gateway/vpn-gateway-troubleshoot-site-to-site-cannot-connect)
+
+I would collect evidence before resetting the tunnel or gateway, since a reset can interrupt unaffected connections and remove useful diagnostic state.
+
+---
+
+**13. There are 100 applications that need rules. How would you apply them from the cloud side?**
+
+I would first identify what kind of rules are required:
+
+| Requirement                                     | Azure mechanism             |
+| ----------------------------------------------- | --------------------------- |
+| HTTP attack protection                          | WAF policies                |
+| IP and port filtering                           | NSGs and Azure Firewall     |
+| Grouping VM network interfaces by application   | Application Security Groups |
+| Approved regions, tagging, encryption standards | Azure Policy                |
+| User or workload permissions                    | Azure RBAC                  |
+| Pod-to-Pod restrictions                         | Kubernetes NetworkPolicies  |
+
+For common web-security rules, I would manage a shared WAF policy and associate it with the appropriate application entry points. Application-specific exceptions would have explicit ownership and scope. [Azure WAF policies](https://learn.microsoft.com/en-us/azure/web-application-firewall/ag/policy-overview)
+
+For governance, I would group Azure Policy definitions into an initiative and assign it at the appropriate management-group, subscription, or resource-group scope. [Azure Policy](https://learn.microsoft.com/en-us/azure/governance/policy/overview)
+
+Terraform could apply these associations from an application inventory using `for_each`.
+
+I would test changes against representative applications, examine rule matches, and then expand enforcement. This reduces manual configuration while keeping exceptions reviewable.
+
+---
+
+**14. What is zero-shot prompting?**
+
+Zero-shot prompting gives the model an instruction **without providing worked examples**.
+
+Example:
+
+```text
+Classify this alert as availability, performance, or security.
+Return only the category.
+
+Alert: API response time increased from 200 milliseconds to 4 seconds.
+```
+
+The prompt defines the task and the expected output. The model uses its existing capabilities to answer.
+
+Zero-shot prompting is useful when the task is clear and the model already understands the relevant concepts.
+
+It does not mean the model had no training. It means the current prompt supplies no demonstrations of the task. [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
+
+---
+
+**15. What is few-shot prompting?**
+
+Few-shot prompting includes a small number of input-output examples before the new task.
+
+Example:
+
+```text
+Classify alerts as availability, performance, or security.
+
+Alert: All API requests return HTTP 503.
+Category: availability
+
+Alert: An unexpected privileged process started.
+Category: security
+
+Alert: Database query latency increased significantly.
+Category: performance
+
+Alert: API response time increased from 200 milliseconds to 4 seconds.
+Category:
+```
+
+Examples communicate the intended categories, formatting, and decision boundaries.
+
+Good examples should be relevant, consistently labeled, and representative of the cases the model will encounter.
+
+**Few-shot prompting does not update model weights.** The examples guide the current response through the prompt. Fine-tuning performs additional training. [Few-shot learning paper](https://arxiv.org/abs/2005.14165)
+
+---
+
+**16. What are Azure Network Watcher’s features? Is it global?**
+
+Network Watcher provides Azure network monitoring and troubleshooting capabilities.
+
+| Feature                              | Use                                             |
+| ------------------------------------ | ----------------------------------------------- |
+| Topology                             | View network resources and relationships        |
+| Connection Monitor                   | Continuously test connectivity                  |
+| Connection troubleshoot              | Diagnose a specific connectivity problem        |
+| IP flow verify                       | Evaluate whether NSG rules allow or deny a flow |
+| Next hop                             | Inspect routing decisions                       |
+| Packet capture                       | Capture traffic for investigation               |
+| VPN troubleshooting                  | Diagnose supported VPN gateway connections      |
+| VNet flow logs and Traffic Analytics | Analyze network-flow records                    |
+
+**Network Watcher is regional**, with an instance associated with a subscription and region. You enable it in the regions where relevant resources are deployed.
+
+Some capabilities can test connections to endpoints in other regions or outside Azure, but that does not make Network Watcher a single global resource.
+
+For new flow-logging designs, use **VNet flow logs**. New NSG flow-log creation is no longer supported, and existing NSG flow logs are scheduled to retire on **September 30, 2027**. [Azure Network Watcher](https://learn.microsoft.com/en-us/azure/network-watcher/network-watcher-overview)
+
+---
+
+**17. What is the difference between a Deployment and a StatefulSet?**
+
+| Aspect           | Deployment                                                                              | StatefulSet                                                        |
+| ---------------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Pod identity     | Replicas are generally interchangeable                                                  | Pods have stable identities, such as `db-0`                        |
+| Naming           | Generated Pod names                                                                     | Predictable ordinal-based names                                    |
+| Storage          | Can use persistent storage, but does not inherently allocate a unique claim per replica | Supports per-replica claims through `volumeClaimTemplates`         |
+| Scaling          | Replicas can usually be created concurrently                                            | Ordered behavior by default; configuration can change this         |
+| Network identity | Typically accessed through a Service                                                    | Stable DNS identities commonly provided through a headless Service |
+| Typical workload | APIs, web servers, stateless workers                                                    | Workloads requiring stable identity or per-instance storage        |
+
+A StatefulSet does not guarantee an unchanging Pod IP. Its stable identity is maintained through naming and service discovery.
+
+It also does not automatically configure database replication, backups, or failover. Those require application-specific configuration or an operator.
+
+Persistent-volume retention depends on the relevant retention and reclaim policies. [Kubernetes StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/)
+
+---
+
+**18. How do you configure monitoring through Log Analytics?**
+
+For Azure, I would:
+
+1. **Create a Log Analytics workspace:** Choose its region, access model, retention, and cost controls.
+2. **Configure collection:** For VMs, deploy Azure Monitor Agent and associate Data Collection Rules.
+3. **Enable application-specific collection:** For AKS, configure Container Insights.
+4. **Collect resource logs:** Use diagnostic settings for supported Azure resources, including AKS control-plane logs.
+5. **Query and visualize:** Use KQL, Workbooks, or supported Grafana integrations.
+6. **Create alerts:** Define scheduled-query alerts and connect them to Action Groups.
+7. **Validate:** Generate test telemetry and verify both ingestion and alert delivery. [Azure Monitor Agent](https://learn.microsoft.com/en-us/azure/azure-monitor/agents/azure-monitor-agent-overview), [AKS monitoring setup](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/kubernetes-monitoring-enable)
+
+Example query for recent application errors:
+
+```kusto
+ContainerLogV2
+| where TimeGenerated >= ago(15m)
+| where PodNamespace == "payments"
+| where tostring(LogMessage) has "ERROR"
+| summarize ErrorCount = count()
+    by PodName, bin(TimeGenerated, 5m)
+```
+
+The query uses documented `ContainerLogV2` fields. [ContainerLogV2 schema](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/containerlogv2)
+
+A **Log Analytics workspace stores logs**. Azure Monitor managed Prometheus uses an **Azure Monitor workspace** for its metrics.
+
+---
+
+**19. How do you use Prometheus and Grafana?**
+
+Prometheus collects and stores metrics. Grafana queries data sources and presents dashboards. Alertmanager handles notification routing, grouping, and deduplication for Prometheus alerts.
+
+A common Kubernetes installation uses `kube-prometheus-stack`:
+
+```bash
+helm repo add prometheus-community \
+  https://prometheus-community.github.io/helm-charts
+
+helm repo update
+
+helm upgrade --install monitoring \
+  prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace
+```
+
+This is a basic installation example. In managed deployments, I would pin the chart version and supply reviewed configuration for persistence, access, retention, and resources. [kube-prometheus-stack](https://github.com/prometheus-community/helm-charts/blob/main/charts/kube-prometheus-stack/README.md)
+
+Next, I would:
+
+* Instrument applications to expose metrics.
+* Define `ServiceMonitor` or `PodMonitor` resources.
+* Verify that their labels and namespaces match Prometheus discovery selectors.
+* Confirm targets are being scraped successfully.
+* Create dashboards and alert rules.
+* Test alert delivery.
+
+The Prometheus Operator manages these Kubernetes-native monitoring resources. [Prometheus Operator](https://prometheus-operator.dev/docs/getting-started/introduction/)
+
+For an application exposing `http_requests_total`, an illustrative error-ratio query is:
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+Metric names and labels must match the application. Alert logic also needs an explicit policy for missing data and low request volume.
+
+---
+
+**20. Write Terraform that creates two Azure Storage Accounts in dev and five in prod.**
+
+This example validates the environment and gives each storage account a stable `for_each` key.
+
+Authenticate to Azure and set `ARM_SUBSCRIPTION_ID` for the target subscription.
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.0"
+    }
+
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+}
+
+variable "environment" {
+  type        = string
+  description = "Deployment environment: dev or prod."
+
+  validation {
+    condition     = contains(["dev", "prod"], var.environment)
+    error_message = "environment must be dev or prod."
+  }
+}
+
+locals {
+  account_count = var.environment == "dev" ? 2 : 5
+
+  account_keys = toset([
+    for n in range(local.account_count) : format("%02d", n + 1)
+  ])
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+resource "azurerm_resource_group" "storage" {
+  name     = "rg-storage-${var.environment}"
+  location = "eastus"
+}
+
+resource "azurerm_storage_account" "this" {
+  for_each = local.account_keys
+
+  name                     = "st${var.environment}${random_id.suffix.hex}${each.key}"
+  resource_group_name      = azurerm_resource_group.storage.name
+  location                 = azurerm_resource_group.storage.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+
+  min_tls_version                 = "TLS1_2"
+  allow_nested_items_to_be_public = false
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+output "storage_account_names" {
+  value = {
+    for key, account in azurerm_storage_account.this :
+    key => account.name
+  }
+}
+```
+
+For a development state:
+
+```bash
+terraform init
+terraform plan -var='environment=dev' -out=tfplan
+terraform apply tfplan
+```
+
+For production, use a **separate production state/backend** and set `environment=prod`.
+
+The random suffix reduces name collisions because Azure Storage Account names must be globally unique. The generated names contain only lowercase letters and numbers. [AzureRM Storage Account resource](https://github.com/hashicorp/terraform-provider-azurerm/blob/main/website/docs/r/storage_account.html.markdown)
+
+---
+
+**21. Write a shell script to extract today’s log entries containing `ERROR`.**
+
+Assumption: each entry occupies one line and begins with an ISO date, such as:
+
+```text
+2026-09-21 10:15:00 ERROR Database connection failed
+```
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 1 )); then
+  echo "Usage: $0 LOG_FILE" >&2
+  exit 2
+fi
+
+log_file=$1
+if [[ ! -f "$log_file" || ! -r "$log_file" ]]; then
+  echo "Log file must be a readable regular file." >&2
+  exit 2
+fi
+
+today=$(date +%F)
+
+awk -v today="$today" '
+  substr($0, 1, 10) == today &&
+  substr($0, 11, 1) ~ /[ T]/ &&
+  /(^|[^[:alnum:]_])ERROR([^[:alnum:]_]|$)/ { print }
+' < "$log_file"
+```
+
+Usage:
+
+```bash
+bash extract_errors.sh application.log > today-errors.log
+```
+
+This checks the date at the beginning of the line and matches uppercase `ERROR` as a keyword, including forms such as `[ERROR]`.
+
+It uses the machine’s local date. For UTC-dated logs, use `date -u +%F`.
+
+I checked it against current-date entries, older entries, misleading words such as `ERRORS`, empty results, and invalid file arguments.
+
+---
+
+**22. Write a shell script to print numbers divisible by 3 or 5, but not by 15, within a range.**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 2 )); then
+  echo "Usage: $0 START END" >&2
+  exit 2
+fi
+
+integer='^-?(0|[1-9][0-9]*)$'
+if [[ ! $1 =~ $integer || ! $2 =~ $integer ]]; then
+  echo "Use signed decimal integers without leading zeros." >&2
+  exit 2
+fi
+
+start=$1
+end=$2
+
+if (( start > end )); then
+  echo "START must be less than or equal to END." >&2
+  exit 2
+fi
+
+for (( n=start; ; n++ )); do
+  if (( (n % 3 == 0 || n % 5 == 0) && n % 15 != 0 )); then
+    printf '%s\n' "$n"
+  fi
+
+  if (( n == end )); then
+    break
+  fi
+done
+```
+
+Usage:
+
+```bash
+bash divisible.sh 1 20
+```
+
+Output:
+
+```text
+3
+5
+6
+9
+10
+12
+18
+20
+```
+
+The range is inclusive. The condition requires divisibility by at least one of 3 or 5, then excludes multiples of 15.
+
+The script also handles negative ranges. Inputs must fit Bash’s integer range.
+
+---
+
+**23. Explain RBAC in Kubernetes.**
+
+**Role-Based Access Control** determines which operations an authenticated identity can perform against Kubernetes API resources.
+
+| Object             | Purpose                                                                      |
+| ------------------ | ---------------------------------------------------------------------------- |
+| Role               | Defines permissions within a namespace                                       |
+| ClusterRole        | Defines permissions usable across namespaces or for cluster-scoped resources |
+| RoleBinding        | Grants permissions within one namespace                                      |
+| ClusterRoleBinding | Grants permissions across the cluster                                        |
+| ServiceAccount     | Provides a Kubernetes identity commonly used by workloads                    |
+
+A permission rule identifies:
+
+* API groups.
+* Resources or subresources.
+* Verbs such as `get`, `list`, `watch`, `create`, or `delete`.
+* Optionally, specific resource names.
+
+For example, an application might receive `get`, `list`, and `watch` permissions on Pods in `payments`, without permission to read Secrets.
+
+A RoleBinding can reference a ClusterRole while granting its applicable permissions only in the RoleBinding’s namespace.
+
+RBAC permissions are additive; Kubernetes RBAC has no general explicit-deny rule. [Kubernetes RBAC](https://kubernetes.io/docs/reference/access-authn-authz/rbac/)
+
+An administrator can verify a workload’s access with:
+
+```bash
+kubectl auth can-i get pods \
+  --namespace payments \
+  --as=system:serviceaccount:payments:app-reader
+```
+
+Authentication establishes identity; RBAC authorizes actions for that identity.
+
+---
+
+**24. How do you define variables in a pipeline?**
+
+Assuming Azure Pipelines:
+
+```yaml
+variables:
+  environmentName: dev
+  imageTag: $(Build.BuildId)
+
+steps:
+  - bash: |
+      printf 'Environment: %s\n' "$DEPLOY_ENV"
+      printf 'Image tag: %s\n' "$IMAGE_TAG"
+    env:
+      DEPLOY_ENV: $(environmentName)
+      IMAGE_TAG: $(imageTag)
+```
+
+The main syntaxes are:
+
+| Syntax                          | Typical use                                                   |
+| ------------------------------- | ------------------------------------------------------------- |
+| `$(variableName)`               | Macro substitution before a task runs                         |
+| `${{ variables.variableName }}` | Template-time evaluation                                      |
+| `$[variables.variableName]`     | Runtime expressions, including conditions and output handling |
+
+Variables can be defined at pipeline, stage, or job scope, and shared through variable groups.
+
+**Parameters are different:** they support types and are evaluated during template expansion. They are useful for selecting an environment or controlling pipeline structure.
+
+Secrets should be stored through protected pipeline settings, variable groups, or supported Key Vault integration. Map them explicitly into the task environment when required, and avoid printing them. [Azure Pipelines variables](https://learn.microsoft.com/en-us/azure/devops/pipelines/process/variables?view=azure-devops)
+
+---
+
+**25. How do you run Terraform from an Azure pipeline?**
+
+I would structure the workflow as:
+
+1. Check out the reviewed commit.
+2. Use a controlled Terraform version.
+3. Authenticate through a workload-federated service connection.
+4. Initialize the remote backend.
+5. Run formatting, validation, and policy checks.
+6. Generate and retain a saved plan.
+7. Obtain the required deployment authorization.
+8. Apply that same saved plan using fresh credentials.
+
+Example planning task, assuming Terraform is installed and the backend is configured:
+
+```yaml
+steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: Terraform plan
+    inputs:
+      azureSubscription: sc-terraform-prod
+      scriptType: bash
+      scriptLocation: inlineScript
+      addSpnToEnvironment: true
+      inlineScript: |
+        set -euo pipefail
+
+        export ARM_CLIENT_ID="$servicePrincipalId"
+        export ARM_TENANT_ID="$tenantId"
+        export ARM_USE_OIDC=true
+        export ARM_OIDC_TOKEN="$idToken"
+        export ARM_USE_AZUREAD=true
+
+        ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+        export ARM_SUBSCRIPTION_ID
+
+        terraform init -input=false
+        terraform fmt -check
+        terraform validate
+        terraform plan -input=false -out=tfplan
+    env:
+      TF_VAR_environment: prod
+```
+
+The service connection must use workload identity federation for the `idToken` flow shown here. AzureCLI exposes these identity values when configured accordingly. [AzureCLI task](https://learn.microsoft.com/en-us/azure/devops/pipelines/tasks/reference/azure-cli-v2?view=azure-pipelines)
+
+The apply stage would retrieve the protected plan artifact, initialize the same backend, obtain fresh credentials, and execute:
+
+```bash
+terraform apply -input=false tfplan
+```
+
+I would serialize deployments per state and restrict plan-artifact access because plans can contain sensitive values. For long-running operations, use the supported token-refresh integration for the selected Terraform/provider versions.
+
+---
+
+**26. What is the difference between Classic and YAML pipelines?**
+
+| Aspect            | Classic pipelines                                          | YAML pipelines                               |
+| ----------------- | ---------------------------------------------------------- | -------------------------------------------- |
+| Definition        | Primarily configured in the web editor                     | Pipeline structure stored in repository YAML |
+| Change review     | Pipeline configuration history and permissions             | Git history, pull requests, and code review  |
+| Reuse             | Task groups and platform features                          | Templates and parameterized components       |
+| Branch behavior   | Configuration generally separate from application branches | Pipeline definition can evolve with branches |
+| Build and release | Separate Classic build/release experiences                 | Multi-stage workflows can combine CI and CD  |
+| Reproducibility   | Depends more on external configuration management          | Version-controlled pipeline definition       |
+
+Both approaches support automation and require protected credentials and deployment permissions.
+
+YAML does not mean every security setting belongs in Git. For example, protected-resource approvals and checks are managed outside the YAML definition, helping prevent a pipeline author from simply removing them in a code change. [Azure YAML and Classic pipelines](https://learn.microsoft.com/en-us/azure/devops/pipelines/get-started/pipelines-get-started?view=azure-devops)
+
+---
+
+**27. What is the difference between “service end…”?**
+
+Assuming you mean **Azure Service Endpoints versus Private Endpoints**:
+
+| Aspect               | Service Endpoint                                                        | Private Endpoint                                                            |
+| -------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Service address      | Service continues to use its public endpoint                            | Service is reached through a private IP in your VNet                        |
+| Main mechanism       | Extends subnet identity to supported Azure services                     | Creates a private network interface mapped to a supported service           |
+| DNS                  | Normally continues resolving to the public service address              | Requires DNS resolution to the private endpoint                             |
+| Access configuration | Configure service-side network restrictions for the subnet              | Approve/configure the private connection and service access                 |
+| On-premises access   | Does not extend subnet service-endpoint identity to on-premises clients | Can support access through VPN or ExpressRoute with correct routing and DNS |
+
+A private endpoint does not automatically disable the service’s public endpoint. Configure public network access separately when that is required. [Service Endpoints](https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-service-endpoints-overview), [Private Endpoints](https://learn.microsoft.com/en-us/azure/private-link/private-endpoint-overview)
+
+If you meant an **Azure DevOps service connection**, that is the pipeline’s configured authentication connection to an external service; it is a different concept.
+
+---
+
+**28. Explain Docker networking.**
+
+Docker networking controls container connectivity, isolation, name resolution, and exposure to external clients.
+
+| Driver  | Typical use                                                                                |
+| ------- | ------------------------------------------------------------------------------------------ |
+| Bridge  | Containers communicating on one Docker host                                                |
+| Host    | Container shares the host’s networking namespace                                           |
+| Overlay | Multi-host networking, commonly with Docker Swarm                                          |
+| Macvlan | Containers appear on the network with distinct MAC addresses                               |
+| IPvlan  | Networking based on IP assignments with different integration characteristics from Macvlan |
+| None    | Disables ordinary external container networking                                            |
+
+For a user-defined bridge:
+
+```bash
+docker network create app-net
+
+docker run -d \
+  --name web \
+  --network app-net \
+  -p 127.0.0.1:8080:80 \
+  nginx:stable
+```
+
+Other containers attached to `app-net` can use the name `web` to reach it. The host can reach the published service at `127.0.0.1:8080`.
+
+Important points:
+
+* User-defined bridge networks support container-name resolution.
+* `localhost` inside a normally isolated container refers to that container.
+* `-p` publishes a port.
+* Dockerfile `EXPOSE` documents a port; it does not publish it by itself.
+
+Kubernetes networking is implemented through its networking model and CNI integration, rather than Docker bridge configuration. [Docker network drivers](https://docs.docker.com/engine/network/drivers/)
+
+---
+
+**29. What is the difference between Docker `ARG` and `ENV`?**
+
+| Aspect               | `ARG`                                        | `ENV`                                                               |
+| -------------------- | -------------------------------------------- | ------------------------------------------------------------------- |
+| Primary purpose      | Build-time input                             | Environment configuration for subsequent build steps and containers |
+| Override             | `docker build --build-arg`                   | Runtime options such as `docker run -e`                             |
+| Runtime availability | Not automatically available                  | Persisted as an image environment default                           |
+| Scope                | Depends on declaration and build-stage scope | Persists within the stage and resulting image configuration         |
+| Secrets              | Can leak through build metadata or history   | Baked values are visible in image configuration                     |
+
+Example:
+
+```dockerfile
+ARG PYTHON_VERSION=3.13
+FROM python:${PYTHON_VERSION}-slim
+
+ENV APP_ENV=production
+```
+
+Build with a different base version:
+
+```bash
+docker build \
+  --build-arg PYTHON_VERSION=3.12 \
+  -t demo .
+```
+
+Override the runtime environment:
+
+```bash
+docker run --rm \
+  -e APP_ENV=dev \
+  demo python -c 'import os; print(os.environ["APP_ENV"])'
+```
+
+An `ARG` declared before `FROM` can parameterize `FROM`; redeclare it inside a stage if that stage needs to reference it in later instructions.
+
+Use BuildKit secret mounts for build credentials rather than baking credentials into `ARG` or `ENV`. [Docker build variables](https://docs.docker.com/build/building/variables/)
+
+---
+
+**30. Someone manually deleted a Terraform-managed resource. What would you do?**
+
+This creates **drift** between Terraform configuration, recorded state, and the real environment.
+
+I would first determine whether the deletion was accidental or intentional, then run a normal plan with refresh enabled:
+
+```bash
+terraform plan -out=tfplan
+```
+
+If the resource is genuinely absent but still required by the configuration, Terraform will generally plan to create it again. I would review its dependencies and then apply the approved plan.
+
+The response depends on the situation:
+
+| Situation                            | Action                                                                        |
+| ------------------------------------ | ----------------------------------------------------------------------------- |
+| Accidental deletion                  | Restore the required resource through Terraform                               |
+| Intentional removal                  | Update the configuration through the normal change process                    |
+| Replacement already created manually | Reconcile configuration and import the replacement into the correct address   |
+| Deleted database or storage          | Restore data from the appropriate backup as well as rebuilding infrastructure |
+
+A refresh-only plan can inspect state reconciliation, but it does not recreate infrastructure.
+
+I would not use `terraform state rm` as a general fix: configuration that still declares the resource can still cause Terraform to create it.
+
+Finally, I would investigate the deletion through Azure Activity Logs and improve access controls or drift detection. `prevent_destroy` cannot prevent deletion performed outside Terraform.
+
+---
+
+**31. What is the difference between lists and sets in Terraform?**
+
+| Property         | List                | Set                    |
+| ---------------- | ------------------- | ---------------------- |
+| Ordering         | Defined order       | No ordering guarantee  |
+| Duplicate values | Allowed             | Removed                |
+| Indexed access   | Supported           | No positional indexing |
+| Typical use      | Ordered collections | Unique membership      |
+
+Example:
+
+```hcl
+variable "environments" {
+  type    = list(string)
+  default = ["dev", "qa", "dev", "prod"]
+}
+
+locals {
+  unique_environments = toset(var.environments)
+}
+```
+
+The list contains four elements. The set contains three unique values: `dev`, `qa`, and `prod`.
+
+For resource iteration:
+
+```hcl
+for_each = toset(var.environments)
+```
+
+This produces one instance per unique environment.
+
+Use a map when each instance needs additional attributes:
+
+```hcl
+locals {
+  environments = {
+    dev = {
+      location = "eastus"
+    }
+    prod = {
+      location = "westus2"
+    }
+  }
+}
+```
+
+Stable map keys make instance identity explicit. Changing a key can represent removing one instance and creating another, so keys should reflect durable identity. [Terraform collection types](https://developer.hashicorp.com/terraform/language/expressions/types)
+
