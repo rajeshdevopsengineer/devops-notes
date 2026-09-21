@@ -1595,3 +1595,812 @@ Spot workloads should tolerate replacement through retries, checkpointing, and s
 
 A common design maintains dependable baseline capacity with applicable commitment discounts and uses Spot for additional work that can tolerate interruption.
 
+
+Below are detailed answers for the **EPAM, 6 years’ experience** questions. The experience-based scenarios are illustrative—adapt them to projects you have actually worked on.
+
+**1. How would you design a scalable, highly available CI/CD system for microservices across multiple teams?**
+
+I would start by defining the platform’s requirements: number of teams, build concurrency, acceptable queue time, deployment frequency, security boundaries, and recovery objectives.
+
+I would separate the system into independently scalable components:
+
+| Component                | Design                                                                                    |
+| ------------------------ | ----------------------------------------------------------------------------------------- |
+| CI orchestration         | Managed CI or controllers with a documented availability and recovery design              |
+| Build execution          | Ephemeral runners that scale with queued jobs                                             |
+| Artifacts                | Durable container registry and artifact storage, with regional replication where required |
+| Deployment configuration | Version-controlled manifests, Helm charts, or Kustomize overlays                          |
+| CD                       | Regional GitOps controllers and rollout controllers                                       |
+| Governance               | Shared pipeline templates, team permissions, quotas, and audit records                    |
+
+A typical architecture would be:
+
+```mermaid
+flowchart TD
+    A["Team repositories"] --> B["CI orchestration"]
+    B --> C["Isolated build runners"]
+    C --> D["Signed image registry"]
+    C --> E["Release configuration in Git"]
+    E --> F["Regional delivery controllers"]
+    F --> G["Region A workloads"]
+    F --> H["Region B workloads"]
+    D --> G
+    D --> H
+    G --> I["Release health analysis"]
+    H --> I
+    I --> F
+```
+
+Each build would produce an immutable artifact, identified by digest. The same artifact would move through testing and production, avoiding differences caused by rebuilding for each environment.
+
+Teams would own their applications while the platform team maintains reusable pipeline components. Untrusted pull-request builds would run separately from privileged release jobs.
+
+For availability, I would protect the dependencies too: Git, registries, identity services, secrets, and deployment controllers. Argo CD provides an HA deployment model, but its components still require appropriate placement and capacity planning. [Argo CD high availability](https://argo-cd.readthedocs.io/en/stable/operator-manual/high_availability/)
+
+I would measure queue time, build success rate, deployment lead time, change failure rate, and recovery time.
+
+---
+
+**2. How would you manage cross-region deployments using Terraform in a multi-cloud setup?**
+
+I would divide infrastructure into independently managed stacks based on **cloud, account or project, environment, region, and ownership**.
+
+For example:
+
+```text
+aws / production / eu-west-1 / payments
+aws / production / us-east-1 / payments
+gcp / production / europe-west1 / analytics
+```
+
+Each stack would have its own state and narrowly scoped deployment identity. This limits how much infrastructure a failed deployment can affect.
+
+My implementation would include:
+
+* **Reusable, cloud-specific modules:** AWS networking and Google Cloud networking can expose similar inputs, while retaining their different implementations.
+* **Explicit provider configurations:** Provider aliases handle multiple regions within a configuration. Child modules receive the intended provider through their `providers` mapping. [Terraform provider configuration](https://developer.hashicorp.com/terraform/language/block/provider)
+* **Pipeline orchestration:** Generate and review plans independently, then deploy regions in a controlled sequence.
+* **Short-lived credentials:** Federate the pipeline into each cloud rather than store permanent access keys.
+* **Shared contracts:** Publish required outputs, such as private endpoints, through controlled interfaces.
+* **Regional validation:** Run connectivity, application, and failover tests before expanding deployment.
+
+The design must also address non-overlapping network ranges, DNS, connectivity, data replication, encryption keys, and cross-cloud transfer costs.
+
+Terraform provisions infrastructure; application deployment, database replication, and traffic failover need their own orchestration. A successful apply in one cloud does not make a multi-cloud deployment an atomic transaction.
+
+---
+
+**3. How do you implement GitOps in a Kubernetes environment?**
+
+GitOps uses version-controlled desired state and a controller that continuously reconciles the cluster with that state.
+
+I would implement it as follows:
+
+1. **Bootstrap Argo CD or Flux** with restricted access to approved repositories and cluster resources.
+2. **Store application configuration in Git**, using Helm or Kustomize for environment differences.
+3. **Run CI on application changes:** test, scan, build, sign, and publish an immutable image.
+4. **Update the deployment repository** with the new image digest through a reviewed change.
+5. **Let the GitOps controller deploy it** and report synchronization and application health.
+6. **Detect configuration drift** and either alert or automatically reconcile according to policy.
+
+Production repositories would have protected branches, code ownership, and required checks. Application permissions would restrict which namespaces and resource types each team can manage.
+
+Automatic pruning needs safeguards around critical resources, especially resources containing persistent data. Argo CD exposes separate controls for automatic synchronization, pruning, and self-healing. [Argo CD automated synchronization](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/)
+
+For recovery, I would commit a known-good desired state and let reconciliation apply it. Emergency changes would also be recorded in Git.
+
+**The operational benefit:** deployments become reproducible, reviewable, and continuously checked against an explicit source of truth.
+
+---
+
+**4. How would you create a fully automated blue-green deployment in Kubernetes?**
+
+I would use a rollout controller such as **Argo Rollouts**, with:
+
+* An **active Service** receiving production traffic.
+* A **preview Service** reaching the new version.
+* Automated analysis before and after promotion.
+
+The deployment sequence would be:
+
+1. Keep blue serving production traffic.
+2. Create green and wait for readiness.
+3. Run smoke tests, API compatibility checks, and dependency checks against the preview Service.
+4. Promote green after successful analysis.
+5. Observe production metrics.
+6. Abort and restore traffic to the previous stable version if post-promotion analysis fails.
+
+Example fragment from a Rollout’s `spec`:
+
+```yaml
+strategy:
+  blueGreen:
+    activeService: payments-active
+    previewService: payments-preview
+    autoPromotionEnabled: true
+    prePromotionAnalysis:
+      templates:
+        - templateName: preview-checks
+    postPromotionAnalysis:
+      templates:
+        - templateName: production-slo
+```
+
+The Services and AnalysisTemplates must be defined separately. Keep the previous replicas available through post-promotion analysis and the required connection-draining period. Argo’s scale-down timing interacts with analysis execution, so configure it deliberately. [Argo Rollouts blue-green deployments](https://argo-rollouts.readthedocs.io/en/stable/features/bluegreen/)
+
+Database changes should remain compatible with both versions, usually through an expand-and-contract migration.
+
+For payment systems, I would also prevent preview consumers or scheduled jobs from processing production work twice. Traffic promotion does not automatically coordinate every microservice or reverse database writes.
+
+---
+
+**5. How do you design an end-to-end DevSecOps pipeline for a fintech application with PCI-DSS requirements?**
+
+I would first identify the **cardholder data environment**, its dependencies, and the controls applicable to the organization. PCI DSS 4.0.1 is the standard version listed in the PCI SSC document library. [PCI SSC standards](https://www.pcisecuritystandards.org/document_library/)
+
+Then I would map controls to pipeline stages and retain evidence:
+
+| Stage                     | Controls and evidence                                                   |
+| ------------------------- | ----------------------------------------------------------------------- |
+| Source changes            | Protected branches, peer review, ownership checks, secret detection     |
+| Code validation           | Unit tests, SAST, dependency and license checks                         |
+| Infrastructure validation | IaC scanning and policy checks for networking, encryption, and identity |
+| Build                     | Isolated runners, pinned dependencies, restricted credentials           |
+| Artifact creation         | Image scanning, SBOM, signing, build provenance                         |
+| Integration testing       | API, authorization, DAST, and payment-flow tests                        |
+| Release authorization     | Required approvals, approved exceptions, release identity               |
+| Deployment                | Verified artifacts, admission policies, progressive rollout             |
+| Operations                | Audit collection, vulnerability reassessment, incident detection        |
+
+This follows a secure development lifecycle in which security controls and evidence span development and operation. [NIST Secure Software Development Framework](https://csrc.nist.gov/pubs/sp/800/218/final)
+
+Additional design choices would include synthetic test data, restricted production access, separate build and deployment identities, and redaction of payment data from logs.
+
+A vulnerability exception would need an owner, justification, compensating controls, and expiry.
+
+**Passing pipeline checks provides compliance evidence; compliance also depends on organizational processes, assessment, infrastructure configuration, and ongoing operation.**
+
+---
+
+**6. What are best practices for managing pipeline as code across large, distributed teams?**
+
+I would keep application pipelines small and move repeated behavior into versioned, centrally maintained components.
+
+For example, an application pipeline should select an approved build template and provide application-specific inputs, rather than copy hundreds of lines of deployment logic.
+
+My practices would include:
+
+* **Versioned shared components:** Teams adopt tested releases rather than automatically consuming every template change.
+* **Ownership:** CODEOWNERS and mandatory review for deployment, identity, and security logic.
+* **Testing:** Validate syntax and exercise shared pipelines in representative test repositories.
+* **Safe rollout:** Introduce template changes to a small group before broad adoption.
+* **Explicit interfaces:** Document inputs, outputs, required permissions, and compatibility.
+* **Operational controls:** Timeouts, bounded retries, cancellation handling, and deployment concurrency limits.
+* **Protected dependencies:** Pin third-party actions to reviewed immutable revisions.
+* **Trust separation:** Prevent untrusted contributions from obtaining production credentials or accessing privileged runners.
+
+GitHub specifically recommends secure handling of untrusted input, constrained permissions, and immutable action references. [GitHub Actions security guidance](https://docs.github.com/en/actions/reference/security/secure-use)
+
+I would also define an exception process. Central standards should provide a supported default while accommodating justified application requirements.
+
+---
+
+**7. How would you dynamically provision ephemeral dev/test environments using pipelines?**
+
+I would make the environment lifecycle follow the pull request.
+
+On an approved PR event, the pipeline would:
+
+1. Generate a unique environment identifier, such as `pr-482`.
+2. Provision required infrastructure using an isolated Terraform state.
+3. Create the application namespace and GitOps configuration.
+4. Deploy the proposed application versions.
+5. Initialize synthetic test data and short-lived credentials.
+6. Run integration and end-to-end tests.
+7. Publish the environment URL and test results.
+
+A namespace can be sufficient for trusted workloads, provided it has RBAC, quotas, and network restrictions. Untrusted code or strong tenant-isolation requirements may justify a dedicated cluster or cloud account.
+
+Every resource would carry ownership and expiry information.
+
+When the PR closes, automation would remove the GitOps application and destroy the associated infrastructure. A separate scheduled cleanup process would remove expired environments if the normal cleanup event failed.
+
+I would pay particular attention to resources that survive application deletion: load balancers, disks, snapshots, DNS records, and database instances.
+
+**The environment’s lifecycle is complete only when its resources and credentials are removed.**
+
+---
+
+**8. In a monorepo, how do you ensure only relevant services are built and deployed?**
+
+I would use changed-file detection together with a **dependency graph**.
+
+A directory-only filter is insufficient when services share libraries, schemas, build tooling, or base images.
+
+For example:
+
+| Change                         | Expected validation scope        |
+| ------------------------------ | -------------------------------- |
+| Payment service implementation | Payment service                  |
+| Shared authentication library  | Every dependent service          |
+| Shared API schema              | Relevant producers and consumers |
+| Root build configuration       | Potentially all services         |
+| Documentation                  | Documentation checks             |
+
+Tools such as Nx combine Git history with a project graph to identify affected projects and their dependents. [Nx affected projects](https://nx.dev/docs/features/ci-features/affected)
+
+For pull requests, I would compare against the appropriate merge base. For deployment, I would consider changes since the last successful deployment to that environment.
+
+The pipeline would generate a matrix of affected services, run their checks, build their artifacts, and update only the required deployment definitions.
+
+Cache keys must include relevant source files, dependencies, lockfiles, and toolchain versions. Otherwise, a fast build can return stale results.
+
+I would also keep an aggregate required check that reports success when no application builds are needed, so intentionally skipped jobs do not leave merge requirements unresolved.
+
+---
+
+**9. How do you implement canary deployment with real-time monitoring and rollback?**
+
+I would combine a rollout controller, a supported traffic router, and release-specific metrics.
+
+A possible progression is:
+
+| Stage      | Canary traffic | Required evidence                           |
+| ---------- | -------------: | ------------------------------------------- |
+| Initial    |             5% | Readiness, smoke tests, sufficient requests |
+| Expansion  |            25% | Error rate and latency within limits        |
+| Validation |            50% | Business metrics and dependencies healthy   |
+| Promotion  |           100% | Sustained successful analysis               |
+
+For controlled request percentages, I would use traffic-routing integration. Replica ratios alone provide an approximation of traffic distribution. [Argo Rollouts traffic management](https://argo-rollouts.readthedocs.io/en/stable/features/traffic-management/)
+
+Analysis would compare stable and canary versions using:
+
+* Error rate.
+* Tail latency.
+* Resource saturation.
+* Dependency failures.
+* Business outcomes, such as successful payment completion.
+
+Thresholds and observation windows would follow the application’s SLOs. A minimum request count prevents a low-traffic canary from passing without meaningful evidence.
+
+Missing metrics would trigger an explicit pause or failure policy. Argo analysis supports successful, failed, and inconclusive outcomes. [Argo Rollouts analysis](https://argo-rollouts.readthedocs.io/en/stable/features/analysis/)
+
+On failure, the controller would abort promotion and restore stable traffic. Automation would also record the recovery in Git; Argo Rollouts does not rewrite the deployment repository.
+
+Database and event-processing compatibility remain necessary because traffic rollback cannot undo every application side effect.
+
+---
+
+**10. How do you manage secrets and configuration securely at scale without compromising GitOps?**
+
+I would separate ordinary configuration from secret values:
+
+| Information                     | Management approach                    |
+| ------------------------------- | -------------------------------------- |
+| Non-sensitive configuration     | Git, ConfigMaps, Helm values           |
+| Secret references               | Git-managed ExternalSecret definitions |
+| Secret values                   | Cloud secret manager or Vault          |
+| Encrypted secrets stored in Git | SOPS with controlled KMS access        |
+
+With External Secrets Operator, Git stores the reference and desired synchronization configuration. The operator retrieves the value from the external provider. [External Secrets Operator](https://external-secrets.io/latest/introduction/overview/)
+
+SOPS is another approach: encrypted content remains version controlled and is decrypted by an authorized controller. [Flux with SOPS](https://fluxcd.io/flux/guides/mozilla-sops/)
+
+At scale, I would enforce:
+
+* Workload identities scoped to the required secrets.
+* Tenant restrictions on secret stores and permitted secret paths.
+* Encryption at rest and restricted Kubernetes Secret access.
+* Credential rotation and application reload procedures.
+* Redaction from logs, test output, and build artifacts.
+* Recovery procedures for secret stores and encryption keys.
+
+Base64 encoding does not encrypt Kubernetes Secrets. Also, permission to create Pods can become an indirect route to consuming secrets, so workload-authoring permissions matter. [Kubernetes Secrets practices](https://kubernetes.io/docs/concepts/security/secrets-good-practices/)
+
+For rotation, applications must reload updated mounted values; secrets supplied through environment variables generally require a Pod restart.
+
+---
+
+**11. Explain Kubernetes control-plane components and production hardening.**
+
+The main components are:
+
+| Component                | Responsibility                                                                        |
+| ------------------------ | ------------------------------------------------------------------------------------- |
+| API server               | Exposes the Kubernetes API and processes authentication, authorization, and admission |
+| etcd                     | Stores cluster state                                                                  |
+| Scheduler                | Assigns unscheduled Pods to suitable nodes                                            |
+| Controller manager       | Runs reconciliation controllers                                                       |
+| Cloud controller manager | Integrates with supported cloud infrastructure                                        |
+
+These components coordinate desired state; worker-node components run the workloads. [Kubernetes components](https://kubernetes.io/docs/concepts/overview/components/)
+
+For production, I would harden the control plane through:
+
+* **Restricted API access:** Private connectivity or tightly controlled network access.
+* **Strong identity:** Central authentication, short-lived credentials, and least-privilege RBAC.
+* **Protected etcd:** Restricted access, encrypted communications, encrypted sensitive data, and tested backups.
+* **Admission controls:** Pod security requirements and organization-specific policies.
+* **Audit logging:** Capture relevant administrative activity without unnecessarily recording secret contents.
+* **Availability:** Distribute supported control-plane replicas across failure domains.
+* **Lifecycle management:** Patch components and rotate certificates.
+* **Monitoring:** Track API latency, etcd health, scheduler delays, and admission-webhook failures.
+
+Admission webhooks also need availability and timeout planning because a failing webhook can obstruct deployments.
+
+With managed Kubernetes, the provider operates portions of the control plane, while the customer still configures access, permissions, admission policies, and workload security. [Kubernetes cluster security](https://kubernetes.io/docs/tasks/administer-cluster/securing-a-cluster/)
+
+---
+
+**12. How would you scale Kubernetes across regions and achieve zero-downtime upgrades?**
+
+I would normally use **multiple regional clusters**, each distributed across availability zones.
+
+Each region would scale independently using workload autoscaling and node provisioning. A global traffic layer would direct requests according to health, capacity, and application requirements.
+
+The data design is central:
+
+* Stateless services can often operate in multiple regions.
+* Databases need an explicit replication and failover strategy.
+* Asynchronous replication introduces potential data loss.
+* Single-writer systems need protection against simultaneous writers after failover.
+
+For upgrades, I would:
+
+1. Check API deprecations and compatibility of networking, storage, ingress, and admission components.
+2. Validate the upgrade in a representative environment.
+3. Upgrade one production region or cluster at a time.
+4. Maintain enough capacity elsewhere to handle diverted traffic.
+5. Add replacement capacity before draining old nodes.
+6. Use readiness checks, graceful termination, disruption budgets, and connection draining.
+7. Validate application and business metrics before continuing.
+
+Where fast platform fallback is essential, I would consider migrating traffic between parallel clusters.
+
+**Zero downtime is an objective that must be demonstrated through testing.** It depends on application behavior, data availability, spare capacity, clients, and traffic management—not just the Kubernetes upgrade procedure.
+
+---
+
+**13. What is a PodDisruptionBudget, and how do you use it for critical workloads?**
+
+A **PodDisruptionBudget, or PDB**, limits disruption through the Kubernetes Eviction API.
+
+For an application with three replicas:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-pdb
+  namespace: production
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: payments
+```
+
+When all three Pods are healthy, one can be voluntarily evicted while the budget is respected. If one Pod is already unavailable, further healthy-Pod eviction may be blocked.
+
+PDBs are useful during node draining, maintenance, and supported autoscaler operations.
+
+Their limits matter:
+
+* They cannot prevent node crashes.
+* Direct Pod deletion bypasses them.
+* Deployment rolling updates use the Deployment’s own update settings.
+* A restrictive PDB cannot create replacement capacity.
+
+For critical workloads, I would combine PDBs with suitable replica counts, topology spreading, reliable readiness checks, spare capacity, and appropriate Deployment `maxUnavailable` and `maxSurge` settings.
+
+A single replica with `minAvailable: 1` can block maintenance without providing redundancy. [Kubernetes disruptions and PDBs](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)
+
+---
+
+**14. How do you implement NetworkPolicies for strict inter-service communication?**
+
+First, I would verify that the cluster’s networking implementation enforces NetworkPolicy.
+
+Then I would establish default-deny ingress and egress policies and explicitly allow required communications.
+
+For example, this policy permits payment Pods to receive TCP traffic on port 8443 from checkout Pods in the `orders` namespace:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payments-from-checkout
+  namespace: payments
+spec:
+  podSelector:
+    matchLabels:
+      app: payments
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orders
+          podSelector:
+            matchLabels:
+              app: checkout
+      ports:
+        - protocol: TCP
+          port: 8443
+```
+
+The namespace and Pod selectors are in the same peer entry, so both must match.
+
+The checkout Pods also need an appropriate egress allowance if their egress is isolated. DNS and other required dependencies need separate rules.
+
+NetworkPolicies are additive: a broad allowance in another policy can expand access. They mainly control network connectivity; application authorization and mTLS address additional identity requirements.
+
+I would test both permitted and prohibited connections in CI and observe denied traffic during rollout. [Kubernetes NetworkPolicies](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
+
+---
+
+**15. How would you refactor a legacy Terraform codebase for DRY and modularity?**
+
+I would first establish a reliable baseline:
+
+* Inventory resources, state files, provider versions, and owners.
+* Identify drift and existing duplication.
+* Back up state.
+* Understand current plans before changing structure.
+
+Then I would extract cohesive modules, such as networking, clusters, or databases. Modules should have clear inputs and outputs, with provider configuration supplied from the root.
+
+When moving a resource into a module, I would preserve its identity with a `moved` block:
+
+```hcl
+moved {
+  from = aws_vpc.main
+  to   = module.network.aws_vpc.this
+}
+```
+
+The destination configuration must still describe the same intended resource. The plan should show the address transition without unintended destruction or replacement. [Terraform refactoring](https://developer.hashicorp.com/terraform/language/modules/develop/refactoring)
+
+I would refactor one stack at a time and keep infrastructure behavior changes separate from structural changes.
+
+Other improvements would include stable `for_each` keys, versioned modules, meaningful outputs, validation, and documented ownership.
+
+Moving resources between separate state files requires a controlled state migration; an ordinary `moved` block does not migrate resources across backends.
+
+**DRY should reduce maintenance cost while keeping infrastructure understandable.** A module with dozens of unrelated switches often makes maintenance harder.
+
+---
+
+**16. How does Terraform build and use its dependency graph during planning?**
+
+Terraform derives execution order from a dependency graph.
+
+Conceptually, it:
+
+1. Creates nodes for configured resource instances.
+2. Includes relevant existing state, including resources removed from configuration.
+3. Adds provider-configuration dependencies.
+4. Adds explicit edges from `depends_on`.
+5. Infers dependencies from references between resources.
+6. Represents creation and destruction separately where necessary.
+7. Validates the graph for cycles and processes available nodes.
+
+For example:
+
+```hcl
+resource "aws_subnet" "app" {
+  vpc_id     = aws_vpc.main.id
+  cidr_block = "10.20.1.0/24"
+}
+```
+
+The reference to `aws_vpc.main.id` creates a dependency. Independent subnets can be processed concurrently once their prerequisites are satisfied.
+
+During planning, Terraform consults providers and evaluates proposed changes. Some values remain unknown until apply; resource instance keys must still be determinable when required.
+
+Default graph parallelism is 10, configurable through `-parallelism`. [Terraform dependency graph](https://developer.hashicorp.com/terraform/internals/graph)
+
+I use `depends_on` for dependencies Terraform cannot infer. Excessively broad dependencies reduce concurrency and can make plans less precise.
+
+Infrastructure dependency ordering also does not prove that an application is ready to serve requests.
+
+---
+
+**17. How do you isolate Terraform state across environments and teams?**
+
+I would create separate states around ownership, permissions, lifecycle, and operational impact.
+
+For example, production networking and a team’s development application should usually have separate states and deployment identities.
+
+An S3 backend configuration might be:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "company-terraform-state-prod"
+    key          = "payments/prod/eu-west-1/terraform.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+The bucket must already exist and have appropriate encryption, versioning, access restrictions, and recovery controls. Current Terraform supports S3-native locking through `use_lockfile`; DynamoDB-based locking is deprecated. [Terraform S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3)
+
+I would combine backend locking with pipeline concurrency controls to prevent competing deployments.
+
+CLI workspaces can separate state instances, but they are unsuitable as the sole mechanism when environments require different credentials and access controls. [Terraform workspaces](https://developer.hashicorp.com/terraform/language/state/workspaces)
+
+State is sensitive. Even reading outputs through `terraform_remote_state` requires access to the underlying state snapshot. For cross-team sharing, I would prefer publishing selected values through a separately controlled configuration interface. [Remote state access considerations](https://developer.hashicorp.com/terraform/language/state/remote-state-data)
+
+---
+
+**18. How do you prevent and recover from corrupted or deleted remote state?**
+
+Prevention would include versioning, restricted write access, locking, backup copies, encryption-key protection, and restore exercises.
+
+My recovery procedure would be:
+
+1. **Stop all writers:** Suspend pipelines and other Terraform operations.
+2. **Confirm the problem:** Check backend location, workspace, permissions, and object versions.
+3. **Preserve evidence:** Save the damaged state and relevant operation logs.
+4. **Recover a known-good snapshot:** Follow the backend’s recovery procedure.
+5. **Validate identity and history:** Check the state’s lineage, serial, and expected resources.
+6. **Compare with actual infrastructure:** Identify changes made after the snapshot.
+7. **Repair mappings:** Import missing managed resources or perform reviewed state corrections.
+8. **Review plans before resuming:** Investigate unexpected creation, deletion, or replacement.
+
+Terraform’s `state push` performs lineage and serial checks. I would investigate failed checks rather than automatically bypass them with `-force`. [Terraform state push](https://developer.hashicorp.com/terraform/cli/commands/state/push)
+
+If no usable backup exists, recovery may require reconstructing configuration and importing existing resources.
+
+**Restoring state does not restore infrastructure.** It restores Terraform’s record, which must then be reconciled with the real environment.
+
+---
+
+**19. Have you implemented policy as code with Sentinel or OPA? Give a use case.**
+
+Answer the experience portion truthfully. An illustrative implementation would be enforcing infrastructure controls for a financial application.
+
+Possible policies:
+
+* No publicly accessible production databases.
+* No unrestricted SSH or RDP ingress.
+* Encryption required for supported storage resources.
+* Deployments limited to approved regions.
+* Mandatory ownership and environment tags.
+* Additional authorization for deleting protected resources.
+
+The pipeline would produce a saved plan and its JSON representation:
+
+```bash
+terraform plan -out=tfplan
+terraform show -json tfplan > tfplan.json
+```
+
+OPA can evaluate planned changes before they are applied. Its documentation also highlights that some values are unknown during planning. [OPA with Terraform](https://www.openpolicyagent.org/docs/terraform)
+
+I would therefore test policies against allowed, denied, missing, and unknown values. Rules must cover the resource forms teams actually use, including separate security-group-rule resources.
+
+Policy failures would block deployment. Exceptions would have specific scope, an approver, and an expiry.
+
+The apply stage would use the same approved saved plan, with the plan artifact protected because it can contain sensitive information.
+
+Cloud-level controls and drift detection would supplement pipeline checks, covering changes made through other access paths.
+
+---
+
+**20. How would you implement centralized logging across multiple clouds and environments?**
+
+I would centralize the logging experience while allowing collection and storage to remain regional where required.
+
+A practical design would include:
+
+* Node or workload agents such as Fluent Bit or OpenTelemetry collectors.
+* Regional collection gateways.
+* Searchable storage such as OpenSearch, Loki, or a managed logging platform.
+* Object storage for longer-term retention.
+* A federated query and investigation interface.
+
+Every application would emit structured logs with common fields:
+
+```text
+timestamp, service, environment, cloud, region,
+cluster, release, severity, trace_id, message
+```
+
+I would redact secrets and sensitive business data before forwarding.
+
+Collectors would use authenticated encrypted transport, bounded queues, retry handling, and persistent buffering where appropriate. OpenTelemetry supports persistent sending queues, but storage exhaustion and queue overflow can still cause loss. [OpenTelemetry collector resilience](https://opentelemetry.io/docs/collector/resiliency/)
+
+Operational monitoring would include ingestion lag, dropped records, queue utilization, storage growth, and failed exports.
+
+Access and retention would follow data classification and tenant ownership. Security audit records would receive stronger preservation controls than disposable debug logs.
+
+This design lets an engineer follow an incident across clouds using service identity, release information, and trace correlation.
+
+---
+
+**21. How would you secure DevOps infrastructure using federation between Azure AD and AWS IAM?**
+
+For human access, I would connect **Microsoft Entra ID, formerly Azure AD, to AWS IAM Identity Center**.
+
+The setup would include:
+
+1. Configure the SAML federation relationship.
+2. Provision users and groups through SCIM.
+3. Map groups to permission sets.
+4. Assign those permission sets to the required AWS accounts.
+5. Enforce workforce authentication requirements through the identity provider.
+
+AWS Identity Center supports external identity providers, and Microsoft documents the Entra integration. [AWS external identity providers](https://docs.aws.amazon.com/singlesignon/latest/userguide/manage-your-identity-source-idp.html), [Microsoft Entra integration](https://learn.microsoft.com/en-us/entra/identity/saas-apps/aws-single-sign-on-tutorial)
+
+For example:
+
+| Group                   | Access                                    |
+| ----------------------- | ----------------------------------------- |
+| Developers              | Deployment access in development accounts |
+| Production support      | Restricted investigation permissions      |
+| Platform administrators | Controlled administrative access          |
+| Security auditors       | Audit and configuration visibility        |
+
+I would use temporary sessions, least-privilege permission sets, organization guardrails, and audit correlation between identity-provider and AWS events.
+
+Joiner, mover, and leaver processes must also be tested. Removing a group assignment does not necessarily invalidate every already-issued session immediately.
+
+Emergency access would be separately protected and audited. CI/CD workloads would use their own federated identities rather than a human user’s credentials.
+
+---
+
+**22. How do you securely configure GitHub Actions workload identity federation into Google Cloud or Azure?**
+
+The workflow requests a GitHub OIDC token. The cloud validates its identity claims and exchanges it for short-lived credentials.
+
+The job needs:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+```
+
+`id-token: write` permits requesting an OIDC token; it does not grant cloud permissions by itself.
+
+For **Google Cloud**, I would:
+
+1. Create a Workload Identity Pool and OIDC provider.
+2. Configure GitHub’s issuer.
+3. Map required claims, including stable repository and owner IDs.
+4. Add conditions restricting the approved organization, repository, and deployment context.
+5. Grant the resulting principal narrowly scoped access, directly or through service-account impersonation.
+6. Give the service account only the workload permissions it needs.
+
+Google recommends restricting the shared issuer to the intended organization and using immutable identifiers to avoid name-reuse risks. [Google Cloud deployment federation](https://cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines)
+
+For **Azure**, I would create a federated credential on the intended application or supported managed identity, then assign scoped Azure RBAC permissions. The trust must match the issuer, subject, and audience. A standard Azure audience is `api://AzureADTokenExchange`. [Microsoft workload federation](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-create-trust)
+
+**Current GitHub detail:** repositories created after July 15, 2026 use an immutable default subject containing owner and repository IDs. Earlier repositories may retain the previous format. Repository renames and transfers after that date also affect the format. Configure trust against the actual expected subject. [GitHub OIDC subjects](https://docs.github.com/en/actions/reference/security/oidc)
+
+For production, I would additionally use protected GitHub environments and branch restrictions. An environment-based subject alone does not enforce the deployment branch.
+
+Finally, I would test both successful access and denial from unauthorized repositories, branches, forks, and environments.
+
+---
+
+**23. How do you ensure cost-efficient autoscaling under heavy CI/CD workloads?**
+
+I would optimize for **cost per successful build while meeting queue-time and delivery targets**.
+
+Runner capacity should follow queued work. Infrastructure capacity should then follow the resource requirements of those runners.
+
+For GitHub Actions on Kubernetes, Actions Runner Controller can manage ephemeral runner scale sets. [Actions Runner Controller](https://docs.github.com/en/actions/concepts/runners/actions-runner-controller)
+
+My approach would include:
+
+* Separate runner pools for different resource requirements and trust levels.
+* Retryable build jobs on interruption-tolerant capacity where appropriate.
+* Stable capacity for critical controllers and other interruption-sensitive services.
+* Accurate CPU, memory, and disk requests.
+* Limits on concurrency, cloud spending, and per-team consumption.
+* A small warm pool where startup delay would otherwise breach queue-time targets.
+* Scheduled capacity increases for predictable peaks.
+* Cleanup of abandoned environments and temporary resources.
+* Dependency and build caching with appropriate trust separation.
+* Regional placement to reduce artifact-transfer latency and cost.
+
+I would measure retries and interruption losses alongside instance prices. Cheap capacity can become expensive if large builds repeatedly restart.
+
+Long-term commitments should cover predictable baseline usage; burst capacity needs a more flexible purchasing strategy.
+
+---
+
+**24. Explain a scenario where you designed disaster recovery for DevOps infrastructure.**
+
+An illustrative scenario is a regional outage that disables the CI/CD platform while production applications continue serving traffic.
+
+Suppose the business agrees to a **60-minute recovery-time objective** and **15-minute recovery-point objective** for delivery-platform metadata. Those are example targets; actual values must come from business impact. AWS’s DR guidance likewise starts with business-defined recovery objectives. [AWS disaster recovery planning](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/plan-for-disaster-recovery-dr.html)
+
+I would prepare:
+
+| Asset                              | Recovery provision                                 |
+| ---------------------------------- | -------------------------------------------------- |
+| Source and deployment repositories | Independent recovery access and backups            |
+| Terraform state                    | Versioned, protected recovery copies               |
+| Released artifacts                 | Replicated images, signatures, and provenance      |
+| CI/CD controllers                  | Reproducible infrastructure and configuration      |
+| Secrets and encryption keys        | Tested availability in the recovery environment    |
+| Audit records                      | Durable storage independent of the failed platform |
+
+The recovery runbook would:
+
+1. Declare the incident and stop competing deployment writers.
+2. Activate the recovery platform.
+3. Restore and validate state and configuration.
+4. Verify identity, secrets, registries, and cluster connectivity.
+5. Run a controlled deployment test.
+6. Resume releases with clear operational ownership.
+
+I would ensure production releases are available in the recovery registry before relying on them for failover.
+
+Regular exercises would measure actual recovery time and test hidden dependencies, especially identity, DNS, and encryption keys. Application DR and delivery-platform DR would have separate, coordinated runbooks.
+
+---
+
+**25. How do you enforce compliance and auditability across global regions?**
+
+I would turn applicable requirements into a control map containing:
+
+* The requirement and affected systems.
+* The control owner.
+* The automated or manual enforcement mechanism.
+* The retained evidence.
+* The exception and review process.
+
+Every deployment would be traceable through:
+
+| Question                   | Evidence                                       |
+| -------------------------- | ---------------------------------------------- |
+| Who authorized the change? | Review and approval records                    |
+| What source was used?      | Repository and commit                          |
+| What was deployed?         | Artifact digest and provenance                 |
+| Which checks passed?       | Test, scan, and policy results                 |
+| Where did it run?          | Account, region, cluster, and environment      |
+| What happened?             | Deployment result and operational observations |
+
+Regional controls would govern where sensitive data, logs, artifacts, and backups can be stored or accessed.
+
+For **GDPR**, international transfers require an applicable legal basis and safeguards; GDPR does not impose a universal rule that all personal data must remain in the EU. [EDPB international transfer guidance](https://www.edpb.europa.eu/sme-data-protection-guide/international-data-transfers_en)
+
+For **HIPAA-regulated systems**, controls must address applicable administrative, physical, and technical safeguards for electronic protected health information. [HHS Security Rule guidance](https://www.hhs.gov/hipaa/for-professionals/security/laws-regulations/index.html)
+
+I would minimize personal data in audit records, apply justified retention periods, restrict access, and continuously check configuration drift. Compliance teams would validate that the technical evidence satisfies the organization’s actual obligations.
+
+---
+
+**26. What is your strategy for container image security throughout the pipeline?**
+
+I would cover the complete image lifecycle:
+
+| Stage                | Controls                                                            |
+| -------------------- | ------------------------------------------------------------------- |
+| Base image selection | Trusted source, supported version, minimal contents, pinned digest  |
+| Build                | Isolated builder, controlled dependencies, secure secret injection  |
+| Validation           | OS and application dependency scanning, secret checks, SBOM         |
+| Publication          | Restricted registry access, immutable release references            |
+| Release              | Signing and verifiable provenance                                   |
+| Admission            | Verify approved registry, digest, signer, and required attestations |
+| Runtime              | Non-root execution, reduced privileges, network restrictions        |
+| Maintenance          | Continuous reassessment and patch-driven rebuilds                   |
+
+Build secrets should use mechanisms designed to avoid persisting them in image layers or build history.
+
+An SBOM identifies components. Provenance describes how an artifact was produced; SLSA provides a framework for assessing build integrity and provenance. [SLSA specification](https://slsa.dev/spec/v1.2/)
+
+For signatures, I would verify the expected identity and issuer, or the approved signing key. Accepting any valid signature is insufficient. Cosign supports verification against specific certificate identities and OIDC issuers. [Cosign verification](https://docs.sigstore.dev/cosign/verifying/verify/)
+
+Deployment would reference an immutable image digest. Vulnerability exceptions would be explicit, scoped, and time limited.
+
+After deployment, new vulnerabilities would trigger reassessment and rebuilds from controlled sources. A valid signature establishes authenticity and integrity; ongoing vulnerability management establishes whether that artifact remains acceptable to run.
