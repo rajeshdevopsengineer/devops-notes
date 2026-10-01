@@ -3991,3 +3991,534 @@ kubectl describe pod application
 ```
 
 Events such as `Insufficient cpu` or `Insufficient memory` help distinguish capacity problems from taints, affinity constraints, or storage-related scheduling failures.
+
+
+Here are practical answers for a **5-year DevOps interview**. The Docker and Compose examples use a Python/FastAPI application.
+
+**1. How do you display the last 10 lines of a large log file without opening it fully?**
+
+Use `tail`:
+
+```bash
+tail -n 10 /var/log/application.log
+```
+
+For a normal, seekable log file, `tail` reads from the end efficiently instead of loading the complete file into an editor.
+
+To display the last 10 lines and continue watching new entries:
+
+```bash
+tail -n 10 -F /var/log/application.log
+```
+
+`-F` follows the filename and retries if it disappears, making it useful when log rotation replaces the file. :chatgpt-content-reference{index="0"}
+
+---
+
+**2. In Kubernetes, how would you double CPU allocation once usage crosses 70%?**
+
+First clarify what **“CPU allocation”** means:
+
+| Requirement | Appropriate approach |
+|---|---|
+| Add application replicas as CPU utilization increases | Horizontal Pod Autoscaler — HPA |
+| Increase CPU requests or limits for each Pod | Vertical scaling, potentially using VPA |
+| Exactly double a configured value after crossing a threshold | An explicit scaling policy or custom automation |
+
+**HPA does not increase CPU per Pod, and a 70% target does not mean “double immediately.”**
+
+**For horizontal scaling**
+
+Assume a Deployment named `api` in namespace `apps`. Configure resource requests on its application container:
+
+```yaml
+resources:
+  requests:
+    cpu: "500m"
+    memory: "256Mi"
+  limits:
+    cpu: "1"
+    memory: "512Mi"
+```
+
+Then configure an HPA:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-cpu
+  namespace: apps
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+
+  minReplicas: 2
+  maxReplicas: 4
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+The cluster needs a working resource-metrics API, commonly provided by Metrics Server. Relevant CPU requests must be defined for utilization-based scaling. :chatgpt-content-reference{index="1"}
+
+Here, **70% is relative to CPU requests**, averaged across the targeted Pods. With a `500m` request, 70% corresponds to approximately `350m` CPU usage.
+
+The basic HPA calculation is:
+
+```text
+desired replicas =
+ceil(current replicas × current utilization / target utilization)
+```
+
+For two replicas:
+
+- At 80% utilization: `ceil(2 × 80 / 70) = 3`
+- At 140% utilization: `ceil(2 × 140 / 70) = 4`
+
+Actual decisions also account for tolerance, missing metrics, readiness, and scaling behavior. Setting `maxReplicas: 4` establishes a ceiling; it does not force a jump from two to four. :chatgpt-content-reference{index="2"}
+
+Check behavior with:
+
+```bash
+kubectl get hpa -n apps
+kubectl describe hpa api-cpu -n apps
+kubectl top pods -n apps
+```
+
+**For increasing CPU per Pod**
+
+VPA can recommend and apply resource changes, using recreation or supported in-place update modes. Its recommendations are not a built-in “70%, then multiply by two” rule. :chatgpt-content-reference{index="3"}
+
+A literal doubling requirement needs a defined policy—for example, sustained utilization above the agreed threshold changes a request from `500m` to `1000m`, with maximum values, a cooldown, and separate scale-down criteria.
+
+Also distinguish **requests** from **limits**: increasing the request changes scheduling allocation; increasing the limit changes the permitted CPU ceiling.
+
+---
+
+**3. Can you write a basic Dockerfile for your application?**
+
+Assume:
+
+- The application is in `app.py`.
+- It exposes a FastAPI object named `app`.
+- `requirements.txt` includes the application’s pinned dependencies, including FastAPI and Uvicorn.
+
+```dockerfile
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN useradd --create-home --uid 10001 appuser
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY --chown=appuser:appuser . .
+
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**Explanation:**
+
+| Instruction | Purpose |
+|---|---|
+| `FROM` | Selects the base image |
+| `ENV` | Configures Python runtime behavior |
+| `WORKDIR` | Sets the application directory |
+| First `COPY` | Copies dependency definitions separately for caching |
+| `RUN pip install` | Installs dependencies |
+| Second `COPY` | Copies application source |
+| `USER` | Runs the application as a non-root user |
+| `EXPOSE` | Documents the application port |
+| `CMD` | Defines the default startup command |
+
+The JSON form of `CMD` starts the executable directly, which helps it receive process signals correctly. `EXPOSE` does not publish the port to the host. :chatgpt-content-reference{index="4"}
+
+Example `.dockerignore`:
+
+```text
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.env.*
+secrets/
+*.log
+```
+
+Build and run:
+
+```bash
+docker build -t interview-api:local .
+
+docker run --rm \
+  -p 127.0.0.1:8000:8000 \
+  interview-api:local
+```
+
+The application is available locally on port `8000`, provided it starts successfully.
+
+For production, use an approved base-image digest, scan the resulting image, keep credentials out of the build context, and add only the operating-system dependencies the application requires.
+
+---
+
+**4. What top-level OWASP security risks do you usually check?**
+
+Name the edition you are using. The current **OWASP Top 10:2025** includes the following categories. :chatgpt-content-reference{index="5"}
+
+| Category | Practical checks |
+|---|---|
+| **A01: Broken Access Control** | Can users access another user’s records, another tenant’s data, or unauthorized administrative actions? |
+| **A02: Security Misconfiguration** | Default credentials, debug mode, excessive permissions, exposed management endpoints, unsafe configuration |
+| **A03: Software Supply Chain Failures** | Vulnerable dependencies, untrusted packages, compromised build tools, unsafe artifact distribution |
+| **A04: Cryptographic Failures** | Missing TLS, weak password protection, exposed secrets, inadequate key management |
+| **A05: Injection** | SQL injection, command injection, unsafe queries, and untrusted data rendered without appropriate encoding |
+| **A06: Insecure Design** | Missing abuse controls, flawed business workflows, inadequate trust boundaries |
+| **A07: Authentication Failures** | Weak account recovery, missing MFA where required, insecure sessions, ineffective brute-force protection |
+| **A08: Software or Data Integrity Failures** | Unverified updates, unsafe deserialization, missing integrity verification |
+| **A09: Security Logging and Alerting Failures** | Missing security events, ineffective alerts, inadequate incident evidence |
+| **A10: Mishandling of Exceptional Conditions** | Fail-open behavior, unsafe error handling, resource exhaustion, unexpected failure paths |
+
+For access-control testing, I would use different authorized test accounts and verify that server-side authorization protects each sensitive operation. Hiding a button in the UI is insufficient. :chatgpt-content-reference{index="6"}
+
+For supply-chain security, I would review more than dependency vulnerabilities: repository access, build permissions, artifact provenance, and the integrity of the release process also matter. :chatgpt-content-reference{index="7"}
+
+For logging, I would verify that meaningful security events generate usable evidence and reach the responsible team through actionable alerts. :chatgpt-content-reference{index="8"}
+
+**How I integrate checks into delivery:**
+
+- SAST for source-code issues.
+- Software composition analysis for dependencies.
+- Secret scanning.
+- Container and infrastructure-configuration scanning.
+- DAST against an authorized test environment.
+- Manual authorization and business-logic testing.
+
+The Top 10 is an awareness framework. For detailed verification requirements, OWASP ASVS provides a more comprehensive testing basis. :chatgpt-content-reference{index="9"}
+
+---
+
+**5. How do you configure Prometheus and Grafana for monitoring?**
+
+For Kubernetes, I would configure the collection pipeline, dashboards, alerting, and operational controls.
+
+| Component | Responsibility |
+|---|---|
+| Application instrumentation | Exposes application metrics |
+| Exporters | Expose infrastructure or dependency metrics |
+| Prometheus | Scrapes and stores metrics; evaluates rules |
+| Prometheus Operator | Manages Prometheus-related Kubernetes resources |
+| Grafana | Queries data sources and displays dashboards |
+| Alertmanager | Groups and routes Prometheus alerts |
+
+**Step 1: Install the monitoring stack.**
+
+A common approach is the `kube-prometheus-stack` Helm chart.
+
+After selecting an approved chart version and setting `CHART_VERSION`:
+
+```bash
+helm repo add prometheus-community \
+  https://prometheus-community.github.io/helm-charts
+
+helm repo update
+
+helm upgrade --install monitoring \
+  prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace \
+  --version "$CHART_VERSION"
+```
+
+Use version-controlled values for persistence, retention, resource requests, authentication, and other environment settings. :chatgpt-content-reference{index="10"}
+
+**Step 2: Expose application metrics.**
+
+Assume the API:
+
+- Runs in namespace `apps`.
+- Has Pod label `app: api`.
+- Exposes Prometheus-format metrics at `/metrics` on port `8000`.
+
+FastAPI needs suitable instrumentation; `/metrics` does not appear automatically merely because the application runs in Kubernetes.
+
+Create a Service and ServiceMonitor:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-metrics
+  namespace: apps
+  labels:
+    app: api
+spec:
+  selector:
+    app: api
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - apps
+
+  selector:
+    matchLabels:
+      app: api
+
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+```
+
+The selection chain is important:
+
+1. Prometheus selects the ServiceMonitor.
+2. The ServiceMonitor selects the Service.
+3. The Service selects application Pods.
+
+The endpoint’s `port` refers to the **Service port name**, here `metrics`. :chatgpt-content-reference{index="11"}
+
+The `release: monitoring` label matches the conventional chart selection behavior for this release name. Verify the selectors in your pinned chart and deployed Prometheus resource.
+
+**Step 3: Verify collection.**
+
+```bash
+kubectl get pods -n monitoring
+kubectl get servicemonitors -A
+kubectl get endpointslices -n apps
+```
+
+Then check Prometheus targets and query `up`.
+
+If a target is missing or down, inspect labels, namespaces, port names, network policies, authentication, and the metrics endpoint itself.
+
+**Step 4: Configure Grafana.**
+
+The chart can provision a Prometheus data source. Verify its URL and connectivity.
+
+For manual configuration, select the Prometheus data-source type and use the actual Prometheus Service address. `localhost:9090` inside the Grafana container refers to Grafana’s own network namespace, not another Prometheus container. :chatgpt-content-reference{index="12"}
+
+**Step 5: Build dashboards and alerts.**
+
+Useful signals include:
+
+- Request rate, error rate, and latency percentiles.
+- CPU throttling and memory usage.
+- Unavailable replicas and container restarts.
+- Node and persistent-volume capacity.
+- Database latency and connection utilization.
+- SLO performance and error-budget consumption.
+
+Configure alert ownership, routing, severity, grouping, and runbook links. Keep administrative interfaces and metrics endpoints appropriately protected, and monitor the telemetry pipeline itself.
+
+---
+
+**6. How would you migrate an on-premises application to a cloud-native environment?**
+
+I would plan the migration around business requirements, application dependencies, and recoverability.
+
+**Step 1: Assess the application.**
+
+Document:
+
+- Application components and dependency versions.
+- Databases, files, sessions, queues, and scheduled jobs.
+- External integrations and network dependencies.
+- Current traffic, latency, availability, and capacity.
+- Data sensitivity and residency requirements.
+- RTO, RPO, and acceptable migration downtime.
+
+This identifies state that must survive container replacement and dependencies that might block migration.
+
+**Step 2: Choose the migration strategy.**
+
+Common options include:
+
+- **Rehost:** Move the existing workload with minimal architectural change.
+- **Replatform:** Introduce selected cloud improvements, such as containers or a managed database.
+- **Refactor:** Change architecture where business requirements justify it.
+
+A phased replatforming approach can reduce the risk of combining a large migration with extensive application redesign. :chatgpt-content-reference{index="13"}
+
+**Step 3: Build the cloud foundation.**
+
+For an AWS example:
+
+| Requirement | Possible implementation |
+|---|---|
+| Network isolation | VPC, public/private subnets, security groups |
+| Hybrid connectivity | Site-to-Site VPN or Direct Connect |
+| Application platform | EKS, ECS, or an appropriate managed application service |
+| Database | Compatible managed database such as RDS |
+| File/object storage | S3 or suitable shared storage |
+| Identity and secrets | IAM roles and Secrets Manager |
+| Repeatable infrastructure | Terraform |
+
+Select services according to the workload’s needs and the team’s operating capabilities.
+
+**Step 4: Prepare the application.**
+
+- Build a tested container image.
+- Externalize environment-specific configuration.
+- Move required persistent data to appropriate storage.
+- Provide health endpoints.
+- Implement graceful shutdown and dependency retries.
+- Define resource requests and scaling behavior.
+
+**Step 5: Create the delivery pipeline.**
+
+A typical flow is:
+
+```text
+Commit → Tests → Security checks → Image build
+→ Registry → Test deployment → Validation → Production promotion
+```
+
+Promote the same validated artifact between environments.
+
+**Step 6: Migrate data.**
+
+Choose backup/restore, replication, or full-load-plus-change-data-capture according to database compatibility and downtime requirements.
+
+Validate replication lag, data completeness, and application transactions. AWS DMS is one option where supported, but migration tasks still need sizing, monitoring, and validation. :chatgpt-content-reference{index="14"}
+
+**Step 7: Test and cut over.**
+
+Run functional, performance, security, recovery, and dependency-failure tests.
+
+During cutover:
+
+1. Control writes as required.
+2. Complete final synchronization.
+3. Validate the target.
+4. Redirect traffic.
+5. Monitor customer transactions and reliability signals.
+
+Define rollback before cutover. Once the new database accepts writes, changing DNS back alone may lose or split data; recovery must account for those writes.
+
+**Step 8: Stabilize and optimize.**
+
+Confirm operational ownership, alerts, backups, restore procedures, capacity, and costs before retiring the old environment.
+
+---
+
+**7. What is Docker Compose, and how does it help with multi-container applications?**
+
+Docker Compose defines and runs an application’s containers, networks, volumes, configuration, and secrets through a YAML file.
+
+It helps make environments repeatable: developers and CI jobs can start the same application stack with one command. :chatgpt-content-reference{index="15"}
+
+Here is a **local development example** for the Python API and PostgreSQL:
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: appdb
+      DB_USER: appuser
+      DB_PASSWORD_FILE: /run/secrets/db_password
+
+    secrets:
+      - db_password
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17
+
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+
+    secrets:
+      - db_password
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+```
+
+**How it works:**
+
+- `api` is built from the Dockerfile.
+- `db` runs PostgreSQL.
+- Compose provides a project network.
+- The API connects to hostname `db`, using Compose service discovery.
+- The named volume preserves database data across container replacement.
+- The API waits for the database’s configured health check before starting.
+
+`depends_on` with `service_healthy` governs startup readiness. The application still needs retry and recovery behavior for later database interruptions. :chatgpt-content-reference{index="16"}
+
+Create the secret file outside version control and ensure the relevant container users can read it. Exclude `secrets/` from both `.gitignore` and `.dockerignore`.
+
+The application must implement reading `DB_PASSWORD_FILE`. The `_FILE` convention is supported by some images, including PostgreSQL; it is not automatically implemented for arbitrary application code. :chatgpt-content-reference{index="17"}
+
+Common commands:
+
+```bash
+# Build and start the application stack
+docker compose up -d --build
+
+# Inspect services
+docker compose ps
+
+# Follow API logs
+docker compose logs -f api
+
+# Stop and remove containers and the project network
+docker compose down
+```
+
+Named volumes remain after a normal `docker compose down`.
+
+Compose is useful for local development, integration testing, and suitable single-host deployments. Cluster scheduling, automatic failover across hosts, and broader platform scaling require an appropriate orchestration platform.
