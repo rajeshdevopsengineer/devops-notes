@@ -2498,3 +2498,1496 @@ Falco can detect suspicious runtime behavior, such as unexpected shells or sensi
 - **Prevention:** Add dependency-update automation and retain evidence for each release.
 
 If scanning discovers a committed credential, revoke or rotate it and investigate possible use. Deleting the value from the latest commit does not invalidate the exposed credential.
+
+
+Below are detailed, interview-ready answers. For experience-based questions, adapt the examples to the tools and responsibilities you actually handled.
+
+**1. What is the difference between PV and PVC?**
+
+A **PersistentVolume (PV)** represents storage available to Kubernetes. A **PersistentVolumeClaim (PVC)** is an application’s request for storage.
+
+| Aspect | PV | PVC |
+|---|---|---|
+| Represents | A provisioned storage volume | A request for storage |
+| Scope | Cluster-wide | Namespaced |
+| Created by | Administrator or storage provisioner | Application owner or workload controller |
+| Contains | Capacity, access modes, storage details, reclaim policy | Requested capacity, access mode, StorageClass |
+| Used by | Bound to a claim | Referenced by a Pod |
+
+A bound PV–PVC relationship is one-to-one. The storage lifecycle is independent of an individual Pod. :chatgpt-content-reference{index="0"}
+
+Example PVC:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: application-data
+spec:
+  storageClassName: gp3
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+This assumes a suitable StorageClass named `gp3` exists. With dynamic provisioning, its provisioner creates the backing storage and PV in response to the claim. :chatgpt-content-reference{index="1"}
+
+**Interview detail:** `ReadWriteOnce` means writable from one **node**, not necessarily one Pod. `ReadWriteOncePod` restricts access to one Pod when supported.
+
+---
+
+**2. Explain Kubernetes architecture.**
+
+Kubernetes has a **control plane**, which manages desired state, and **worker nodes**, which run application containers.
+
+```mermaid
+flowchart TD
+    Client["kubectl, CI or GitOps"] --> API["API server"]
+
+    subgraph CP["Control plane"]
+        API <--> ETCD["etcd"]
+        Scheduler["Scheduler"] <--> API
+        Controllers["Controller manager"] <--> API
+    end
+
+    subgraph Worker["Worker node"]
+        Kubelet["kubelet"] --> Runtime["Container runtime"]
+        Runtime --> Pods["Application Pods"]
+        Network["CNI and Service networking"] --- Pods
+    end
+
+    Kubelet <--> API
+```
+
+| Component | Responsibility |
+|---|---|
+| **kube-apiserver** | Exposes the Kubernetes API; processes authenticated and authorized requests |
+| **etcd** | Persists Kubernetes cluster state |
+| **kube-scheduler** | Selects suitable nodes for unscheduled Pods |
+| **kube-controller-manager** | Runs controllers that reconcile actual state with desired state |
+| **Cloud integration components** | Connect Kubernetes to cloud resources where applicable |
+| **kubelet** | Ensures assigned Pods and containers run on its node |
+| **Container runtime** | Runs containers, commonly through containerd or CRI-O |
+| **Service networking** | Implements Service traffic routing through kube-proxy or an alternative |
+| **CNI implementation** | Provides Pod networking |
+
+Some networking implementations replace kube-proxy, so it is not mandatory in every cluster design. :chatgpt-content-reference{index="2"}
+
+**What happens when you create a Deployment?**
+
+1. The API server accepts and stores the desired configuration.
+2. The Deployment controller creates or updates a ReplicaSet.
+3. The ReplicaSet controller creates the required Pods.
+4. The scheduler assigns Pods to nodes.
+5. Each node’s kubelet works with the runtime to start containers.
+6. Controllers keep reconciling the workload when replicas fail or configuration changes. :chatgpt-content-reference{index="3"}
+
+---
+
+**3. What is the difference between a Deployment and a StatefulSet?**
+
+| Aspect | Deployment | StatefulSet |
+|---|---|---|
+| Typical workloads | APIs, web applications, interchangeable workers | Applications requiring stable identity or per-replica storage |
+| Pod identity | Replaceable; replacement names generally change | Stable ordinal names such as `mongo-0` |
+| Storage | Can use PVCs | Can create a separate PVC for each replica |
+| Replacement | Any suitable replica serves the workload | Replacement preserves the replica’s logical identity |
+| Default rolling update | Uses ReplicaSets and surge/unavailability settings | Updates in reverse ordinal order |
+| Network identity | Usually accessed through a shared Service | Can have stable per-Pod DNS through a headless Service |
+
+A Deployment **can use persistent storage**. The main distinction is whether replicas require individual, stable identities and storage associations. :chatgpt-content-reference{index="4"}
+
+**Example:**
+
+- A stateless payment API is usually a Deployment.
+- A database replica set may require a StatefulSet or an application-specific operator.
+
+A StatefulSet does not automatically configure database replication, leader election, or backups.
+
+---
+
+**4. What is Calico?**
+
+Calico provides Kubernetes networking and network security.
+
+Its main responsibilities can include:
+
+- Pod-to-Pod connectivity.
+- IP address management.
+- NetworkPolicy enforcement.
+- Controlling allowed ingress and egress traffic.
+- Additional networking and observability capabilities, depending on the edition and configuration.
+
+Its networking architecture can use different routing or overlay options. The installation mode determines which networking functions Calico owns. :chatgpt-content-reference{index="5"}
+
+**Example use case:**
+
+Suppose an application has frontend, API, and database workloads.
+
+You can implement policies that:
+
+- Allow frontend Pods to contact API Pods.
+- Allow API Pods to contact database Pods.
+- Deny direct frontend-to-database communication.
+- Permit necessary DNS and platform traffic.
+
+The Kubernetes `NetworkPolicy` resource expresses the policy; a supporting implementation such as Calico enforces it.
+
+**Interview answer:**
+
+> “Calico is a Kubernetes networking and network-security solution. I would use its policy capabilities to restrict communication between workloads according to application requirements.”
+
+---
+
+**5. What is etcd?**
+
+etcd is a distributed, strongly consistent key-value store used by Kubernetes to persist cluster state.
+
+It stores representations of resources such as:
+
+- Deployments and StatefulSets.
+- Pods and Services.
+- ConfigMaps and Secrets.
+- RBAC configuration.
+- PersistentVolume and PersistentVolumeClaim objects.
+
+The Kubernetes API server reads and writes this state. Other components normally interact through the API server.
+
+etcd uses the **Raft consensus algorithm** to maintain agreement between members. :chatgpt-content-reference{index="6"}
+
+For voting-member clusters:
+
+- Three members require a majority of two.
+- Five members require a majority of three.
+
+If etcd loses quorum, it cannot continue accepting updates. Existing application containers may continue running, but normal control-plane operations are affected. :chatgpt-content-reference{index="7"}
+
+**Important distinction:** etcd stores the Kubernetes objects describing persistent storage. It does **not** contain the application files or database records stored inside those volumes.
+
+---
+
+**6. How do you back up a Kubernetes cluster?**
+
+A complete backup strategy covers several layers.
+
+| Layer | What to preserve |
+|---|---|
+| Kubernetes state | Resource definitions, custom resources, configuration |
+| Application data | Persistent volumes and application-aware database backups |
+| Infrastructure | Terraform, networking configuration, node configuration |
+| Recovery dependencies | Certificates, encryption configuration, required keys, images and external services |
+
+**For self-managed Kubernetes**
+
+Take etcd snapshots using compatible etcd tools.
+
+For a typical kubeadm-style control-plane node, an illustrative command sequence is:
+
+```bash
+sudo install -d -m 0700 /var/backups/etcd
+
+sudo etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+  snapshot save /var/backups/etcd/snapshot.db
+
+sudo etcdutl snapshot status \
+  /var/backups/etcd/snapshot.db \
+  --write-out=table
+```
+
+Paths depend on the installation. Snapshot status is a useful check, but a successful restore test provides stronger evidence of recoverability. Encrypt backups, use unique filenames, and store copies outside the failed cluster’s infrastructure. :chatgpt-content-reference{index="8"}
+
+**For application resources and volumes**
+
+Velero can back up and restore Kubernetes resources and persistent data through supported integrations. Verify that the chosen configuration actually protects the required volumes. Database workloads may need native backups or consistency hooks. :chatgpt-content-reference{index="9"}
+
+**For Amazon EKS**
+
+AWS manages the control-plane etcd service; customers do not perform direct etcd snapshot restores against it.
+
+Current AWS Backup functionality supports EKS cluster-state backups and supported persistent storage. Check its prerequisites, supported storage types, and exclusions. Keep infrastructure definitions and container images protected separately. :chatgpt-content-reference{index="10"}
+
+A backup process should include retention, failure alerts, restoration exercises, and measured RPO/RTO.
+
+---
+
+**7. How do you upgrade an EKS cluster?**
+
+Treat it as a controlled change across the **control plane, nodes, add-ons, and applications**.
+
+The high-level process is:
+
+1. Review compatibility and deprecated APIs.
+2. Test the target version in a representative environment.
+3. Verify backups and recovery arrangements.
+4. Prepare application availability and node capacity.
+5. Upgrade the control plane one minor version at a time.
+6. Update nodes and compatible add-ons.
+7. Validate workloads and customer transactions.
+
+Changing the control-plane version alone does not complete the upgrade of every cluster component. :chatgpt-content-reference{index="11"}
+
+Question 15 below gives the operational sequence in more detail.
+
+---
+
+**8. What is a rolling update?**
+
+A rolling update gradually replaces old application replicas with new replicas, allowing the application to continue serving traffic during the transition.
+
+For a Deployment:
+
+- `maxSurge` controls additional replicas above the desired count.
+- `maxUnavailable` controls how many desired replicas may be unavailable.
+- Readiness checks determine whether a new Pod is ready to serve traffic. :chatgpt-content-reference{index="12"}
+
+Example:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  minReadySeconds: 10
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  selector:
+    matchLabels:
+      app: web
+
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:stable
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+```
+
+This example permits an extra replica while maintaining the desired availability during a healthy rollout. In production, use an approved immutable image reference.
+
+```bash
+kubectl apply -f deployment.yaml
+kubectl rollout status deployment/web
+```
+
+Changing the Pod template triggers replacement. Successful rolling updates also depend on spare capacity, graceful termination, and compatibility between old and new application versions. :chatgpt-content-reference{index="13"}
+
+---
+
+**9. Which deployment strategy do you use?**
+
+Answer using the strategy you actually implemented, then explain why it fits the application.
+
+| Strategy | Suitable situation | Main consideration |
+|---|---|---|
+| Rolling update | Routine releases of replicated, compatible services | Old and new versions coexist temporarily |
+| Blue-green | A controlled switch between complete application versions | Requires additional capacity and careful state handling |
+| Canary | Gradual exposure of a new version | Requires meaningful traffic control and health evaluation |
+| Recreate | Workloads that cannot safely run mixed versions | Usually introduces downtime |
+
+**Sample answer to adapt:**
+
+> “For routine releases of our stateless services, we use rolling updates with readiness checks and sufficient spare capacity. For higher-risk changes, we use a canary process and compare errors, latency, and business-transaction success before increasing exposure.”
+
+If using Argo Rollouts, explain the rollout steps, analysis, and traffic-routing integration. Replica percentages alone do not guarantee an exact percentage of requests reaches the new version. :chatgpt-content-reference{index="14"}
+
+Also explain how you roll back application configuration and handle database changes.
+
+---
+
+**10. Can we run one container with two Pods?**
+
+**One running container instance belongs to one Pod.** It cannot simultaneously belong to two Pods.
+
+However, you can run the **same container image in two Pods**.
+
+For example, a Deployment with:
+
+```yaml
+spec:
+  replicas: 2
+```
+
+and one application container in its template creates two Pods, each with its own container instance.
+
+Those containers share the image definition but have separate runtime identities and writable container filesystems.
+
+If the interviewer means **“Can one Pod contain two containers?”**, the answer is yes. Containers in a Pod share its network namespace and can access explicitly shared volumes. An application container and a tightly coupled helper container are a common example. :chatgpt-content-reference{index="15"}
+
+---
+
+**11. What is a StatefulSet?**
+
+A StatefulSet manages Pods that need stable identities and often individual persistent storage.
+
+For a StatefulSet named `mongo` with three replicas, the default ordinal names are:
+
+- `mongo-0`
+- `mongo-1`
+- `mongo-2`
+
+With a volume claim template named `data`, the corresponding claims can be:
+
+- `data-mongo-0`
+- `data-mongo-1`
+- `data-mongo-2`
+
+The controller associates replacement Pods with their existing logical identities and storage claims. :chatgpt-content-reference{index="16"}
+
+A headless Service can provide stable per-Pod DNS names. For example, with Service `mongo-headless` in namespace `database`:
+
+```text
+mongo-0.mongo-headless.database.svc.cluster.local
+```
+
+The StatefulSet supplies Kubernetes lifecycle behavior. MongoDB replication, authentication, elections, and backup procedures still require application-specific configuration.
+
+---
+
+**12. Have you built a VM using Terraform?**
+
+If you have, describe what you provisioned and how you managed its lifecycle.
+
+**Sample answer:**
+
+> “I used Terraform to provision EC2 instances with networking, security groups, IAM instance profiles, encrypted storage, and tags. Changes went through a reviewed plan and apply workflow.”
+
+An illustrative resource block is:
+
+```hcl
+resource "aws_instance" "application" {
+  ami                         = var.ami_id
+  instance_type               = "t3.small"
+  subnet_id                   = var.private_subnet_id
+  vpc_security_group_ids      = [var.application_security_group_id]
+  iam_instance_profile        = var.instance_profile_name
+  associate_public_ip_address = false
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = 20
+    encrypted   = true
+  }
+
+  tags = {
+    Name        = "application-vm"
+    Environment = var.environment
+  }
+}
+```
+
+This assumes the provider, input variables, and referenced infrastructure are configured separately.
+
+Typical workflow:
+
+```bash
+terraform init
+terraform fmt -check
+terraform validate
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+Terraform uses the cloud provider’s APIs and records resource mappings in state. Explain how your team protects state, authenticates the pipeline, and reviews changes. :chatgpt-content-reference{index="17"}
+
+---
+
+**13. What is an Ingress controller?**
+
+An **Ingress resource** declares HTTP/HTTPS routing rules.
+
+An **Ingress controller** watches those resources and configures the implementation that handles traffic.
+
+For example:
+
+- `shop.example.com` routes to the shop Service.
+- `api.example.com/orders` routes to the orders Service.
+
+Creating an Ingress resource requires a corresponding controller or managed implementation to make those rules effective. :chatgpt-content-reference{index="18"}
+
+The implementation might be:
+
+- An in-cluster reverse proxy.
+- A cloud load balancer configured by a controller.
+
+On AWS, the AWS Load Balancer Controller can configure an ALB from Kubernetes resources. With IP targets, the ALB sends traffic directly to registered Pod IPs. In instance-target mode, traffic reaches nodes through the configured NodePort path. :chatgpt-content-reference{index="19"}
+
+**Interview distinction:** The controller is responsible for configuration. It is not necessarily the component through which application traffic passes.
+
+---
+
+**14. If we have an etcd backup and the old VM is corrupted, can we create a new VM and recover?**
+
+**Yes, you can rebuild a self-managed control plane on replacement infrastructure and restore its etcd state. An etcd snapshot is not a VM image.**
+
+First identify the failure:
+
+- **Worker VM failed:** Normally rebuild and rejoin the worker; an etcd restore is unnecessary.
+- **One etcd member failed but quorum remains:** Replace the failed member using the healthy cluster.
+- **The etcd cluster is unrecoverable:** Perform disaster recovery from a snapshot.
+
+Replacing a member in a healthy cluster is different from restoring the entire cluster to an earlier point. :chatgpt-content-reference{index="20"}
+
+For disaster recovery:
+
+1. Provision replacement VMs.
+2. Install compatible Kubernetes and etcd components.
+3. Restore or reconstruct required certificates and configuration.
+4. Recover encryption configuration and access to required keys.
+5. Restore the snapshot using `etcdutl snapshot restore`.
+6. Configure the restored etcd membership, peer addresses, and data directories.
+7. Start and reconnect the control-plane components.
+8. Restore or reconnect application storage.
+9. Validate cluster health and application transactions.
+
+For Kubernetes, etcd recommends considering revision bumps and `--mark-compacted` during restoration to invalidate stale watcher caches. Follow the procedure for the installed etcd version and recovery topology. :chatgpt-content-reference{index="21"}
+
+The snapshot does not restore the old VM’s operating system, container images, or database-volume contents. Writes after the backup may also be lost from the restored cluster state.
+
+---
+
+**15. What are the detailed steps to upgrade an EKS cluster?**
+
+**Step 1: Assess the current environment.**
+
+Record:
+
+- Control-plane and node versions.
+- Add-on and controller versions.
+- Deprecated API usage.
+- Admission webhooks and custom resources.
+- Storage and networking dependencies.
+
+Review EKS upgrade insights and the target version’s release notes.
+
+**Step 2: Test compatibility.**
+
+Run the upgrade in a representative non-production environment. Test application deployment, DNS, networking, storage attachment, autoscaling, and critical transactions.
+
+**Step 3: Prepare availability and recovery.**
+
+- Verify recoverable backups.
+- Ensure sufficient replica and node capacity.
+- Review PodDisruptionBudgets and topology placement.
+- Check available subnet addresses.
+- Define validation and recovery criteria.
+
+Upgrade preparation should account for the whole platform, including third-party controllers. :chatgpt-content-reference{index="22"}
+
+**Step 4: Apply prerequisite component updates.**
+
+Some add-ons or controllers may need an intermediate compatible version before the control-plane upgrade. Follow their compatibility requirements.
+
+**Step 5: Upgrade the control plane.**
+
+Upgrade one minor version at a time. For example, after setting `TARGET_VERSION` to the approved next supported minor version:
+
+```bash
+aws eks update-cluster-version \
+  --name example-eks \
+  --kubernetes-version "$TARGET_VERSION" \
+  --region ap-south-1
+```
+
+Track the returned update ID and wait for successful completion.
+
+**Step 6: Update the data plane.**
+
+For managed node groups, use a controlled node-group update or migrate to a new group. Check drain behavior, replacement capacity, and PDB constraints. Avoid forcing evictions simply to make a blocked update proceed. :chatgpt-content-reference{index="23"}
+
+**Step 7: Complete compatible add-on updates and validate.**
+
+Review VPC CNI, CoreDNS, kube-proxy where applicable, CSI drivers, autoscaling components, and other controllers.
+
+Validate application behavior and monitor errors, latency, pending Pods, node health, and storage operations.
+
+**Current rollback detail:** AWS now documents rollback to the previous minor version within seven days for eligible in-place upgrades, subject to prerequisites. Add-ons and non-Auto-Mode nodes require separate handling. Verify eligibility rather than assuming any upgrade can always be reversed. :chatgpt-content-reference{index="24"}
+
+---
+
+**16. If `mongo-0` dies, what will the replacement Pod be named?**
+
+The replacement will still be named **`mongo-0`**.
+
+| Property | Replacement behavior |
+|---|---|
+| Pod name | Remains `mongo-0` |
+| Ordinal | Remains `0` |
+| Pod UID | New value |
+| Pod IP | May change |
+| Node | May change |
+| Existing associated PVC | Normally reused |
+| MongoDB primary role | Determined by MongoDB, not the ordinal |
+
+The controller preserves the replica’s logical identity. It does not rename the replacement to `mongo-3`. :chatgpt-content-reference{index="25"}
+
+Replacement may not be immediate when a node is unreachable and the old Pod’s status is uncertain. Force-deleting a StatefulSet Pod without ensuring the old instance has stopped can violate the application’s single-identity assumptions. :chatgpt-content-reference{index="26"}
+
+---
+
+**17. Have you worked with Argo CD and Helm?**
+
+Explain their different responsibilities.
+
+| Tool | Purpose |
+|---|---|
+| **Helm** | Packages and templates Kubernetes resources |
+| **Argo CD** | Reconciles declared application state from Git into a cluster |
+
+Typical Helm commands:
+
+```bash
+helm lint ./chart
+
+helm template application ./chart \
+  -f values-prod.yaml
+
+helm upgrade --install application ./chart \
+  --namespace production \
+  -f values-prod.yaml \
+  --wait
+```
+
+The last command is a direct Helm deployment workflow. Helm supports installing, upgrading, and managing releases. :chatgpt-content-reference{index="27"}
+
+With Argo CD:
+
+1. Store the application definition and configuration in Git.
+2. Configure an Argo CD Application.
+3. Review differences between desired and live state.
+4. Synchronize manually or through configured automated synchronization.
+5. Monitor application health and reconciliation.
+
+When Argo CD uses Helm, Helm renders the manifests; Argo CD manages the application lifecycle. Avoid routinely running direct Helm upgrades against resources Argo CD owns. :chatgpt-content-reference{index="28"}
+
+**Experience answer:** Describe which parts you configured, such as values files, applications, access control, synchronization policies, or troubleshooting.
+
+---
+
+**18. How do rolling updates work when some workloads are Deployments and others are StatefulSets?**
+
+The controllers operate **independently**. Kubernetes does not automatically coordinate application release order across them.
+
+Assume a Deployment and a StatefulSet each have two replicas.
+
+**Deployment with two replicas**
+
+With:
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+```
+
+One possible sequence is:
+
+| Stage | Old replicas | New replicas |
+|---|---:|---:|
+| Initial state | 2 | 0 |
+| Start and ready a new replica | 2 | 1 |
+| Remove an old replica | 1 | 1 |
+| Start and ready another new replica | 1 | 2 |
+| Finish replacement | 0 | 2 |
+
+Terminating Pods may remain visible temporarily, so the observed Pod count can exceed the simple running-replica counts shown here. :chatgpt-content-reference{index="29"}
+
+**StatefulSet with two replicas**
+
+With the default rolling behavior and maximum unavailability of one:
+
+1. Replace the higher ordinal, such as `db-1`.
+2. Wait for the replacement `db-1` to become Ready.
+3. Replace `db-0`.
+4. Wait for `db-0` to become Ready.
+
+The names and storage associations remain stable. If the updated Pod never becomes Ready, the rollout can stall. :chatgpt-content-reference{index="30"}
+
+**Cross-workload considerations**
+
+- Application and database versions must remain compatible.
+- Database quorum and replication determine whether an update preserves availability.
+- Pipeline orchestration, operators, or GitOps ordering can coordinate dependencies.
+- A PDB does not replace each controller’s rolling-update settings.
+- Changing one workload does not automatically update the other.
+
+---
+
+**19. What is a Docker multi-stage build, and why is it used?**
+
+A multi-stage build uses multiple `FROM` instructions in one Dockerfile.
+
+An earlier stage compiles or builds the application. A later stage copies only the required runtime artifacts.
+
+Example for a Go application:
+
+```dockerfile
+FROM golang:1 AS build
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux \
+    go build -trimpath -o /out/application .
+
+FROM scratch AS runtime
+
+COPY --from=build /out/application /application
+COPY --from=build /etc/ssl/certs/ca-certificates.crt \
+    /etc/ssl/certs/ca-certificates.crt
+
+USER 65532:65532
+
+ENTRYPOINT ["/application"]
+```
+
+This assumes the project contains `go.mod` and `go.sum` and supports the illustrated static build. The runtime image contains the application and CA certificates, without the Go compiler and source tree. :chatgpt-content-reference{index="31"}
+
+**Benefits:**
+
+- Smaller runtime images.
+- Faster image transfer and startup preparation.
+- Fewer unnecessary runtime packages.
+- Separation of build dependencies from runtime dependencies.
+- Better caching when dependencies are copied before frequently changing source files.
+
+For production, pin approved base-image versions or digests, use `.dockerignore`, and scan the final image. Multi-stage builds do not make it safe to embed credentials in build instructions. :chatgpt-content-reference{index="32"}
+
+---
+
+**20. Have you worked with Grafana?**
+
+Explain what you configured and how it helped operations.
+
+Grafana queries configured data sources to visualize and investigate telemetry. With Prometheus, dashboards commonly use PromQL queries. :chatgpt-content-reference{index="33"}
+
+**Typical setup:**
+
+1. Instrument applications and configure appropriate exporters.
+2. Configure Prometheus to discover and scrape targets.
+3. Add the Prometheus data source to Grafana.
+4. Build dashboards with useful filters such as cluster, namespace, and service.
+5. Configure actionable alerts and notification routing.
+6. Maintain access controls, dashboard definitions, and monitoring-system health.
+
+Prometheus performs metric collection and time-series storage in this setup; Grafana queries the resulting data. :chatgpt-content-reference{index="34"}
+
+**Useful dashboards include:**
+
+| Area | Example signals |
+|---|---|
+| Application | Request rate, error rate, p95/p99 latency |
+| Kubernetes | Available replicas, restarts, Pending Pods |
+| Nodes | CPU, memory, disk capacity, network usage |
+| Database | Connections, query latency, replication health |
+| Reliability | SLO performance and error-budget consumption |
+
+**Sample answer to adapt:**
+
+> “I configured Grafana dashboards for [actual services] using [actual data sources]. I used them to investigate [real issue], correlate application behavior with infrastructure signals, and improve [specific alert or operational process].”
+
+Be prepared to explain one dashboard’s queries, why its metrics matter, and what action an associated alert should trigger.
+
+Below are detailed answers for a **5-year DevOps interview**, with corrections to a few assumptions in your notes. For experience questions, describe only the work you actually performed.
+
+**1. What are landing zones, guardrails, SCPs, and AWS Control Tower?**
+
+These terms describe the foundation and governance of a multi-account AWS environment.
+
+| Term | Meaning | Example |
+|---|---|---|
+| **Landing zone** | A configured AWS environment containing account structure, identity, security, logging, and networking foundations | Separate production, development, security, and log-archive accounts |
+| **AWS Control Tower** | A service that helps establish and govern a multi-account landing zone | Account provisioning, baseline configuration, and governance controls |
+| **Guardrail / control** | A rule that prevents or detects undesirable configurations | Detect publicly accessible S3 buckets |
+| **SCP — Service Control Policy** | An AWS Organizations policy limiting the permissions available to principals in member accounts | Prevent selected accounts from using an unapproved service |
+
+Control Tower uses AWS Organizations and other services to implement and manage the landing zone. “Guardrails” is commonly used interview vocabulary; AWS documentation now generally calls them **controls**. :chatgpt-content-reference{index="0"}
+
+Control Tower has three control behaviors:
+
+- **Preventive:** Prevent prohibited actions, using mechanisms such as SCPs.
+- **Detective:** Identify noncompliant resources, commonly through AWS Config rules.
+- **Proactive:** Evaluate supported CloudFormation resources before provisioning, using hooks. :chatgpt-content-reference{index="1"}
+
+**SCP interview points:**
+
+- An SCP does **not grant permissions**.
+- An IAM policy must still allow the action.
+- An applicable SCP can restrict an otherwise allowed action.
+- SCPs affect member-account principals, including the member account’s root user.
+- They do not restrict management-account principals or service-linked roles. :chatgpt-content-reference{index="2"}
+
+If “guard trail” meant **CloudTrail**, that is different: CloudTrail records AWS account activity for auditing and investigation. :chatgpt-content-reference{index="3"}
+
+---
+
+**2. How do you share a KMS-encrypted AMI from Account 1 to Account 2?**
+
+You must consider **AMI permissions, backing-storage permissions, and KMS permissions**.
+
+First determine whether Account 2 needs to:
+
+- Launch instances from the shared AMI, or
+- Create its own independent copy.
+
+**Step 1: Check the encryption key.**
+
+If the backing snapshots use the default AWS-managed EBS key, commonly identified as `aws/ebs`, you cannot share that encrypted AMI across accounts.
+
+In Account 1, first copy the AMI and re-encrypt its snapshots using a **customer-managed KMS key**. :chatgpt-content-reference{index="4"}
+
+**Step 2: Grant Account 2 launch permission on the AMI.**
+
+Illustrative command using example account and resource IDs:
+
+```bash
+aws ec2 modify-image-attribute \
+  --profile account1 \
+  --region ap-south-1 \
+  --image-id ami-0123456789abcdef0 \
+  --launch-permission 'Add=[{UserId=222222222222}]'
+```
+
+The profiles must represent authorized identities in the respective accounts.
+
+**Step 3: Configure cross-account KMS access.**
+
+Both sides are involved:
+
+- Account 1’s key policy permits the intended Account 2 principal.
+- Account 2’s IAM policy permits that principal to use Account 1’s key.
+
+Cross-account access is not established merely by adding an IAM permission in Account 2. :chatgpt-content-reference{index="5"}
+
+For encrypted EBS operations, grant the required decrypt, re-encryption, data-key, key-description, and grant permissions. Restrict service-created grants using `kms:GrantIsForAWSResource` where appropriate. Preserve existing key-administration access when editing the key policy. :chatgpt-content-reference{index="6"}
+
+**Step 4: If Account 2 will copy the AMI, share its backing snapshots.**
+
+For an AMI copy, Account 2 also needs read access to the backing EBS snapshots.
+
+This differs from simply launching an instance: sharing the AMI provides access to its referenced snapshots for launch, but encrypted launches still need KMS access. :chatgpt-content-reference{index="7"}
+
+**Step 5: Copy and re-encrypt in Account 2.**
+
+```bash
+aws ec2 copy-image \
+  --profile account2 \
+  --region ap-south-1 \
+  --source-region ap-south-1 \
+  --source-image-id ami-0123456789abcdef0 \
+  --name application-account2-copy \
+  --encrypted \
+  --kms-key-id \
+    "arn:aws:kms:ap-south-1:222222222222:key/DESTINATION-KEY-ID"
+```
+
+Wait until the copied AMI is available, then validate a test launch and confirm the copied snapshots use Account 2’s key. The destination KMS key must be in the destination Region. :chatgpt-content-reference{index="8"}
+
+**Interview answer:**
+
+> “I share the AMI, configure cross-account KMS authorization, and share backing snapshots if the target account will copy it. For independent ownership, the target account copies the AMI and encrypts the copy with its own KMS key.”
+
+---
+
+**3. An EC2 instance has an IAM role. What can applications on it access?**
+
+Applications can perform the AWS actions allowed by the role’s effective permissions.
+
+Examples include:
+
+| Permission | Possible use |
+|---|---|
+| S3 object permissions | Upload reports or download application files |
+| Secrets Manager permissions | Retrieve an application secret |
+| CloudWatch permissions | Publish logs or custom metrics |
+| SQS permissions | Send or consume messages |
+| DynamoDB permissions | Read or update application records |
+| `sts:AssumeRole` | Assume an authorized role, potentially in another account |
+
+EC2 receives the role through an **instance profile**. Supported SDKs and the CLI can obtain temporary credentials through the instance metadata credential provider, avoiding embedded access keys. :chatgpt-content-reference{index="9"}
+
+To identify the identity actually being used, when STS is reachable:
+
+```bash
+aws sts get-caller-identity
+```
+
+This is useful because environment variables or a configured profile might override the intended instance-role credentials.
+
+To inspect the role’s policies, your identity needs appropriate IAM read permissions.
+
+**Important:** Attaching a role does not automatically grant administrator access, Linux root access, or network connectivity to AWS services.
+
+---
+
+**4. EC2 and S3 are in the same subnet and Region. How do you access the bucket?**
+
+The premise needs correction: **an ordinary S3 bucket is not located inside your VPC subnet**. EC2 resides in a subnet; S3 is accessed through service endpoints.
+
+You need two things:
+
+1. **Authorization**
+2. **Network connectivity**
+
+**Authorization**
+
+Attach an appropriate IAM role to EC2.
+
+For example:
+
+| Action | Resource scope |
+|---|---|
+| `s3:ListBucket` | Bucket ARN |
+| `s3:GetObject` | Required object-prefix ARN |
+| `s3:PutObject` | Required object-prefix ARN |
+
+Bucket policies, endpoint policies, and applicable organization controls must not block the request. Reading objects encrypted with a customer-managed KMS key also requires appropriate KMS authorization.
+
+**Connectivity**
+
+For private EC2-to-S3 access in the same Region, an **S3 gateway VPC endpoint** is a common choice:
+
+- Create the endpoint.
+- Associate the relevant subnet route tables.
+- Configure its policy.
+- Verify security-group egress and other network controls.
+
+This allows S3 access without an Internet Gateway or NAT gateway. The endpoint itself does not grant S3 permissions. :chatgpt-content-reference{index="10"}
+
+Example access:
+
+```bash
+aws s3 ls s3://example-reports-bucket/reports/
+
+aws s3 cp ./report.csv \
+  s3://example-reports-bucket/reports/report.csv
+```
+
+---
+
+**5. An EC2 instance has no internet connectivity. How do you troubleshoot it?**
+
+First establish whether internet access is required and whether the instance is intended to be public or private.
+
+**For direct public IPv4 connectivity, check:**
+
+- The instance has a public IPv4 address or Elastic IP.
+- An Internet Gateway is attached to the VPC.
+- The instance’s subnet route table has the appropriate route to that gateway.
+- Security groups, NACLs, and host controls permit the traffic.
+
+A public subnet alone does not give an instance a public IP address. :chatgpt-content-reference{index="11"}
+
+**For private-instance internet access, check:**
+
+- The private subnet has a route through the intended NAT or approved proxy.
+- The NAT gateway is available.
+- Its internet-routing configuration is correct.
+- The instance’s egress rules permit the destination.
+- NACLs permit the request and return traffic.
+
+If only AWS service access is required, VPC endpoints may remove the need for general internet connectivity.
+
+**Then isolate the failure layer.**
+
+```bash
+ip addr
+ip route
+
+getent hosts aws.amazon.com
+
+curl -I \
+  --connect-timeout 5 \
+  --max-time 10 \
+  https://aws.amazon.com
+```
+
+Interpret the results:
+
+- DNS failure suggests a resolver or DNS configuration issue.
+- Connection timeout suggests routing, filtering, or destination reachability.
+- TLS errors suggest certificate, trust-store, proxy, or clock issues.
+- An HTTP error can still demonstrate that network connectivity works.
+
+Check host firewall rules and proxy settings as well.
+
+VPC Reachability Analyzer helps identify configuration blocks on supported network paths. It analyzes configuration rather than sending live test packets. :chatgpt-content-reference{index="12"}
+
+Do not conclude that all internet connectivity is broken solely because `ping` fails.
+
+---
+
+**6. What is the best way for two EC2 instances to communicate? Do we need another NIC?**
+
+Usually, they should communicate through their **existing network interfaces and private IP addresses or private DNS names**.
+
+For two instances in the same VPC:
+
+1. Verify the routing path.
+2. Allow the application port in the destination instance’s security group.
+3. Prefer a source security-group reference where appropriate.
+4. Ensure source egress, NACLs, and host firewalls allow communication.
+5. Ensure the application listens on the correct interface and port.
+
+The VPC route tables contain local routes for communication within the VPC, although custom routing can alter the path. :chatgpt-content-reference{index="13"}
+
+**Example:** An application instance connects to a database instance on TCP port `5432`. The database security group allows that port from the application security group.
+
+Additional network interfaces are useful for specific requirements, such as separate management networks, network appliances, or moving a secondary interface between replacement instances. They are not normally required for basic instance-to-instance connectivity.
+
+An ENI can attach to an instance in the same Availability Zone; it is not a shared cable connecting two instances. :chatgpt-content-reference{index="14"}
+
+For instances in different VPCs, establish suitable connectivity such as peering, Transit Gateway, or service-specific PrivateLink access.
+
+---
+
+**7. Should policies be attached individually to IAM users or through groups?**
+
+Between those two choices, **group-based permissions are generally easier to manage**.
+
+For example:
+
+- `Developers`
+- `OperationsReadOnly`
+- `DatabaseAdministrators`
+
+Attach suitable policies to the groups, then manage membership.
+
+Advantages include:
+
+- Consistent permissions for people with the same responsibilities.
+- Easier onboarding and removal.
+- Less duplicated policy administration.
+- Simpler access reviews.
+
+IAM groups contain IAM users; you do not place IAM roles inside IAM groups. :chatgpt-content-reference{index="15"}
+
+Direct user policies can handle a specific exception, but excessive exceptions make access difficult to audit.
+
+For workforce access in a modern multi-account environment, AWS recommends federation and temporary credentials. IAM Identity Center with group assignments and permission sets is often the appropriate approach instead of maintaining many long-lived IAM users. :chatgpt-content-reference{index="16"}
+
+---
+
+**8. Which is better: an inline policy or an attached managed policy?**
+
+Neither is universally correct. Choose according to the policy’s ownership and reuse requirements.
+
+| Aspect | Managed policy | Inline policy |
+|---|---|---|
+| Exists independently | Yes | No |
+| Can be reused across identities | Yes | No |
+| Relationship | One policy can serve many identities | Embedded in one user, group, or role |
+| Identity deletion | Policy can remain | Embedded policy is deleted |
+| Typical use | Centrally maintained permissions | Permissions tightly coupled to one identity |
+
+Managed policies include:
+
+- **AWS-managed policies:** Maintained by AWS.
+- **Customer-managed policies:** Maintained by your organization.
+
+For reusable organizational permissions, customer-managed policies provide centralized control and policy versioning. AWS-managed policies are convenient, but their permissions can change when AWS updates them.
+
+Inline policies can be appropriate for a deliberately unique permission set that should remain attached to one identity. :chatgpt-content-reference{index="17"}
+
+**Interview answer:**
+
+> “I generally use customer-managed policies for reusable, reviewed permissions. I use inline policies when a strict one-to-one relationship with the identity is intentional.”
+
+---
+
+**9. What are permissions boundaries? Have you used them?**
+
+A permissions boundary is a managed policy attached as a boundary to an IAM user or role. It limits the permissions that identity-based policies can grant.
+
+**It does not grant permissions itself.**
+
+Example:
+
+- Role policy allows S3 and EC2 actions.
+- Boundary allows only the relevant S3 actions.
+- In this identity-policy example, the role cannot perform the EC2 actions.
+
+A common use case is **delegating role creation**:
+
+> Developers may create application roles, but every role must use an approved boundary that prevents excessive privileges.
+
+The delegation policy should also prevent users from removing, replacing, or modifying the controls that enforce that boundary.
+
+| Mechanism | Main scope |
+|---|---|
+| IAM permissions policy | Grants permissions to an identity |
+| Permissions boundary | Limits identity-policy permissions for a user or role |
+| SCP | Establishes organization-level permission restrictions for member-account principals |
+
+AWS policy evaluation includes special rules for resource-based grants. Some same-account grants directly to user or session principals are not constrained by a boundary’s implicit deny, so a boundary should not be described as a universal restriction on every possible access path. Explicit denies still matter. :chatgpt-content-reference{index="18"}
+
+For the experience question, explain your actual use case. If you have not implemented boundaries, state that and describe how you would use them.
+
+---
+
+**10. What are the advantages of S3 lifecycle rules?**
+
+S3 lifecycle rules automate storage transitions and object expiration according to defined conditions.
+
+They can help:
+
+- Reduce storage costs as data ages.
+- Apply retention schedules.
+- Remove obsolete noncurrent object versions.
+- Clean up incomplete multipart uploads.
+- Reduce repetitive manual administration. :chatgpt-content-reference{index="19"}
+
+Example policy for an appropriate log dataset:
+
+| Object age | Action |
+|---|---|
+| Initially | Store in S3 Standard |
+| After 30 days | Transition to Standard-IA |
+| After 90 days | Transition to Glacier Flexible Retrieval |
+| After 365 days | Expire, if retention requirements permit |
+
+Evaluate retrieval requirements before archiving. Some storage classes have retrieval charges, minimum storage durations, or delayed retrieval.
+
+Current lifecycle defaults generally prevent objects smaller than 128 KB from transitioning unless configured otherwise; transition costs can outweigh savings for small objects. :chatgpt-content-reference{index="20"}
+
+For versioned buckets, expiring a current version does not automatically remove every older version. Configure noncurrent-version handling separately.
+
+Lifecycle rules are also different from immutable retention controls such as S3 Object Lock.
+
+---
+
+**11. What is Transit Gateway, and how would you use it?**
+
+AWS Transit Gateway is a regional routing hub connecting VPCs and on-premises networks.
+
+It is useful when many networks need controlled connectivity and individual peering connections become difficult to operate. :chatgpt-content-reference{index="21"}
+
+A typical implementation involves:
+
+1. Creating the Transit Gateway.
+2. Creating VPC attachments with suitable Availability Zone coverage.
+3. Adding VPN or Direct Connect connectivity where required.
+4. Configuring Transit Gateway route tables.
+5. Updating VPC subnet route tables.
+6. Configuring return routes and security controls.
+7. Validating permitted and prohibited paths.
+
+For VPC A to reach VPC B:
+
+| Location | Required route |
+|---|---|
+| VPC A subnet route table | VPC B CIDR → Transit Gateway |
+| Relevant TGW route table | VPC B CIDR → VPC B attachment |
+| Return path | Corresponding routes back to VPC A |
+
+**Association** determines which TGW route table processes traffic arriving through an attachment.
+
+**Propagation** determines where an attachment’s routes are advertised.
+
+An attachment associates with one TGW route table and can propagate routes to multiple tables. These controls allow segmentation between production, development, and shared services. :chatgpt-content-reference{index="22"}
+
+Transit Gateway does not automatically solve overlapping CIDR ranges.
+
+---
+
+**12. What is the difference between ALB and NLB?**
+
+| Aspect | ALB | NLB |
+|---|---|---|
+| Main layer | Application layer, Layer 7 | Transport layer, Layer 4 |
+| Typical traffic | HTTP and HTTPS | TCP, UDP, TLS, and other supported transport protocols |
+| Routing decisions | Host, path, headers, and other HTTP conditions | Connection or flow characteristics |
+| Common use | Websites, APIs, microservice routing | Transport-level services and static-IP requirements |
+| Addressing | Normally accessed through its DNS name | Supports static addresses per enabled Availability Zone |
+| TLS | Can terminate HTTPS | Can terminate TLS or pass encrypted TCP traffic through |
+
+ALB is appropriate when different URLs or hostnames must route to different target groups. NLB is appropriate when transport-level handling or its addressing characteristics are required. :chatgpt-content-reference{index="23"}
+
+**Examples:**
+
+- `/orders` and `/payments` routing to separate services: ALB.
+- A TCP service requiring fixed ingress addresses: NLB.
+
+A common outdated interview answer is “NLB does not support security groups.” NLB does support them. AWS documents that an NLB created without associated security groups cannot have them added later. :chatgpt-content-reference{index="24"}
+
+For an experience answer, explain listeners, target groups, health checks, TLS configuration, and an actual troubleshooting example.
+
+---
+
+**13. A private subnet uses a NAT gateway. What is its purpose?**
+
+Its usual purpose is to let private instances initiate outbound connections without assigning public IPv4 addresses to those instances.
+
+Examples include:
+
+- Downloading operating-system updates.
+- Calling external APIs.
+- Downloading dependencies.
+
+In the traditional **zonal public NAT gateway** design:
+
+| Component | Configuration |
+|---|---|
+| Private subnet | Default route points to the NAT gateway |
+| Public NAT gateway | Located in a public subnet and associated with an Elastic IP |
+| NAT subnet route table | Internet-bound route points to the Internet Gateway |
+
+The private subnet is associated with a route table that points to the NAT gateway. That does not mean the public NAT gateway is deployed inside the private subnet.
+
+A **private NAT gateway** is a different connectivity type, used for translated private connectivity. It does not provide internet access through an Internet Gateway. :chatgpt-content-reference{index="25"}
+
+**Current AWS distinction:** Regional NAT gateways are VPC-level resources and do not require a public subnet to host them. Specify the availability mode when discussing placement rather than assuming every NAT gateway uses the traditional zonal design. :chatgpt-content-reference{index="26"}
+
+---
+
+**14. Does NAT protect a private subnet by “masking” its IP addresses?**
+
+Address translation is part of the explanation, but **IP masking alone is not a security guarantee**.
+
+For an outbound connection:
+
+1. The private instance initiates traffic.
+2. NAT translates the source address and, where needed, source port.
+3. The gateway maintains the mapping required for return traffic.
+4. Responses are translated back to the original instance.
+5. Unsolicited inbound internet connections cannot use that outbound mapping to initiate arbitrary connections to the instance.
+
+For a zonal public NAT gateway, AWS documents translation to the NAT gateway’s private address, followed by the Internet Gateway mapping it to the associated Elastic IP. :chatgpt-content-reference{index="27"}
+
+However, NAT does not:
+
+- Inspect application payloads for attacks.
+- Authenticate users.
+- Encrypt traffic.
+- Prevent an already compromised instance from making permitted outbound connections.
+
+Security still depends on security groups, appropriate NACLs, application controls, patching, and any required egress inspection.
+
+You cannot attach a security group directly to a NAT gateway; apply relevant security groups to the workloads. :chatgpt-content-reference{index="28"}
+
+**Interview answer:**
+
+> “NAT provides outbound translation and return-flow handling while preventing unsolicited inbound connections through that path. Its protection comes from that connectivity model, not simply from hiding an IP address.”
+
+---
+
+**15. What are KMS and Secrets Manager?**
+
+| Service | Main purpose | Example |
+|---|---|---|
+| **AWS KMS** | Manage cryptographic keys and authorize cryptographic operations | Protect EBS, S3, and application encryption keys |
+| **AWS Secrets Manager** | Store, retrieve, and manage secret values | Database credentials, API keys, application tokens |
+
+KMS controls access to encryption keys through policies and grants. AWS services commonly integrate with it to protect their data. :chatgpt-content-reference{index="29"}
+
+Secrets Manager stores secret values and supports rotation workflows. It uses KMS to protect those values at rest. :chatgpt-content-reference{index="30"}
+
+**Example application flow:**
+
+1. The application runs with an IAM role.
+2. The role is permitted to retrieve a specific secret.
+3. The application retrieves it through the SDK.
+4. Where applicable, access to the customer-managed KMS key is also authorized.
+5. The application uses the credential without logging it.
+
+**Rotation distinction:**
+
+- KMS key rotation changes cryptographic key material.
+- Secret rotation changes a credential, such as a database password.
+
+Rotating a KMS key does not rotate the database password. A secret-rotation design must also account for updating the database credential and how application clients obtain the new value.
+
+---
+
+**16. EC2 was manually changed from `t3.medium` to `t3.large`. The code was updated and committed, but the pipeline did not run. What happens when it runs?**
+
+The result depends on **the effective configuration and exact revision the pipeline uses**.
+
+Assume the real instance is currently `t3.large`.
+
+| Configuration used by the pipeline | Expected fresh-plan result |
+|---|---|
+| `t3.large` | Usually no instance-type change is proposed |
+| `t3.medium` | Terraform normally proposes returning the instance to `t3.medium` |
+| Instance type is ignored through `ignore_changes` | Terraform generally does not reconcile that attribute |
+| Pipeline applies a previously saved plan | It applies that plan’s intended actions; the latest checkout does not rewrite it |
+
+A normal plan refreshes its view of remote objects and proposes changes to reconcile them with configuration. The plan itself does not perform those infrastructure changes. :chatgpt-content-reference{index="31"}
+
+**The Git distinction matters:**
+
+- `git commit` records a change locally.
+- The pipeline cannot see that commit until it reaches the source revision the pipeline checks out.
+- That normally requires pushing it to the appropriate remote branch and selecting that revision.
+
+Therefore, “nothing happens because the code is on the local machine” is not a reliable answer. If the pipeline still reads `t3.medium`, it may propose reverting the manual resize.
+
+Also verify:
+
+- Backend and workspace.
+- Variable files and pipeline overrides.
+- Lifecycle settings.
+- Whether a fresh plan or saved plan is being applied.
+
+After an intentional manual change, review a fresh plan and persist the refreshed state through the appropriate apply workflow. A refresh-only apply updates Terraform’s records; it does not rewrite your configuration. :chatgpt-content-reference{index="32"}
+
+---
+
+**17. Can the same CodeBuild buildspec be reused for Terraform?**
+
+Yes. CodeBuild can run Terraform commands, and a parameterized buildspec can be reused across projects or environments.
+
+The environment-specific details still need separation:
+
+- AWS role and account.
+- Terraform root directory.
+- Variable inputs.
+- Backend/state location.
+- Approval and deployment permissions.
+
+Example **planning buildspec**, assuming the build image already contains an approved Terraform version and the project defines `TF_ROOT` and `TF_VARS_FILE`:
+
+```yaml
+version: 0.2
+
+env:
+  variables:
+    TF_IN_AUTOMATION: "true"
+    TF_INPUT: "false"
+
+phases:
+  build:
+    commands:
+      - terraform -chdir="$TF_ROOT" fmt -check -recursive
+      - terraform -chdir="$TF_ROOT" init -input=false
+      - terraform -chdir="$TF_ROOT" validate
+      - terraform -chdir="$TF_ROOT" plan -input=false -var-file="$TF_VARS_FILE" -out="$CODEBUILD_SRC_DIR/tfplan"
+
+artifacts:
+  files:
+    - tfplan
+```
+
+Buildspec version `0.2` supports commands sharing the build shell’s state, unlike the isolation behavior of version `0.1`. :chatgpt-content-reference{index="33"}
+
+A separate controlled apply stage can consume the approved plan, using the corresponding source revision and provider selections.
+
+Protect plan artifacts because they can contain sensitive values. Reusing a buildspec does not mean sharing production and development state or granting every build broad production permissions.
+
+---
+
+**18. What is a DaemonSet? Which default daemons run in Kubernetes?**
+
+A DaemonSet maintains a Pod on each **eligible node**.
+
+Eligibility can depend on node selection, affinity, taints, tolerations, and other scheduling requirements.
+
+Typical uses include:
+
+- Node log collectors.
+- Monitoring agents.
+- Networking agents.
+- Storage-node plugins.
+- Runtime-security agents. :chatgpt-content-reference{index="34"}
+
+There is no universal list of default DaemonSets across every Kubernetes distribution.
+
+Examples in conventional EKS configurations include:
+
+- `aws-node` for the Amazon VPC CNI.
+- `kube-proxy` for Service networking.
+
+Other networking modes or managed compute options can differ. :chatgpt-content-reference{index="35"}
+
+Inspect the actual cluster with:
+
+```bash
+kubectl get daemonsets --all-namespaces
+```
+
+**Distinguish a daemon from a DaemonSet:**
+
+| Component | Common deployment form |
+|---|---|
+| kubelet | Host service |
+| Container runtime | Host service |
+| kube-proxy | Often a DaemonSet |
+| CoreDNS | Usually a Deployment |
+| kubeadm control-plane components | Commonly static Pods |
+| Managed EKS control plane | Operated by AWS |
+
+A component running on a node is not automatically a DaemonSet.
+
+---
+
+**19. Does an init container automatically start when the Kubernetes cluster starts?**
+
+No. A regular init container belongs to a **Pod specification**. It runs during that Pod’s initialization.
+
+Regular init containers:
+
+- Run before application containers.
+- Run sequentially when several are defined.
+- Must complete successfully before application startup proceeds.
+- Can prepare files, validate prerequisites, or perform bounded initialization.
+
+They are not automatically created merely because the cluster starts. :chatgpt-content-reference{index="36"}
+
+Example Pod-spec fragment:
+
+```yaml
+spec:
+  initContainers:
+    - name: prepare-content
+      image: busybox:1.37
+      command:
+        - sh
+        - -c
+        - 'printf "Application ready\n" > /work/index.html'
+      volumeMounts:
+        - name: content
+          mountPath: /work
+
+  containers:
+    - name: web
+      image: nginx:stable
+      volumeMounts:
+        - name: content
+          mountPath: /usr/share/nginx/html
+
+  volumes:
+    - name: content
+      emptyDir: {}
+```
+
+Here, initialization creates content in a shared volume before the web container starts.
+
+Init logic should tolerate retries. Avoid treating a one-time dependency check as a substitute for application retries and readiness handling during normal operation.
+
+---
+
+**20. What are taints and tolerations?**
+
+A **taint** is applied to a node to repel Pods that do not tolerate it.
+
+A **toleration** is applied to a Pod to allow it past a matching taint.
+
+| Effect | Behavior |
+|---|---|
+| `NoSchedule` | Prevents new non-tolerating Pods from being scheduled there |
+| `PreferNoSchedule` | Attempts to avoid placing non-tolerating Pods there |
+| `NoExecute` | Also evicts existing Pods that do not tolerate the taint |
+
+Example node taint:
+
+```bash
+kubectl taint nodes worker-1 dedicated=batch:NoSchedule
+```
+
+Matching Pod configuration:
+
+```yaml
+spec:
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: batch
+      effect: NoSchedule
+```
+
+**Important:** A toleration permits scheduling on the node; it does not force the Pod onto it.
+
+If the batch workload must run only on dedicated batch nodes, also use a matching node label and required node affinity or an appropriate node selector. :chatgpt-content-reference{index="37"}
+
+Typical uses include dedicated workloads, specialized hardware, and handling node conditions.
+
+To remove the example taint:
+
+```bash
+kubectl taint nodes worker-1 dedicated=batch:NoSchedule-
+```
+
+`NoSchedule` does not evict Pods that are already running.
+
+---
+
+**21. What is “compute reservation” in Kubernetes manifests?**
+
+This usually refers to **resource requests**, configured alongside resource limits.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: application
+spec:
+  containers:
+    - name: application
+      image: nginx:stable
+
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "256Mi"
+
+        limits:
+          cpu: "1"
+          memory: "512Mi"
+```
+
+| Setting | Meaning |
+|---|---|
+| CPU request `500m` | Scheduler accounts for half a CPU unit |
+| Memory request `256Mi` | Scheduler accounts for 256 MiB |
+| CPU limit `1` | CPU usage is constrained to the configured limit |
+| Memory limit `512Mi` | Memory consumption is constrained by the container’s memory limit |
+
+Requests help the scheduler decide whether a node has sufficient **allocatable capacity after accounting for other requests**. Scheduling is not based solely on current observed CPU or memory usage. :chatgpt-content-reference{index="38"}
+
+**Requests are not necessarily exclusive hardware reservations.**
+
+- A CPU request does not normally pin an exclusive CPU core.
+- A memory request does not mean all that memory is allocated immediately.
+- A container can use more than its request when capacity and limits permit.
+- CPU limits can cause throttling.
+- Exceeding memory limits can trigger an out-of-memory kill. :chatgpt-content-reference{index="39"}
+
+If requests cannot fit on any eligible node, the Pod may remain `Pending`. Inspect the scheduler events:
+
+```bash
+kubectl describe pod application
+```
+
+Events such as `Insufficient cpu` or `Insufficient memory` help distinguish capacity problems from taints, affinity constraints, or storage-related scheduling failures.
