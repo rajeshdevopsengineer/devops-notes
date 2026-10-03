@@ -840,3 +840,1347 @@ ansible-playbook -i inventory.ini web.yml
 Use idempotent modules where possible: running the same desired configuration again should avoid unnecessary changes.
 
 For credentials, use Ansible Vault or an approved external secret store. Keep SSH and privilege-escalation access controlled, and avoid exposing secret values in task output.
+
+Below are detailed answers to all **27 questions**. The examples use **AWS Lambda, ECR, and EKS**, with Azure-specific explanations for Application Gateway and NSGs.
+
+The complete example files are available here: LTIMindtree_Interview_Examples.zip[LTIMindtree_Interview_Examples.zip](sandbox:/workspace/scratch/cb08965e1c64/LTIMindtree_Interview_Examples.zip).
+
+**LTIMindtree — 5 years**
+
+**1. Write Terraform code to create Azure App Service or AWS Lambda.**
+
+For AWS Lambda, Terraform must configure the deployment package, execution role, logging permissions, and function.
+
+Create `app.py`:
+
+```python
+import json
+import os
+
+def lambda_handler(event, context):
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "Hello from Lambda",
+            "environment": os.getenv("APP_ENV", "dev")
+        })
+    }
+```
+
+Create `main.tf`:
+
+```hcl
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "ap-south-1"
+}
+
+locals {
+  function_name = "interview-python-dev"
+}
+
+data "archive_file" "application" {
+  type        = "zip"
+  source_file = "${path.module}/app.py"
+  output_path = "${path.module}/application.zip"
+}
+
+resource "aws_cloudwatch_log_group" "application" {
+  name              = "/aws/lambda/${local.function_name}"
+  retention_in_days = 30
+}
+
+resource "aws_iam_role" "lambda_execution" {
+  name = "${local.function_name}-execution"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [{
+      Effect = "Allow"
+      Action = "sts:AssumeRole"
+
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "logging" {
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [{
+      Effect = "Allow"
+
+      Action = [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ]
+
+      Resource = "${aws_cloudwatch_log_group.application.arn}:*"
+    }]
+  })
+}
+
+resource "aws_lambda_function" "application" {
+  function_name = local.function_name
+  role          = aws_iam_role.lambda_execution.arn
+
+  runtime = "python3.12"
+  handler = "app.lambda_handler"
+
+  filename         = data.archive_file.application.output_path
+  source_code_hash = data.archive_file.application.output_base64sha256
+
+  memory_size = 128
+  timeout     = 10
+
+  environment {
+    variables = {
+      APP_ENV = "dev"
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.logging]
+}
+```
+
+Execute:
+
+```bash
+terraform init
+terraform fmt
+terraform validate
+terraform plan -out=tfplan
+terraform apply tfplan
+
+aws lambda invoke \
+  --function-name interview-python-dev \
+  response.json
+```
+
+Explain these points in the interview:
+
+- `handler = "app.lambda_handler"` identifies the Python file and function.
+- `source_code_hash` lets Terraform detect changes to the packaged code.
+- The execution role controls what Lambda can access while running.
+- The Terraform deployment identity separately needs resource-creation permissions and permission to pass the execution role.
+- An API Gateway, function URL, or another trigger must be configured if the function needs an external invocation endpoint. [raw.githubusercontent.com](https://raw.githubusercontent.com/hashicorp/terraform-provider-aws/main/website/docs/r/lambda_function.html.markdown?utm_source=chatgpt.com)
+
+For Python dependencies, package them with the application, use an appropriate layer, or deploy a supported container image.
+
+---
+
+**2. Create three different images, push them to ECR, and deploy them to EKS.**
+
+Consider three components:
+
+| Component | Image | Deployment | Service |
+|---|---|---|---|
+| Frontend | `frontend:<release>` | Two replicas | ClusterIP |
+| API | `api:<release>` | Two replicas | ClusterIP |
+| Background worker | `worker:<release>` | One replica initially | Usually unnecessary |
+
+Each component has its own Dockerfile and build context.
+
+Example Dockerfiles:
+
+```dockerfile
+# apps/frontend/Dockerfile
+FROM nginxinc/nginx-unprivileged:stable-alpine
+
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY index.html /usr/share/nginx/html/index.html
+
+EXPOSE 8080
+```
+
+```dockerfile
+# apps/api/Dockerfile
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY app.py .
+
+USER 10001:10001
+
+EXPOSE 8080
+CMD ["python", "app.py"]
+```
+
+```dockerfile
+# apps/worker/Dockerfile
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY worker.py .
+
+USER 10001:10001
+
+CMD ["python", "worker.py"]
+```
+
+The application files are included in the downloadable bundle.
+
+Create the repositories once:
+
+```bash
+export AWS_REGION=ap-south-1
+export IMAGE_TAG=release-001
+
+export AWS_ACCOUNT_ID="$(aws sts get-caller-identity \
+  --query Account --output text)"
+
+export REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+for app in frontend api worker; do
+  aws ecr create-repository \
+    --region "$AWS_REGION" \
+    --repository-name "$app" \
+    --image-tag-mutability IMMUTABLE
+done
+```
+
+Authenticate, build, and push:
+
+```bash
+aws ecr get-login-password --region "$AWS_REGION" |
+  docker login --username AWS --password-stdin "$REGISTRY"
+
+for app in frontend api worker; do
+  docker build \
+    -t "$REGISTRY/$app:$IMAGE_TAG" \
+    "apps/$app"
+
+  docker push "$REGISTRY/$app:$IMAGE_TAG"
+done
+```
+
+A compact manifest for all three applications:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: REGISTRY_PLACEHOLDER/frontend:IMAGE_TAG_PLACEHOLDER
+          ports:
+            - containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: REGISTRY_PLACEHOLDER/api:IMAGE_TAG_PLACEHOLDER
+          ports:
+            - containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: REGISTRY_PLACEHOLDER/worker:IMAGE_TAG_PLACEHOLDER
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: demo
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: demo
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 8080
+      targetPort: 8080
+```
+
+Kubernetes does not automatically substitute environment variables in manifests. The bundle contains a renderer and a more complete manifest with probes, resources, and security settings:
+
+```bash
+python3 scripts/render-manifest.py k8s/three-apps.yaml \
+  > /tmp/three-apps.yaml
+
+aws eks update-kubeconfig \
+  --region "$AWS_REGION" \
+  --name YOUR_CLUSTER
+
+kubectl apply -f /tmp/three-apps.yaml
+
+for app in frontend api worker; do
+  kubectl rollout status \
+    -n demo "deployment/$app" \
+    --timeout=180s
+done
+```
+
+For EKS on EC2, the node role needs ECR pull permissions. For Fargate, the Pod execution role needs them. Application workload permissions alone do not necessarily enable image pulls. [Amazon ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/ECR_on_EKS.html?utm_source=chatgpt.com)
+
+Use an ingress or load balancer when external access is required. The worker generally needs no Service because it does not accept incoming requests.
+
+---
+
+**3. Explain your branching strategy.**
+
+Describe the strategy your team actually uses. A strong example for frequent delivery is **trunk-based development**:
+
+1. Developers create short-lived feature branches from `main`.
+2. Pull requests run tests, code-quality checks, security scans, and review.
+3. Protected branch rules control merges.
+4. A successful merge produces an immutable image or package.
+5. Development and QA validate that artifact.
+6. Production receives the same artifact after the required approval.
+
+| Git event | Typical action |
+|---|---|
+| Feature-branch change | Run CI; optionally deploy a preview environment |
+| Merge to `main` | Build a release candidate and deploy to development |
+| Approved candidate | Promote to QA |
+| Approved release | Promote the tested artifact to production |
+
+Feature flags allow unfinished functionality to be merged safely without exposing it immediately.
+
+For a production hotfix, start from the deployed release, make and validate the correction, release it, and ensure the fix also reaches ongoing development.
+
+**Gitflow** is another strategy, with feature, develop, release, main, and hotfix branches. It can suit scheduled releases and multiple supported versions, but requires more merge coordination.
+
+---
+
+**4. Application Gateway backends are healthy, but users receive 404. How do you troubleshoot?**
+
+Backend health checks test a particular endpoint. They do not validate every application route.
+
+My troubleshooting sequence would be:
+
+1. **Reproduce the exact request.** Capture hostname, path, HTTP method, query parameters, and timestamp.
+2. **Identify which layer generated the 404.** Check gateway access logs and application logs.
+3. **Verify listener and routing configuration.**
+4. **Test the backend with the same path and expected Host header.**
+5. **Compare the working health-probe request with the failing user request.**
+
+Example access-log query, when resource-specific diagnostic logs are enabled:
+
+```kusto
+AGWAccessLogs
+| where TimeGenerated > ago(30m)
+| where HttpStatus == 404
+| project TimeGenerated, Host, RequestUri,
+          ListenerName, BackendPoolName,
+          ServerRouted, ServerStatus, ErrorInfo
+```
+
+`HttpStatus` shows the response returned to the client; `ServerStatus` identifies the backend’s response status. Routing fields help locate the failing component. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/agwaccesslogs?utm_source=chatgpt.com)
+
+Check:
+
+- DNS points to the intended gateway.
+- The requested hostname matches the correct listener.
+- Rule priority selects the intended backend.
+- URL path mappings cover the requested path.
+- Rewrite rules or backend path overrides have not changed the URL incorrectly.
+- Backend settings use the hostname expected by the application. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/application-gateway/configuration-overview?utm_source=chatgpt.com)
+
+Direct backend test:
+
+```bash
+curl -v \
+  -H 'Host: app.example.com' \
+  http://10.0.2.10:8080/api/orders
+```
+
+For App Service, inspect hostname and custom-domain bindings. For AKS, inspect the Ingress host/path and selected Service.
+
+A received 404 generally makes routing and application paths the first investigation areas.
+
+---
+
+**5. What is the difference between Azure Firewall and NSG?**
+
+| Feature | NSG | Azure Firewall |
+|---|---|---|
+| Main purpose | Filter traffic at subnet or NIC level | Centralized network security |
+| Rule matching | IP addresses, ports, protocols, service tags | Network and application rules |
+| Stateful | Yes | Yes |
+| Application/FQDN filtering | No equivalent application-rule engine | Supported |
+| NAT service | No | DNAT and SNAT |
+| Deployment | Associated with subnet or NIC | Dedicated managed firewall service |
+| Typical role | Restrict workload-to-workload access | Control and inspect routed network traffic |
+
+NSGs enforce traffic rules close to workloads. Azure Firewall supports centralized policy and application-aware controls, with additional inspection features depending on the tier. Traffic must be routed through the firewall for its rules to apply. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/firewall/overview?utm_source=chatgpt.com)
+
+A common design uses both:
+
+- NSG: permit only the application subnet to reach the database port.
+- Azure Firewall: control outbound access to approved destinations.
+- WAF: protect HTTP applications against application-layer attacks.
+
+---
+
+**LTIMindtree — 3 years**
+
+**1. How do you deploy a Python application on AWS using Jenkins?**
+
+For a containerized application on EKS:
+
+1. Git webhook triggers Jenkins.
+2. Jenkins checks out the reviewed commit.
+3. Run Python unit and integration tests.
+4. Run quality, dependency, and secret checks.
+5. Build a Docker image.
+6. Scan the image.
+7. Push the approved image to ECR.
+8. Deploy it to the target Kubernetes namespace.
+9. Wait for rollout completion.
+10. Run smoke tests and check operational metrics.
+11. Stop promotion or roll back if validation fails.
+
+Typical commands:
+
+```bash
+PYTHONPATH=apps/api \
+  python3 -m unittest discover -s apps/api/tests -v
+
+docker build -t "$IMAGE_URI" apps/api
+
+trivy image \
+  --exit-code 1 \
+  --severity HIGH,CRITICAL \
+  "$IMAGE_URI"
+
+docker push "$IMAGE_URI"
+
+kubectl apply -f rendered-manifest.yaml
+
+kubectl rollout status \
+  deployment/api \
+  -n "$NAMESPACE" \
+  --timeout=180s
+```
+
+The bundle contains a Jenkinsfile implementing this flow and a deployment script that attempts rollback to the previous Deployment revision on rollout failure.
+
+Use temporary AWS credentials or an agent role. Configure EKS authentication and namespace-scoped Kubernetes permissions.
+
+For production, restrict deployment references, approvers, and environment parameters. Build the artifact once, then promote the same image through environments.
+
+---
+
+**2. How does your day start, and what activities do you perform?**
+
+Adapt this sample to your actual work:
+
+> “I start by reviewing the handover, production dashboards, overnight alerts, failed pipelines, and planned changes. I prioritize issues affecting users and then review sprint tasks with the team.
+>
+> My regular activities include maintaining CI/CD pipelines, reviewing Terraform changes, supporting Kubernetes deployments, troubleshooting infrastructure and application issues, managing access and secrets, and improving monitoring.
+>
+> Before production deployments, I verify test results, approvals, dependencies, and rollback readiness. After deployment, I validate application health and user-facing metrics. I also work on automation, cost optimization, runbooks, and incident follow-up.”
+
+If asked whether it is support or project work, explain how your time is divided. Give real examples rather than claiming responsibilities you have not handled.
+
+---
+
+**3. How do you upgrade EKS?**
+
+An EKS upgrade involves the control plane, nodes, add-ons, and application compatibility.
+
+1. **Assess:** review current/target versions, deprecated APIs, upgrade insights, controllers, and add-ons.
+2. **Test:** upgrade a lower environment and validate representative application flows.
+3. **Prepare recovery:** back up configuration and application data.
+4. **Prepare availability:** verify replica counts, readiness, spare capacity, and disruption budgets.
+5. **Upgrade the control plane:** follow the supported one-minor-version-at-a-time path.
+6. **Update nodes and add-ons:** follow their compatibility requirements.
+7. **Validate:** check networking, DNS, storage, autoscaling, application errors, and latency.
+
+EKS does not support downgrading an upgraded control plane in place. The recovery plan must account for that limitation. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/update-cluster.html?utm_source=chatgpt.com)
+
+For managed node groups, update gradually and inspect blocked evictions. Forcing an update can bypass disruption protection and affect application availability. 
+
+Because EKS manages the control plane, customers do not directly take etcd snapshots. Back up workload configuration and stateful application data using suitable tools and service-native backups.
+
+---
+
+**4. How do you handle a Pod dying?**
+
+First distinguish the failure:
+
+| Situation | Expected recovery mechanism |
+|---|---|
+| Container exits | Kubelet may restart it according to restart policy |
+| Deployment-managed Pod is deleted | Controller creates a replacement |
+| Bare Pod is deleted | No workload controller recreates it |
+| Node fails | Controllers and scheduling restore workloads when conditions permit |
+
+A replacement Pod has a new identity; it is not the original Pod moving to another node. 
+
+Start with:
+
+```bash
+kubectl get pods -n demo -o wide
+kubectl describe pod POD_NAME -n demo
+kubectl logs POD_NAME -n demo -c api --previous
+kubectl get events -n demo --sort-by=.metadata.creationTimestamp
+kubectl get nodes
+```
+
+Check:
+
+- Exit reason and code.
+- OOM kills.
+- Startup or liveness failures.
+- Recent image/configuration changes.
+- Node pressure or eviction.
+- Volume attachment problems.
+- Available replacement capacity.
+
+Restore service through healthy replicas or a known-good release, then fix the underlying cause. For stateful workloads, validate storage and data consistency.
+
+---
+
+**5. Your Jenkins pipeline takes too long. How do you troubleshoot?**
+
+Measure the pipeline before changing it. Separate time spent waiting for an agent from time spent executing stages.
+
+| Bottleneck | Investigation | Improvement |
+|---|---|---|
+| Agent allocation | Capacity, labels, provisioning delay | Suitable agent capacity |
+| Git checkout | Repository size, submodules, LFS | Appropriate checkout depth |
+| Dependency download | Slow repositories, repeated downloads | Trusted caching |
+| Tests | Serial execution, redundant suites | Parallel independent tests |
+| Docker build | Cache misses, large context | Better layer order and `.dockerignore` |
+| Security scans | Repeated database downloads | Cache scanner databases |
+| Image upload | Large layers, network failures | Smaller images and stable connectivity |
+| Kubernetes rollout | Pending Pods, slow pulls/startup | Fix scheduling, capacity, or health checks |
+
+Inspect the agent’s CPU, memory, disk, I/O, and network. Check retries and authentication failures that silently add delay.
+
+Then optimize the measured bottleneck:
+
+- Build once and promote.
+- Reuse dependencies and Docker layers appropriately.
+- Run independent checks concurrently.
+- Avoid rebuilding unaffected components.
+- Avoid running unchanged infrastructure operations on every application release.
+
+Preserve the required release checks and compare timings after each improvement.
+
+---
+
+**6. Create a manifest for two nginx replicas.**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx-demo
+  template:
+    metadata:
+      labels:
+        app: nginx-demo
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:stable-alpine
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-demo
+spec:
+  selector:
+    app: nginx-demo
+  ports:
+    - port: 80
+      targetPort: http
+```
+
+Apply and verify:
+
+```bash
+kubectl apply -f nginx-two-replicas.yaml
+kubectl rollout status deployment/nginx-demo
+kubectl get pods -l app=nginx-demo
+kubectl port-forward service/nginx-demo 8080:80
+```
+
+The Deployment maintains two replicas. The Service provides a stable endpoint.
+
+If the replicas must run on different nodes or availability zones, add appropriate topology spread constraints or anti-affinity.
+
+---
+
+**7. Create a Terraform state S3 bucket that expires within 30 days.**
+
+The important clarification is that **S3 Lifecycle expires objects, not buckets**.
+
+For production, keep active Terraform state. A sensible 30-day example is to expire disposable objects and older state versions.
+
+With the AWS provider configured:
+
+```hcl
+variable "bucket_name" {
+  type = string
+}
+
+resource "aws_s3_bucket" "state" {
+  bucket        = var.bucket_name
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "retention" {
+  bucket = aws_s3_bucket.state.id
+
+  rule {
+    id     = "expire-disposable-objects"
+    status = "Enabled"
+
+    filter {
+      prefix = "demo/"
+    }
+
+    expiration {
+      days = 30
+    }
+  }
+
+  rule {
+    id     = "expire-old-state-versions"
+    status = "Enabled"
+
+    filter {}
+
+    noncurrent_version_expiration {
+      noncurrent_days = 30
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.state]
+}
+```
+
+This configuration:
+
+- Makes objects under `demo/` eligible for expiration after 30 days.
+- Expires older versions 30 days after becoming noncurrent.
+- Keeps active state outside the disposable prefix.
+
+For versioned objects, current-version expiration normally creates a delete marker. Lifecycle processing is asynchronous. [Amazon Simple Storage Service](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html?utm_source=chatgpt.com)
+
+The complete bucket example in the download adds encryption, public-access blocking, and a TLS-only policy.
+
+Choose retention according to recovery requirements. Losing state does not delete the actual infrastructure, but it removes Terraform’s current mapping to it.
+
+---
+
+**8. How do you provide security in Docker?**
+
+Secure the build, registry, container runtime, and host.
+
+**Build controls:**
+
+- Trusted minimal base images.
+- Reviewed image digests.
+- Multi-stage builds.
+- Dependency and image scanning.
+- `.dockerignore` to exclude credentials and unnecessary files.
+- Non-root execution.
+- Exec-form `CMD` and `ENTRYPOINT`.
+- Build secret mounts instead of embedding secrets.
+- SBOM generation and image signing where supported.
+
+**Runtime controls:**
+
+- Avoid privileged containers.
+- Avoid mounting the Docker socket into application containers.
+- Drop unnecessary Linux capabilities.
+- Disable privilege escalation.
+- Use a read-only root filesystem where supported.
+- Configure seccomp and resource limits.
+- Restrict network access.
+- Patch the host kernel and container runtime.
+
+Also restrict registry push permissions and continuously rescan published images, because new vulnerabilities can be discovered after release.
+
+---
+
+**LTIMindtree — L2, 3–5 years**
+
+**1. How do you design a fault-tolerant cloud architecture?**
+
+Start with the required availability, latency, RTO, RPO, and failure scenarios.
+
+A typical regional design is:
+
+```mermaid
+flowchart TD
+    Entry["WAF and load balancer"] --> A["Application replicas: AZ A"]
+    Entry --> B["Application replicas: AZ B"]
+    A --> DB["Database with Multi-AZ failover"]
+    B --> DB
+    A --> Queue["Durable queue"]
+    B --> Queue
+    Queue --> Workers["Workers across availability zones"]
+    DB --> Backup["Independent recovery backups"]
+```
+
+Key design decisions:
+
+- Place redundant application instances across failure domains.
+- Keep application instances replaceable and externalize durable state.
+- Use health checks and load balancing.
+- Maintain capacity to survive an instance or zone failure.
+- Use database replication/failover appropriate to the workload.
+- Use durable queues for asynchronous work.
+- Design consumers and retries to be idempotent.
+- Configure timeouts, bounded retries, and circuit breakers.
+- Keep recoverable backups with appropriate isolation.
+- Implement regional recovery when regional failure is in scope.
+
+Test the failure paths. Replication supports availability, while backups support recovery from deletion and corruption.
+
+---
+
+**2. How do you manage secrets securely in GitOps or deployment pipelines?**
+
+Store secret values in AWS Secrets Manager, Azure Key Vault, or HashiCorp Vault.
+
+For GitOps, use one of these approaches:
+
+1. Commit secret references; an operator or CSI integration retrieves values using workload identity.
+2. Commit encrypted secret files, such as SOPS files, with decryption keys kept outside Git.
+
+For pipelines:
+
+- Authenticate with short-lived credentials.
+- Retrieve only required secrets.
+- Prevent secret values from appearing in logs.
+- Exclude them from caches, artifacts, and image layers.
+- Separate access by environment.
+- Audit use and automate rotation.
+
+Kubernetes Secret encoding does not provide encryption. Configure encryption at rest and restrict access through RBAC. 
+
+Plan how the application receives rotated values. Environment variables in an existing process do not automatically refresh when a secret changes.
+
+---
+
+**3. How do you implement blue-green or canary deployments?**
+
+| Strategy | Traffic behavior | Main benefit |
+|---|---|---|
+| Blue-green | Switch traffic between complete versions | Fast promotion and reversal |
+| Canary | Gradually increase traffic to the new version | Limit exposure while evaluating behavior |
+
+For **blue-green**:
+
+1. Keep the current version serving traffic.
+2. Deploy the new version separately.
+3. Validate through a preview endpoint.
+4. Switch the active Service or traffic router.
+5. Retain the old version during observation.
+6. Remove it after successful validation.
+
+Argo Rollouts supports active and preview Services for this workflow. 
+
+For **canary**:
+
+1. Deploy the new version.
+2. Route a small percentage of traffic to it.
+3. Compare errors, latency, saturation, and business outcomes.
+4. Increase traffic progressively.
+5. Abort on failed analysis.
+
+Use a supported traffic router for controlled percentages. Replica proportions alone provide approximate traffic distribution. 
+
+Ensure database changes remain compatible with both application versions during the transition.
+
+---
+
+**4. How do you manage multiple environments using reusable infrastructure code?**
+
+Use shared modules with separate environment root configurations.
+
+| Location | Purpose |
+|---|---|
+| `modules/network` | Reusable networking |
+| `modules/cluster` | Reusable cluster infrastructure |
+| `modules/application` | Reusable application resources |
+| `environments/dev` | Development inputs and backend |
+| `environments/qa` | QA inputs and backend |
+| `environments/prod` | Production inputs and backend |
+
+Example module consumption:
+
+```hcl
+module "application" {
+  source = "../../modules/application"
+
+  environment   = var.environment
+  instance_type = var.instance_type
+  min_capacity  = var.min_capacity
+  max_capacity  = var.max_capacity
+}
+```
+
+Separate environments through:
+
+- Different input values.
+- Separate state keys.
+- Separate deployment identities.
+- Separate accounts or subscriptions where appropriate.
+- Environment-specific approvals.
+
+Pin provider and remote module versions. Promote reviewed module changes through lower environments before production.
+
+Terraform workspaces separate state instances, but account and permission isolation must be configured independently.
+
+---
+
+**5. What is the purpose of backends, and how do you implement remote state with locking?**
+
+A backend determines where Terraform stores state and how supported coordination features operate.
+
+State maps Terraform resource addresses to real infrastructure objects. A shared backend lets the team use the same mapping.
+
+Example:
+
+```hcl
+terraform {
+  required_version = ">= 1.10.0"
+
+  backend "s3" {
+    bucket       = "YOUR-STATE-BUCKET"
+    key          = "prod/application/terraform.tfstate"
+    region       = "ap-south-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+Create the backend bucket first. Enable versioning, encryption, and restricted access.
+
+Current S3 backend configuration supports native locking through `use_lockfile`. DynamoDB-based locking is deprecated. Appropriate permissions are needed for the state object and `.tflock` object. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/backend/s3?utm_source=chatgpt.com)
+
+To migrate existing local state:
+
+```bash
+terraform init -migrate-state
+```
+
+With an S3 backend, Terraform still runs on the selected workstation or CI runner; its state is stored in S3.
+
+Locking coordinates Terraform operations against the same state. Manual cloud changes and separate state files managing the same resources require additional controls.
+
+---
+
+**6. How do you implement rollback in an automated deployment pipeline?**
+
+Define failure conditions before deployment:
+
+- Rollout timeout.
+- Failed smoke tests.
+- Increased error rate or latency.
+- Failed business transactions.
+- Failed progressive-delivery analysis.
+
+Capture the previous successful Deployment revision, deploy, and validate. On failure:
+
+```bash
+kubectl rollout undo \
+  deployment/api \
+  -n demo \
+  --to-revision=PREVIOUS_REVISION
+
+kubectl rollout status \
+  deployment/api \
+  -n demo \
+  --timeout=180s
+```
+
+Validate recovery and mark the release as failed.
+
+A Deployment progress deadline reports a stalled rollout; it does not automatically trigger rollback. The pipeline or delivery controller must act. 
+
+For GitOps, revert the desired configuration in Git so reconciliation restores the known-good version.
+
+A Pod-template rollback does not reverse database migrations, external side effects, or every resource in the release. Use backward-compatible schema changes and separate data-recovery procedures.
+
+---
+
+**7. How do readiness and liveness probes work?**
+
+| Probe | Purpose | Failure effect |
+|---|---|---|
+| Readiness | Determine whether the instance can serve requests | Pod becomes unready |
+| Liveness | Detect a condition requiring process restart | Container restarts after the threshold |
+| Startup | Allow application initialization to complete | Delays other probes; repeated failure restarts the container |
+
+Readiness failures do not themselves restart containers. Startup probes protect slow-starting applications from premature liveness failures. 
+
+Example:
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  periodSeconds: 2
+  failureThreshold: 30
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 3
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+Use liveness for conditions a restart can resolve. Making it depend on a shared database can create widespread restarts during a database outage.
+
+Readiness should represent whether the instance can safely accept traffic. Configure dependency checks carefully to avoid unnecessarily removing all replicas.
+
+---
+
+**8. How do you troubleshoot CrashLoopBackOff?**
+
+It indicates repeated container restarts with a retry delay.
+
+Start with:
+
+```bash
+kubectl describe pod POD_NAME -n demo
+
+kubectl logs POD_NAME -n demo \
+  -c CONTAINER_NAME --tail=100
+
+kubectl logs POD_NAME -n demo \
+  -c CONTAINER_NAME --previous --tail=100
+
+kubectl get events -n demo \
+  --sort-by=.metadata.creationTimestamp
+
+kubectl top pod POD_NAME -n demo
+```
+
+Investigate:
+
+| Evidence | Likely cause |
+|---|---|
+| `OOMKilled` | Memory limit, leak, or startup demand |
+| Exception in logs | Application/configuration problem |
+| Startup/liveness failures | Incorrect probe or actual failure |
+| Permission denied | User, mount, or filesystem permissions |
+| Missing configuration | Secret, ConfigMap, or environment issue |
+| Immediate successful exit | Process finishes instead of remaining active |
+| Execution-format error | Architecture or executable mismatch |
+
+If logs are empty, inspect the previous termination state, entrypoint, arguments, init containers, and logging destination.
+
+If the container exits too quickly for `exec`, use an approved ephemeral debugger or a suitably configured copied Pod. Kubernetes supports these debugging approaches. [Kubernetes](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/?utm_source=chatgpt.com)
+
+Fix or revert the cause, then confirm stable operation and restart counts.
+
+---
+
+**9. How do you secure passwords and API keys in infrastructure?**
+
+Use dedicated secret storage, least-privilege access, encryption, auditing, and rotation.
+
+For Terraform:
+
+```hcl
+variable "database_password" {
+  type      = string
+  sensitive = true
+}
+```
+
+This masks normal display, but does not automatically exclude the value from state.
+
+Prefer an architecture where Terraform creates the secret container and access permissions, while the application retrieves the value at runtime using workload identity.
+
+Protect:
+
+- State files.
+- Saved plans.
+- CI artifacts.
+- Logs and debug output.
+- Secret-manager permissions.
+- Encryption keys.
+
+AWS Secrets Manager supports storage and rotation workflows, but applications still require appropriate retrieval permissions and credential-refresh behavior. [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html?utm_source=chatgpt.com)
+
+If a credential is exposed, revoke or rotate it promptly and investigate how it was used.
+
+---
+
+**10. How does a GitOps tool detect drift, and how do you manage it?**
+
+Argo CD renders the desired resources from Git and compares them with live cluster resources.
+
+Example:
+
+- Git specifies three replicas.
+- Someone manually changes the Deployment to five.
+- Argo CD detects the difference and marks the application out of sync.
+
+Automatic correction can be configured:
+
+```yaml
+spec:
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+```
+
+`selfHeal` addresses live-state drift. Pruning handles resources removed from the desired configuration. They are separate controls. 
+
+Some differences are legitimate: an HPA may own the replica count, for example. Configure narrow diff handling for externally managed fields. [Declarative GitOps CD for Kubernetes](https://argo-cd.readthedocs.io/en/stable/user-guide/diffing/?utm_source=chatgpt.com)
+
+For emergency changes, coordinate reconciliation behavior and commit the intended final state to Git. Otherwise, the controller may undo the manual change.
+
+---
+
+**11. Write a service-monitoring and restart script with logging.**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+service_unit="${1:-nginx.service}"
+
+if (( $# > 1 )) ||
+   [[ ! "$service_unit" =~ ^[A-Za-z0-9_.@:-]+\.service$ ]]; then
+  printf '%s\n' "Usage: service-watch.sh [name.service]" >&2
+  exit 64
+fi
+
+log_file=/var/log/service-watch.log
+lock_file="/run/lock/service-watch-$service_unit.lock"
+
+log() {
+  local entry
+  entry="$(date -u +'%Y-%m-%dT%H:%M:%SZ') level=$1 unit=$service_unit $2"
+
+  printf '%s\n' "$entry" >> "$log_file"
+
+  if command -v logger >/dev/null 2>&1; then
+    logger -t service-watch -- "$entry" || true
+  fi
+}
+
+exec 9>"$lock_file"
+
+if ! flock -n 9; then
+  log INFO "action=skip reason=another-check-running"
+  exit 0
+fi
+
+if ! load_state="$(systemctl show \
+  --property=LoadState --value -- "$service_unit")"; then
+  log ERROR "action=check result=systemctl-query-failed"
+  exit 1
+fi
+
+if [[ "$load_state" != loaded ]]; then
+  log ERROR "action=check result=unit-not-loaded"
+  exit 1
+fi
+
+if systemctl is-active --quiet -- "$service_unit"; then
+  log INFO "action=check result=healthy"
+  exit 0
+fi
+
+log WARN "action=restart reason=inactive"
+
+if systemctl restart -- "$service_unit"; then
+  sleep 2
+
+  if systemctl is-active --quiet -- "$service_unit"; then
+    log INFO "action=restart result=recovered"
+    exit 0
+  fi
+fi
+
+log ERROR "action=restart result=failed"
+exit 1
+```
+
+Run with appropriate permissions:
+
+```bash
+sudo bash service-watch.sh nginx.service
+```
+
+The script provides timestamps, service identification, action results, concurrency protection, and a failure exit status.
+
+Schedule it with a systemd timer or cron and configure log rotation. Disable it during planned service stops.
+
+For process failures, use systemd’s native recovery controls as well:
+
+```ini
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Restart=on-failure
+RestartSec=5
+```
+
+The script checks process state. An active but unresponsive application requires a business or HTTP health check.
+
+---
+
+**12. How do you handle parallel execution in CI/CD?**
+
+Run independent tasks concurrently and preserve dependencies between stages.
+
+For example, unit tests and source scans can run together:
+
+```groovy
+stage('Checks') {
+    parallel {
+        stage('Unit tests') {
+            steps {
+                sh 'python -m unittest discover'
+            }
+        }
+
+        stage('Security scan') {
+            steps {
+                sh 'trivy fs --exit-code 1 .'
+            }
+        }
+
+        stage('Lint') {
+            steps {
+                sh 'ruff check .'
+            }
+        }
+    }
+}
+```
+
+Jenkins Declarative Pipeline supports parallel stages. Available agents and resources determine the actual performance benefit. [jenkins.io](https://www.jenkins.io/doc/book/pipeline/syntax/?utm_source=chatgpt.com)
+
+Important controls:
+
+- Separate workspaces for tasks modifying files.
+- Unique artifacts and test ports.
+- Bounded concurrency.
+- Timeouts and failure handling.
+- Locks for shared deployment environments.
+- Terraform state locking.
+
+Publishing waits for required checks to pass. Production deployments to the same environment should be coordinated even when builds run concurrently.
+
+---
+
+**13. What is the difference between `count` and `for_each`?**
+
+| Aspect | `count` | `for_each` |
+|---|---|---|
+| Input | Whole number | Map or set of strings |
+| Identity | Numeric index | Key or set member |
+| Reference | `server[0]` | `server["api"]` |
+| Best use | Similar repeated resources | Individually identified resources |
+| Removal behavior | List-derived values can shift indexes | Removing a key affects that keyed instance |
+
+`count` example:
+
+```hcl
+resource "aws_instance" "server" {
+  count = 3
+
+  ami           = var.ami_id
+  instance_type = "t3.micro"
+
+  tags = {
+    Name = "server-${count.index}"
+  }
+}
+```
+
+`for_each` example:
+
+```hcl
+variable "servers" {
+  type = map(string)
+
+  default = {
+    frontend = "t3.small"
+    api      = "t3.medium"
+    worker   = "t3.small"
+  }
+}
+
+resource "aws_instance" "server" {
+  for_each = var.servers
+
+  ami           = var.ami_id
+  instance_type = each.value
+
+  tags = {
+    Name = each.key
+  }
+}
+```
+
+A common interview scenario is removing the middle name from a list used with `count`. Subsequent names shift between indexed resources; Terraform may update or replace them depending on which attributes change.
+
+With `for_each`, removing `"api"` leaves the other keyed instances stable.
+
+Both require determinable instance identities before creation, and cannot be used together in the same resource or module block. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/meta-arguments/count?utm_source=chatgpt.com)
+
+---
+
+**14. How do you monitor and alert on cloud resources effectively?**
+
+Monitor user experience first, then connect failures to application and infrastructure signals.
+
+| Layer | Useful signals |
+|---|---|
+| User experience | Availability, latency, successful transactions |
+| Application | Request rate, errors, duration, dependency failures |
+| Kubernetes | Available replicas, restarts, Pending Pods, OOM kills |
+| Compute | CPU, memory, disk space, I/O, network saturation |
+| Database | Connections, query latency, locks, storage, replication lag |
+| Queue | Backlog, oldest-message age, processing failures |
+| Platform | Load-balancer health, DNS failures, certificate expiry |
+
+A common implementation uses:
+
+- Prometheus for metrics.
+- Node Exporter for host metrics.
+- kube-state-metrics for Kubernetes object-state metrics.
+- Grafana for dashboards.
+- Alertmanager for routing, grouping, deduplication, silences, and inhibition. 
+- Logs and traces for investigation.
+- CloudWatch for AWS telemetry, including Container Insights where appropriate. 
+
+Page on actionable user impact or rapid error-budget consumption. Use lower-priority notifications for capacity trends and housekeeping.
+
+Each alert should have an owner, severity, runbook, relevant dashboard, and clear recovery condition. Test notification delivery and regularly remove or improve noisy alerts.
+
+The included examples were checked locally for Python/API behavior, Bash syntax, rendered YAML structure, and isolated service-monitor behavior. Terraform/provider validation, Docker builds, Kubernetes API validation, and Jenkins runtime execution were not performed; no cloud resources were created.
