@@ -3097,3 +3097,1018 @@ For Helm, restore an appropriate release revision. For GitOps, update or revert 
 The downloadable bundle contains the five executed Python scripts, fixtures, CI promotion templates, Kubernetes examples, Terraform examples, an S3 lifecycle policy, and architecture notes: sigmoid-two-rounds-examples.zip[sigmoid-two-rounds-examples.zip](sandbox:/workspace/scratch/8dc6806ebb9b/sigmoid-two-rounds-examples.zip).
 
 Local coding and structural checks passed. Terraform provider validation and live GitHub, AWS, or Kubernetes deployment were not performed.
+
+Below are answers to all 23 questions, with examples and practical considerations. For questions about “your current project,” use the reference architecture here and adapt it to your actual experience.
+
+The Python scripts and configuration examples are included in devops-linux-observability-examples.zip[devops-linux-observability-examples.zip](sandbox:/workspace/scratch/8dc6806ebb9b/devops-linux-observability-examples.zip). Both Python exercises passed sample and edge-case checks. The Docker, Jenkins, Ansible, Prometheus, and Kubernetes configurations are templates; they were not executed against live services.
+
+**1. Explain the Linux commands**
+
+| Command | Purpose | Example and interpretation |
+|---|---|---|
+| `finger` | Displays user information and available login details. | `finger alice` — inspect information about user `alice`. Often absent on modern servers. |
+| `comm` | Compares **two sorted files**, showing lines unique to either file and lines common to both. | `comm -12 first.sorted second.sorted` — print only common lines. |
+| `netstat` | Shows network connections, listening ports, routing tables, and interface statistics. | `sudo netstat -tulpn` — show listening TCP/UDP ports and associated processes. `ss` is the usual modern alternative. |
+| `jq` | Queries and transforms JSON. | `jq -r '.items[].metadata.name' pods.json` — extract Pod names. |
+| `yq` | Queries and modifies YAML. | With **Mike Farah yq v4**: `yq '.spec.replicas' deployment.yaml`. Other tools named `yq` have different syntax. |
+| `at` | Schedules a command to run once at a future time. | `echo '/usr/local/bin/report.sh' \| at now + 10 minutes`. Requires the scheduling service, usually `atd`. |
+| `atq` | Lists pending `at` jobs. | `atq` — display job IDs, execution times, and queues. |
+| `shuf` | Randomizes input lines or selects a random sample. | `shuf -n 3 servers.txt` — select three lines randomly. |
+| `lsblk` | Lists block devices, partitions, sizes, filesystems, and mount points. | `lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS`. |
+| `less` | Views a file interactively without loading it into an editor. | `less app.log`; search with `/ERROR`, use `n` for the next match, and `q` to exit. `less +F app.log` follows updates. |
+| `last` | Displays recorded login sessions, logouts, and reboots, usually from `wtmp`. | `last -n 5` — show the latest five records. |
+| `nc` | Netcat: tests network connections and sends or receives data. | `nc -vz api.example.com 443` — test TCP connectivity. Options vary between implementations. |
+| `mtr` | Combines traceroute-style path discovery with repeated latency and packet-loss measurements. | `mtr -rw -c 10 api.example.com` — generate a report. Intermediate-hop ICMP loss alone does not prove application traffic is being dropped. |
+| `iftop` | Shows live network bandwidth between hosts on an interface. | `sudo iftop -i eth0 -n -P` — show numeric addresses and ports. |
+| `lsof` | Lists open files, including network sockets, associated with processes. | `sudo lsof -iTCP:8080 -sTCP:LISTEN` — identify the process listening on port 8080. |
+| `blkid` | Identifies filesystem attributes such as UUID, label, and filesystem type. | `sudo blkid` — useful when configuring UUID-based mounts. |
+| `mkfs` | Creates a filesystem on a device. Formatting an existing filesystem can destroy its data. | `mkfs.ext4 /dev/NEW_DEVICE` — illustrative placeholder; verify the actual target before formatting. |
+| `nice` | Starts a process with adjusted CPU scheduling priority. | `nice -n 10 python3 batch_job.py` — give the job less favorable scheduling priority. It does not impose a CPU usage limit. |
+
+For `comm`, sort both files using the same locale:
+
+```bash
+LC_ALL=C sort first.txt > first.sorted
+LC_ALL=C sort second.txt > second.sorted
+LC_ALL=C comm -12 first.sorted second.sorted
+```
+
+The three default columns are: unique to the first file, unique to the second file, and common to both. [gnu.org](https://www.gnu.org/software/coreutils/manual/html_node/comm-invocation.html?utm_source=chatgpt.com)
+
+On Linux, niceness normally ranges from **−20 to 19**; lower values receive more favorable scheduling. Increasing priority usually requires additional permission. [Linux manual page](https://man7.org/linux/man-pages/man1/nice.1.html?utm_source=chatgpt.com)
+
+The JSON/YAML examples above follow the official jq manual and Mike Farah’s yq implementation. [jqlang.org](https://jqlang.org/manual/?utm_source=chatgpt.com)
+
+**2. Python: calculate min, max, and sum for an uppercase letter, then delete its rows**
+
+Assume the input must be exactly **one ASCII uppercase letter, A–Z**, and every file row follows `LETTER,INTEGER`.
+
+The important sequence is:
+
+1. Validate the input and all rows.
+2. Calculate statistics and prepare the remaining content.
+3. Print the statistics.
+4. Replace the original file atomically.
+
+```python
+import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+
+
+def summarize_and_remove(filename, letter):
+    if len(letter) != 1 or not ("A" <= letter <= "Z"):
+        raise ValueError("Enter exactly one uppercase letter: A-Z.")
+
+    path = Path(filename).resolve(strict=True)
+
+    with path.open(encoding="utf-8", newline="") as source:
+        lines = source.readlines()
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    numbers = []
+    remaining = []
+
+    # Validate every row before changing the file.
+    for line_number, line in enumerate(lines, 1):
+        fields = line.rstrip("\r\n").split(",")
+
+        if (
+            len(fields) != 2
+            or not re.fullmatch(r"[A-Z]", fields[0])
+            or not re.fullmatch(r"[+-]?[0-9]+", fields[1])
+        ):
+            raise ValueError(f"Malformed row {line_number}")
+
+        if fields[0] == letter:
+            numbers.append(int(fields[1]))
+        else:
+            remaining.append(line)
+
+    if not numbers:
+        print(f"No matching rows for {letter}; file unchanged.")
+        return
+
+    minimum = min(numbers)
+    maximum = max(numbers)
+    total = sum(numbers)
+    temp_name = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            delete=False,
+        ) as target:
+            temp_name = target.name
+            os.chmod(temp_name, mode)
+            target.writelines(remaining)
+            target.flush()
+            os.fsync(target.fileno())
+
+        print(
+            f"min = {minimum}, max = {maximum}, sum = {total}",
+            flush=True,
+        )
+
+        os.replace(temp_name, path)
+        temp_name = None
+        print(f"Deleted {len(numbers)} matching rows.")
+
+    finally:
+        if temp_name is not None:
+            os.unlink(temp_name)
+
+
+try:
+    letter = input("Letter (A-Z): ")
+    summarize_and_remove("file.txt", letter)
+except (OSError, ValueError, EOFError) as error:
+    print(f"Error: {error}")
+```
+
+For `A`:
+
+```text
+min = 12, max = 67, sum = 120
+Deleted 3 matching rows.
+```
+
+The file then contains:
+
+```text
+C,23
+Q,44
+C,29
+B,88
+```
+
+For `B` against the original sample:
+
+```text
+min = 88, max = 88, sum = 88
+```
+
+Use this on a file with no concurrent writer. Atomic replacement prevents readers from seeing a partially rewritten file, but it does not coordinate another process that is writing to it.
+
+**3. Python: unique IP addresses from a continuously updated log**
+
+Use:
+
+- `ipaddress` to validate addresses.
+- A dictionary to deduplicate while preserving first-seen order.
+- A follow loop that holds incomplete lines until a newline arrives.
+- File identity and size checks to handle observed rotation or truncation.
+
+The complete runnable script is in the archive as `python/unique_ips.py`. Its extraction logic is:
+
+```python
+import ipaddress
+import re
+
+TOKENS = re.compile(r"[0-9A-Za-z_.:%\[\]-]+")
+
+
+def addresses(line):
+    for token in TOKENS.findall(line):
+        token = token.rstrip(".")
+
+        if token.startswith("["):
+            # Example: [2001:db8::1]:443
+            match = re.fullmatch(r"\[([^\]]+)\](?::[0-9]+)?", token)
+            if not match:
+                continue
+            token = match[1]
+
+        elif token.count(":") == 1 and "." in token:
+            # Example: 192.0.2.10:443
+            host, port = token.rsplit(":", 1)
+            if port.isdecimal():
+                token = host
+
+        try:
+            yield str(ipaddress.ip_address(token))
+        except ValueError:
+            continue
+
+
+seen = {}
+
+with open("app.log", encoding="utf-8", errors="replace") as log:
+    for line in log:
+        for address in addresses(line):
+            seen.setdefault(address, None)
+
+print(", ".join(seen))
+print(f"count={len(seen)}")
+```
+
+For your sample:
+
+```text
+145.11.21.78, 189.22.99.19
+count=2
+```
+
+After extracting the archive, run either mode:
+
+```bash
+# Read the current log:
+python3 python/unique_ips.py app.log
+
+# Continue reading new complete lines:
+python3 python/unique_ips.py app.log --follow
+```
+
+The follow version prints updated results when a new address appears. It supports common IPv4/IPv6 tokens and port notation; adapt parsing if your application has a different log schema.
+
+For production ingestion, use a log collector with durable read positions. Polling scripts can miss very rapid rotations, and the cumulative set grows with the number of unique addresses.
+
+**4. Write a three-stage Dockerfile**
+
+Because the supplied image names and paths are unspecified, this example assumes:
+
+- The configuration image contains the indicated nonsecret files and profiles.
+- The build image contains Go and Bash.
+- The runtime image can run the resulting Linux binary.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+ARG CONFIG_IMAGE
+ARG BUILD_IMAGE
+ARG RUNTIME_IMAGE
+
+# Stage 1: supplied configuration image
+FROM ${CONFIG_IMAGE} AS configuration
+
+# Stage 2: prerequisites and application build
+FROM ${BUILD_IMAGE} AS builder
+
+WORKDIR /src
+
+COPY --from=configuration /etc/company/env/build.env /opt/company/env/build.env
+COPY --from=configuration /etc/company/app/runtime.json /opt/company/app/runtime.json
+COPY --from=configuration /root/.bashrc /root/.bashrc
+COPY --from=configuration /root/.bash_profile /root/.bash_profile
+
+ENV APP_ENV=production
+
+COPY . .
+
+RUN ["/bin/bash", "-c", "set -euo pipefail; set -a; source /opt/company/env/build.env; set +a; bash ./scripts/prerequisites.sh; mkdir -p /out; CGO_ENABLED=0 go build -trimpath -o /out/server ./cmd/server"]
+
+# Stage 3: final runtime image
+FROM ${RUNTIME_IMAGE} AS runtime
+
+ENV APP_ENV=production \
+    APP_CONFIG=/etc/app/runtime.json
+
+WORKDIR /app
+
+COPY --from=builder /out/server /app/server
+COPY --from=builder /opt/company/app/runtime.json /etc/app/runtime.json
+
+USER 65532:65532
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/server"]
+CMD ["--port", "8080"]
+```
+
+Build it with the supplied images:
+
+```bash
+docker build \
+  --build-arg CONFIG_IMAGE=registry.example.com/company/config:approved \
+  --build-arg BUILD_IMAGE=registry.example.com/company/go-builder:approved \
+  --build-arg RUNTIME_IMAGE=registry.example.com/company/runtime:approved \
+  -t application:demo .
+```
+
+**Important:** `COPY --from` transfers files, not the source image’s `ENV` metadata. Independent stages inherit configuration from their own base images. Also, copying `.bashrc` or `.bash_profile` does not automatically execute them; this example explicitly sources a dedicated environment file. [Docker Docs](https://docs.docker.com/build/building/multi-stage/?utm_source=chatgpt.com)
+
+Keep credentials out of copied configuration files and image layers; use runtime secret injection or BuildKit secret mounts.
+
+**5. How are images and layers created? What does the final image contain?**
+
+An image consists of filesystem layers plus configuration metadata.
+
+| Dockerfile instruction | Typical effect |
+|---|---|
+| `FROM` | Selects a base image and its existing layers/configuration. |
+| `RUN` | Produces a filesystem change, such as installing packages or compiling code. |
+| `COPY` / `ADD` | Adds or changes filesystem content. |
+| `ENV`, `CMD`, `ENTRYPOINT`, `USER` | Primarily changes image configuration metadata. |
+
+For example:
+
+```dockerfile
+RUN apt-get update && apt-get install -y curl
+COPY server /app/server
+ENV APP_ENV=production
+```
+
+The `RUN` instruction records one filesystem change for that instruction; its individual shell commands do not each become separate Dockerfile layers.
+
+For the three-stage example, the final image contains:
+
+- The runtime base image’s filesystem and configuration.
+- `/app/server`.
+- `/etc/app/runtime.json`.
+- The final stage’s environment variables, user, working directory, and startup configuration.
+
+Build tools and source files are excluded unless explicitly copied into the final stage. Deleting a file in a later layer does not erase its bytes from earlier layers, which is why secrets should never be copied into an image. [Docker Docs](https://docs.docker.com/get-started/docker-concepts/building-images/understanding-image-layers/?utm_source=chatgpt.com)
+
+**6. Which instructions create intermediate images? Are they still used afterward?**
+
+Each `FROM` begins a build stage. Filesystem-changing instructions such as `RUN`, `COPY`, and `ADD` produce build results that can be cached.
+
+With modern BuildKit, these results are often managed as cache records and snapshots rather than visible, tagged intermediate images.
+
+After the build:
+
+- The application container runs from the final image.
+- Earlier stages are unnecessary for executing that container.
+- Their cached results may accelerate later builds.
+- Some content-addressed layers may be shared with other images.
+
+Example:
+
+```dockerfile
+FROM build-image AS builder
+RUN compile-application
+
+FROM runtime-image
+COPY --from=builder /output/application /app/application
+```
+
+The runtime needs the copied application and its runtime dependencies. It does not need the builder stage or its build processes. Build cache remains useful until it is evicted or pruned. [Docker Docs](https://docs.docker.com/build/cache/?utm_source=chatgpt.com)
+
+**7. CMD versus ENTRYPOINT, and why use both?**
+
+| Instruction | Purpose |
+|---|---|
+| `ENTRYPOINT` | Defines the executable normally started by the container. |
+| `CMD` | Supplies default arguments, or the default command when there is no entrypoint. |
+
+Example:
+
+```dockerfile
+ENTRYPOINT ["/app/server"]
+CMD ["--port", "8080"]
+```
+
+Default invocation:
+
+```bash
+docker run application:demo
+```
+
+Effective command:
+
+```text
+/app/server --port 8080
+```
+
+Override the arguments:
+
+```bash
+docker run application:demo --port 9090
+```
+
+Effective command:
+
+```text
+/app/server --port 9090
+```
+
+Override the executable:
+
+```bash
+docker run --entrypoint /bin/sh application:demo
+```
+
+Use the **exec form**, shown above, for predictable arguments and signal handling. A shell wrapper should generally end with `exec "$@"` or `exec /app/server ...` so the application receives termination signals correctly. [Docker Docs](https://docs.docker.com/reference/dockerfile/?utm_source=chatgpt.com)
+
+**8. What happens with multiple CMD or ENTRYPOINT instructions?**
+
+Within one stage, only the **last effective `CMD`** and **last effective `ENTRYPOINT`** are used.
+
+```dockerfile
+FROM alpine
+
+ENTRYPOINT ["echo"]
+ENTRYPOINT ["printf"]
+
+CMD ["first"]
+CMD ["second"]
+```
+
+The resulting startup configuration is:
+
+```text
+printf second
+```
+
+The earlier instructions do not run sequentially.
+
+A normal build can complete, but Docker’s build checks flag duplicate instructions. Builds configured to treat those checks as errors can fail.
+
+Instructions in separate stages configure their respective stages; the selected final stage determines the resulting image’s startup configuration. [Docker Docs](https://docs.docker.com/reference/build-checks/multiple-instructions-disallowed/?utm_source=chatgpt.com)
+
+**9. What is a publisher in Jenkins?**
+
+In a traditional Freestyle job, a publisher is usually a **post-build action** that processes or distributes build results.
+
+Examples include:
+
+- Publishing JUnit test results.
+- Archiving artifacts.
+- Publishing HTML or coverage reports.
+- Uploading artifacts.
+- Sending configured notifications.
+
+Pipeline commonly expresses these activities through steps in `post`:
+
+```groovy
+post {
+    always {
+        junit 'reports/junit.xml'
+        archiveArtifacts artifacts: 'dist/*.jar'
+    }
+}
+```
+
+A publisher can also affect build status—for example, test failures can mark a build unstable. “Publisher” describes the action category; a particular plugin, such as Git Publisher, has its own behavior. [jenkins.io](https://www.jenkins.io/doc/developer/plugin-development/pipeline-integration/?utm_source=chatgpt.com)
+
+**10. What are Jenkins executors? How do they work?**
+
+An executor is a **slot for executing work on a Jenkins node**.
+
+Suppose an agent has two executors:
+
+```text
+Two allocated builds can execute concurrently.
+A third matching build waits in the queue.
+```
+
+The scheduling flow is:
+
+1. A build or Pipeline requests an agent, possibly using a label.
+2. Jenkins checks matching nodes and available executor capacity.
+3. It allocates an executor and workspace.
+4. Build commands execute on the allocated agent.
+5. The allocation is released when that work finishes.
+
+Under the hood, Jenkins represents an executor with an `Executor` thread that coordinates build execution. Remote shell/build processes run through the agent connection on the selected machine. [jenkins.io](https://www.jenkins.io/doc/book/using/using-agents/?utm_source=chatgpt.com)
+
+An executor is **not a CPU core**. Ten executors on a small machine can cause CPU, memory, disk, and network contention.
+
+For Pipeline, `node` or an `agent` allocation consumes executor capacity. Lightweight waiting steps can run outside that allocation. I normally keep controller executors at zero and size agent concurrency according to actual build resource usage.
+
+**11. Integrating SonarQube with Jenkins, quality gates, and coverage**
+
+A reference setup is:
+
+1. Install the SonarQube Scanner for Jenkins plugin.
+2. Configure the SonarQube server and a scoped analysis token in Jenkins credentials.
+3. Configure the scanner tool.
+4. Run tests and generate coverage reports.
+5. Run analysis with the coverage report paths.
+6. Wait for the server’s quality-gate result.
+7. Permit promotion only after the gate passes.
+
+**JUnit reports and coverage reports serve different purposes:**
+
+| Report | Information |
+|---|---|
+| JUnit XML | Test cases, failures, errors, and durations. |
+| Coverage XML / JaCoCo / LCOV | Executed lines and, where supported, branch coverage. |
+
+SonarQube imports coverage generated by the test tooling; it does not generate coverage itself. [docs.sonarsource.com](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/test-coverage/python-test-coverage?utm_source=chatgpt.com)
+
+For a Python application:
+
+```groovy
+pipeline {
+    agent none
+
+    stages {
+        stage('Test and analyze') {
+            agent { label 'python-sonar' }
+
+            steps {
+                checkout scm
+
+                sh '''
+                    pytest tests --cov=src \
+                      --cov-report=xml:coverage.xml \
+                      --junitxml=junit.xml
+                '''
+
+                script {
+                    def scanner = tool 'SonarScanner'
+
+                    withEnv(["SCANNER_HOME=${scanner}"]) {
+                        withSonarQubeEnv('sonarqube-prod') {
+                            sh '''
+                                "$SCANNER_HOME/bin/sonar-scanner" \
+                                  -Dsonar.projectKey=my-api \
+                                  -Dsonar.sources=src \
+                                  -Dsonar.tests=tests \
+                                  -Dsonar.python.coverage.reportPaths=coverage.xml
+                            '''
+                        }
+                    }
+                }
+            }
+
+            post {
+                always {
+                    junit testResults: 'junit.xml',
+                          allowEmptyResults: true
+                }
+            }
+        }
+
+        stage('Quality gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    script {
+                        def gate = waitForQualityGate(
+                            webhookSecretId: 'sonarqube-webhook-secret'
+                        )
+
+                        if (gate.status != 'OK') {
+                            error "Quality gate failed: ${gate.status}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Configure the SonarQube webhook to:
+
+```text
+https://JENKINS_HOST/sonarqube-webhook/
+```
+
+The analysis task ID connects the scan to the gate result. With the wait outside an agent allocation, Jenkins does not occupy a build executor while waiting. [docs.sonarsource.com](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/ci-integration/jenkins-integration/pipeline-pause?utm_source=chatgpt.com)
+
+Example new-code policy:
+
+| Check | Threshold |
+|---|---:|
+| Coverage | At least 80% |
+| Duplicated lines | At most 3% |
+| New issues | None |
+| Security hotspots reviewed | 100% |
+
+Configure these on the **SonarQube quality gate associated with the project**, and define the new-code baseline. Overall-code coverage is a separate condition.
+
+SonarQube normally has a small-change exception: coverage conditions are ignored below 20 new lines to cover, and duplication conditions below 20 new lines. Disable that exception if your agreed policy requires the thresholds for every change. [docs.sonarsource.com](https://docs.sonarsource.com/sonarqube-server/2026.1/quality-standards-administration/managing-quality-gates/introduction-to-quality-gates?utm_source=chatgpt.com)
+
+**12. Passing Ansible task output between blocks**
+
+Use `register` on the task that produces the output. The result remains accessible to later tasks for that host, including tasks outside the block.
+
+```yaml
+- hosts: web
+  gather_facts: false
+
+  tasks:
+    - name: First block
+      block:
+        - name: Read OS information
+          ansible.builtin.command: cat /etc/os-release
+          register: os_result
+          changed_when: false
+
+    - name: Second block
+      block:
+        - name: Use the earlier output
+          ansible.builtin.debug:
+            msg: "{{ os_result.stdout }}"
+
+    - name: Fourth block
+      block:
+        - name: Collect disk information
+          ansible.builtin.command: df -P /var/log
+          register: disk_result
+          changed_when: false
+
+    - name: Use results from earlier blocks
+      ansible.builtin.debug:
+        msg:
+          os: "{{ os_result.stdout }}"
+          disk: "{{ disk_result.stdout }}"
+```
+
+Useful distinctions:
+
+- Register a **task**, rather than a whole block.
+- Use `set_fact` when you want to derive another reusable value.
+- Loop results are normally under `registered_variable.results`.
+- Results are host-specific; use `hostvars` when accessing another host’s variables.
+- Registered variables persist through the current playbook run, including subsequent plays, but are not automatically available in a separate run.
+- Guard skipped or failed task results before accessing fields such as `stdout`. [Ansible Community Documentation](https://docs.ansible.com/ansible/latest/playbook_guide/playbooks_variables.html?utm_source=chatgpt.com)
+
+**13. Why host/path routing when Services already route traffic to Pods?**
+
+A standard Kubernetes Service provides a stable endpoint and distributes transport-level traffic to its selected endpoints. It does not choose a backend based on an HTTP hostname or URL path.
+
+An Ingress/Gateway controller provides application-level routing.
+
+| Requirement | Component |
+|---|---|
+| Distribute traffic among interchangeable Products Pods | Products Service |
+| Send `/api/products` to Products and `/api/cart` to Cart | Ingress/Gateway routing |
+| Terminate HTTPS and manage external HTTP entry | Ingress/Gateway or external load balancer |
+
+An Ingress object requires a controller to implement its rules. [Kubernetes](https://kubernetes.io/docs/concepts/services-networking/service/?utm_source=chatgpt.com)
+
+```mermaid
+flowchart TD
+    UI["Browser frontend"] --> Gateway["Ingress or Gateway"]
+    Gateway -->|"/api/products"| Products["Products Service"]
+    Gateway -->|"/api/cart"| Cart["Cart Service"]
+    Products --> ProductPods["Products Pods"]
+    Cart --> CartPods["Cart Pods"]
+    ProductPods --> DB["Private database"]
+    CartPods --> DB
+```
+
+When the user opens product 42:
+
+1. Frontend JavaScript requests `GET /api/products/42`.
+2. The gateway selects the Products backend using its path rule.
+3. A healthy Products replica handles the request.
+4. The application extracts product ID `42` and queries the database.
+5. The API returns JSON, which the frontend renders.
+
+The frontend does not need to know which Pod stores product 42. In this design, the replicas share access to the relevant data store.
+
+The diagram represents logical routing. Some implementations, such as ALB IP targets, send traffic directly to Pod IPs selected through Service endpoints.
+
+**14. Handling heavy concurrency in multiplayer games or streaming applications**
+
+The objective is to meet a defined latency target, such as p99 below a specified budget. Zero latency is impossible.
+
+These workloads need different designs:
+
+| Workload | Typical approach |
+|---|---|
+| Multiplayer game | Matchmaking, regional session placement, authoritative game servers, and persistent connections or UDP-based protocols. |
+| Video streaming | Encoded segments, manifests, origin storage, CDN distribution, and adaptive bitrate. |
+| Interactive calls/live communication | WebRTC, regional media servers/SFUs, and bandwidth-aware scaling. |
+
+For a multiplayer game:
+
+- Place the session close to its players.
+- Route players to the server owning their match.
+- Partition matches across servers.
+- Keep active game state near the simulation.
+- Persist durable results asynchronously where game correctness allows.
+- Scale using active sessions, connection count, message rate, CPU, network usage, and queue age.
+- Drain existing sessions before terminating servers.
+
+Adding Pods does not automatically redistribute existing persistent connections. New capacity primarily serves new sessions until clients reconnect or sessions migrate.
+
+ALB supports WebSockets, but protocol choice matters; UDP-based game traffic requires a compatible networking design. [Elastic Load Balancing](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-listeners.html?utm_source=chatgpt.com)
+
+For video, package content into formats such as HLS or DASH and deliver segments through a CDN. Many viewers can then receive the same content from edge caches rather than repeatedly loading application Pods. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/on-demand-streaming-video.html?utm_source=chatgpt.com)
+
+Also apply bounded queues, backpressure, connection limits, and controlled retries. Otherwise, overload can increase both latency and retry traffic.
+
+**15. Production latency increases from 5 ms to approximately 5 minutes: troubleshooting and RCA**
+
+Run **impact mitigation and evidence collection concurrently**.
+
+A strong interview answer follows this sequence:
+
+1. **Establish scope.** Identify affected endpoints, users, regions, versions, and the incident start time. Check p95/p99 latency, errors, throughput, and queue age.
+2. **Check recent changes.** Correlate deployments, configuration changes, database migrations, scaling events, certificates, and traffic increases.
+3. **Locate the delay.** Use browser timings and distributed traces to separate DNS, connection/TLS, backend processing, dependency calls, and frontend rendering.
+4. **Mitigate using the evidence.** Roll back a correlated release, disable the offending feature, stop a runaway job, shed excess load, or restore capacity.
+5. **Verify recovery.** Confirm customer journeys, latency percentiles, errors, throughput, and backlog recovery.
+6. **Complete the RCA.** Document the trigger, causal chain, impact, detection gap, and preventive actions.
+
+Use traces to identify where the request spends its time:
+
+| Layer | Evidence to inspect |
+|---|---|
+| Browser | DNS/connect time, TTFB, failed API calls, long-running JavaScript |
+| CDN/WAF/load balancer | Origin latency, rejected traffic, target health, 4xx/5xx |
+| Application | Request queues, worker/thread pools, connection pools, GC, retries |
+| Kubernetes | CPU throttling, OOMs, restarts, placement, node pressure |
+| Database | Slow queries, lock waits, transactions, connections, storage latency |
+| Network/dependencies | DNS errors, retransmissions, connection exhaustion, upstream timeouts |
+
+Useful Kubernetes commands include:
+
+```bash
+kubectl top nodes
+kubectl top pods -n production --containers
+
+kubectl describe pod POD_NAME -n production
+kubectl logs POD_NAME -n production --since=15m
+kubectl get events -n production --sort-by=.metadata.creationTimestamp
+```
+
+Pod logs, events, and descriptions help distinguish application failures from scheduling, resource, or container failures. [Kubernetes](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/?utm_source=chatgpt.com)
+
+A hypothetical causal chain might be:
+
+```text
+New query holds a database lock
+→ requests occupy all DB connections
+→ application workers wait
+→ retries increase incoming load
+→ request queues grow
+→ users experience five-minute responses
+```
+
+In that scenario, adding application replicas can create more database connections and worsen contention. The immediate fix targets the blocking operation or release; prevention might include query changes, bounded pools, request deadlines, retry budgets, and load tests.
+
+The RCA should explain **why the system became slow**, supported by timings and observations, rather than stopping at “CPU was high.”
+
+**16. PromQL: alert when CPU usage exceeds 80% on any node**
+
+For Linux node_exporter:
+
+```promql
+100 * (
+  1 - avg by (instance) (
+    rate(node_cpu_seconds_total{
+      job="node-exporter",
+      mode="idle"
+    }[5m])
+  )
+) > 80
+```
+
+Interpretation:
+
+- `rate` calculates idle seconds per second.
+- `avg by (instance)` averages across the node’s CPU cores.
+- Subtracting idle from one gives the non-idle fraction.
+- Multiplying by 100 converts it to a percentage.
+
+This measures **five-minute average non-idle time**, including I/O wait. It is node utilization, not utilization relative to a Pod’s CPU request. The job name must match your scrape configuration. [GitHub](https://github.com/prometheus/node_exporter/blob/master/collector/cpu_linux.go?utm_source=chatgpt.com)
+
+**17. CPU above 90% for five minutes, only when running Pods are below five**
+
+Assume the requirement applies **per node**, and both predicates must remain true for five minutes.
+
+First record CPU usage using consistent `cluster` and `node` labels:
+
+```yaml
+- record: node:cpu_nonidle:percent
+  expr: |
+    100 * (1 - avg by (cluster, node) (
+      rate(node_cpu_seconds_total{
+        job="node-exporter", mode="idle"
+      }[5m])
+    ))
+```
+
+Then calculate running Pods per node:
+
+```yaml
+- record: node:running_pods:count
+  expr: |
+    sum by (cluster, node) (
+      (max by (cluster, namespace, pod, uid) (
+        kube_pod_status_phase{phase="Running"}
+      ) == 1)
+      * on (cluster, namespace, pod, uid) group_left(node)
+      max by (cluster, namespace, pod, uid, node) (
+        kube_pod_info{node!=""}
+      )
+    )
+    or on (cluster, node)
+    (0 * max by (cluster, node) (kube_node_info))
+```
+
+`kube_pod_status_phase` does not normally contain the node label, so the query joins it to `kube_pod_info`. The zero fallback includes nodes with no running Pods. [GitHub](https://github.com/kubernetes/kube-state-metrics/blob/main/docs/metrics/workload/pod-metrics.md?utm_source=chatgpt.com)
+
+Finally:
+
+```yaml
+- alert: HighCPUWithFewRunningPods
+  expr: |
+    (node:cpu_nonidle:percent > 90)
+    and on (cluster, node)
+    (node:running_pods:count < 5)
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "High CPU with fewer than five running Pods"
+```
+
+`for: 5m` requires the combined condition to remain true before firing. It is separate from the rate sampling window. [Prometheus](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/?utm_source=chatgpt.com)
+
+Important assumptions:
+
+- Add matching node names and cluster labels to the queried metrics.
+- `Running` is a Pod phase, not a readiness check.
+- The count includes system and DaemonSet Pods unless filtered.
+- With exactly five Pods, the alert does not qualify.
+
+**18. Custom Resource versus CustomResourceDefinition**
+
+| Aspect | CRD | Custom Resource |
+|---|---|---|
+| Purpose | Defines an additional Kubernetes API type | Represents an instance of that type |
+| Contents | Group, versions, kind, scope, schema, validation | Desired configuration and potentially status |
+| Example | Definition of `Kibana` | A Kibana resource named `logs-ui` |
+
+Example custom resource:
+
+```yaml
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: logs-ui
+spec:
+  version: "9.5.4"
+  count: 2
+  elasticsearchRef:
+    name: logs-es
+```
+
+The corresponding CRD must already be installed for Kubernetes to accept this object.
+
+**A CRD provides the API; it does not implement deployment or database-management behavior.** A controller/operator supplies that automation. [Kubernetes](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/?utm_source=chatgpt.com)
+
+**19. Explain an end-to-end ELK setup in Kubernetes**
+
+Use this as a reference project answer:
+
+> “Applications write structured JSON logs to stdout. A node-level collector enriches them with Kubernetes metadata and forwards them through Logstash to Elasticsearch. Kibana provides search and dashboards. We manage Elasticsearch and Kibana through ECK, with persistent storage, controlled retention, snapshots, and restricted access.”
+
+```mermaid
+flowchart TD
+    Apps["Application Pods"] --> Collector["Filebeat or Elastic Agent"]
+    Collector --> Logstash["Logstash"]
+    Logstash --> ES["Elasticsearch cluster"]
+    Kibana["Kibana"] -->|Queries| ES
+    Users["Engineers"] --> Kibana
+    ES -->|Snapshots| Store["Object storage"]
+    ECK["ECK operator"] -.-> ES
+    ECK -.-> Kibana
+```
+
+The setup includes:
+
+1. **Collection:** Run a collector on eligible nodes, usually as a DaemonSet. Read container logs, track positions, handle multiline events, and attach namespace/Pod/container metadata. [Beats](https://www.elastic.co/docs/reference/beats/filebeat/running-on-kubernetes?utm_source=chatgpt.com)
+2. **Processing:** Use Logstash for required parsing, normalization, redaction, enrichment, and routing. Configure TLS and persistent queues. Logstash is optional when Elasticsearch ingest pipelines cover the processing needs.
+3. **Storage and availability:** Use persistent volumes, separate failure domains, appropriate resources, and replica shards. A small deployment might use three combined-role Elasticsearch nodes; larger deployments can separate master and data roles. [Elastic Docs](https://www.elastic.co/docs/deploy-manage/deploy/cloud-on-k8s/volume-claim-templates?utm_source=chatgpt.com)
+4. **Retention:** Configure rollover and retention using ILM or the appropriate data-stream lifecycle. Size shards according to ingestion volume and query needs. [Elastic Docs](https://www.elastic.co/docs/manage-data/lifecycle/index-lifecycle-management?utm_source=chatgpt.com)
+5. **Access:** Keep Elasticsearch private, use TLS and restricted ingestion credentials, and apply scoped human access through Kibana.
+6. **Recovery:** Configure snapshots to object storage and exercise restores. Replica shards protect availability; they do not replace backups. [Elastic Docs](https://www.elastic.co/docs/deploy-manage/tools/snapshot-and-restore?utm_source=chatgpt.com)
+
+Monitor collector failures, ingestion lag, Logstash queues, rejected indexing requests, disk watermarks, JVM pressure, and cluster health.
+
+**20. How does Kibana connect to Elasticsearch? YAML example**
+
+With ECK:
+
+```yaml
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: logs-ui
+  namespace: observability
+spec:
+  version: "9.5.4"
+  count: 2
+  elasticsearchRef:
+    name: logs-es
+    namespace: observability
+```
+
+The `elasticsearchRef` association lets ECK configure the Elasticsearch connection, credentials, and trust material. Use a supported Elasticsearch/Kibana version pair compatible with your operator. [Elastic Docs](https://www.elastic.co/docs/deploy-manage/deploy/cloud-on-k8s/k8s-kibana-es?utm_source=chatgpt.com)
+
+For separately managed Kibana, the equivalent configuration can look like:
+
+```yaml
+elasticsearch.hosts:
+  - "https://logs-es-es-http.observability.svc:9200"
+
+elasticsearch.serviceAccountToken: "${ELASTICSEARCH_SERVICE_ACCOUNT_TOKEN}"
+
+elasticsearch.ssl.certificateAuthorities:
+  - /etc/kibana/certs/ca.crt
+```
+
+Mount the CA certificate and inject the token securely. This is an **Elasticsearch Kibana service-account token**, distinct from a Kubernetes ServiceAccount token. Kibana ordinarily uses Elasticsearch’s REST endpoint on port 9200. [Kibana](https://www.elastic.co/docs/reference/kibana/configuration-reference/general-settings?utm_source=chatgpt.com)
+
+**21. What are Kubernetes operators? Is there an Elasticsearch operator?**
+
+An operator is a controller containing application-specific operational knowledge.
+
+It repeatedly:
+
+1. Reads desired configuration.
+2. Observes current resources and application health.
+3. Performs actions to reconcile the two.
+4. Updates status.
+
+For Elasticsearch, **Elastic Cloud on Kubernetes—ECK** is an operator. It manages resources such as StatefulSets, volumes, Services, credentials, TLS, and supported configuration or upgrade operations. The Elasticsearch processes run in their own Pods; the operator is their manager. [Kubernetes](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/?utm_source=chatgpt.com)
+
+Elasticsearch itself distributes data across primary and replica shards. Indexing enters through a primary shard and is replicated; searches are distributed to relevant shard copies and their results combined. The operator manages deployment operations rather than processing these searches. [Elastic Docs](https://www.elastic.co/docs/deploy-manage/distributed-architecture/clusters-nodes-shards?utm_source=chatgpt.com)
+
+If the operator stops, existing Elasticsearch Pods can continue serving traffic. Operator-driven reconciliation and management are interrupted until it recovers.
+
+**22. MySQL operator versus a normal Pod running a MySQL image**
+
+The operator Pod is a controller. Database instances run in separate Pods that it manages.
+
+A normal MySQL container can start `mysqld`, initialize a database, and use configured storage. Kubernetes can recreate its Pod. Database-aware clustering still requires additional implementation.
+
+For example, Oracle’s MySQL Operator manages InnoDB Cluster, configuring MySQL Group Replication and MySQL Router. [dev.mysql.com](https://dev.mysql.com/doc/mysql-operator/en/mysql-operator-introduction.html?ff=nopfpls\&utm_source=chatgpt.com)
+
+| Scenario | Additional database-aware behavior |
+|---|---|
+| Primary instance fails | Group Replication elects an eligible primary; Router directs clients appropriately. |
+| Replacement member joins | Configure membership and clone/resynchronize data. |
+| Pod restarts | Preserve identity/storage and reconcile the member back into the cluster. |
+| Planned maintenance | Coordinate database membership and health rather than merely restart containers. |
+| Backup requirement | Use supported backup profiles and schedules. |
+| Restore requirement | Bootstrap or recover a database from supported backup data. |
+
+Supported backup and restore workflows depend on the operator and its configuration. [dev.mysql.com](https://dev.mysql.com/doc/mysql-operator/en/mysql-operator-backups.html?ff=nopfpls\&utm_source=chatgpt.com)
+
+Example:
+
+> “With three database members, if the primary’s node fails and quorum remains, the database can elect another primary. MySQL Router gives applications a stable connection entry point while Kubernetes and the operator repair the failed member.”
+
+The election belongs to the database replication system; Kubernetes restarting a Pod is not a database primary election.
+
+An operator still depends on correct volumes, topology, quorum, backups, and restore procedures. It cannot reconstruct unreplicated data after every surviving copy is lost.
+
+**23. Run exactly one MySQL instance on each node using a custom operator**
+
+First distinguish the data model:
+
+- **Independent database per node:** each instance owns a separate dataset.
+- **Members of one logical database:** membership, replication, quorum, and primary routing must also be managed.
+
+A **DaemonSet** supplies the basic desired placement of one Pod per eligible node. However, it does not provide MySQL clustering or StatefulSet-style per-Pod volume claim templates. [Kubernetes](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/?utm_source=chatgpt.com)
+
+One custom-operator design is:
+
+1. Watch the custom resource, eligible Nodes, workloads, and PVCs.
+2. Select nodes labeled `workload=mysql`.
+3. Create one single-replica StatefulSet per selected node.
+4. Give each instance its own identity and PVC.
+5. Use required node affinity for placement.
+6. Configure database membership and Router if the instances form one cluster.
+7. Handle node removal deliberately, retaining or migrating durable data according to policy.
+
+```mermaid
+flowchart TD
+    CR["PerNodeMySQL resource"] --> Operator["Custom operator"]
+    Nodes["Eligible node changes"] --> Operator
+    Operator --> A["Node A StatefulSet and PVC"]
+    Operator --> B["Node B StatefulSet and PVC"]
+    Operator --> C["Node C StatefulSet and PVC"]
+    A --> DB1["MySQL instance A"]
+    B --> DB2["MySQL instance B"]
+    C --> DB3["MySQL instance C"]
+```
+
+An illustrative custom API could be:
+
+```yaml
+# Requires a custom CRD and an implemented controller.
+apiVersion: platform.example.com/v1alpha1
+kind: PerNodeMySQL
+metadata:
+  name: node-databases
+  namespace: databases
+spec:
+  nodeSelector:
+    workload: mysql
+  image: mysql:8.4
+  storageClassName: gp3-wffc
+  storageSize: 100Gi
+  deletionPolicy: Retain
+```
+
+This is an API design example, not an Oracle MySQL Operator built-in resource. Defining its CRD alone will not create databases.
+
+The operator must account for storage locality, failed-node fencing, safe membership changes, backups, and replacement-node recovery. Each MySQL process needs a separate data directory.
+
+“Exactly one per node” is an eventual desired state; failures and reconciliation can temporarily prevent it. For a conventional HA database, I would normally choose a supported operator with a deliberately sized database topology on dedicated nodes, rather than tie database membership to every general-purpose worker.
