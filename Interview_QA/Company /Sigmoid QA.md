@@ -1803,3 +1803,1297 @@ Complexity:
 The `previous >= left` condition matters. For `abba`, the final `a` appeared outside the current window, so moving `left` backward would incorrectly include duplicate characters.
 
 The supplied examples and additional cases passed local checks. The scripts, Docker example, Kubernetes manifests, and architecture are included in sigmoid-regional-failover-examples.zip[sigmoid-regional-failover-examples.zip](sandbox:/workspace/scratch/8dc6806ebb9b/sigmoid-regional-failover-examples.zip). Docker builds and live AWS/Kubernetes deployments were not performed.
+
+Use the introduction and “current project” answers as templates, replacing placeholders with your actual experience. The architecture below is one consistent reference project used throughout both rounds.
+
+**Round 1 — Technical whiteboard**
+
+**1. Give your introduction**
+
+A good introduction covers your experience, current responsibilities, strongest skills, and one measurable contribution.
+
+> “I’m [Name], with [X] years of experience in IT, including [Y] years in DevOps and cloud engineering. My main skills are AWS, Kubernetes, Terraform, CI/CD, Linux, and monitoring.
+>
+> In my current project, I support [application/domain]. My responsibilities include provisioning infrastructure, maintaining deployment pipelines, managing Kubernetes workloads, implementing security controls, and investigating production incidents.
+>
+> One contribution I’m particularly proud of is [actual example], where I improved [deployment time, reliability, recovery time, or infrastructure cost] from [before] to [after].
+>
+> I work closely with developers and platform teams to make releases repeatable and to ensure that we can monitor, recover, and operate the application reliably.”
+
+Be ready to explain the contribution technically: what changed, how you measured it, and what trade-offs you made.
+
+**2. Explain the development-to-production flow and security checks in CI**
+
+My reference workflow uses short-lived feature branches, protected pull requests, and promotion of a tested release through environments.
+
+```mermaid
+flowchart TD
+    F["Feature commit"] --> C["PR checks"]
+    C --> G{"Checks and review pass"}
+    G -->|No| X["Fix findings"]
+    X --> F
+    G -->|Yes| M["Merge to main"]
+    M --> I["Build and verify release"]
+    I --> D["Dev and test"]
+    D --> Q["QA and staging"]
+    Q --> A{"Acceptance and approval"}
+    A -->|Pass| P["Production"]
+    A -->|Fail| X
+    P --> O["Observe application"]
+    O -->|Regression| R["Restore previous release"]
+```
+
+The important practice is **build once, promote the same artifact**. For containers, deploy the same `image@sha256:digest` through every environment. Supply environment configuration separately.
+
+Typical security gates:
+
+| Check | Purpose | Example tools or controls |
+|---|---|---|
+| Secret scanning | Detect credentials committed to source | Gitleaks, repository secret protection |
+| SAST | Detect vulnerable code patterns | Semgrep, SonarQube |
+| Dependency scanning | Detect vulnerable third-party packages | Trivy, language-specific scanners |
+| License checks | Enforce the organization’s dependency policy | Approved license allowlist |
+| IaC scanning | Detect unsafe infrastructure configuration | Checkov, Trivy |
+| Container scanning | Check application packages and base-image vulnerabilities | Trivy |
+| Configuration checks | Reject privileged containers, broad IAM, public databases, missing encryption | Policy checks |
+| Artifact verification | Associate the release with its source and build | Image digest, SBOM, signing and provenance |
+| Deployment controls | Limit who and what can deploy | Protected environments, approvals, scoped roles |
+
+Secret scanning, code analysis, dependency analysis, and image scanning address different problems; one scanner does not replace the others. [GitHub](https://github.com/gitleaks/gitleaks?utm_source=chatgpt.com)
+
+I also secure the pipeline itself:
+
+- PR jobs run without production credentials.
+- Cloud authentication uses short-lived OIDC credentials.
+- Third-party actions are pinned to reviewed commit SHAs.
+- Deployment roles have only the permissions required for their environment.
+- Untrusted PR code runs on isolated runners.
+- Workflow changes require review.
+- Exceptions to security findings have an owner, justification, and expiry date.
+
+Privileged workflow triggers require particular care: checking out untrusted PR code in a privileged context can expose credentials or trusted runners. [GitHub Docs](https://docs.github.com/en/actions/reference/security/secure-use?utm_source=chatgpt.com)
+
+**3. What branching strategy would you choose, and why?**
+
+For a team delivering frequently, I would choose **trunk-based development with short-lived feature branches and a protected `main` branch**.
+
+| Branch or reference | Purpose |
+|---|---|
+| `main` | Integrated, releasable code |
+| `feature/*` | Short-lived development work |
+| `hotfix/*` | Urgent fixes through a controlled review process |
+| Release tag | Identifies a particular released commit |
+
+A developer opens a PR, automated checks run, reviewers approve, and the change merges into `main`. Required checks and reviews are enforced through branch protection. [GitHub Docs](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches?utm_source=chatgpt.com)
+
+I choose this because:
+
+- Frequent integration reduces merge conflicts.
+- Environments receive the same tested release artifact.
+- Release history is easier to trace.
+- Feature flags can separate code integration from feature exposure.
+
+Comparison:
+
+| Strategy | Useful when | Main trade-off |
+|---|---|---|
+| Trunk-based | Frequent releases and strong automated testing | Requires small changes and good release discipline |
+| GitFlow | Maintaining parallel release lines or scheduled releases | More branch management and merging |
+| Branch per environment | An existing process depends on environment branches | Different commits can drift between environments |
+
+For a hotfix based on an older production release, merge the fix back into the main development line as well.
+
+**4. Design an optimized, secure, highly available three-tier AWS architecture**
+
+First establish the requirements: frontend runtime, peak traffic, user locations, database workload, availability target, recovery objectives, and budget.
+
+For this example, assume:
+
+- A static single-page frontend.
+- Stateless backend APIs.
+- PostgreSQL transactions.
+- An organization already operating Kubernetes.
+- Availability across multiple AZs.
+
+My component choices are:
+
+| Tier | Choice | Reason |
+|---|---|---|
+| Frontend | Private S3 bucket and CloudFront | Static content needs no continuously running application server |
+| Backend | EKS Deployments on private nodes | Fits the existing Kubernetes platform |
+| Database | RDS PostgreSQL Multi-AZ | Managed database availability and operations |
+
+```mermaid
+flowchart TD
+    B["Browser"] --> C["CloudFront and WAF"]
+    B -. "DNS lookup" .-> DNS["Route 53"]
+    DNS -. "CloudFront address" .-> B
+
+    C -->|Static assets| S["Private S3 through OAC"]
+    C -->|Uncached API requests| L["Public ALB across AZs"]
+
+    subgraph V["VPC"]
+        subgraph A["Private application subnets"]
+            P1["Backend Pods in AZ A"]
+            P2["Backend Pods in AZ B"]
+        end
+
+        L -->|HTTPS to Pod IP| P1
+        L -->|HTTPS to Pod IP| P2
+
+        P1 --> R["RDS writer endpoint"]
+        P2 --> R
+
+        subgraph D["Isolated database subnets"]
+            D1["PostgreSQL primary"]
+            D2["Multi-AZ standby"]
+            D1 -. "Synchronous replication" .-> D2
+        end
+
+        R --> D1
+    end
+```
+
+**Why S3 and CloudFront for the frontend?**
+
+For a static SPA, they provide edge caching and remove frontend container capacity management. Use a private S3 REST origin with CloudFront Origin Access Control, rather than exposing the bucket publicly. OAC does not apply to an S3 website endpoint. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html?utm_source=chatgpt.com)
+
+If the frontend requires server-side rendering, it needs compute; S3 alone cannot execute application code.
+
+**Why RDS rather than a database StatefulSet?**
+
+| Concern | Database on StatefulSet | RDS |
+|---|---|---|
+| Pod identity and persistent storage | Kubernetes provides these building blocks | Managed by the database service |
+| Database replication | Must configure and operate it | Managed options available |
+| Failover | Requires database-aware orchestration | Managed Multi-AZ failover |
+| Backups and recovery | Your responsibility | Managed features, with configuration and restore testing still required |
+| Upgrades and patching | Your responsibility | Managed maintenance capabilities |
+| Operational effort | Higher | Usually lower |
+
+A StatefulSet does not automatically make a database highly available. You still need database replication, leader selection, backup management, recovery procedures, and storage failure handling.
+
+For standard PostgreSQL workloads, RDS is a strong default. Its Multi-AZ DB-instance standby provides availability and does not serve read traffic. [Amazon Relational Database Service](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html?utm_source=chatgpt.com)
+
+**Security and latency decisions**
+
+- Keep nodes and database interfaces private.
+- Use HTTPS, IAM roles, managed secrets, encryption, and controlled administration.
+- Restrict direct access to the ALB origin.
+- Cache static assets aggressively.
+- Keep backend and database in the same region.
+- Use indexed queries and bounded connection pools.
+- Add caching or RDS Proxy when measurements justify them.
+- Size surviving-AZ capacity for a failure, rather than relying entirely on scaling after the failure.
+
+CloudFront can also use a private ALB through VPC origins. The public-ALB example above is useful for explaining the interview’s public-subnet follow-ups; restrict it using the CloudFront origin-facing prefix list and a secret origin header. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/restrict-access-to-load-balancer.html?utm_source=chatgpt.com)
+
+**5. Architecture follow-up questions**
+
+**5.1. How do you identify a public or private subnet?**
+
+Inspect the subnet’s associated route table.
+
+| Subnet | Typical IPv4 default route |
+|---|---|
+| Public | `0.0.0.0/0 → Internet Gateway` |
+| Private with internet egress | `0.0.0.0/0 → NAT` |
+| Isolated database | No default internet route |
+
+The defining distinction is whether the subnet has a **direct route to an Internet Gateway**. A subnet name or tag does not determine its actual connectivity. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html?utm_source=chatgpt.com)
+
+For direct IPv4 internet communication, an instance also needs a public IPv4 address or EIP, along with permitted security-group and NACL traffic.
+
+Giving an instance a public IP does not create an Internet Gateway route.
+
+**5.2. How can an end user access Pods on private nodes?**
+
+The user connects to a reachable load balancer, which connects to private targets through VPC networking.
+
+In this architecture:
+
+1. The browser connects to CloudFront.
+2. CloudFront connects to the ALB.
+3. The ALB forwards to a healthy backend Pod’s private IP.
+4. The Pod returns its response through the ALB.
+
+With ALB `ip` target mode, the Pod does not need a public IP. The Kubernetes Service identifies the selected workload, but its ClusterIP is not an additional hop in this ALB-to-Pod path.
+
+With `instance` target mode, the ALB targets a node’s NodePort, and Kubernetes networking forwards the request to a Pod. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/alb-ingress.html?utm_source=chatgpt.com)
+
+Example Ingress settings:
+
+```yaml
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  ingressClassName: alb
+```
+
+**5.3. What is Route 53, and what happens when a user submits something from the UI?**
+
+Route 53 is AWS’s DNS service. It resolves a domain to the configured destination; it does not proxy the application’s HTTP requests. [Amazon Route 53](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/welcome-dns-service.html?utm_source=chatgpt.com)
+
+For `https://app.example.com`:
+
+1. The browser resolves the hostname, possibly using a cached answer.
+2. It establishes HTTPS with CloudFront.
+3. CloudFront serves the frontend HTML and JavaScript from its cache or S3.
+4. The JavaScript sends a request such as `POST /api/orders`.
+5. CloudFront forwards that API request to the ALB.
+6. The ALB routes it to a healthy Pod.
+7. The Pod authorizes the operation and writes to PostgreSQL.
+8. The response returns through ALB and CloudFront.
+9. The browser updates the UI.
+
+Configure the API cache behavior to allow the required HTTP methods and explicitly forward necessary authorization headers, cookies, and query strings. Disable API response caching unless there is a deliberate, safe caching design. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DownloadDistValuesCacheBehavior.html?utm_source=chatgpt.com)
+
+**5.4. Explain inbound and outbound connectivity, including firewalls, NACLs, SGs, and routes**
+
+These controls enforce different boundaries:
+
+| Control | Responsibility |
+|---|---|
+| Route table | Selects a network destination or next hop |
+| Internet Gateway | Provides internet connectivity for appropriately configured public resources |
+| WAF | Inspects HTTP requests |
+| Security group | Stateful traffic rules associated with network interfaces |
+| NACL | Stateless rules at subnet boundaries |
+| NetworkPolicy | Controls supported Pod network traffic |
+| NAT | Translates initiated outbound connections |
+
+Security groups are stateful. NACLs are stateless, so their rules must permit both the request and return traffic, including appropriate ephemeral ports. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html?utm_source=chatgpt.com)
+
+Example access boundaries:
+
+| Destination | Allowed source | Port |
+|---|---|---:|
+| ALB | CloudFront origin-facing prefix list | 443 |
+| Backend Pod | ALB security group | 8443 |
+| PostgreSQL | Authorized backend security group | 5432 |
+| AWS interface endpoints | Authorized workload/node groups | 443 |
+| Cluster DNS | Authorized cluster workloads | DNS ports |
+
+For narrower database access, supported Security Groups for Pods can distinguish backend workloads from other workloads sharing a node. When combining that feature with EKS NetworkPolicies, use the supported enforcement configuration. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/best-practices/network-security.html?utm_source=chatgpt.com)
+
+**Inbound:** CloudFront reaches the ALB; the ALB reaches the Pod through local VPC routing. NAT is not required for this connection.
+
+**Outbound:** A Pod calling an external API follows its private-subnet default route to NAT and then the Internet Gateway. Supported AWS services can instead be reached using VPC endpoints.
+
+Cluster management also needs connectivity: nodes and controllers reach the Kubernetes API, and the control plane reaches kubelets and required admission webhooks.
+
+AWS WAF is the HTTP firewall in this design. If dedicated network inspection is required, AWS Network Firewall can be added with explicitly designed inspection routes and return paths.
+
+**5.5. How can a LoadBalancer Service on private nodes create a public load balancer? Which component does it?**
+
+A Service is a Kubernetes API object. Its Pods can run in private subnets while its external load balancer is created in selected public subnets.
+
+For a cluster using **AWS Load Balancer Controller**:
+
+1. The controller watches Service and Ingress objects.
+2. It reads the requested load-balancer configuration.
+3. It discovers or uses explicitly specified subnets.
+4. It assumes its authorized AWS IAM role.
+5. It calls AWS APIs to create and reconcile the load balancer and related resources.
+
+The controller needs AWS API connectivity through NAT or appropriate VPC endpoints. IAM provides authorization; the controller does not need to run in a public subnet.
+
+The controller normally runs as a Deployment on worker compute. The scheduler and API server do not directly create the AWS load balancer. Other implementations, including cloud-controller-manager integrations and EKS Auto Mode, have different ownership. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/lbc-helm.html?utm_source=chatgpt.com)
+
+The reference architecture uses **Ingress → ALB** and a ClusterIP Service. A LoadBalancer Service commonly creates an NLB instead:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+spec:
+  type: LoadBalancer
+  loadBalancerClass: service.k8s.aws/nlb
+  selector:
+    app: backend
+  ports:
+    - port: 443
+      targetPort: 8443
+      protocol: TCP
+```
+
+This example passes TCP/TLS traffic to the Pod. It requires suitable public-subnet selection, routing, IAM permissions, and target connectivity. [AWS Load Balancer Controller](https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/guide/service/annotations/?utm_source=chatgpt.com)
+
+**5.6. Why EKS rather than ECS?**
+
+For this reference project, EKS fits because the organization already has Kubernetes expertise, Helm charts, operational tooling, and Kubernetes platform requirements.
+
+| Requirement | EKS | ECS |
+|---|---|---|
+| Kubernetes APIs and ecosystem | Strong fit | Different orchestration model |
+| Existing Kubernetes applications/operators | Strong fit | Requires adaptation |
+| AWS-focused services with fewer orchestration requirements | More platform responsibilities | Often simpler |
+| Serverless container compute | Fargate available | Fargate available |
+
+EKS is a conditional choice, not a universal default. For a small AWS-only application without Kubernetes requirements, ECS may reduce operating effort. AWS’s container decision guide treats the choice as a fit to requirements and operating model. [AWS Decision Guides](https://docs.aws.amazon.com/decision-guides/latest/decision-guides/choosing-aws-container-service.html?icmpid=docs_homepage_decision_guides\&utm_source=chatgpt.com)
+
+**5.7. How do you manage cluster nodes?**
+
+My reference approach is:
+
+- A small managed node group for essential system workloads.
+- Separate application capacity managed through Karpenter.
+- On-Demand capacity for critical baseline availability.
+- Spot capacity where interruption is acceptable.
+
+Managed node groups simplify node provisioning and updates. I still manage versions, AMI updates, permissions, capacity, and workload disruption. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/managed-node-groups.html?utm_source=chatgpt.com)
+
+Karpenter provisions nodes according to unschedulable Pods’ requirements, including resource requests and placement constraints. It also supports consolidation of unnecessary capacity. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/best-practices/karpenter.html?utm_source=chatgpt.com)
+
+Operational activities include:
+
+- Monitoring node and Pod capacity.
+- Updating nodes through controlled replacement.
+- Maintaining system-workload capacity.
+- Configuring disruption budgets.
+- Restricting instance families and maximum spending/capacity.
+- Monitoring CNI, DNS, storage, and image-pull failures.
+
+HPA scales workload replicas; node autoscaling supplies compute for those replicas. Avoid having two autoscalers control the same node pool.
+
+**5.8. How many IP addresses would you need?**
+
+Start with a workload estimate. There is no reliable fixed number for every EKS application.
+
+For VPC `10.40.0.0/16`, an illustrative layout is:
+
+| Purpose | AZ A | AZ B | Usable IPv4 addresses per subnet |
+|---|---|---|---:|
+| Public ALB and zonal NAT | `10.40.0.0/24` | `10.40.1.0/24` | 251 |
+| Private nodes and Pods | `10.40.16.0/20` | `10.40.32.0/20` | 4,091 |
+| Isolated database | `10.40.64.0/24` | `10.40.65.0/24` | 251 |
+
+AWS reserves five IPv4 addresses in each subnet. Thus `/24` provides `256 − 5 = 251` assignable addresses. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html?utm_source=chatgpt.com)
+
+With Amazon VPC CNI, Pod addresses also consume VPC address space. Warm pools and prefix allocation must be included, not just running Pods. Prefix mode allocates IPv4 addresses in `/28` blocks of 16. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/best-practices/ip-opt.html?utm_source=chatgpt.com)
+
+Example **planning budget per private application subnet**:
+
+| Allocation | Illustrative budget |
+|---|---:|
+| Worker primary addresses | 10 |
+| Allocated Pod addresses, including warm capacity | 512 |
+| EKS interfaces and upgrade reserve | 12 |
+| Interface endpoint addresses | 10 |
+| Other interfaces | 20 |
+| Growth reserve | 250 |
+| **Total** | **814** |
+
+If the surviving AZ takes the other AZ’s workload, allow additional node and Pod allocations. In this example, roughly another 522 addresses brings the budget to 1,336, within the `/20`.
+
+These are design assumptions, not guaranteed AWS footprints. Validate them against node ENI limits, CNI mode, endpoint count, rollout surge, and failure capacity.
+
+Also remember:
+
+- Service ClusterIPs come from the Kubernetes Service range.
+- CloudFront, Route 53, and S3 do not consume addresses in these application subnets.
+- ALBs need free subnet addresses for scaling.
+- EKS requires subnets in at least two AZs and sufficient free addresses for its interfaces. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/network-reqs.html?utm_source=chatgpt.com)
+
+A production design usually needs several subnet types across multiple AZs; “two subnets” alone does not describe the complete layout.
+
+**5.9. How do you recover from a DDoS attack exhausting cluster resources?**
+
+First identify the source and bottleneck using WAF logs, ALB metrics, access logs, VPC Flow Logs, Pod metrics, and database metrics.
+
+A high CPU reading alone does not distinguish an attack from legitimate traffic, a bad release, or a compromised workload.
+
+Recovery actions:
+
+1. Apply filtering or rate controls at the edge.
+2. Block or challenge identified abusive traffic.
+3. Restrict origin access so attackers cannot bypass CloudFront.
+4. Shed expensive requests and protect critical operations.
+5. Apply bounded concurrency and database connection limits.
+6. Restore sufficient healthy capacity for legitimate traffic.
+7. Isolate offending internal workloads if the source is inside the cluster.
+8. Preserve relevant evidence and review the incident afterward.
+
+AWS Shield provides DDoS protection capabilities, while WAF rate-based rules help limit matching HTTP traffic. Tune controls to the application and legitimate traffic patterns. [docs.aws.amazon.com](https://docs.aws.amazon.com/waf/latest/developerguide/ddos-overview.html?utm_source=chatgpt.com)
+
+Future prevention includes:
+
+- WAF managed rules and tuned rate controls.
+- Protected origins.
+- Application-level per-user quotas.
+- Timeouts, circuit breakers, and bounded queues.
+- Container requests and limits.
+- Namespace quotas and workload isolation.
+- Autoscaling caps and cost alerts.
+- Load and resilience testing.
+
+Unlimited autoscaling can increase the bill while leaving the actual bottleneck unresolved.
+
+**5.10. How do you implement HA, and why choose particular Kubernetes features?**
+
+| Feature | What it provides | Important distinction |
+|---|---|---|
+| Deployment replicas | Replacement and multiple serving instances | Replicas can still land together |
+| Topology spread | Distribution across AZs or nodes | Controls distribution/skew |
+| Pod anti-affinity | Avoids particular workload colocations | Strong constraints can limit scheduling |
+| Readiness probe | Signals whether a Pod should serve | Does not itself restart the container |
+| Liveness probe | Detects conditions requiring restart | Must avoid restarting healthy-but-busy processes |
+| PDB | Limits voluntary evictions | Does not prevent AZ failure |
+| Rolling-update settings | Control deployment replacement availability | Separate from PDB |
+| HPA | Adjusts replicas for load | Requires available compute |
+| Node autoscaling | Adds suitable compute | Requires time and capacity availability |
+
+For this design, I use multiple replicas across AZs and nodes, with spare survivor capacity.
+
+Topology spread is useful for balanced placement. Soft constraints can allow temporarily uneven placement during recovery; hard constraints are appropriate when placement requirements outweigh that flexibility.
+
+A PDB cannot prevent involuntary failures. Deployment controllers also use their own rollout settings rather than being constrained by the PDB for rolling updates. [Kubernetes](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/?utm_source=chatgpt.com)
+
+EKS manages a control plane distributed across three AZs. Application HA still depends on your nodes, Pods, networking, and data services. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/eks-architecture.html?utm_source=chatgpt.com)
+
+**5.11. Why is NAT required, and where should it be placed?**
+
+Private workloads may need outbound access for third-party APIs, package downloads, or AWS public endpoints.
+
+For a **zonal public NAT gateway**:
+
+- Place it in a public subnet.
+- Give its subnet a route to the Internet Gateway.
+- Route private-subnet internet traffic to NAT.
+- For HA, use a NAT gateway in each AZ and local-AZ routing. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-basics.html?utm_source=chatgpt.com)
+
+Current AWS also offers **regional NAT gateways**, which support multi-AZ expansion and do not require a public subnet to host them. Be explicit about which availability mode your design uses. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateways-regional.html?utm_source=chatgpt.com)
+
+NAT is for initiated outbound connections. Public load balancers provide application ingress.
+
+VPC endpoints can remove the need for NAT for supported AWS-service traffic.
+
+**6. Script: replace a name in a file**
+
+This implementation replaces every literal, case-sensitive occurrence in a UTF-8 file.
+
+```python
+import argparse
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("file", type=Path)
+parser.add_argument("old")
+parser.add_argument("new")
+args = parser.parse_args()
+
+if not args.old:
+    parser.error("Old text must not be empty")
+
+text = args.file.read_text(encoding="utf-8")
+count = text.count(args.old)
+
+if count:
+    args.file.write_text(
+        text.replace(args.old, args.new),
+        encoding="utf-8",
+    )
+
+print(f"Replaced {count} occurrence(s)")
+```
+
+Example input:
+
+```text
+Alice owns dev.
+Bob owns QA.
+Alice reviews production.
+```
+
+Execution:
+
+```bash
+python3 replace_text.py people.txt Alice Asha
+```
+
+Result:
+
+```text
+Replaced 2 occurrence(s)
+
+Asha owns dev.
+Bob owns QA.
+Asha reviews production.
+```
+
+Literal replacement also changes matches inside longer strings. Use explicitly defined word boundaries if that is not the desired behavior.
+
+The bundled version includes file-error handling. For large files or production bulk edits, add streaming and suitable backup/atomic-write handling.
+
+**7. Script: extract the full line of the first pattern occurrence**
+
+```python
+import argparse
+from pathlib import Path
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("file", type=Path)
+parser.add_argument("pattern")
+args = parser.parse_args()
+
+if not args.pattern:
+    parser.error("Pattern must not be empty")
+
+with args.file.open(encoding="utf-8") as source:
+    for line in source:
+        if args.pattern in line:
+            sys.stdout.write(line)
+            break
+    else:
+        sys.exit("Pattern not found")
+```
+
+Input:
+
+```text
+INFO: application started
+ERROR: database connection failed
+INFO: retrying
+ERROR: API timed out
+```
+
+Execution:
+
+```bash
+python3 first_match.py app.log ERROR
+```
+
+Output:
+
+```text
+ERROR: database connection failed
+```
+
+The script stops at the first matching line and preserves the complete line. Matching is literal and case-sensitive.
+
+**8. Script: files modified more than five hours ago, but within today**
+
+Define the interval precisely:
+
+```text
+Today at 00:00 inclusive ≤ modification time < now minus five hours
+```
+
+Example implementation using the user’s timezone:
+
+```python
+from datetime import datetime, time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+import os
+import stat
+
+zone = ZoneInfo("Asia/Kolkata")
+now = datetime.now(zone)
+
+midnight = datetime.combine(
+    now.date(), time.min, tzinfo=zone
+).timestamp()
+
+cutoff = now.timestamp() - 5 * 60 * 60
+
+for directory, _, names in os.walk(".", followlinks=False):
+    for name in names:
+        path = Path(directory) / name
+        info = path.lstat()
+
+        if (
+            stat.S_ISREG(info.st_mode)
+            and midnight <= info.st_mtime < cutoff
+        ):
+            print(path)
+```
+
+If the current time is 17:00, it matches files modified from midnight up to, but excluding, 12:00.
+
+It excludes:
+
+- Yesterday’s files.
+- Files modified exactly five hours ago.
+- More recent files.
+- Symlink files.
+
+Before 05:00, there are no matching timestamps within today.
+
+I executed the bundled version with controlled timestamps and verified the midnight, exact-cutoff, previous-day, and nested-directory cases.
+
+---
+
+**Round 2 — Cloud DevOps architect**
+
+**1. Reverse a string without loops, slicing, or built-in helpers**
+
+Use recursive indexing. An `IndexError` signals the end, avoiding `len()`.
+
+```python
+def reverse_string(text, index=0):
+    try:
+        character = text[index]
+    except IndexError:
+        return ""
+
+    return reverse_string(text, index + 1) + character
+
+
+print(reverse_string("DevOps"))
+```
+
+Output:
+
+```text
+spOveD
+```
+
+How it works:
+
+- Recursive calls read successive characters.
+- The final call returns an empty string.
+- As calls return, each earlier character is appended.
+
+The reversal logic uses no loop, slicing, imports, or built-in reversal/length function. Console `input()` and `print()` can be used separately for I/O.
+
+Limitations:
+
+- String concatenation makes this implementation `O(n²)` in time.
+- Recursive call depth limits supported input length.
+- It uses `O(n)` call-stack space.
+
+**2. Integer classification: divisibility, primality, and divisors**
+
+Check divisibility by both first. Otherwise a number such as `15` could incorrectly be reported as “divisible by 3 only.”
+
+This version accepts signed integers whose absolute value is at least 10.
+
+```python
+def classify_integer(number):
+    if -9 <= number <= 9:
+        raise ValueError(
+            "Enter an integer whose absolute value is at least 10"
+        )
+
+    by_3 = number % 3 == 0
+    by_5 = number % 5 == 0
+
+    if by_3 and by_5:
+        return "Divisible by both 3 and 5"
+
+    if by_3:
+        return "Divisible by 3 only (among 3 and 5)"
+
+    if by_5:
+        return "Divisible by 5 only (among 3 and 5)"
+
+    magnitude = abs(number)
+    divisors = []
+    candidate = 2
+
+    while candidate * candidate <= magnitude:
+        if magnitude % candidate == 0:
+            divisors.append(candidate)
+
+            partner = magnitude // candidate
+            if partner != candidate:
+                divisors.append(partner)
+
+        candidate += 1
+
+    divisors.sort()
+
+    if number > 1 and not divisors:
+        return "Prime number"
+
+    return f"Not prime; positive proper divisors of |n|: {divisors}"
+
+
+try:
+    number = int(input("Integer: "))
+    print(classify_integer(number))
+except ValueError as error:
+    print(f"Error: {error}")
+```
+
+Examples:
+
+| Input | Result |
+|---:|---|
+| 15 | Both 3 and 5 |
+| 12 | 3 only, among the two tested divisors |
+| 10 | 5 only, among the two tested divisors |
+| 11 | Prime |
+| 14 | `[2, 7]` |
+| 49 | `[7]` |
+| 9 | Invalid: fewer than two digits |
+| `12.5` | Invalid integer input |
+
+The divisor search only needs to reach the square root: factors occur in pairs. Avoid adding a square-root factor twice.
+
+Negative numbers are not prime; their returned list contains positive proper divisors of their absolute value.
+
+I executed the branches and checked 582 positive and negative cases.
+
+**3. Explain your project architecture and how you meet security requirements and SLA**
+
+Use the Round 1 architecture as a reference, then explain your ownership.
+
+A sample project description:
+
+> “The application has a static frontend served through CloudFront, stateless APIs on EKS, and PostgreSQL on RDS Multi-AZ. Terraform manages infrastructure, while CI builds and verifies releases and promotes the same image digest through environments.
+>
+> I’m responsible for infrastructure changes, deployment automation, platform monitoring, access controls, incident response, and recovery testing.”
+
+Tie controls to measurable objectives:
+
+| Objective | Measures |
+|---|---|
+| Availability | Multiple AZs, replicas, healthy-target routing, failure capacity |
+| Latency | Edge caching, load testing, indexed queries, connection management |
+| Release reliability | Environment acceptance, gradual exposure, rollback |
+| Data recovery | Backups, regional recovery design, restore tests |
+| Security | Private resources, scoped identities, encryption, scanning, audit trails |
+
+Distinguish:
+
+- **SLI:** measured behavior, such as successful-request ratio.
+- **SLO:** the internal target for that behavior.
+- **SLA:** the contractual commitment.
+
+For example, a request-based SLO of 99.9% success permits an error budget of 0.1% of eligible requests. It is not automatically equivalent to a fixed number of downtime minutes. Use explicit definitions and measurement windows. [Continuous Improvement To Get Reliability](https://sre.google/workbook/implementing-slos/?utm_source=chatgpt.com)
+
+Demonstrate compliance through dashboards, alerts, release records, incident reviews, and recovery-test results.
+
+**4. How do you integrate CI across dev, test, QA, staging, and production?**
+
+Separate the release artifact from environment configuration.
+
+| Shared across environments | Environment-specific |
+|---|---|
+| Image digest | AWS account and deployment role |
+| Application version | EKS cluster and namespace |
+| Build provenance | Database endpoint |
+| Tested application code | Secrets |
+| Chart version | Replica counts and resource settings |
+| Release identifier | URLs and feature flags |
+
+My example process:
+
+1. PR checks validate the change.
+2. A trusted main-branch build creates a release artifact.
+3. Dev deployment and acceptance succeed.
+4. Test deployment and acceptance succeed.
+5. QA validation succeeds.
+6. Staging validation and approval succeed.
+7. Production approval and deployment occur.
+8. Production monitoring verifies the release.
+
+Reuse the deployment implementation while passing an explicit environment and release reference. GitHub Actions supports reusable workflows for this purpose. [GitHub Docs](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows?utm_source=chatgpt.com)
+
+**5. Where exactly does CI select the environment, cluster, and approvals?**
+
+In this branching model:
+
+- Feature PRs run checks.
+- A trusted push to `main` starts the release process.
+- Promotion jobs explicitly select the environment.
+- Environment configuration selects the deployment role, cluster, namespace, and URL.
+
+The production decision is not just a branch-name comparison.
+
+This is the promotion portion of the workflow; `build` produces a verified immutable image reference:
+
+```yaml
+jobs:
+  dev:
+    needs: build
+    uses: ./.github/workflows/deploy-environment.yml
+    permissions: {contents: read, id-token: write}
+    with:
+      environment: dev
+      image: ${{ needs.build.outputs.image }}
+
+  test:
+    needs: [build, dev]
+    uses: ./.github/workflows/deploy-environment.yml
+    permissions: {contents: read, id-token: write}
+    with:
+      environment: test
+      image: ${{ needs.build.outputs.image }}
+
+  qa:
+    needs: [build, test]
+    uses: ./.github/workflows/deploy-environment.yml
+    permissions: {contents: read, id-token: write}
+    with:
+      environment: qa
+      image: ${{ needs.build.outputs.image }}
+
+  staging:
+    needs: [build, qa]
+    uses: ./.github/workflows/deploy-environment.yml
+    permissions: {contents: read, id-token: write}
+    with:
+      environment: staging
+      image: ${{ needs.build.outputs.image }}
+
+  prod:
+    needs: [build, staging]
+    uses: ./.github/workflows/deploy-environment.yml
+    permissions: {contents: read, id-token: write}
+    with:
+      environment: prod
+      image: ${{ needs.build.outputs.image }}
+```
+
+Inside the reusable workflow:
+
+```yaml
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, eks-deployer]
+
+    environment: ${{ inputs.environment }}
+
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Select environment cluster
+        env:
+          CLUSTER: ${{ vars.EKS_CLUSTER }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: |
+          aws eks update-kubeconfig \
+            --region "$REGION" --name "$CLUSTER"
+
+      - name: Deploy tested release
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+          IMAGE: ${{ inputs.image }}
+          NAMESPACE: ${{ vars.NAMESPACE }}
+        run: |
+          helm upgrade --install backend ./charts/backend \
+            --namespace "$NAMESPACE" \
+            --values "environments/$TARGET_ENV.yaml" \
+            --set-string image.ref="$IMAGE" \
+            --wait --timeout 5m
+```
+
+The important locations are:
+
+| Configuration | Effect |
+|---|---|
+| `with.environment` | Passes the target environment |
+| Job `environment` | Activates that environment’s protection and variables |
+| `DEPLOY_ROLE_ARN` | Selects AWS permissions/account |
+| `EKS_CLUSTER` | Selects Kubernetes cluster |
+| `NAMESPACE` | Selects workload namespace |
+| `needs` | Prevents promotion before prior acceptance succeeds |
+
+**PR approvals** are configured through branch protection or repository rules.
+
+**Deployment approvals** are configured through GitHub environments, including required reviewers and deployment branch restrictions where supported by the plan. Referencing an environment in YAML does not itself create the approval policy. [GitHub Docs](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches?utm_source=chatgpt.com)
+
+Restrict AWS OIDC trust to the intended repository and environment. For example, production can require the subject:
+
+```text
+repo:ORG/REPO:environment:prod
+```
+
+Combine that with protected environment rules. `id-token: write` permits requesting an OIDC token; AWS trust and permissions determine what it can access. [GitHub Docs](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws?utm_source=chatgpt.com)
+
+Private EKS endpoints need a privately connected trusted deployment runner. Use environment-specific runner isolation where required. The readable action versions above should be replaced with reviewed full commit SHAs before adoption.
+
+**6. What happens after each deployment before promotion?**
+
+| Environment | Acceptance activities |
+|---|---|
+| Dev | Rollout checks, smoke tests, basic API checks |
+| Test | Integration, contract, and migration tests |
+| QA | Functional, regression, and acceptance checks |
+| Staging | Production-like configuration, load, security, and recovery checks |
+| Production | Synthetic checks, release metrics, business outcomes, SLO observation |
+
+Common gates include:
+
+- Pods and load-balancer targets become healthy.
+- The expected version is actually serving.
+- Critical customer journeys pass.
+- Errors and latency remain within agreed thresholds.
+- Database changes remain compatible.
+- Rollback is available.
+
+For database changes, prefer expand–migrate–contract patterns: introduce compatible changes, migrate data and callers, then remove obsolete structures in a later release.
+
+Promotion stops when acceptance fails. A completed Kubernetes rollout alone does not prove business functionality.
+
+**7. How do you segregate AWS environments?**
+
+Use AWS accounts as security and operational boundaries, with AWS Organizations for centralized governance. [AWS Organizations](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_introduction.html?utm_source=chatgpt.com)
+
+An example balance between isolation and cost:
+
+| Account or group | Contents |
+|---|---|
+| Management | Organization administration |
+| Security/log archive | Central audit and security records |
+| Non-production | Dev/test/QA, with stronger separation when required |
+| Staging | Production-like validation |
+| Production | Production workloads |
+| Shared services | Controlled artifact or platform services |
+
+Within environments, separate:
+
+- VPCs and access paths as required.
+- Databases and datasets.
+- IAM deployment roles.
+- Terraform state.
+- Secrets and encryption permissions.
+- Kubernetes namespaces, quotas, and policies.
+
+Production should have a separate account and cluster for stronger isolation. Lower-risk non-production environments may share a cluster using namespaces, quotas, RBAC, and network controls.
+
+Centralized ECR requires deliberate cross-account read permissions. Use sanitized test data and prevent non-production identities from accessing production data.
+
+**8. How is a Terraform data block different from a resource block?**
+
+| Block | Responsibility |
+|---|---|
+| `resource` | Manages an object’s lifecycle |
+| `data` | Reads information through a data source |
+
+Example: use an existing platform VPC to create a new security group.
+
+```hcl
+data "aws_vpc" "platform" {
+  id = var.vpc_id
+}
+
+resource "aws_security_group" "backend" {
+  name_prefix = "backend-"
+  description = "Backend security group"
+  vpc_id      = data.aws_vpc.platform.id
+}
+```
+
+Terraform reads the VPC but does not take ownership of its lifecycle through that data block. It manages the new security group.
+
+Data-source reads often occur during planning, but can be deferred until apply when their inputs depend on values not yet known. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/data-sources?utm_source=chatgpt.com)
+
+**9. Remove resources from Terraform management without destroying them**
+
+Use a `removed` block with `destroy = false` on supported Terraform versions.
+
+Remove the original resource block and replace it with:
+
+```hcl
+removed {
+  from = aws_s3_bucket.legacy
+
+  lifecycle {
+    destroy = false
+  }
+}
+```
+
+Procedure:
+
+1. Coordinate against concurrent applies.
+2. Securely back up state.
+3. Remove the managed configuration and add the removal declaration.
+4. Update references to use supplied IDs or data sources.
+5. Review the plan.
+6. Apply the state-management change.
+7. Verify that the live resource remains intact.
+
+The `destroy = false` setting is essential: the default removed-block behavior can destroy the object. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/block/removed?utm_source=chatgpt.com)
+
+An alternative is:
+
+```bash
+terraform state rm 'aws_s3_bucket.legacy'
+```
+
+This removes Terraform’s state binding without deleting the live bucket. Also remove or update its configuration; otherwise a future plan may attempt to create it again. [HashiCorp Developer](https://developer.hashicorp.com/terraform/cli/commands/state/rm?utm_source=chatgpt.com)
+
+Detach associated separately managed resources as appropriate—for example, bucket policies and versioning configuration.
+
+`ignore_changes` and `prevent_destroy` do not make a resource independent of Terraform.
+
+**10. What is taint, and when would you use it?**
+
+Taint marks a managed resource for replacement on the next apply.
+
+Example: an instance exists but its bootstrap left it in a condition that should be repaired through replacement.
+
+Legacy command:
+
+```bash
+terraform taint aws_instance.app
+```
+
+The command marks state; it does not immediately destroy the instance.
+
+The taint command is deprecated. Prefer an explicitly reviewed replacement:
+
+```bash
+terraform plan \
+  -replace=aws_instance.app \
+  -out=replacement.tfplan
+
+terraform apply replacement.tfplan
+```
+
+This associates the replacement with the reviewed plan rather than leaving a persistent taint marker for a later operation. [HashiCorp Developer](https://developer.hashicorp.com/terraform/cli/commands/taint?utm_source=chatgpt.com)
+
+**11. What are Terraform workspaces?**
+
+Terraform CLI workspaces provide separate state instances for the same configuration and supported backend.
+
+Example:
+
+```bash
+terraform workspace new dev
+terraform workspace new qa
+terraform workspace select dev
+
+terraform plan -var-file=environments/dev.tfvars
+```
+
+They are useful for repeated instances of a similar configuration, such as temporary environments.
+
+They do not automatically provide separate accounts, permissions, credentials, or secure environment boundaries. HashiCorp advises against using CLI workspaces for deployments requiring separate access controls. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/state/workspaces?utm_source=chatgpt.com)
+
+For production isolation, I generally use separate root configurations/backends and deployment roles while reusing modules.
+
+Also distinguish CLI workspaces from HCP Terraform workspaces, which encompass configuration, variables, runs, and other managed settings.
+
+**12. What caused downtime during Terraform apply, and how do you reduce it?**
+
+Possible causes include:
+
+- Destroy-before-create replacement.
+- A service restart during an in-place update.
+- Replacing a single serving instance.
+- New targets not becoming healthy before old targets disappear.
+- Insufficient surge capacity.
+- Database reboot or incompatible changes.
+- Incorrect network-rule changes.
+
+Inspect the plan, provider behavior, resource events, and application metrics. A `~` in-place update does not guarantee that the service remains available.
+
+`create_before_destroy` changes replacement order:
+
+```hcl
+lifecycle {
+  create_before_destroy = true
+}
+```
+
+It requires the old and new resources to coexist and does not cover every form of downtime. Unique names, quotas, dependencies, and application readiness still matter. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle?utm_source=chatgpt.com)
+
+For an EC2 application behind an existing ALB, use a launch template and controlled ASG instance refresh:
+
+```hcl
+resource "aws_launch_template" "app" {
+  name_prefix            = "app-"
+  image_id               = var.ami_id
+  instance_type          = "t3.medium"
+  vpc_security_group_ids = var.security_group_ids
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_group" "app" {
+  name_prefix              = "app-"
+  min_size                 = 2
+  desired_capacity         = 2
+  max_size                 = 4
+  vpc_zone_identifier      = var.subnet_ids
+  target_group_arns        = [var.target_group_arn]
+  health_check_type        = "ELB"
+  health_check_grace_period = 120
+
+  launch_template {
+    id      = aws_launch_template.app.id
+    version = tostring(aws_launch_template.app.latest_version)
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+
+    preferences {
+      min_healthy_percentage = 100
+      max_healthy_percentage = 150
+      instance_warmup        = 120
+    }
+  }
+
+  lifecycle {
+    create_before_destroy = true
+    ignore_changes        = [desired_capacity]
+  }
+}
+```
+
+This example assumes working bootstrap, target health checks, sufficient capacity, and multiple AZ subnets. Instance refresh uses health and warmup controls during replacement. [Amazon EC2 Auto Scaling](https://docs.aws.amazon.com/autoscaling/ec2/userguide/instance-refresh-overview.html?utm_source=chatgpt.com)
+
+For EKS applications, use rollout settings, readiness, target-health readiness gates, and graceful shutdown. For databases, use engine-appropriate availability and migration procedures; blindly enabling `create_before_destroy` is not a database recovery strategy.
+
+**13. Explain S3 Lifecycle and storage classes**
+
+S3 Lifecycle rules automate actions such as:
+
+- Transitioning eligible objects to another storage class.
+- Expiring objects.
+- Managing noncurrent versions.
+- Removing incomplete multipart uploads. [Amazon Simple Storage Service](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html?utm_source=chatgpt.com)
+
+Common storage classes:
+
+| Class | Typical use |
+|---|---|
+| S3 Standard | Frequently accessed data |
+| S3 Intelligent-Tiering | Changing or uncertain access patterns |
+| S3 Standard-IA | Infrequent access with immediate retrieval |
+| S3 One Zone-IA | Infrequent, reproducible data stored in one AZ |
+| S3 Glacier Instant Retrieval | Infrequent archived data needing immediate access |
+| S3 Glacier Flexible Retrieval | Archive data with restore-based access |
+| S3 Glacier Deep Archive | Long-term archive with longer recovery |
+| S3 Express One Zone | Latency-sensitive workloads using directory buckets |
+
+Choose using access frequency, retrieval requirements, resilience requirements, and cost—not storage price alone. [Amazon Simple Storage Service](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html?utm_source=chatgpt.com)
+
+Example log policy:
+
+| Object age/action | Policy |
+|---|---|
+| First 30 days | Standard |
+| Day 30 | Transition to Standard-IA |
+| Day 90 | Transition to Glacier Flexible Retrieval |
+| Day 365 | Expire |
+| Incomplete multipart upload after 7 days | Abort |
+
+Consider transition charges, minimum storage durations, and object size. Current general-purpose lifecycle rules do not transition objects smaller than 128 KB by default. [Amazon Simple Storage Service](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html?utm_source=chatgpt.com)
+
+For versioned buckets, expiring the current version can create a delete marker; configure noncurrent-version handling separately. [Amazon Simple Storage Service](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html?utm_source=chatgpt.com)
+
+Directory-bucket lifecycle behavior differs: it supports expiration and incomplete-upload cleanup, but not storage-class transitions. [Amazon Simple Storage Service](https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-buckets-objects-lifecycle.html?utm_source=chatgpt.com)
+
+**14. How do you expose a static frontend with CloudFront?**
+
+My deployment procedure is:
+
+1. Build the frontend into static HTML, JavaScript, CSS, and assets.
+2. Upload the release to a private S3 bucket.
+3. Configure CloudFront with S3 as the origin.
+4. Use OAC and a bucket policy scoped to the distribution.
+5. Configure the domain and HTTPS.
+6. Set appropriate cache behavior.
+7. Verify the deployed release through synthetic checks.
+
+Use content-hashed asset names:
+
+```text
+app.4b3f2.js
+styles.981ac.css
+```
+
+Give immutable assets a long cache lifetime and HTML a short, controlled lifetime. This lets a new HTML release reference new assets without replacing a cached filename.
+
+CloudFront recommends versioned filenames as a way to manage content updates. Keep previous assets available through the rollback window. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/UpdatingExistingObjects.html?utm_source=chatgpt.com)
+
+Configure SPA deep-link handling only for the frontend routes so API errors retain their correct response codes.
+
+CloudFront viewer certificates from ACM must be in `us-east-1`; the ALB’s certificate belongs in its own region. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cnames-and-https-requirements.html?utm_source=chatgpt.com)
+
+**15. What is the Kubernetes API? Can an external application call it directly?**
+
+The Kubernetes API is the interface for reading and changing cluster resources. `kubectl`, controllers, and external clients use it.
+
+Examples:
+
+| Operation | API path |
+|---|---|
+| List Pods | `/api/v1/namespaces/app/pods` |
+| List Deployments | `/apis/apps/v1/namespaces/app/deployments` |
+| Create a Deployment | POST to the deployments collection |
+| Update resources | Appropriate PATCH or PUT operation |
+| Delete resources | DELETE operation |
+
+Yes, an external application can make REST calls directly, provided it has:
+
+- Network access to the endpoint.
+- Valid TLS verification.
+- Supported authentication.
+- Permission for the requested operation. [Kubernetes](https://kubernetes.io/docs/concepts/overview/kubernetes-api/?utm_source=chatgpt.com)
+
+Example, with authorized credentials and a known endpoint:
+
+```bash
+TOKEN=$(aws eks get-token \
+  --cluster-name prod \
+  --region us-east-1 \
+  --query status.token \
+  --output text)
+
+curl --cacert cluster-ca.pem \
+  -H "Authorization: Bearer $TOKEN" \
+  "$API_ENDPOINT/api/v1/namespaces/app/pods"
+```
+
+EKS IAM authentication also requires appropriate cluster access configuration and authorization. Access policies or Kubernetes RBAC determine permitted Kubernetes operations. [Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/access-policy-permissions.html?utm_source=chatgpt.com)
+
+For a private API endpoint, the external application needs private network connectivity. Do not disable certificate verification to make the call work.
+
+**16. How does Deployment rollback know which image to restore?**
+
+A Deployment keeps revision history through its ReplicaSets and their stored Pod templates.
+
+When the Pod template changes, Kubernetes creates a new revision. The earlier template includes the earlier image reference.
+
+```bash
+kubectl rollout history deployment/backend
+
+kubectl rollout undo deployment/backend --to-revision=3
+
+kubectl rollout status deployment/backend
+```
+
+Kubernetes restores the selected historical Pod template. It does not query the image registry to decide which version was “previous.” Kubelets then obtain the referenced image as required. [Kubernetes](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/?utm_source=chatgpt.com)
+
+Use immutable image digests so the historical reference still identifies the same content.
+
+Important limits:
+
+- Rollback history must still exist.
+- The old image must remain available.
+- Database writes and migrations are not undone.
+- Updating the contents of an existing ConfigMap or Secret is not automatically reversed.
+- An app rollback may fail if its dependencies are no longer compatible.
+
+For Helm, restore an appropriate release revision. For GitOps, update or revert the desired state in Git; an imperative rollback alone may be overwritten by reconciliation.
+
+The downloadable bundle contains the five executed Python scripts, fixtures, CI promotion templates, Kubernetes examples, Terraform examples, an S3 lifecycle policy, and architecture notes: sigmoid-two-rounds-examples.zip[sigmoid-two-rounds-examples.zip](sandbox:/workspace/scratch/8dc6806ebb9b/sigmoid-two-rounds-examples.zip).
+
+Local coding and structural checks passed. Terraform provider validation and live GitHub, AWS, or Kubernetes deployment were not performed.
