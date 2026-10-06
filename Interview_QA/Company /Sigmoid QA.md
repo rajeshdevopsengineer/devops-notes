@@ -1087,3 +1087,719 @@ For Kubernetes, CPU usage alone is insufficient. A service can have low average 
 An example monitoring stack is Prometheus, kube-state-metrics, node exporters, Grafana, Alertmanager, and CloudWatch for AWS service metrics. Correlate alerts with logs and traces during diagnosis.
 
 Keep metric labels bounded—for example, environment, service, route, and status—so cardinality remains manageable. [Prometheus](https://prometheus.io/docs/practices/naming/?utm_source=chatgpt.com)
+
+
+
+These answers use AWS examples with `us-east-1` and `us-west-2`. I treat “us-south” in the question as the primary region.
+
+**1. If a load balancer’s region goes down, what happens?**
+
+An AWS ALB or NLB is a **regional resource**. It can distribute traffic across Availability Zones within its region, but it does not automatically move into another region.
+
+During a complete regional outage:
+
+- Requests to that regional application can fail or time out.
+- Its DNS name may still resolve; DNS resolution does not prove application availability.
+- Healthy servers in another region do not help unless traffic routing and application recovery have been configured.
+
+For regional recovery, deploy a second application stack and use global routing:
+
+| Option | How regional failover works |
+|---|---|
+| Route 53 failover routing | Returns the secondary endpoint when the primary is unhealthy; recovery depends partly on health detection and DNS caching. |
+| AWS Global Accelerator | Routes new connections to another healthy regional endpoint after detecting failure. Existing connections must reconnect. |
+
+Route 53 supports primary/secondary failover records; Global Accelerator supports health-based routing across regional endpoints. Neither creates the replacement application stack for you. [Amazon Route 53](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-failover.html?utm_source=chatgpt.com)
+
+```mermaid
+flowchart TD
+    U["Users"] --> G["Global routing"]
+
+    subgraph A["Primary region"]
+        LA["Regional ALB"] --> AA["Application"]
+        AA --> DA["RDS primary"]
+    end
+
+    subgraph B["Recovery region"]
+        LB["Regional ALB"] --> AB["DR application"]
+        AB --> DB["DR database"]
+    end
+
+    G --> LA
+    G -. "Failover after recovery readiness" .-> LB
+    DA -. "Cross-region replication" .-> DB
+```
+
+The recovery application must have usable data, credentials, network access, and sufficient capacity. A healthy load balancer alone is insufficient.
+
+**Interview answer:** “Multi-AZ load balancing handles failures within a region. For a regional outage, I need another regional application stack and Route 53 or Global Accelerator to redirect traffic.”
+
+---
+
+**2. RDS is in us-west, with cross-region read replicas. How do you redirect traffic without paying for another database?**
+
+**Promote an existing healthy read replica.** You already have another database instance because each read replica has its own compute and storage.
+
+For a standard RDS PostgreSQL or MySQL example, my recovery procedure is:
+
+1. Confirm the primary failure.
+2. Fence the old writer: prevent the original application from resuming writes unexpectedly.
+3. Choose the healthiest replica using replication progress and available capacity.
+4. Promote that replica to an independent writable database.
+5. Verify that promotion completed and the database accepts writes.
+6. Update the application’s database endpoint configuration.
+7. Refresh application connection pools and validate transactions.
+8. Enable application traffic to the recovery region.
+
+Read-replica promotion is a recovery operation, not merely a DNS change. RDS can reboot the replica during promotion, and promotion takes time. [Amazon Relational Database Service](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.Promote.html?utm_source=chatgpt.com)
+
+Example: promote a replica located in `us-east-1`, while the original writer was in `us-west-2`:
+
+```bash
+aws rds promote-read-replica \
+  --region us-east-1 \
+  --db-instance-identifier orders-dr
+
+aws rds wait db-instance-available \
+  --region us-east-1 \
+  --db-instance-identifier orders-dr
+```
+
+After confirming it is writable, retrieve its endpoint and update the application’s `DB_HOST` configuration. The web ALB does not redirect SQL database connections.
+
+Cross-region replication is asynchronous, so recently acknowledged writes might not have reached the replica before the outage. Assess this against the business’s **RPO**, the acceptable data-loss window. **RTO** is the acceptable recovery time. [Amazon Relational Database Service](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.Promote.html?utm_source=chatgpt.com)
+
+**What if the client cannot afford a continuously running replica?**
+
+| Design | Normal operating cost | Recovery trade-off |
+|---|---|---|
+| Cross-region backup and restore | Lower; backup storage and transfer | Must restore a DB before serving traffic |
+| Pilot light | Core data resources remain running | Must create or scale application resources |
+| Warm standby | Smaller application stack stays running | Faster recovery, but capacity may need scaling |
+| Full second-region stack | Higher | Less provisioning needed during recovery |
+
+RDS supports cross-region replication of automated backups for supported configurations. This avoids continuously running recovery DB compute, but recovery requires restoring an instance. [Amazon Relational Database Service](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReplicateBackups.html?utm_source=chatgpt.com)
+
+A smaller replica can reduce compute cost, provided it keeps up with replication and can support recovery traffic. Storage and replication-transfer costs still apply.
+
+After recovery, rebuild or reconfigure replication from the new primary. Other replicas do not automatically start following it. Failback should be a planned operation.
+
+**Interview answer:** “I would promote an existing cross-region replica and update the application’s database configuration. If the client cannot fund a running replica, I would propose cross-region backups and explicitly agree on the longer recovery time.”
+
+---
+
+**3. Which deployment strategy is best when only one Pod is running?**
+
+The key distinction is **one steady-state replica** versus **a strict maximum of one Pod at any time**.
+
+| Constraint | Suitable strategy | Result |
+|---|---|---|
+| One replica normally, but temporary extra capacity is available | Rolling update | Old Pod can serve while the replacement starts |
+| Only one Pod is permitted at any time | Recreate | Downtime during replacement |
+| Controlled traffic switching and quick application rollback are priorities | Blue/green | Requires blue and green to coexist |
+
+For a stateless web application, I would usually choose a rolling update with:
+
+```yaml
+spec:
+  replicas: 1
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+```
+
+These are fields within a Deployment:
+
+- `maxSurge: 1` allows an additional Pod during the rollout.
+- `maxUnavailable: 0` prevents deliberately removing the available old Pod before the replacement becomes available.
+- `minReadySeconds: 10` requires the replacement to remain ready before it counts as available. [Kubernetes](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/?utm_source=chatgpt.com)
+
+Use a meaningful readiness probe, available scheduling capacity, graceful shutdown, and compatible database migrations.
+
+If the new Pod cannot schedule or become ready, the rollout can stall while the old Pod continues serving. This configuration supports deployment continuity; **one replica still provides no ongoing application redundancy** against an unexpected Pod or node failure.
+
+For applications that require exclusive storage access or prohibit concurrent instances, Recreate may be necessary.
+
+---
+
+**4. In blue/green deployment, exactly which configuration changes to reroute traffic?**
+
+It depends on the routing layer.
+
+| Routing layer | Configuration to change |
+|---|---|
+| Kubernetes Service | `spec.selector` |
+| Ingress routing to separate Services | Backend Service reference |
+| AWS ALB | Listener rule’s `forward` action or target-group weights |
+| DNS-based switching | DNS record target or routing configuration |
+
+**Kubernetes example**
+
+Assume:
+
+- Blue Pods have labels `app: web`, `slot: blue`.
+- Green Pods have labels `app: web`, `slot: green`.
+- The external Ingress continues targeting the stable Service `web-live`.
+
+Initially, the Service selects blue:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-live
+spec:
+  selector:
+    app: web
+    slot: blue
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+After testing green through a preview Service, change **the live Service selector**:
+
+```bash
+kubectl patch service web-live --type=merge \
+  -p '{"spec":{"selector":{"app":"web","slot":"green"}}}'
+```
+
+Rollback the traffic switch:
+
+```bash
+kubectl patch service web-live --type=merge \
+  -p '{"spec":{"selector":{"app":"web","slot":"blue"}}}'
+```
+
+Kubernetes updates the Service’s EndpointSlices to match the selected Pods. Keep the Deployment selectors unchanged. [Kubernetes](https://kubernetes.io/docs/concepts/services-networking/service/?utm_source=chatgpt.com)
+
+**AWS ALB example**
+
+Create separate blue and green target groups. Change the relevant listener rule:
+
+| Stage | Blue weight | Green weight |
+|---|---:|---:|
+| Before release | 100 | 0 |
+| Optional validation phase | 95 | 5 |
+| After cutover | 0 | 100 |
+
+The exact ALB field is:
+
+```text
+Actions[].ForwardConfig.TargetGroups[].Weight
+```
+
+For a single-target forwarding action, change `TargetGroupArn`. If routing uses the listener’s default action, modify that default action instead.
+
+**Weighted ALB target groups do not automatically fail over to another target group when one group is empty or unhealthy.** Deployment automation must make the routing decision. [Elastic Load Balancing](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/rule-action-types.html?utm_source=chatgpt.com)
+
+Retain blue during the observation period and allow existing connections to drain. With GitOps or a Kubernetes ALB controller, update the source configuration so reconciliation preserves the switch.
+
+Application rollback also requires database schema compatibility; switching traffic does not undo database writes.
+
+---
+
+**5. A new web deployment happened today. How do you detect issues before users report them?**
+
+I would combine **synthetic checks, release-specific monitoring, and controlled exposure**.
+
+**Synthetic checks**
+
+Run customer journeys regularly, including when real traffic is low:
+
+- Open the website and verify expected content.
+- Log in using a test account.
+- Search or retrieve data.
+- Perform a safe test transaction.
+- Verify its resulting state.
+- Check certificate validity and response time.
+
+CloudWatch Synthetics supports scheduled endpoint and browser checks that follow customer-like workflows. [Amazon CloudWatch](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Synthetics_Canaries.html?utm_source=chatgpt.com)
+
+**Monitor the release**
+
+| Area | Useful signals |
+|---|---|
+| Availability | Synthetic success, HTTP errors |
+| Performance | p95/p99 latency, dependency response time |
+| Application | Exceptions, timeouts, failed transactions |
+| Kubernetes | Readiness, restarts, OOM kills, CPU throttling |
+| Database | Connection failures, locks, query latency |
+| Frontend | JavaScript errors, page-load failures |
+| Business | Order completion, payment success, login success |
+
+Tag logs, metrics, and traces with the release version, then compare the new version against the previous version and its baseline. Latency, traffic, errors, and saturation are useful starting signals. [sre golden signals](https://sre.google/sre-book/monitoring-distributed-systems/?utm_source=chatgpt.com)
+
+**Example**
+
+Before deployment:
+
+- p95 latency: 250 ms.
+- HTTP 5xx rate: 0.1%.
+
+After deployment:
+
+- p95 latency: 900 ms.
+- HTTP 5xx rate: 3%.
+- Database timeout exceptions increase.
+
+The release pipeline should pause promotion or initiate the agreed rollback procedure when these conditions exceed defined thresholds with sufficient traffic.
+
+For a new release, expose a small traffic percentage first and increase it only after checks pass. A readiness probe returning `200` cannot prove that login, checkout, or data correctness works.
+
+---
+
+**6. What practical difficulties arise with infrastructure in two regions?**
+
+| Difficulty | Practical approach |
+|---|---|
+| Replication lag and possible data loss | Monitor replication progress; define and test RPO |
+| Conflicting writes during recovery | Establish one authoritative writer and fence the old one |
+| Increased latency | Keep application requests close to their database; reduce cross-region calls |
+| Additional cost | Account for replicated storage, compute, transfer, networking, and observability |
+| Configuration drift | Reuse Terraform modules with separate regional configuration and state |
+| Regional dependencies | Prepare images, secrets, certificates, keys, and required services in recovery |
+| Insufficient recovery capacity | Validate quotas and test scaling to the expected recovery load |
+| Session and cache behavior | Use an explicit session strategy; avoid relying on instance-local state |
+| Monitoring failure | Run external checks and maintain monitoring outside the primary region |
+| Difficult failback | Resynchronize data and perform a controlled return |
+| Data-location restrictions | Replicate only to approved regions |
+
+A common failure is having recovery servers available but keeping their image registry, database credentials, or deployment pipeline dependent on the failed region.
+
+**Interview answer:** “The hardest part is consistent data and coordinated recovery. I validate that the second region can serve the application independently, then regularly test failover and failback.”
+
+---
+
+**7. Write a shell script to delete log files older than 30 days**
+
+This GNU/Linux script uses **last modification time** and supports previewing the matches.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# < 1 || $# > 2 )); then
+  printf 'Usage: %s LOG_DIRECTORY [--dry-run|--delete]\n' "$0" >&2
+  exit 2
+fi
+
+log_dir=$(realpath -e -- "$1")
+mode="${2:---dry-run}"
+
+if [[ ! -d "$log_dir" || "$log_dir" == / ]]; then
+  printf 'Use a specific application log directory.\n' >&2
+  exit 2
+fi
+
+find_args=(
+  "$log_dir" -xdev -type f
+  \( -name '*.log' -o -name '*.log.*' \)
+  ! -newermt '30 days ago'
+)
+
+case "$mode" in
+  --dry-run)
+    TZ=UTC0 find "${find_args[@]}" -print
+    ;;
+  --delete)
+    TZ=UTC0 find "${find_args[@]}" -delete -print
+    ;;
+  *)
+    printf 'Unknown mode: %s\n' "$mode" >&2
+    exit 2
+    ;;
+esac
+```
+
+Usage:
+
+```bash
+# Preview
+bash delete_old_logs.sh /var/log/myapp --dry-run
+
+# Delete matching files
+bash delete_old_logs.sh /var/log/myapp --delete
+```
+
+The script:
+
+- Matches regular `.log` and rotated `.log.*` files.
+- Uses a cutoff of 30 days ago in UTC.
+- Preserves directories and descendant symlinks.
+- Avoids crossing into other mounted filesystems.
+
+`-mtime +30` rounds age down to complete 24-hour periods, so it generally starts matching at 31 days. The timestamp comparison avoids that extra-day boundary. It includes files modified at or before the cutoff. [gnu.org](https://www.gnu.org/software/findutils/manual/html_node/find_html/Age-Ranges.html?utm_source=chatgpt.com)
+
+Use this against rotated logs under the agreed retention policy. For continuing rotation of active application logs, configure `logrotate`.
+
+---
+
+**8. Explain the failover mechanism in a load balancer**
+
+Separate the failure levels:
+
+| Failure | Recovery mechanism |
+|---|---|
+| One application target fails | Health checks remove it from normal traffic selection; remaining healthy targets serve |
+| An EC2 instance fails | ASG replaces it using configured health checks |
+| An Availability Zone fails | Multi-AZ load balancer and surviving targets serve traffic |
+| A region fails | Global routing selects another regional stack |
+| Database fails | Database recovery is required; application load balancing does not elect a DB writer |
+
+For ALB, configure a target-group health check such as:
+
+```text
+Protocol: HTTP
+Path: /ready
+Success code: 200
+Interval: 10 seconds
+Unhealthy threshold: 2
+Healthy threshold: 2
+```
+
+Choose values suitable for the application. The readiness endpoint should reflect whether the application can serve its intended workload.
+
+ALB normally routes requests to healthy targets. However, **if all registered targets in a target group are unhealthy, ALB can fail open and route to those unhealthy targets**. Health checks are therefore not a general traffic-blocking mechanism. [Elastic Load Balancing](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html?utm_source=chatgpt.com)
+
+Also enable **ELB health checks in the ASG** if application health failures should cause instance replacement. ASG does not use ELB health results for replacement by default. [Amazon EC2 Auto Scaling](https://docs.aws.amazon.com/autoscaling/ec2/userguide/getting-started-elastic-load-balancing.html?utm_source=chatgpt.com)
+
+Client timeouts, retries with backoff, and idempotency are still necessary because failover does not preserve every in-flight request.
+
+---
+
+**9. Can an ASG and load balancer be in different regions?**
+
+**They cannot use the normal direct ASG-to-load-balancer attachment across regions.**
+
+For managed integration, the load balancer and target group must be in the same AWS account, VPC, and region as the ASG. The target group must use the `instance` target type. [Amazon EC2 Auto Scaling](https://docs.aws.amazon.com/autoscaling/ec2/userguide/getting-started-elastic-load-balancing.html?utm_source=chatgpt.com)
+
+There is a technical distinction: an ALB using **private IP targets** can reach targets in a peered VPC in another region, with appropriate routing and security configuration. That requires separate management of target registration as instances change; it is not native cross-region ASG attachment. [Elastic Load Balancing](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html?utm_source=chatgpt.com)
+
+The usual design is:
+
+- Region A: ALB A with ASG A.
+- Region B: ALB B with ASG B.
+- Route 53 or Global Accelerator above both regional stacks.
+
+This also removes the dependency on one regional load balancer.
+
+---
+
+**10. How do you create a sub-user in a Dockerfile?**
+
+Create a Linux user and group inside the image, then set `USER` so the application runs under that identity.
+
+Example using an Alpine-based image:
+
+```dockerfile
+FROM python:3.13-alpine
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app
+
+WORKDIR /app
+
+COPY --chown=10001:10001 app.py /app/app.py
+
+USER 10001:10001
+
+EXPOSE 8080
+
+CMD ["python", "app.py"]
+```
+
+Explanation:
+
+| Instruction | Purpose |
+|---|---|
+| `addgroup` | Creates the application group |
+| `adduser` | Creates the application user |
+| `COPY --chown` | Gives the copied file the specified ownership |
+| `USER 10001:10001` | Sets the default runtime UID and GID |
+| `EXPOSE 8080` | Documents the application port; it does not publish it |
+
+`USER` selects an identity; it does not itself create an account. It affects subsequent build instructions and the default runtime identity. [Docker Docs](https://docs.docker.com/reference/dockerfile/?utm_source=chatgpt.com)
+
+Verify:
+
+```bash
+docker run --rm my-web:1.0.0 id
+```
+
+In Kubernetes, complement this with `runAsNonRoot`, disabled privilege escalation, dropped capabilities, and a read-only root filesystem where the application supports them.
+
+---
+
+**11. How do you create custom Docker images?**
+
+A custom image packages the application, its runtime dependencies, and its startup configuration.
+
+My process is:
+
+1. Select a suitable base image.
+2. Write the Dockerfile.
+3. Exclude unnecessary files from the build context.
+4. Build the image.
+5. Run application tests and security scans.
+6. Publish an immutable release to a registry.
+7. Deploy the tested image reference.
+
+Using the Dockerfile above:
+
+```bash
+docker build --pull -t my-web:1.0.0 .
+
+docker run --rm \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -p 8080:8080 \
+  my-web:1.0.0
+```
+
+For larger applications, use multi-stage builds to keep compilers and build tooling out of the runtime image. Arrange dependency-copying steps before frequently changing application code to improve caching. Use reviewed base-image versions or digests and refresh them through the release process. [Docker Docs](https://docs.docker.com/build/building/best-practices/?utm_source=chatgpt.com)
+
+Example publication to ECR, assuming the repository exists and the caller has permission:
+
+```bash
+REGISTRY="123456789012.dkr.ecr.us-east-1.amazonaws.com"
+
+aws ecr get-login-password --region us-east-1 |
+  docker login --username AWS --password-stdin "$REGISTRY"
+
+docker tag my-web:1.0.0 "$REGISTRY/my-web:1.0.0"
+
+docker push "$REGISTRY/my-web:1.0.0"
+```
+
+Replace the account ID with your account. ECR publication requires registry authentication, tagging, and pushing the image. [Amazon ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/docker-push-ecr-image.html?utm_source=chatgpt.com)
+
+Inject credentials at runtime from the platform’s secret mechanism. Do not bake them into image layers.
+
+---
+
+**12. How do you enable debug logs in Terraform?**
+
+Set `TF_LOG` and optionally `TF_LOG_PATH`:
+
+```bash
+(
+  umask 077
+
+  export TF_LOG=DEBUG
+  export TF_LOG_PATH="$PWD/terraform-debug.log"
+
+  terraform plan -no-color
+)
+```
+
+The subshell confines the environment changes to that command block.
+
+| Variable | Purpose |
+|---|---|
+| `TF_LOG` | Enables logs and sets verbosity |
+| `TF_LOG_PATH` | Appends logs to the specified file |
+| `TF_LOG_CORE` | Controls Terraform core logging |
+| `TF_LOG_PROVIDER` | Controls provider logging |
+
+Verbosity, from most to least detailed:
+
+```text
+TRACE, DEBUG, INFO, WARN, ERROR
+```
+
+`TF_LOG_PATH` alone does not enable logging. Start with `DEBUG`; use `TRACE` when more detail is needed. [HashiCorp Developer](https://developer.hashicorp.com/terraform/internals/debugging?utm_source=chatgpt.com)
+
+If you exported variables in the current shell, disable them afterward:
+
+```bash
+unset TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER
+```
+
+Treat debug logs as potentially sensitive, redact them before sharing, and keep them out of source control.
+
+---
+
+**13. Design a secure, highly available three-tier architecture**
+
+Assume a web application with a PostgreSQL database:
+
+1. **Presentation tier:** serves the web interface.
+2. **Application tier:** executes business logic.
+3. **Data tier:** stores persistent application data.
+
+```mermaid
+flowchart TD
+    C["Users"] --> E["CloudFront and WAF"]
+    E --> L["Public ALB"]
+
+    subgraph V["VPC across two Availability Zones"]
+        subgraph W["Presentation tier: private web subnets"]
+            W1["Web in AZ A"]
+            W2["Web in AZ B"]
+        end
+
+        L --> W1
+        L --> W2
+        W1 --> I["Internal ALB"]
+        W2 --> I
+
+        subgraph A["Application tier: private app subnets"]
+            A1["App in AZ A"]
+            A2["App in AZ B"]
+        end
+
+        I --> A1
+        I --> A2
+        A1 --> D["RDS writer endpoint"]
+        A2 --> D
+
+        subgraph B["Data tier: isolated DB subnets"]
+            P["Primary in AZ A"]
+            S["Standby in AZ B"]
+            P -. "Synchronous replication" .-> S
+        end
+
+        D --> P
+    end
+```
+
+The public ALB is one regional load balancer enabled across two public subnets.
+
+**Network layout**
+
+Example VPC: `10.0.0.0/16`.
+
+| Subnet purpose | AZ A | AZ B | Default routing |
+|---|---|---|---|
+| Public ALB and NAT | `10.0.0.0/24` | `10.0.1.0/24` | Internet gateway |
+| Private web | `10.0.10.0/24` | `10.0.11.0/24` | Local NAT if outbound internet is required |
+| Private application | `10.0.20.0/24` | `10.0.21.0/24` | Local NAT if outbound internet is required |
+| Isolated database | `10.0.30.0/24` | `10.0.31.0/24` | No default internet or NAT route |
+
+Place a NAT gateway in each AZ’s public subnet where outbound internet access is required. Use VPC endpoints for supported AWS services to reduce internet dependency. AWS documents this pattern with private servers, multi-AZ load balancing, and NAT gateways in both AZs. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-example-private-subnets-nat.html?utm_source=chatgpt.com)
+
+**Security-group boundaries**
+
+For this example:
+
+| Destination | Allowed source | Port |
+|---|---|---:|
+| Public ALB | CloudFront origin-facing prefix list | 443 |
+| Web servers | Public ALB security group | 8080 |
+| Internal ALB | Web security group | 443 |
+| App servers | Internal ALB security group | 8080 |
+| RDS PostgreSQL | App security group | 5432 |
+
+Security-group references allow traffic from matching interfaces; they do not create network routes or inherit the referenced group’s rules. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/security-group-rules.html?utm_source=chatgpt.com)
+
+If WAF is applied only at CloudFront, prevent direct ALB access from bypassing it. Combine the CloudFront origin-facing prefix list with a secret origin header required by the ALB listener rule. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/restrict-access-to-load-balancer.html?utm_source=chatgpt.com)
+
+Additional controls:
+
+- HTTPS with appropriate certificates and backend TLS where required.
+- IAM roles with permissions specific to each workload.
+- Secrets Manager for database credentials.
+- Encryption for databases, volumes, backups, and object storage.
+- SSM-based administration with controlled access.
+- Central application logs, ALB access logs, CloudTrail, and alerts.
+- Authentication and authorization at the application layer.
+
+**Availability**
+
+- Separate web and app ASGs, each with at least two instances across AZs.
+- Health checks and autoscaling based on suitable workload metrics.
+- Stateless application instances or an explicit shared-session design.
+- RDS PostgreSQL Multi-AZ DB instance with a synchronous standby.
+- Automated backups and regularly tested restores.
+
+The standby in this RDS Multi-AZ DB-instance design provides availability and does not serve read traffic. During supported failures, RDS changes the writer endpoint’s DNS mapping; applications must reconnect. [Amazon Relational Database Service](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html?utm_source=chatgpt.com)
+
+**Regional disaster recovery**
+
+This architecture handles failures within its region. For a full regional outage, add the cross-region backup or replica strategy from Question 2 and a recoverable application stack.
+
+**Interview answer:** “I isolate web, application, and database access, distribute compute across AZs, and use RDS Multi-AZ for database availability. I design cross-region recovery separately according to the required RPO, RTO, and budget.”
+
+---
+
+**14. Python: longest substring without duplicate characters**
+
+Use a **sliding window** and track each character’s most recent index.
+
+When a repeated character appears inside the current window, move the window’s left boundary just past its previous occurrence.
+
+```python
+#!/usr/bin/env python3
+
+import argparse
+
+
+def length_of_longest_substring(s: str) -> int:
+    last_seen: dict[str, int] = {}
+    left = 0
+    best = 0
+
+    for right, char in enumerate(s):
+        previous = last_seen.get(char, -1)
+
+        # Move left only if the repeat is inside the current window.
+        if previous >= left:
+            left = previous + 1
+
+        last_seen[char] = right
+        best = max(best, right - left + 1)
+
+    return best
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("s", help="String to examine")
+    args = parser.parse_args()
+
+    print(length_of_longest_substring(args.s))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+python3 longest_substring.py "abcabcbb"  # 3
+python3 longest_substring.py "bbbbb"     # 1
+python3 longest_substring.py "pwwkew"    # 3
+```
+
+**Walkthrough for `pwwkew`**
+
+| Index | Character | Left boundary | Current unique window | Best length |
+|---:|---|---:|---|---:|
+| 0 | p | 0 | `p` | 1 |
+| 1 | w | 0 | `pw` | 2 |
+| 2 | w | 2 | `w` | 2 |
+| 3 | k | 2 | `wk` | 2 |
+| 4 | e | 2 | `wke` | 3 |
+| 5 | w | 3 | `kew` | 3 |
+
+The answer is **3**. Both `wke` and `kew` are valid contiguous substrings.
+
+`pwke` is a subsequence because it skips a character; it is not a substring.
+
+Complexity:
+
+- **Time:** `O(n)` with average constant-time dictionary operations.
+- **Space:** `O(min(n, character-set size))`.
+
+The `previous >= left` condition matters. For `abba`, the final `a` appeared outside the current window, so moving `left` backward would incorrectly include duplicate characters.
+
+The supplied examples and additional cases passed local checks. The scripts, Docker example, Kubernetes manifests, and architecture are included in sigmoid-regional-failover-examples.zip[sigmoid-regional-failover-examples.zip](sandbox:/workspace/scratch/8dc6806ebb9b/sigmoid-regional-failover-examples.zip). Docker builds and live AWS/Kubernetes deployments were not performed.
