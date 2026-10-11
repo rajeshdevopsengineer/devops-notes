@@ -553,3 +553,509 @@ Configure the intended service identity, permissions, missed-run policy and over
 ```
 
 This runs at minutes **0, 15, 30 and 45** in the scheduler’s configured time zone. Provision writable lock/log paths, rotate logs and monitor failures. `flock -n` skips an overlapping invocation when the previous run holds the lock. [GitHub](https://github.com/cronie-crond/cronie/blob/master/man/crontab.5?utm_source=chatgpt.com)
+
+These answers cover both four-year Wipro rounds. Adapt the personal-experience examples to work you actually performed.
+
+The wipro-four-year-devops-interview-guide.md[wipro-four-year-devops-interview-guide.md](sandbox:/workspace/scratch/8dc6806ebb9b/wipro-four-year-devops-interview-guide.md) includes expanded explanations, troubleshooting commands, mesh policies and S3 locking permissions.
+
+**Round 1: Microservices and service mesh**
+
+**1. What prerequisites would you request before converting a monolith to microservices?**
+
+First, understand **why the organization wants microservices**: independent releases, selective scaling, better fault isolation or clearer team ownership.
+
+I would request:
+
+| Required input | Purpose |
+|---|---|
+| Current architecture and dependency map | Identify tightly coupled modules and integrations |
+| Business capabilities/service boundaries | Decide what should become an independent service |
+| Database schema and transaction requirements | Plan data ownership and consistency |
+| API/event contracts | Support communication and independent releases |
+| Traffic, latency, availability and recovery requirements | Design capacity and resilience |
+| Authentication and data-security requirements | Establish identities and authorization |
+| Build, runtime, health-check and shutdown requirements | Prepare services for deployment |
+| Tests and observability baseline | Detect migration regressions |
+| Ownership, budget and rollback plan | Make the migration operable |
+
+**Example:** Extract the catalog service first while orders and payments remain in the monolith. A routing layer directs catalog requests to the new service.
+
+This incremental approach is commonly called the **strangler fig pattern**. Splitting deployments while retaining tightly coupled data and release dependencies may create a distributed monolith. [AWS Prescriptive Guidance](https://docs.aws.amazon.com/prescriptive-guidance/latest/modernization-decomposing-monoliths/strangler-fig.html?utm_source=chatgpt.com)
+
+**2. How would you design microservices infrastructure?**
+
+For an AWS team already experienced with Kubernetes, an example design is:
+
+| Component | Choice and reason |
+|---|---|
+| Static frontend | CloudFront with a private S3 origin |
+| DNS/security edge | Route 53, TLS certificates, WAF |
+| API entry point | ALB and an appropriate gateway/ingress controller |
+| Application runtime | EKS nodes in private subnets across AZs |
+| Availability | Multiple replicas, zone spreading, readiness and graceful shutdown |
+| Scaling | HPA plus node autoscaling |
+| Database | Managed RDS/Aurora with appropriate HA and backups |
+| Async processing | SQS/EventBridge where asynchronous communication helps |
+| Delivery | CI builds images; Argo CD deploys approved desired state |
+| Observability | Metrics, logs, traces and synthetic checks |
+| Service mesh | Optional, based on demonstrated requirements |
+
+CloudFront can access a private S3 REST origin through Origin Access Control. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html?utm_source=chatgpt.com)
+
+```mermaid
+flowchart TB
+    Client["API clients"] --> Edge["Public ALB"]
+    Edge --> Gateway["Private gateway"]
+    Gateway --> Legacy["Remaining monolith"]
+    Gateway --> Orders["Orders service"]
+    Gateway --> Payments["Payments service"]
+    Legacy --> LegacyDB["Legacy data"]
+    Orders --> OrdersDB["Order-owned data"]
+    Payments --> PaymentsDB["Payment-owned data"]
+    Orders --> Queue["Order events"]
+    Queue --> Worker["Notification worker"]
+```
+
+The architecture supports gradual extraction. Each service should own its data interface, deployment and operational responsibilities.
+
+**Interview point:** Kubernetes and Istio are choices, not prerequisites for microservices. ECS/Fargate may provide a simpler solution when Kubernetes-specific capabilities are unnecessary.
+
+**3. How do you decide the number of control planes and data planes?**
+
+Distinguish **control-plane deployments, their replicas and data-plane proxies**.
+
+`istiod` distributes configuration and identities. Application requests flow through data-plane proxies rather than through `istiod`.
+
+| Model | Sizing approach |
+|---|---|
+| Single cluster | Usually one logical control-plane deployment with HA replicas |
+| Multiple clusters/regions | Choose shared or independent control planes based on connectivity and failure isolation |
+| Sidecar mode | Usually one proxy per participating application Pod |
+| Ambient mode | Node-level ztunnels, plus waypoints where Layer 7 processing is required |
+
+**Example:** If 100 services each have three meshed Pods, sidecar mode implies approximately **300 sidecar proxies**, not 100 control planes.
+
+Three `istiod` replicas could be an initial HA configuration, but sizing should follow CPU/memory, configuration volume, connected proxies, rollout churn and configuration-distribution latency. Ambient mode changes proxy placement and sizing. [istio.io](https://istio.io/latest/docs/ops/deployment/deployment-models/?utm_source=chatgpt.com)
+
+**4. What security measures should be implemented in a service mesh?**
+
+Use:
+
+- Workload identity and service-to-service mTLS.
+- Default-deny authorization with explicit allowed callers and operations.
+- Protected certificate authorities and trust configuration.
+- Restricted access to mesh configuration through Kubernetes RBAC.
+- JWT validation where required.
+- NetworkPolicies, Pod security and secure secret handling.
+- Auditing and testing of allowed and denied traffic.
+
+**Example:** Permit the orders service account to call the payments service, while denying unrelated callers.
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-orders
+  namespace: payments
+spec:
+  selector:
+    matchLabels:
+      app: payments
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/orders/sa/orders
+      to:
+        - operation:
+            methods: [POST]
+            paths: [/payments]
+```
+
+This is a **sidecar-oriented workload policy example**; configure required mTLS and other necessary traffic deliberately. Ambient Layer 7 policies need the appropriate waypoint attachment model. [istio.io](https://istio.io/latest/docs/concepts/security/?utm_source=chatgpt.com)
+
+Workload mTLS does not determine whether an end user may access another customer’s record. Application authorization still handles that.
+
+**5. Is installing Istio worth its operational burden?**
+
+Evaluate a concrete capability gap.
+
+Istio can be valuable when many teams need consistent workload identity, mTLS, authorization, traffic policy and telemetry without implementing them independently in every application.
+
+Account for:
+
+- Installation and upgrades.
+- Proxy/waypoint resource overhead and latency.
+- Certificate and policy management.
+- Troubleshooting skills and ownership.
+- Protocol and application compatibility.
+
+Run a representative pilot and measure the benefit.
+
+**Example:** A small platform needing path routing, tracing and basic network isolation may meet its requirements with a gateway, OpenTelemetry and NetworkPolicy. A larger platform needing uniform service identities and authorization may justify a mesh.
+
+Ambient mode changes the overhead model but still requires operation and governance. [istio.io](https://istio.io/latest/docs/overview/dataplane-modes/?utm_source=chatgpt.com)
+
+**6. How do you handle service discovery during migration?**
+
+Replace hardcoded Pod IPs and process-local assumptions with stable service names and explicit contracts.
+
+In Kubernetes, create a Service and call it through DNS:
+
+```text
+orders.commerce.svc.cluster.local
+```
+
+The cluster domain can differ. Readiness and EndpointSlices identify usable endpoints.
+
+```bash
+kubectl get service orders -n commerce
+
+kubectl get endpointslices -n commerce \
+  -l kubernetes.io/service-name=orders
+```
+
+During migration, route extracted functionality to new services and retain other routes on the monolith. Define timeouts, safe retry behavior, version compatibility and trace propagation.
+
+A mesh consumes supported service-registry information; it does not eliminate Kubernetes Services/DNS or define application contracts. Hybrid environments may use private DNS, Cloud Map or another appropriate registry. [Kubernetes](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/?utm_source=chatgpt.com)
+
+**7. Pods are running, but the URL returns 403, 404 or 503. How do you troubleshoot?**
+
+**Running Pods do not prove readiness or correct routing.** First identify which component generated the response.
+
+| Error | Likely areas to investigate |
+|---|---|
+| **403 Forbidden** | WAF, gateway/mesh authorization, application permissions, allowlists |
+| **404 Not Found** | Wrong hostname/path, missing route, rewrite mismatch, absent application endpoint |
+| **503 Service Unavailable** | No usable backend, failed readiness, wrong target port, upstream failure or overload |
+
+Capture the hostname, path, method, timestamp and request ID:
+
+```bash
+curl -sS --max-time 10 -D - -o /dev/null \
+  https://app.example.com/orders
+```
+
+Inspect routing, Service configuration and endpoints:
+
+```bash
+kubectl get ingress -n commerce
+kubectl describe ingress app -n commerce
+
+kubectl get pods,services,endpointslices -n commerce -o wide
+kubectl describe service orders -n commerce
+kubectl describe pod <pod-name> -n commerce
+kubectl logs <pod-name> -n commerce --all-containers=true --tail=100
+```
+
+If using Gateway API, inspect Gateway/HTTPRoute status, listener configuration and reference resolution. Check load-balancer target health and controller logs.
+
+For Istio sidecars:
+
+```bash
+istioctl analyze -n commerce
+istioctl proxy-status
+istioctl proxy-config routes <pod-name> -n commerce
+```
+
+**Example:** A Service selector typo produces no endpoints despite healthy Pods, causing a gateway-generated 503. Fix the selector and retest the real request path. [Kubernetes](https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/?utm_source=chatgpt.com)
+
+**8. What achievement are you most satisfied with?**
+
+Use a real example structured as **situation, task, action and result**.
+
+An adaptable answer:
+
+> “One improvement I am proud of was making our deployment process more reliable. We had [actual manual step or failure]. I owned [specific change], introduced [automation/check/recovery procedure], and validated it with the application team. The result was [measured improvement]. It mattered because [customer or team impact].”
+
+Possible examples, if true:
+
+- Automating a recurring deployment step.
+- Implementing a restore test.
+- Removing long-lived cloud credentials from CI.
+- Improving an alert that reduced detection time.
+
+Be ready to explain your contribution, tradeoffs and evidence.
+
+**9. Must achievements be big and complex?**
+
+No. **Impact matters more than complexity.**
+
+A small automation that removes repeated effort, prevents a common deployment error or improves recovery can be a strong achievement.
+
+Explain the baseline, your action and the sustained result. Use pipeline timings, incident records or before/after counts instead of invented percentages.
+
+**10. Is a service mesh always necessary?**
+
+No. Match the requirement to the appropriate tool.
+
+| Requirement | Possible alternative |
+|---|---|
+| Service naming/load distribution | Kubernetes Services and DNS |
+| External host/path routing | ALB, gateway or ingress controller |
+| Pod network isolation | NetworkPolicy with an enforcing CNI |
+| Distributed traces | OpenTelemetry |
+| Timeouts/retries | Application libraries or proxies |
+| End-user authentication | Identity provider and application/gateway controls |
+| Encrypted communication | Application TLS or suitable platform capabilities |
+
+These are not identical substitutes. NetworkPolicy does not provide Layer 7 authorization or automatic mTLS.
+
+Choose a mesh when coordinated service-to-service capabilities solve a demonstrated problem and the team can operate it.
+
+**Round 2: Terraform, AWS, CI/CD and Dynatrace**
+
+**1. Which Terraform commands do you know?**
+
+| Command | Purpose |
+|---|---|
+| `terraform init` | Initialize backend, providers and modules |
+| `terraform fmt -check -recursive` | Check formatting |
+| `terraform validate` | Validate configuration consistency |
+| `terraform plan -out=tfplan` | Create a saved plan |
+| `terraform apply tfplan` | Apply that plan |
+| `terraform show tfplan` | Inspect the plan |
+| `terraform output` | Read outputs |
+| `terraform state list` | List tracked addresses |
+| `terraform state show ADDRESS` | Inspect a tracked resource |
+| `terraform import ADDRESS ID` | Associate an existing resource with an address |
+| `terraform plan -refresh-only` | Review recorded-state updates |
+| `terraform apply -replace=ADDRESS` | Request resource replacement |
+| `terraform force-unlock LOCK_ID` | Remove a confirmed stale lock |
+| `terraform plan -destroy` | Preview destruction |
+| `terraform destroy` | Destroy resources managed by the selected state |
+
+`validate` is not a live cloud test. Import also requires suitable configuration. Prefer replacement planning over the deprecated taint workflow. [HashiCorp Developer](https://developer.hashicorp.com/terraform/cli/commands?utm_source=chatgpt.com)
+
+**2. How do you manage the state file?**
+
+Use a protected remote backend with:
+
+- State locking.
+- Encryption and restricted access.
+- Versioning/backups and tested recovery.
+- Separate state boundaries for environments and owners.
+- Serialized operations on each state.
+
+State maps Terraform addresses to real resources and can contain sensitive attributes. Keep state and saved plans out of source repositories and unrestricted artifacts.
+
+`sensitive = true` primarily hides normal output; it does not encrypt state. Avoid manual JSON edits, and use an appropriate migration when moving backends. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/state/locking?utm_source=chatgpt.com)
+
+**3. What is the process for a cloud-resource request?**
+
+1. Capture purpose, owner, environment and sizing.
+2. Confirm networking, IAM, data sensitivity, availability, backup and budget.
+3. Select an approved architecture/module.
+4. Create the configuration through a change branch.
+5. Run validation, security/policy checks and planning.
+6. Review the proposed changes.
+7. Apply the reviewed plan through the environment-scoped identity.
+8. Verify operation and document ownership/runbooks.
+
+**Example:** A database request needs engine/version, private connectivity, credentials, retention and recovery requirements—not only a database name.
+
+**4. Have you used terraform destroy?**
+
+Use a truthful example, such as removing an ephemeral test environment.
+
+Before destruction, confirm the account, backend, state and dependencies:
+
+```bash
+terraform plan -destroy -out=destroy.tfplan
+terraform show destroy.tfplan
+
+# After the destruction plan is reviewed and authorized:
+terraform apply destroy.tfplan
+```
+
+Preserve required data and backups. Destruction is not a normal production redeployment strategy.
+
+If the objective is to retain a resource while stopping Terraform ownership, use the appropriate state/removed-block workflow with destruction disabled. [HashiCorp Developer](https://developer.hashicorp.com/terraform/cli/commands/destroy?utm_source=chatgpt.com)
+
+**5. Explain your CI/CD pipeline.**
+
+A sample answer:
+
+> “Pull requests run formatting, tests and security checks. After review and merge, CI builds and scans a versioned image and publishes its digest. An approved Git change references that digest, and Argo CD deploys it to Kubernetes. We validate development, promote the same artifact to QA and production, and monitor rollout and user-facing behavior.”
+
+For infrastructure changes, describe:
+
+**Validation → security/policy checks → plan → approval → apply reviewed plan → operational verification.**
+
+Use short-lived identities, restricted state/plan access, deployment concurrency controls and documented recovery procedures.
+
+**6. Explain your Terraform modules.**
+
+A module groups configuration behind an input/output interface.
+
+Examples:
+
+- `network`: VPC/subnets and their IDs.
+- `eks`: Cluster/node configuration consuming network IDs.
+- `database`: Database configuration and connection metadata.
+- `observability`: Monitoring infrastructure.
+
+```hcl
+module "network" {
+  source      = "./modules/network"
+  name        = "commerce-dev"
+  vpc_cidr    = "10.20.0.0/16"
+  environment = "dev"
+}
+```
+
+Typical files include `main.tf`, `variables.tf`, `outputs.tf`, `versions.tf` and documentation. These filenames are conventions; Terraform loads the directory’s configuration together.
+
+Modules improve reuse and consistency. Their caller’s backend determines state boundaries; a child module does not automatically receive separate state. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/modules?utm_source=chatgpt.com)
+
+**7. What policies do you use in CI/CD?**
+
+Distinguish permissions from release governance:
+
+| Area | Example |
+|---|---|
+| Cloud IAM | Scoped OIDC roles for the repository/environment |
+| Repository | Protected branches, reviews and required checks |
+| Supply chain | Reviewed actions, trusted artifacts and image policy |
+| Infrastructure | Block public sensitive storage or unapproved destruction |
+| Deployment | Environment approvals and controlled concurrency |
+| Kubernetes | Scoped deployment RBAC and admission controls |
+| Secrets/state | Restricted access and no plaintext logging |
+
+A scanner reports findings; policy determines which findings block release and how exceptions are handled.
+
+Avoid granting administrator access merely to make the pipeline work. [GitHub Docs](https://docs.github.com/en/actions/reference/security/secure-use?utm_source=chatgpt.com)
+
+**8. GitHub Actions versus Argo CD?**
+
+| Aspect | GitHub Actions | Argo CD |
+|---|---|---|
+| Main purpose | CI and general workflow automation; can perform CD | Kubernetes desired-state delivery |
+| Typical tasks | Tests, scans, builds, Terraform jobs | Compare Git-defined and live resources; synchronize |
+| Execution | Jobs on runners | Kubernetes controllers/services |
+| Drift handling | Requires explicit implementation | Continuously observes desired/live differences |
+| Deployment targets | Many platforms | Kubernetes |
+
+They work well together: Actions builds the image, an approved Git change updates its digest, and Argo CD deploys it.
+
+Self-healing and pruning are configured choices; Argo CD does not automatically solve every failed application rollout. [GitHub Docs](https://docs.github.com/en/actions/about-github-actions/understanding-github-actions?utm_source=chatgpt.com)
+
+**9. NAT Gateway versus Internet Gateway?**
+
+| Aspect | Internet Gateway | Public NAT Gateway |
+|---|---|---|
+| Purpose | Connect the VPC to the internet | Enable outbound connectivity for private workloads |
+| Placement | Attached to the VPC | Conventional zonal form is in a public subnet |
+| Workload public IPv4 | Needed for direct IPv4 access | Private workload can retain private IPv4 |
+| Unsolicited inbound access | Possible with correct addressing/routes/security | Does not expose private workloads to unsolicited inbound connections |
+
+In a conventional zonal design:
+
+- Private subnet default route points to the public NAT Gateway.
+- The NAT’s public subnet default route points to the IGW.
+- Return traffic is allowed for connections initiated by private workloads.
+
+AWS also provides private NAT and regional NAT options, so qualify which design you mean. NAT is not a replacement for security controls. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html?utm_source=chatgpt.com)
+
+**10. Explain your roles and responsibilities.**
+
+A sample answer:
+
+> “My responsibilities include [actual AWS/IaC ownership], maintaining pipelines, supporting deployments, troubleshooting incidents, and improving monitoring, security and cost. I work with developers on deployment readiness and with architects/security on infrastructure changes. I own [specific modules or pipelines] and contribute to [shared duties].”
+
+For four years of experience, demonstrate hands-on depth. Prepare one deployment, incident, automation and improvement you can explain thoroughly.
+
+**11. What types of alerts are available in Dynatrace?**
+
+Common alerting use cases include:
+
+| Category | Example |
+|---|---|
+| Availability | Service or synthetic check unavailable |
+| Performance | Response-time degradation |
+| Errors | Elevated application failure rate |
+| Resources | CPU, memory or storage pressure |
+| Kubernetes health | Workload/node health conditions |
+| Custom/business conditions | Queue backlog or failed transaction threshold |
+
+Choose appropriate thresholds, duration, baseline detection and missing-data behavior.
+
+Current Dynatrace distinguishes detection from notification: related conditions can become Problems, and workflows route notifications. Kubernetes health alerts and warning signals have different behavior; Classic alerting profiles differ from current workflow-based features. [Dynatrace Docs](https://docs.dynatrace.com/docs/analyze-explore-automate/alerting-and-notifications?utm_source=chatgpt.com)
+
+**12. Have you installed OneAgent? How?**
+
+Answer truthfully. If applicable:
+
+> “I installed OneAgent on [actual platform], configured the monitoring mode and connectivity, verified host/service discovery and traces, and coordinated supported application restarts where required.”
+
+For VMs, use the environment-provided installer after checking compatibility, privileges and network access.
+
+For Kubernetes, use the supported **Dynatrace Operator and DynaKube configuration** for the intended monitoring mode. Platform monitoring alone does not include OneAgent/application tracing by default.
+
+Protect installer tokens and monitoring permissions, and verify actual telemetry rather than installation success alone. [Dynatrace Docs](https://docs.dynatrace.com/docs/ingest-from/dynatrace-oneagent/installation-and-operation/linux/installation/install-oneagent-on-linux?utm_source=chatgpt.com)
+
+**13. What command enables S3-native state locking?**
+
+There is no separate permanent enable command. Configure the backend:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "example-company-terraform-state"
+    key          = "environments/dev/network/terraform.tfstate"
+    region       = "ap-south-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+Then initialize and run operations with a supported Terraform version:
+
+```bash
+terraform init
+terraform plan -lock-timeout=5m -out=tfplan
+terraform apply -lock-timeout=5m tfplan
+```
+
+Terraform manages the corresponding `.tflock` object. Grant state read/write and lock-file read/write/delete permissions, plus required bucket listing.
+
+DynamoDB-based locking is deprecated. Coordinate locking changes across clients, and use force-unlock only after confirming no active writer owns the lock. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/backend/s3?utm_source=chatgpt.com)
+
+**14. What types of Terraform modules exist, and why use them?**
+
+- **Root module:** Configuration in the working directory.
+- **Child module:** Called through a module block.
+- **Local module:** Source is a local path.
+- **Registry/Git module:** Source is distributed remotely.
+
+“Custom,” “public” and “private” describe authorship/distribution rather than separate execution semantics.
+
+Use modules for meaningful reusable interfaces and consistent infrastructure standards. Pin registry versions or Git references. `.terraform.lock.hcl` primarily records provider selections, not a universal module-version lock. [HashiCorp Developer](https://developer.hashicorp.com/terraform/language/modules?utm_source=chatgpt.com)
+
+**15. What is a route table?**
+
+A route table contains **destination-to-target rules** determining where traffic goes.
+
+| Destination | Example target |
+|---|---|
+| VPC CIDR | Local VPC routing |
+| `0.0.0.0/0` | IGW or NAT, depending on subnet role |
+| On-premises CIDR | Appropriate VPN/transit target |
+
+The most specific matching route normally wins. Routes control forwarding; security groups and NACLs control permitted traffic. IPv4 and IPv6 default routes are separate. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/subnet-route-tables.html?utm_source=chatgpt.com)
+
+**16. Where is a route table placed: public or private subnet?**
+
+**Neither. A route table is a VPC resource associated with subnets.**
+
+| Subnet role | Typical IPv4 default route |
+|---|---|
+| Public | `0.0.0.0/0` → IGW |
+| Private with internet egress | `0.0.0.0/0` → public NAT Gateway |
+| Isolated | No internet default route |
+
+Each subnet has one associated subnet route table at a time. Multiple subnets can share one, and a subnet without an explicit association uses the main route table.
+
+An IGW route does not automatically give an instance a public address or permit incoming traffic. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/subnet-route-tables.html?utm_source=chatgpt.com)
