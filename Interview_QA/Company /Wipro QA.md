@@ -1059,3 +1059,610 @@ The most specific matching route normally wins. Routes control forwarding; secur
 Each subnet has one associated subnet route table at a time. Multiple subnets can share one, and a subnet without an explicit association uses the main route table.
 
 An IGW route does not automatically give an instance a public address or permit incoming traffic. [Amazon Virtual Private Cloud](https://docs.aws.amazon.com/vpc/latest/userguide/subnet-route-tables.html?utm_source=chatgpt.com)
+
+:chatgpt-content-reference{index="18"}[Download the complete interview guide, including YAML examples](sandbox:/workspace/scratch/8dc6806ebb9b/wipro-nine-year-devops-interview-guide.md).
+
+**1. Brief yourself, your project, and your responsibilities**
+
+Use this as an adaptable introduction:
+
+> “I have nine years of overall experience, including [actual experience] in DevOps and cloud operations. My main areas are infrastructure automation, CI/CD, Kubernetes, monitoring, and production reliability.
+>
+> In my current project, we support [business purpose]. I personally manage [your responsibilities], working with development, security, and operations teams to deliver reliable releases and resolve production incidents.”
+
+For an example AWS project:
+
+- **Frontend:** Static application in private S3, served through CloudFront.
+- **Backend:** Containerized APIs on EKS, behind an HTTPS ALB.
+- **Database:** RDS in private database subnets.
+- **Infrastructure:** Terraform.
+- **Delivery:** CI builds and tests images; CD promotes approved versions.
+- **Operations:** CloudWatch, Prometheus/Grafana, centralized logs, and tracing.
+
+```mermaid
+flowchart TD
+    Browser["Browser"] --> CDN["CloudFront"]
+    CDN --> S3["Private S3 frontend"]
+    Browser --> ALB["HTTPS ALB"]
+    ALB --> API["EKS API pods across AZs"]
+    API --> DB["Private RDS"]
+    API --> Monitoring["Metrics, logs and traces"]
+```
+
+At nine years, explain your ownership of architecture decisions, incident coordination, release controls, upgrades, security, capacity, cost optimization, and mentoring. Support achievements with actual measurements.
+
+**2. An EC2 application behind a load balancer suddenly becomes unavailable. How do you troubleshoot?**
+
+Start by identifying the impact, failure time, HTTP error, and recent changes. Then follow the request path.
+
+| Layer | What I check |
+|---|---|
+| DNS/TLS | Correct DNS record, certificate validity and hostname |
+| Load balancer | Listener rules, WAF, target-health reasons, access logs |
+| Network | ALB-to-instance security groups, routes, NACL return traffic |
+| EC2 | Instance status checks, CPU, memory, disk and inodes |
+| Application | Process, listening port, logs, configuration and health endpoint |
+| Dependencies | Database, secrets, DNS, external APIs and connection pools |
+
+Useful commands:
+
+```bash
+aws elbv2 describe-target-health --target-group-arn "$TARGET_GROUP_ARN"
+
+curl -v --connect-timeout 5 --max-time 15 https://api.example.com/health
+
+ss -lntp
+systemctl status api.service
+journalctl -u api.service --since '20 minutes ago'
+df -h
+df -i
+```
+
+For ALB errors, **502** suggests connection resets or invalid target responses; **504** suggests connection/response timeouts. Verify whether the error originated from the ALB or application. [Elastic Load Balancing](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html?utm_source=chatgpt.com)
+
+**Example:** A release changes the application port from 8080 to 8081, but the target group still uses 8080. Correct the configuration or revert the release.
+
+Recover with the smallest validated change, preserve evidence, and verify the customer URL and a business transaction.
+
+**3. The AWS bill suddenly increases. How do you identify the costs?**
+
+Use Cost Explorer to compare equivalent periods using the same cost basis. Break down the increase by service, account, region, usage category, and activated ownership tags. Resource-level detail depends on the service and reporting configuration. [AWS Cost Management](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-exploring-data.html?utm_source=chatgpt.com)
+
+Investigate:
+
+- Unexpected EC2/EKS scaling or expensive instances.
+- NAT processing, internet egress, and cross-AZ traffic.
+- Excessive logging.
+- Growing EBS volumes, snapshots, or S3 storage.
+- Changes to discounts, credits, or commitment coverage.
+
+Correlate the increase with deployment history, CloudTrail events, autoscaling activity, and utilization. Use CUR/Data Exports for deeper analysis, and introduce budgets and Cost Anomaly Detection. [AWS Data Exports](https://docs.aws.amazon.com/cur/latest/userguide/what-is-cur.html?utm_source=chatgpt.com)
+
+**Example:** NAT costs increase after containers repeatedly download dependencies. Fix the repeated downloads and evaluate caching or appropriate VPC endpoints, including their costs.
+
+**4. A developer requests an EC2 instance for local deployment. What do you provide?**
+
+Clarify that EC2 is a remote development environment. Collect OS, runtime, CPU/RAM/disk, architecture, dependency, connectivity, and lifetime requirements.
+
+For intermittent development, start with a small approved **burstable instance**, then size using measurements. Sustained builds or load testing may need a different instance family. ARM is suitable only when the application and tooling support it.
+
+Provision through IaC with:
+
+- Development account/VPC.
+- Approved patched image and encrypted EBS.
+- Scoped IAM access and instance role.
+- Ownership tags, expiry, stop schedules, and budget controls.
+- Private connectivity and Session Manager access.
+
+Session Manager requires the SSM Agent, appropriate IAM permissions, and connectivity to its service endpoints. [AWS Systems Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html?utm_source=chatgpt.com)
+
+Provide a documented connection procedure and validate the application before handing it over.
+
+**5. A Kubernetes Pod enters CrashLoopBackOff. How do you troubleshoot?**
+
+**CrashLoopBackOff describes repeated restarts; it does not identify their cause.**
+
+```bash
+kubectl -n prod describe pod api-abc
+kubectl -n prod logs api-abc -c api --tail=100
+kubectl -n prod logs api-abc -c api --previous --tail=100
+kubectl -n prod get events --sort-by=.metadata.creationTimestamp
+kubectl -n prod top pod api-abc
+```
+
+`kubectl top` requires a working metrics API.
+
+Inspect the container’s last termination reason, exit code, startup command, probes, configuration, mounts, permissions, and dependencies. Previous-container logs are especially useful when the current container has already restarted. [Kubernetes](https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/?utm_source=chatgpt.com)
+
+Examples:
+
+- **OOMKilled:** Investigate memory growth, limits, and runtime heap.
+- **Application exception:** Fix configuration or code.
+- **Probe failure:** Correct the endpoint/timing; use a startup probe for slow initialization.
+- **Exit code 0:** The process may finish or daemonize instead of staying in the foreground.
+
+Exit code **137 alone does not prove OOM**. Readiness failure normally removes traffic; liveness failure can trigger a restart.
+
+**6. Deployment succeeds, but the application is inaccessible externally. How do you troubleshoot?**
+
+A successful rollout does not validate the complete external request path.
+
+Check:
+
+**DNS/TLS → load balancer → Gateway/Ingress routing → Service → EndpointSlices → application.**
+
+```bash
+dig api.example.com
+curl -v --connect-timeout 5 --max-time 15 https://api.example.com/health
+
+kubectl -n prod get ingress,svc,pods -o wide
+kubectl -n prod describe ingress api
+kubectl -n prod get endpointslices \
+  -l kubernetes.io/service-name=api
+kubectl -n prod get svc api -o yaml
+```
+
+Verify Service selectors, `port`/`targetPort`, ready endpoints, controller status, network policies, security groups, and application binding to `0.0.0.0`. For Gateway API, inspect Gateway/HTTPRoute conditions instead of assuming an Ingress exists. [Kubernetes](https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/?utm_source=chatgpt.com)
+
+A public ALB can reach private worker nodes. Those nodes do not need public IPs.
+
+Treat 403, 404, and 503 as starting clues; identify the component generating the response. A successful port-forward bypasses parts of the external path.
+
+**7. What happens when a Kubernetes node fails?**
+
+The control plane loses heartbeats, marks the node unhealthy/unreachable, and applies relevant taints. Eviction and controller reconciliation eventually lead to replacement Pods on healthy capacity.
+
+Many Pods have default not-ready/unreachable tolerations of **300 seconds**, but explicit tolerations and controller behavior change recovery timing. Recovery is not instantaneous. [Kubernetes](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/?utm_source=chatgpt.com)
+
+Key distinctions:
+
+- A Deployment/ReplicaSet creates replacement Pods; the original Pod is not live-migrated.
+- A standalone Pod has no controller to recreate it.
+- Replacements need available capacity.
+- Stateful recovery also requires appropriate storage, replication, quorum, and fencing.
+- A zonal EBS volume cannot simply move into another AZ.
+
+An isolated node may still run its application, so forcing another database writer without fencing can cause split-brain. Design replicas across failure domains and test recovery against RTO/RPO. PDBs do not prevent hardware failures.
+
+**8. What should be configured for production Pods?**
+
+Configure:
+
+- Measured resource requests and limits.
+- Immutable image digests.
+- Startup, readiness, and liveness probes.
+- Graceful shutdown and termination time.
+- Non-root execution, restricted capabilities, and seccomp.
+- Minimal ServiceAccount permissions.
+- Appropriate storage and secret management.
+- Centralized logs, metrics, and traces.
+
+Example **Pod-template fragment**:
+
+```yaml
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 45
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: api
+      image: registry.example.com/api@sha256:REPLACE_WITH_DIGEST
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+      readinessProbe:
+        httpGet:
+          path: /health/ready
+          port: 8080
+      livenessProbe:
+        httpGet:
+          path: /health/live
+          port: 8080
+```
+
+Replace the digest and endpoints with actual application values. Kubernetes’ restricted security standard provides a useful baseline. [Kubernetes](https://kubernetes.io/docs/concepts/security/pod-security-standards/?utm_source=chatgpt.com)
+
+Configure replicas, topology spread, rolling-update settings, HPA, PDB, and NetworkPolicy through the appropriate resources. These settings still require sufficient capacity and application-compatible shutdown behavior.
+
+**9. What is Git, why use it, and which branching strategy do you follow?**
+
+Git is a distributed version-control system providing change history, collaboration, review, and traceability.
+
+For frequently released services, I would use:
+
+1. Short-lived feature branches.
+2. Pull requests with required tests and reviews.
+3. Protected `main`.
+4. Immutable release artifacts promoted through environments.
+5. Release tags and deployment records.
+
+**Example:** A reviewed payment change merges into `main`. CI builds image digest `sha256:...`; that same digest moves through Dev, UAT, and production with different environment configuration.
+
+Release branches are useful when supporting multiple versions. Choose the strategy around release needs and keep hotfixes merged back into maintained source.
+
+**10. Write YAML for a CI/CD pipeline to test and deploy Dev → UAT**
+
+This example uses **GitHub Actions**. Jenkins typically uses a Groovy `Jenkinsfile`.
+
+The workflow below assumes:
+
+- Maven produces `target/app.jar`.
+- The Dockerfile copies that JAR.
+- A Helm chart at `charts/api` supports `image.repository` and `image.digest`.
+- ECR/EKS, namespaces, IAM/RBAC, and runner connectivity already exist.
+- The privileged runners are trusted and ephemeral.
+- UAT approval is configured in GitHub environment settings.
+
+The build environment supplies ECR/build-role variables; Dev and UAT supply their own cluster, namespace, deployment-role, and health-URL variables.
+
+```yaml
+name: Test and promote API
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - run: mvn --batch-mode --no-transfer-progress verify
+      - name: Checksum tested JAR
+        working-directory: target
+        run: sha256sum app.jar > app.jar.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tested-jar
+          path: |
+            target/app.jar
+            target/app.jar.sha256
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: [self-hosted, linux, ephemeral, ci-builder]
+    environment: ci-build
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+    outputs:
+      repository: ${{ steps.image.outputs.repository }}
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: tested-jar
+          path: target
+      - working-directory: target
+        run: sha256sum --check app.jar.sha256
+      - name: Build and scan
+        run: |
+          local_image="api:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build --pull --tag "$local_image" .
+          trivy image --exit-code 1 --severity HIGH,CRITICAL "$local_image"
+          echo "LOCAL_IMAGE=$local_image" >> "$GITHUB_ENV"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.BUILD_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Publish image
+        id: image
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          repository="$ECR_REGISTRY/$ECR_REPOSITORY"
+          tag="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker tag "$LOCAL_IMAGE" "$repository:$tag"
+          docker push "$repository:$tag"
+          digest=$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$tag" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  deploy-dev:
+    needs: publish
+    runs-on: [self-hosted, linux, ephemeral, dev-deployer]
+    environment: dev
+    timeout-minutes: 15
+    concurrency:
+      group: api-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
+      NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      HEALTH_URL: ${{ vars.HEALTH_URL }}
+      IMAGE_REPOSITORY: ${{ needs.publish.outputs.repository }}
+      IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy and validate Dev
+        run: |
+          aws eks update-kubeconfig --name "$EKS_CLUSTER"
+          helm upgrade --install api ./charts/api \
+            --namespace "$NAMESPACE" \
+            --values ./charts/api/values-dev.yaml \
+            --set-string image.repository="$IMAGE_REPOSITORY" \
+            --set-string image.digest="$IMAGE_DIGEST" \
+            --wait --timeout 5m
+          kubectl -n "$NAMESPACE" rollout status deployment/api --timeout=180s
+          status=$(curl --silent --show-error --fail \
+            --connect-timeout 5 --max-time 30 \
+            --output /tmp/health.json --write-out '%{http_code}' "$HEALTH_URL")
+          test "$status" = 200
+
+  deploy-uat:
+    needs: [publish, deploy-dev]
+    runs-on: [self-hosted, linux, ephemeral, uat-deployer]
+    environment: uat
+    timeout-minutes: 15
+    concurrency:
+      group: api-uat
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
+      NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      HEALTH_URL: ${{ vars.HEALTH_URL }}
+      IMAGE_REPOSITORY: ${{ needs.publish.outputs.repository }}
+      IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Promote and validate UAT
+        run: |
+          aws eks update-kubeconfig --name "$EKS_CLUSTER"
+          helm upgrade --install api ./charts/api \
+            --namespace "$NAMESPACE" \
+            --values ./charts/api/values-uat.yaml \
+            --set-string image.repository="$IMAGE_REPOSITORY" \
+            --set-string image.digest="$IMAGE_DIGEST" \
+            --wait --timeout 5m
+          kubectl -n "$NAMESPACE" rollout status deployment/api --timeout=180s
+          status=$(curl --silent --show-error --fail \
+            --connect-timeout 5 --max-time 30 \
+            --output /tmp/health.json --write-out '%{http_code}' "$HEALTH_URL")
+          test "$status" = 200
+```
+
+The central design decisions are:
+
+- PR testing receives no AWS deployment credentials.
+- Publication uses temporary OIDC credentials.
+- Dev and UAT use the **same image digest**.
+- A failed Dev job blocks UAT.
+- `environment: uat` references protection rules; required reviewers must be configured separately. [GitHub Docs](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments?utm_source=chatgpt.com)
+
+Pin production actions to reviewed commit SHAs. Add project-specific acceptance tests: a health endpoint returning 200 does not prove every business operation works. This template fails on validation errors; automatic rollback requires an explicit policy.
+
+**11. What is Maven, and what are its repositories?**
+
+Maven manages builds, dependencies, and project configuration through `pom.xml`.
+
+| Repository | Purpose |
+|---|---|
+| Local repository | Usually `~/.m2/repository`; downloaded dependencies and locally installed artifacts |
+| Maven Central | Default public remote dependency repository |
+| Organization repository | Internal artifacts and dependency proxying through Nexus, Artifactory, or similar |
+
+Artifacts commonly use coordinates such as:
+
+```text
+com.example:orders-api:1.4.2
+```
+
+`mvn install` installs the artifact into the local repository. `mvn deploy` publishes it to a remote artifact repository—it does not deploy the running application. Store repository credentials through CI secret management and generated Maven settings. [Maven](https://maven.apache.org/what-is-maven.html?utm_source=chatgpt.com)
+
+**12. Deploy an application to 100 servers using Ansible**
+
+Use a tested, checksummed artifact and controlled batches:
+
+1. Validate inventory, connectivity, capacity, and rollback readiness.
+2. Deploy to one canary.
+3. Drain traffic before changing each server.
+4. Deploy, restart, and validate.
+5. Restore traffic only after successful validation.
+6. Continue larger batches while observing customer metrics.
+
+An orchestration template:
+
+```yaml
+- name: Rolling application deployment
+  hosts: web
+  become: true
+  serial: [1, 5, 10]
+  any_errors_fatal: true
+
+  tasks:
+    - name: Deploy controlled batch
+      block:
+        - ansible.builtin.include_role:
+            name: lb_drain
+        - ansible.builtin.include_role:
+            name: app_release
+        - ansible.builtin.include_role:
+            name: app_validate
+        - ansible.builtin.include_role:
+            name: lb_enable
+      rescue:
+        - ansible.builtin.include_role:
+            name: app_rollback
+        - ansible.builtin.fail:
+            msg: "Deployment failed; stop further batches."
+```
+
+These roles implement the project’s actual deployment and load-balancer operations.
+
+`serial: [1,5,10]` means one server, then five, then batches of ten. `forks` controls worker concurrency separately. [Ansible Community Documentation](https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_strategies.html?utm_source=chatgpt.com)
+
+Keep failed hosts drained unless recovery is validated. Stateful/quorum services need a different rollout sequence from stateless web servers.
+
+**13. Docker containers stop shortly after starting. How do you troubleshoot?**
+
+```bash
+docker ps -a
+docker logs --tail 100 api
+docker inspect --format '{{json .State}}' api
+```
+
+Check exit code, error, `OOMKilled`, and timestamps. [Docker Docs](https://docs.docker.com/reference/cli/docker/container/inspect/?utm_source=chatgpt.com)
+
+Common causes:
+
+- The main process finishes normally.
+- Application startup fails because of configuration or permissions.
+- Wrong architecture or missing runtime/library.
+- Memory pressure kills the process.
+- The application starts in the background and its parent exits.
+
+**Example:** A command that starts Nginx as a daemon can finish immediately. Use its supported foreground startup command.
+
+For Java:
+
+```dockerfile
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+```
+
+A restart policy cannot fix a permanently invalid startup command.
+
+**14. Jenkins deployment fails in production but works in Dev**
+
+First determine whether production changed and whether users are affected. Stop further promotion and restore a known-good compatible release when necessary.
+
+Compare:
+
+- Image/JAR digest and chart version.
+- Environment configuration and secret versions.
+- IAM/RBAC permissions.
+- Agent tools and runtime versions.
+- Registry and private cluster connectivity.
+- Quotas, admission policies, storage, and capacity.
+- Database schema, data volume, locks, and migration compatibility.
+
+**Example:** Dev’s cluster API is reachable, but production uses a private endpoint that the Jenkins agent cannot access. Fix the approved deployment-agent network path and add a connectivity preflight.
+
+Use console logs, agent logs, Kubernetes events, and application traces to prove the cause. Keep credentials scoped; masking alone does not protect credentials from an untrusted pipeline. [jenkins.io](https://www.jenkins.io/doc/book/pipeline/jenkinsfile/?utm_source=chatgpt.com)
+
+Commit the correction into pipeline/configuration/IaC and add a check that catches the same failure earlier.
+
+**15. What is Argo CD, and why use it?**
+
+Argo CD is a Kubernetes GitOps continuous-delivery controller. It compares declared application configuration with the cluster and synchronizes according to policy.
+
+It provides deployment history, drift visibility, health reporting, and consistent delivery across environments. It supports sources such as Helm and Kustomize. [Declarative GitOps CD for Kubernetes](https://argo-cd.readthedocs.io/en/stable/?utm_source=chatgpt.com)
+
+**Example:** CI publishes an image, and a reviewed configuration change updates its digest. Argo CD reconciles the application to that desired version.
+
+When Argo CD owns the application, make rollback durable by restoring the correct desired state in Git. Otherwise reconciliation may reapply the faulty version. Database compatibility needs separate handling.
+
+**16. What is GitOps?**
+
+GitOps manages systems through:
+
+- Declarative desired state.
+- Versioned configuration history.
+- Automatic pulling by software agents.
+- Continuous reconciliation with actual state. [OpenGitOps](https://opengitops.dev/?utm_source=chatgpt.com)
+
+```mermaid
+flowchart TD
+    Code["Application repository"] --> CI["Build, test and scan"]
+    CI --> Registry["Image registry"]
+    CI --> PR["Configuration PR"]
+    PR --> Git["Approved GitOps configuration"]
+    Git --> Argo["Argo CD"]
+    Argo --> Dev["Dev"]
+    Argo --> UAT["UAT"]
+    Registry --> Dev
+    Registry --> UAT
+```
+
+Each environment’s approved configuration determines its deployed version; the diagram does not imply automatic promotion to every environment.
+
+GitOps provides review, auditability, repeatability, and drift control. Keep plaintext secrets outside Git. Running `kubectl apply` from CI alone does not provide continuous reconciliation.
+
+**17. How do you configure AWS subdomains for domains registered with GoDaddy/BigRock?**
+
+Registration and DNS hosting are separate.
+
+| Situation | Configuration |
+|---|---|
+| Parent DNS already uses Route 53 | Add an Alias record for `api.example.com` pointing to the ALB |
+| Parent DNS remains with the provider | Add a subdomain CNAME pointing to the ALB hostname |
+| Only a subdomain should use Route 53 | Create a hosted zone for `apps.example.com` and delegate it using NS records in the parent DNS zone |
+
+For delegation, copy the subdomain zone’s four Route 53 nameservers into the parent provider’s NS records. Creating the hosted zone alone does not establish delegation. [Amazon Route 53](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/CreatingNewSubdomain.html?utm_source=chatgpt.com)
+
+Then configure:
+
+- ACM certificate covering the hostname.
+- HTTPS listener and hostname routing.
+- Application behavior for that domain.
+- Public reachability where required.
+
+Use the ALB hostname or Route 53 alias, rather than hardcoding changing ALB IPs.
+
+```bash
+dig NS apps.example.com
+dig api.apps.example.com
+curl -v https://api.apps.example.com/health
+```
+
+For CloudFront, its viewer ACM certificate must be in `us-east-1`. A wildcard such as `*.example.com` does not cover `api.apps.example.com`. [Amazon CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cnames-and-https-requirements.html?utm_source=chatgpt.com)
