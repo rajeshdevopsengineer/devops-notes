@@ -854,3 +854,1183 @@ You've completed the Kubernetes fundamentals quiz.
 &#x20;Try again
 
 Preparation advice: For a Kubernetes or DevOps interview, be especially confident explaining the architecture, Pod scheduling flow, Deployment versus StatefulSet, DaemonSets, init containers, and how controllers reconcile desired state. These concepts are foundational to troubleshooting and production Kubernetes operations.
+
+
+# Kubernetes Interview Questions and Answers (26–50)
+
+Topics: Custom Resources, Labels, Annotations, Namespaces, Services, DNS, CNI, EKS Networking, CSI, Persistent Volumes, EBS, EFS, and StatefulSets.
+
+These answers are designed for DevOps, AWS EKS, SRE, and Kubernetes Administrator interviews, with practical explanations, YAML examples, and troubleshooting commands.
+
+## Section 1: Custom Resources, Labels, Annotations, and Namespaces
+
+### 1. How do you create and use Custom Resources in Kubernetes?
+
+Answer:
+
+A Custom Resource (CR) allows us to extend Kubernetes with our own resource types beyond built-in resources such as Pods, Deployments, and Services.
+
+We use a CustomResourceDefinition (CRD) to define the new resource type, then create Custom Resources from that definition.
+
+For example, suppose we want to manage a custom resource called `Database`.
+
+Step 1: Create a CRD
+
+```
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.example.com
+spec:
+  group: example.com
+  scope: Namespaced
+  names:
+    plural: databases
+    singular: database
+    kind: Database
+    shortNames:
+      - db
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+```
+
+Step 2: Apply the CRD
+
+```
+kubectl apply -f database-crd.yaml
+```
+
+Step 3: Create a Custom Resource
+
+```
+apiVersion: example.com/v1
+kind: Database
+metadata:
+  name: production-db
+spec:
+  replicas: 3
+```
+
+```
+kubectl apply -f database.yaml
+kubectl get databases
+kubectl describe database production-db
+```
+
+Interview point: A CRD extends the Kubernetes API. Creating a CRD alone does not automatically create application Pods or databases. A custom controller or Operator is needed to implement that behavior.
+
+### 2. What are labels and annotations in Kubernetes?
+
+Answer:
+
+Labels and annotations are key-value pairs added to Kubernetes objects as metadata.
+
+| Labels                                | Annotations                                 |
+| ------------------------------------- | ------------------------------------------- |
+| Used to identify and select resources | Used to store additional metadata           |
+| Support label selectors               | Not used by standard label selectors        |
+| Typically short, meaningful values    | Can contain longer descriptive information  |
+| Used by Services and controllers      | Used by tools, automation, and integrations |
+
+Example:
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-pod
+  labels:
+    app: nginx
+    environment: production
+  annotations:
+    description: "Production Nginx web server"
+    owner: "platform-team"
+spec:
+  containers:
+    - name: nginx
+      image: nginx:stable
+```
+
+Real-world example:
+
+A Service selects Pods using labels such as `app: nginx`. An annotation may contain a deployment description, build reference, or configuration hint for another tool.
+
+Interview point: Labels are used for identification and selection; annotations provide supporting metadata.
+
+### 3. How do you add labels and annotations to an existing Pod?
+
+Answer:
+
+Use `kubectl label` and `kubectl annotate`.
+
+Add a label:
+
+```
+kubectl label pod nginx-pod environment=production
+```
+
+Add an annotation:
+
+```
+kubectl annotate pod nginx-pod owner=devops-team
+```
+
+View the labels:
+
+```
+kubectl get pod nginx-pod --show-labels
+```
+
+View annotations and other metadata:
+
+```
+kubectl describe pod nginx-pod
+```
+
+Update an existing label:
+
+```
+kubectl label pod nginx-pod \
+  environment=staging --overwrite
+```
+
+Remove a label:
+
+```
+kubectl label pod nginx-pod environment-
+```
+
+Interview point: If the Pod belongs to a Deployment, update the Deployment's Pod template to make the change persist when Pods are recreated.
+
+### 4. What is a namespace in Kubernetes?
+
+Answer:
+
+A namespace is a logical grouping mechanism used to organize and isolate Kubernetes resources within a cluster.
+
+Namespaces are useful for separating applications, projects, teams, or environments.
+
+Common namespaces include:
+
+| Namespace       | Purpose                                                 |
+| --------------- | ------------------------------------------------------- |
+| default         | Default namespace for namespaced resources              |
+| kube-system     | Kubernetes system components                            |
+| kube-public     | Publicly readable resources, subject to access controls |
+| kube-node-lease | Node heartbeat Lease objects                            |
+
+Create a namespace:
+
+```
+kubectl create namespace dev
+```
+
+Create a Deployment in that namespace:
+
+```
+kubectl create deployment nginx \
+  --image=nginx:stable \
+  -n dev
+```
+
+List Pods in the namespace:
+
+```
+kubectl get pods -n dev
+```
+
+List all namespaces:
+
+```
+kubectl get namespaces
+```
+
+Interview point: Namespaces provide logical separation, but they do not automatically enforce network isolation or resource limits. Use NetworkPolicies, RBAC, ResourceQuotas, and LimitRanges as needed.
+
+## Section 2: Kubernetes Services and Networking
+
+### 5. What are the different types of Services in Kubernetes?
+
+Answer:
+
+Kubernetes has four main Service types.
+
+| Service type | Purpose                                                                |
+| ------------ | ---------------------------------------------------------------------- |
+| ClusterIP    | Exposes an application internally within the cluster                   |
+| NodePort     | Exposes an application through a port on nodes                         |
+| LoadBalancer | Exposes an application using an external load balancer, when supported |
+| ExternalName | Maps a Service DNS name to another DNS hostname                        |
+
+How Kubernetes Services expose applications
+
+ClusterIP
+
+Pod → Service virtual IP → Backend Pod
+
+NodePort
+
+Client → Node IP:NodePort → Backend Pod
+
+LoadBalancer
+
+Client → Load Balancer → Service Backend
+
+ExternalName
+
+Service DNS name → External DNS hostname
+
+Conceptual traffic paths; actual forwarding depends on the Kubernetes networking and load-balancer implementation.
+
+Example:
+
+```
+kubectl expose deployment nginx \
+  --type=ClusterIP \
+  --port=80
+```
+
+Interview point: ClusterIP is the default Service type.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://kubernetes.io\&sz=32)
+
+Kubernetes
+
++1
+
+
+
+### 6. What is the difference between ClusterIP and NodePort?
+
+| ClusterIP                              | NodePort                                     |
+| -------------------------------------- | -------------------------------------------- |
+| Accessible through the cluster network | Exposes a port on each applicable node       |
+| Default Service type                   | Must be specified explicitly                 |
+| No node-level external port            | Uses a configured node port                  |
+| Good for internal APIs                 | Useful for simple external access or testing |
+
+Example:
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+spec:
+  type: NodePort
+  selector:
+    app: nginx
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080
+```
+
+Typical NodePort range:
+
+```
+30000–32767
+```
+
+This range is configurable by cluster administrators.
+
+Access using:
+
+```
+http://<node-ip>:30080
+```
+
+Interview point: NodePort builds on ClusterIP behavior. External accessibility still depends on node reachability, firewall rules, and cloud security groups.
+
+### 7. What is the difference between NodePort and LoadBalancer Services?
+
+Answer:
+
+| NodePort                                 | LoadBalancer                                           |
+| ---------------------------------------- | ------------------------------------------------------ |
+| Exposes a port on nodes                  | Requests a load balancer from an integration           |
+| Requires clients to reach a node IP      | Typically provides a load balancer address or hostname |
+| Does not provision a cloud load balancer | Can automatically provision cloud infrastructure       |
+| Common for development and custom setups | Common for production external access                  |
+| Uses a node port                         | May use NodePort or direct Pod IP targets              |
+
+AWS EKS example:
+
+A `LoadBalancer` Service can be used with a supported AWS integration to provision a Network Load Balancer.
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-lb
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx
+  ports:
+    - port: 80
+      targetPort: 80
+```
+
+```
+kubectl get svc nginx-lb
+```
+
+Interview point: LoadBalancer Services are convenient for production traffic, but the exact AWS implementation depends on the installed controller and Service configuration.
+
+### 8. When would you recommend NodePort instead of LoadBalancer?
+
+Answer:
+
+I would recommend NodePort in cases such as:
+
+- Development or lab clusters.
+- On-premises environments without load-balancer integration.
+- Temporary testing of applications.
+- Environments with an existing external load balancer that forwards to NodePorts.
+
+Real-world example:
+
+If I am testing an Nginx application in a small Kubernetes lab, I can expose it using NodePort rather than provisioning a cloud load balancer.
+
+Interview point: For production AWS EKS applications, LoadBalancer or an appropriately configured Ingress/Gateway is usually a better option for managed public traffic.
+
+### 9. What Kubernetes Service types are available apart from ClusterIP, NodePort, and LoadBalancer?
+
+Answer:
+
+The fourth official Service type is ExternalName.
+
+ExternalName maps a Kubernetes Service name to another DNS hostname.
+
+Example:
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-database
+spec:
+  type: ExternalName
+  externalName: db.example.com
+```
+
+Applications can resolve:
+
+```
+external-database.default.svc.cluster.local
+```
+
+The DNS response aliases the Service name to `db.example.com`.
+
+Another important concept is a Headless Service:
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-headless
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+```
+
+Headless Services expose individual endpoint addresses through DNS rather than a single virtual ClusterIP. They are commonly used with StatefulSets.
+
+Interview point: ExternalName is a Service type; Headless is a Service configuration, not a fifth official Service type.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://kubernetes.io\&sz=32)
+
+Kubernetes
+
+
+
+### 10. How does Kubernetes service discovery work?
+
+Answer:
+
+Kubernetes primarily provides service discovery through DNS.
+
+When a Service is created, the cluster DNS system makes its name resolvable.
+
+Example:
+
+Suppose we have:
+
+- Service: `backend`
+- Namespace: `production`
+- Cluster domain: `cluster.local`
+
+Its fully qualified DNS name is:
+
+```
+backend.production.svc.cluster.local
+```
+
+Another Pod can access the application using that name and the Service port.
+
+Frontend Pod
+
+Requests backend.production.svc.cluster.local
+
+CoreDNS
+
+Resolves backend Service to its ClusterIP
+
+Service networking
+
+Forwards application traffic to an eligible backend endpoint
+
+Backend Pod 1
+
+Backend Pod 2
+
+Backend Pod 3
+
+Interview point: Kubernetes service discovery separates logical service names from changing individual Pod IP addresses.
+
+### 11. What is CoreDNS in Kubernetes?
+
+Answer:
+
+CoreDNS is a DNS server commonly used in Kubernetes clusters for internal Service and Pod name resolution.
+
+Its primary responsibilities include:
+
+- Resolving Kubernetes Service DNS names.
+- Supporting DNS discovery of cluster resources.
+- Forwarding external DNS queries to upstream DNS resolvers.
+- Supporting DNS-based service discovery across namespaces.
+
+Check CoreDNS:
+
+```
+kubectl get pods -n kube-system \
+  -l k8s-app=kube-dns
+```
+
+The selector above is common but not universal.
+
+Check DNS Service:
+
+```
+kubectl get svc -n kube-system kube-dns
+```
+
+Troubleshoot DNS:
+
+```
+kubectl run dns-test \
+  --image=busybox:stable \
+  --restart=Never \
+  --command -- sleep 3600
+```
+
+```
+kubectl exec dns-test -- \
+  nslookup kubernetes.default.svc.cluster.local
+```
+
+Interview point: CoreDNS resolves names. It does not itself perform the usual ClusterIP Service traffic forwarding.
+
+## Section 3: CNI, Pod Networking, and AWS EKS
+
+### 12. What is the purpose of CNI in Kubernetes?
+
+Answer:
+
+CNI stands for Container Network Interface. It is a specification and plugin system used to configure networking for containerized workloads.
+
+A Kubernetes CNI plugin typically handles:
+
+- Assigning IP addresses to Pods.
+- Configuring Pod network interfaces.
+- Enabling connectivity between Pods across nodes.
+- Configuring routes or networking datapaths.
+- Supporting network policies where implemented.
+
+Common CNI implementations include Calico, Cilium, Flannel, and Amazon VPC CNI.
+
+Real-world example: When a new Pod starts in EKS, the AWS VPC CNI configures its networking and assigns an IP address from an appropriate VPC subnet.
+
+Interview point: CNI handles Pod networking. CoreDNS handles name resolution, while Kubernetes Service networking is commonly implemented using kube-proxy or an alternative datapath.
+
+### 13. What is the difference between Calico and the AWS VPC CNI plugin?
+
+Answer:
+
+| Calico                                                                       | AWS VPC CNI                                                      |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Kubernetes networking and network security solution                          | AWS-native Kubernetes networking implementation                  |
+| Supports different networking modes, including overlay and routed networking | Integrates with AWS VPC networking and ENIs                      |
+| Can use separate Pod CIDR ranges                                             | Typically allocates Pod IPs from VPC subnets                     |
+| Strong network policy capabilities                                           | Supports Kubernetes network policies in supported configurations |
+| Can run on multiple cloud and on-premises platforms                          | Primarily designed for AWS environments                          |
+
+Real-world example:
+
+Calico can provide Pod networking using an overlay network such as VXLAN.
+
+AWS VPC CNI attaches or manages EC2 network interfaces and assigns VPC-routable addresses to Pods.
+
+Important: Calico networking and AWS VPC CNI are not always mutually exclusive. Calico can also be used to enforce network policies in EKS environments that use AWS VPC CNI for networking.
+
+AWS VPC CNI also supports network policies in supported configurations.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://docs.aws.amazon.com\&sz=32)
+
+Amazon EKS
+
++1
+
+
+
+### 14. How is an IP address assigned to a Pod?
+
+Answer:
+
+A Pod IP is normally assigned as part of Pod network setup by the configured CNI implementation.
+
+Typical process:
+
+1. The scheduler assigns the Pod to a worker node.
+2. The kubelet asks the container runtime to create the Pod sandbox.
+3. The runtime invokes CNI network configuration.
+4. The CNI implementation allocates or obtains an available IP.
+5. The Pod network interface and routing are configured.
+6. The Pod can communicate according to the cluster network configuration.
+
+In EKS, the AWS VPC CNI commonly uses `ipamd` to manage IP addresses and ENIs on EC2 nodes.
+
+Check Pod IP addresses:
+
+```
+kubectl get pods -o wide
+```
+
+```
+kubectl get pod nginx-pod \
+  -o jsonpath='{.status.podIP}'
+```
+
+Interview point: The scheduler decides which node runs a Pod; the network implementation is responsible for its Pod IP configuration.
+
+### 15. Does the CNI plugin use the VPC CIDR range or a different CIDR range?
+
+Answer:
+
+It depends on the CNI implementation and network configuration.
+
+In a standard IPv4 EKS cluster using AWS VPC CNI, Pods generally receive IPs from subnets associated with the cluster VPC.
+
+For example:
+
+Example: Default AWS VPC CNI
+
+VPC CIDR: 10.0.0.0/16
+
+Subnet A
+
+10.0.1.0/24
+
+Node 10.0.1.10
+
+Pod 10.0.1.20
+
+Subnet B
+
+10.0.2.0/24
+
+Node 10.0.2.10
+
+Pod 10.0.2.20
+
+Custom networking option
+
+Secondary VPC CIDR: 100.64.0.0/16
+
+Pod subnet example: 100.64.1.0/24
+
+With configured custom networking, Pods can receive addresses from secondary VPC CIDR subnets.
+
+AWS VPC CNI supports custom networking through `ENIConfig` resources, allowing Pod addresses to come from alternate VPC subnets.
+
+Other CNIs, such as Calico, can use separate Pod networks that are not allocated directly from the underlying VPC subnets.
+
+Interview point: Do not confuse the Pod CIDR with the Kubernetes Service CIDR. They serve different purposes.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://docs.aws.amazon.com\&sz=32)
+
+Amazon EKS
+
++1
+
+
+
+## Section 4: CSI, StorageClass, PV, and PVC
+
+### 16. What is the purpose of CSI drivers in Kubernetes?
+
+Answer:
+
+CSI stands for Container Storage Interface.
+
+CSI is a standard interface that allows Kubernetes to integrate with external storage systems without requiring storage-specific logic inside Kubernetes core.
+
+CSI drivers enable functionality such as:
+
+- Provisioning persistent volumes.
+- Attaching storage to worker nodes.
+- Mounting storage inside Pods.
+- Resizing volumes, when supported.
+- Creating volume snapshots, when supported.
+- Cleaning up storage resources.
+
+Common CSI drivers:
+
+| CSI Driver              | Storage System               |
+| ----------------------- | ---------------------------- |
+| AWS EBS CSI             | Amazon Elastic Block Store   |
+| AWS EFS CSI             | Amazon Elastic File System   |
+| Azure Disk CSI          | Azure Managed Disks          |
+| Azure File CSI          | Azure Files                  |
+| GCE Persistent Disk CSI | Google Cloud Persistent Disk |
+
+Real-world example: In EKS, when a PVC requests 20 GiB of EBS storage using a suitable StorageClass, the AWS EBS CSI driver can provision an EBS volume automatically.
+
+Interview point: CNI handles container networking, while CSI handles container storage.
+
+### 17. What is a Kubernetes StorageClass?
+
+Answer:
+
+A StorageClass defines how Kubernetes should provision storage volumes.
+
+It specifies properties such as the storage provisioner, driver-specific parameters, volume binding mode, and reclaim policy for dynamically provisioned volumes.
+
+Example using AWS EBS:
+
+```
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-storage
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+Apply:
+
+```
+kubectl apply -f storageclass.yaml
+```
+
+Check:
+
+```
+kubectl get storageclass
+```
+
+Important parameters:
+
+- `provisioner`: Specifies the CSI driver.
+- `parameters`: Configures storage characteristics.
+- `reclaimPolicy`: Determines what happens to dynamically provisioned PVs after claim release.
+- `volumeBindingMode`: Controls when storage provisioning and binding occur.
+- `allowVolumeExpansion`: Enables supported volume expansion.
+
+Interview point: `WaitForFirstConsumer` is useful for availability-zone-specific storage such as EBS because it allows scheduling requirements to influence volume provisioning.
+
+On EKS Auto Mode, the EBS provisioner differs from the standard EBS CSI provisioner.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://docs.aws.amazon.com\&sz=32)
+
+Amazon EKS
+
+
+
+### 18. What are PersistentVolumes and PersistentVolumeClaims?
+
+Answer:
+
+A PersistentVolume (PV) represents storage available to workloads in a Kubernetes cluster.
+
+A PersistentVolumeClaim (PVC) is a request for storage made by a user or workload.
+
+A Pod uses a PVC to access a compatible PV.
+
+Kubernetes Persistent Storage Flow
+
+Application Pod
+
+Mounts storage at /app/data
+
+PersistentVolumeClaim (PVC)
+
+Requests 20 GiB, ReadWriteOnce
+
+PersistentVolume (PV)
+
+Represents the bound storage volume
+
+Underlying Storage
+
+For example, an AWS EBS volume
+
+Example PVC:
+
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3-storage
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+Check storage resources:
+
+```
+kubectl get pv
+kubectl get pvc
+```
+
+Interview point: Pod replacement does not automatically delete the PVC. Persistent storage can survive Pod restarts and replacements, subject to the storage configuration and lifecycle policies.
+
+### 19. What is the difference between PV and PVC?
+
+| PersistentVolume (PV)                            | PersistentVolumeClaim (PVC)                         |
+| ------------------------------------------------ | --------------------------------------------------- |
+| Represents cluster storage                       | Requests storage                                    |
+| Cluster-scoped resource                          | Namespace-scoped resource                           |
+| Created manually or by a provisioner             | Usually created by application users or controllers |
+| Defines storage capacity and access capabilities | Defines requested storage and access modes          |
+| Binds to a compatible PVC                        | Binds to a compatible PV                            |
+
+Example:
+
+A PV represents an existing 100 GiB storage volume.
+
+A PVC requests 20 GiB. If compatibility and binding requirements are met, Kubernetes can bind the claim to the PV.
+
+Interview point: A PVC does not necessarily create storage directly. A StorageClass and provisioner can dynamically create the PV and underlying storage when needed.
+
+### 20. What are the different PVC access modes?
+
+Answer:
+
+Kubernetes supports four main PersistentVolume access modes.
+
+| Mode             | Short name | Meaning                                 |
+| ---------------- | ---------- | --------------------------------------- |
+| ReadWriteOnce    | RWO        | Read-write mount by one node            |
+| ReadOnlyMany     | ROX        | Read-only mount by multiple nodes       |
+| ReadWriteMany    | RWX        | Read-write mount by multiple nodes      |
+| ReadWriteOncePod | RWOP       | Read-write mount exclusively by one Pod |
+
+Important distinction:
+
+`ReadWriteOnce` means a single node, not necessarily a single Pod. Multiple Pods on the same node may be able to mount the volume.
+
+`ReadWriteOncePod` provides Pod-level exclusivity for supported CSI storage.
+
+Real-world examples:
+
+- AWS EBS: Commonly RWO.
+- AWS EFS: Commonly RWX.
+- Database requiring exclusive Pod-level access: RWOP, if supported.
+
+Interview point: Supported access modes depend on the underlying storage driver. Listing a mode in a PVC does not make an incompatible storage backend support it.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://kubernetes.io\&sz=32)
+
+Kubernetes
+
+
+
+### 21. What is the difference between static and dynamic volume provisioning?
+
+Answer:
+
+| Static Provisioning                       | Dynamic Provisioning                           |
+| ----------------------------------------- | ---------------------------------------------- |
+| Administrator prepares storage in advance | Storage is provisioned on demand               |
+| PV is created manually                    | PV is created by a provisioner                 |
+| Suitable for existing storage volumes     | Suitable for automated application deployments |
+| More manual lifecycle management          | Reduced manual provisioning work               |
+| PVC binds to an existing suitable PV      | PVC can trigger volume creation                |
+
+Static provisioning example:
+
+An administrator creates an EBS volume and a corresponding PV. An application creates a PVC that binds to it.
+
+Dynamic provisioning example:
+
+An application creates a PVC referencing an EBS StorageClass. The CSI driver provisions a new EBS volume and Kubernetes binds the newly created PV to the PVC.
+
+Interview point: Dynamic provisioning generally requires a suitable storage provisioner, commonly a CSI driver, and a StorageClass.
+
+### 22. How do you mount a PVC into a Deployment?
+
+Answer:
+
+First, create a PVC, then reference it in the Deployment using `volumes` and `volumeMounts`.
+
+Step 1: Create the PVC
+
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nginx-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3-storage
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+Step 2: Mount it into the Deployment
+
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:stable
+          volumeMounts:
+            - name: app-storage
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: app-storage
+          persistentVolumeClaim:
+            claimName: nginx-pvc
+```
+
+Apply both files:
+
+```
+kubectl apply -f pvc.yaml
+kubectl apply -f deployment.yaml
+```
+
+Verify:
+
+```
+kubectl get pvc
+kubectl get pods
+kubectl describe pod <pod-name>
+```
+
+This example assumes the StorageClass and EBS CSI driver are installed and configured.
+
+Interview point: For EBS, avoid scaling a Deployment that shares one RWO PVC across different nodes. Use a StatefulSet with separate PVCs for each replica, or choose suitable shared storage where appropriate.
+
+## Section 5: AWS EBS, EFS, and StatefulSets
+
+### 23. What is the difference between EBS and EFS storage in Kubernetes?
+
+Answer:
+
+Amazon EBS provides block storage, while Amazon EFS provides a managed shared file system.
+
+| Amazon EBS                                   | Amazon EFS                                                |
+| -------------------------------------------- | --------------------------------------------------------- |
+| Block storage                                | Network file storage                                      |
+| Generally tied to a single Availability Zone | Regional file system with multi-AZ access when configured |
+| Commonly supports RWO                        | Commonly supports RWX                                     |
+| Well suited for databases                    | Well suited for shared files                              |
+| Uses EBS CSI driver                          | Uses EFS CSI driver                                       |
+| Volume capacity is provisioned               | File system capacity grows and shrinks with stored data   |
+
+EBS
+
+Dedicated block volume
+
+Database Pod
+
+EBS Volume
+
+Typical use: PostgreSQL data storage
+
+EFS
+
+Shared network file system
+
+Pod A · Pod B · Pod C
+
+Shared EFS
+
+Typical use: shared uploads and documents
+
+Real-world example:
+
+For a PostgreSQL database requiring its own filesystem, EBS is often a suitable choice.
+
+For multiple application Pods accessing the same shared documents, EFS is often more suitable.
+
+Interview point: Standard EBS volumes have AZ and attachment constraints. EFS supports shared file access through NFS, making it a common choice for RWX workloads.
+
+### 24. What is the purpose of the EFS CSI driver?
+
+Answer:
+
+The Amazon EFS CSI driver allows Kubernetes Pods to mount Amazon EFS file systems through Kubernetes persistent storage resources.
+
+It provides integration for:
+
+- Mounting EFS file systems into Pods.
+- Static PV provisioning.
+- Dynamic provisioning through EFS access points in supported configurations.
+- Shared file access across multiple eligible Pods and nodes.
+
+Example EFS StorageClass:
+
+```
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-0123456789abcdef0
+  directoryPerms: "700"
+```
+
+The file system ID must be replaced with an actual EFS file system ID.
+
+Example PVC:
+
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+Check the EFS CSI driver:
+
+```
+kubectl get csidrivers
+```
+
+```
+kubectl get pods -n kube-system
+```
+
+Important: The EFS file system must already exist and have suitable mount targets, networking, security groups, and driver permissions. The storage size requested in an EFS PVC is not a hard EFS filesystem capacity quota.
+
+The EFS CSI driver supports dynamic provisioning on supported EC2-based EKS configurations. Fargate has different restrictions.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://docs.aws.amazon.com\&sz=32)
+
+Amazon EKS
+
+
+
+### 25. What is the difference between a StatefulSet and a Deployment when using persistent storage?
+
+Answer:
+
+Both Deployments and StatefulSets can mount persistent storage, but they differ in how storage identities are managed across replicas.
+
+| Deployment                                        | StatefulSet                                        |
+| ------------------------------------------------- | -------------------------------------------------- |
+| Can mount a PVC                                   | Can mount PVCs                                     |
+| Typically uses manually defined claim references  | Supports `volumeClaimTemplates`                    |
+| Pods are interchangeable                          | Pods have stable ordinal identities                |
+| Replicas can reference the same PVC               | Each replica can automatically receive its own PVC |
+| Common for stateless workloads and shared storage | Common for databases and other stateful workloads  |
+
+Example: StatefulSet with a PVC per replica
+
+```
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.4
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: root-password
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: mysql-storage
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-storage
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: gp3-storage
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+Assume the headless Service, Secret, StorageClass, and CSI driver already exist.
+
+With three replicas, Kubernetes creates storage claims resembling:
+
+```
+mysql-storage-mysql-0
+mysql-storage-mysql-1
+mysql-storage-mysql-2
+```
+
+Each Pod gets its own persistent claim.
+
+Interview point: StatefulSets provide stable storage identity, but they do not automatically configure MySQL replication. That requires additional database configuration or an Operator.
+
+## Quick Revision Cheat Sheet
+
+| Topic            | Remember this                                  |
+| ---------------- | ---------------------------------------------- |
+| CRD              | Extends Kubernetes API with new resource types |
+| Label            | Resource identification and selection          |
+| Annotation       | Additional resource metadata                   |
+| Namespace        | Logical resource organization                  |
+| ClusterIP        | Internal Service access                        |
+| NodePort         | Service exposed through node ports             |
+| LoadBalancer     | External load-balancer integration             |
+| ExternalName     | DNS alias to another hostname                  |
+| Headless Service | Direct endpoint discovery without a ClusterIP  |
+| CoreDNS          | DNS resolution                                 |
+| CNI              | Pod networking                                 |
+| AWS VPC CNI      | VPC-integrated Pod networking                  |
+| Calico           | Networking and network policy enforcement      |
+| CSI              | Storage integration                            |
+| StorageClass     | Defines storage provisioning                   |
+| PV               | Actual storage resource abstraction            |
+| PVC              | Storage request                                |
+| RWO              | Read-write access on one node                  |
+| RWX              | Read-write access on multiple nodes            |
+| RWOP             | Exclusive read-write access by one Pod         |
+| EBS              | Block storage                                  |
+| EFS              | Shared file storage                            |
+| StatefulSet      | Stable per-replica identities and storage      |
+
+## AWS EKS Troubleshooting Commands
+
+```
+# Check all Services
+kubectl get svc -A
+
+# Check Service endpoints
+kubectl get endpointslices -A
+
+# Check DNS
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+
+# Check AWS VPC CNI DaemonSet
+kubectl get ds aws-node -n kube-system
+
+# Check Pod IP assignments
+kubectl get pods -A -o wide
+
+# Check CSI drivers
+kubectl get csidrivers
+
+# Check StorageClasses
+kubectl get storageclass
+
+# Check all PVCs
+kubectl get pvc -A
+
+# Check PVs
+kubectl get pv
+
+# Troubleshoot a pending PVC
+kubectl describe pvc <pvc-name>
+
+# Investigate Pod volume-mount failures
+kubectl describe pod <pod-name>
+
+# Check StatefulSets
+kubectl get statefulsets -A
+```
+
+## Practice Interview Quiz
+
+Knowledge check
+
+Question 1 of 6
+
+What is required for a Custom Resource to automatically manage an application?
+
+Only a CRD
+
+A custom controller or Operator
+
+Only a Namespace
+
+CoreDNS
+
+PreviousNext&#x20;
+
+Interview preparation tip: For AWS EKS roles, give extra attention to questions 13–15 and 17–25. Be ready to explain AWS VPC CNI IP allocation, the difference between EBS and EFS, why an EBS PVC might remain Pending, and how StatefulSets provide dedicated persistent storage to each database replica.
