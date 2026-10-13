@@ -3721,3 +3721,1356 @@ The API server cannot schedule Deployments
 PreviousNext&#x20;
 
 For an experienced DevOps or EKS interview, prioritize being able to explain questions 1–5, 17, 23–24, 29–30, 38–43, and 45–50 with practical examples. These test how you reason about real production environments rather than simply recall definitions.
+
+# Kubernetes Interview Questions and Answers (101–150)
+
+Advanced DevOps, AWS EKS, AKS, Autoscaling, Scheduling, and Troubleshooting
+
+This set covers five areas: autoscaling, resource management, production availability, scheduling, and application health checks.
+
+## Section 1: Kubernetes Autoscaling (Questions 1–18)
+
+### 1. What is Horizontal Pod Autoscaler (HPA)?
+
+Answer:
+
+Horizontal Pod Autoscaler automatically increases or decreases the number of Pods based on observed metrics such as CPU, memory, or application traffic.
+
+For example, if an application has three replicas and CPU utilization increases above the configured target, HPA can increase the replica count.
+
+HPA scaling example
+
+Normal traffic
+
+3 replicas
+
+CPU near target
+
+High traffic
+
+6 replicas
+
+HPA scales out
+
+HPA changes the desired replica count of a Deployment, StatefulSet, or another resource supporting the scale API.
+
+Interview point: HPA scales the number of Pods; it does not increase individual Pod CPU or memory allocations.
+
+### 2. What is Vertical Pod Autoscaler (VPA)?
+
+Answer:
+
+Vertical Pod Autoscaler adjusts or recommends CPU and memory resource requests for containers based on observed usage.
+
+It can help applications that have inaccurate resource requests.
+
+For example:
+
+```
+Before:
+CPU request: 200m
+Memory request: 256Mi
+
+Recommended:
+CPU request: 500m
+Memory request: 1Gi
+```
+
+Depending on the VPA configuration and supported update mechanism, applying recommendations may require Pod replacement or an in-place resource resize.
+
+Interview point: VPA is an additional Kubernetes component, not part of the standard HPA controller. It primarily manages resource requests; handling of limits depends on configuration.
+
+### 3. What is Cluster Autoscaler?
+
+Answer:
+
+Cluster Autoscaler automatically increases or decreases the number of worker nodes according to Pod scheduling requirements and node utilization.
+
+For example:
+
+- The cluster has three nodes.
+- HPA increases an application from 5 to 15 Pods.
+- Some Pods cannot be scheduled due to insufficient resources.
+- Cluster Autoscaler identifies that additional nodes are needed.
+- It requests capacity from the configured node group.
+
+When nodes become unnecessary, Cluster Autoscaler may consolidate capacity by removing eligible underutilized nodes.
+
+Interview point: Cluster Autoscaler scales nodes based largely on Pod scheduling requirements, not simply because node CPU usage reaches a threshold.
+
+### 4. What is the difference between HPA and VPA?
+
+| HPA                                | VPA                                     |
+| ---------------------------------- | --------------------------------------- |
+| Horizontal scaling                 | Vertical scaling                        |
+| Changes replica count              | Changes or recommends resource requests |
+| Adds/removes Pods                  | Adjusts resource sizing                 |
+| Good for scalable web applications | Good for right-sizing workloads         |
+| Responds to configured metrics     | Analyzes resource utilization history   |
+| May require more nodes             | May require Pod replacement or resize   |
+
+Example: HPA increases Nginx replicas from 3 to 8. VPA increases each Pod's CPU request from 200m to 500m.
+
+Interview point: Avoid configuring HPA and VPA to independently control the same CPU or memory utilization metric without carefully coordinating their behavior.
+
+### 5. What is the difference between Cluster Autoscaler and HPA?
+
+Answer:
+
+HPA scales application Pods, while Cluster Autoscaler scales worker nodes.
+
+HPA + Cluster Autoscaler
+
+Application traffic increases
+
+HPA
+
+Increases desired Pods from 3 to 8
+
+Insufficient node capacity
+
+Some Pods cannot be scheduled
+
+Cluster Autoscaler
+
+Adds worker node capacity
+
+Scheduler + kubelet
+
+Place and start additional Pods
+
+Interview point: HPA and Cluster Autoscaler complement each other. HPA does not directly create EC2 instances.
+
+### 6. What is the difference between scaling and autoscaling in Kubernetes?
+
+Answer:
+
+Scaling means changing application or cluster capacity. Autoscaling means doing that automatically according to rules or observed demand.
+
+Manual scaling:
+
+```
+kubectl scale deployment nginx --replicas=5
+```
+
+Automatic scaling:
+
+```
+kubectl autoscale deployment nginx \
+  --cpu=70% \
+  --min=2 \
+  --max=10
+```
+
+Interview point: Manual scaling uses a directly specified replica count; HPA continuously reconciles replicas with metric targets.
+
+### 7. What metrics can trigger HPA?
+
+Answer:
+
+HPA supports several metric categories.
+
+| Metric source              | Example                             |
+| -------------------------- | ----------------------------------- |
+| Resource metrics           | CPU and memory                      |
+| Container resource metrics | CPU of a particular container       |
+| Pods custom metrics        | Requests per second per Pod         |
+| Object custom metrics      | Requests associated with an Ingress |
+| External metrics           | SQS queue depth                     |
+
+For CPU and memory, Metrics Server commonly supplies data through the resource metrics API.
+
+Custom or external metrics require a compatible metrics adapter.
+
+Interview point: HPA is not limited to CPU and memory. With appropriate metric adapters, it can scale on application and external workload signals.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://kubernetes.io\&sz=32)
+
+Kubernetes
+
++1
+
+
+
+### 8. How do you configure HPA using CPU utilization?
+
+Answer:
+
+First ensure your Deployment has CPU requests:
+
+```
+resources:
+  requests:
+    cpu: "500m"
+    memory: "256Mi"
+  limits:
+    cpu: "1000m"
+    memory: "512Mi"
+```
+
+Then create the HPA:
+
+```
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+Apply:
+
+```
+kubectl apply -f hpa.yaml
+kubectl get hpa
+```
+
+If a container requests 500m CPU, 70% utilization corresponds to approximately 350m CPU usage for that container.
+
+Interview point: HPA CPU utilization is calculated relative to CPU requests, not CPU limits.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://kubernetes.io\&sz=32)
+
+Kubernetes
+
+
+
+### 9. How would you configure a Deployment to increase CPU allocation when utilization crosses 70%?
+
+Answer:
+
+This is a trick interview question.
+
+HPA does not increase CPU allocation per Pod. It increases the number of replicas.
+
+If you want individual Pods to receive larger CPU requests based on usage, use VPA or an appropriate custom resource-sizing controller.
+
+For example, VPA can be configured to manage CPU and memory requests:
+
+```
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  updatePolicy:
+    updateMode: "Recreate"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: "*"
+        controlledResources:
+          - cpu
+          - memory
+```
+
+This requires VPA components and CRDs to be installed. The example does not implement a precise 70% threshold: VPA makes recommendations from usage history rather than following a simple HPA-style percentage threshold.
+
+For an exact threshold-based resize requirement, implement an appropriate custom metric/controller solution.
+
+### 10. How do you configure HPA for an application with changing traffic?
+
+Answer:
+
+For traffic-sensitive applications, I would configure HPA using CPU plus an application-specific metric, such as requests per second, latency-related saturation, or queue depth.
+
+Example HPA using CPU with configurable scaling behavior:
+
+```
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 0
+```
+
+For queue-based workloads, KEDA can be useful for event-driven scaling.
+
+Interview point: Choose metrics reflecting real workload saturation. CPU alone may not accurately represent traffic or processing capacity.
+
+### 11. How do you scale both Pods and cluster nodes during high traffic?
+
+Answer:
+
+Use HPA together with a node autoscaler such as Cluster Autoscaler or Karpenter.
+
+Process:
+
+1. Application traffic increases.
+2. HPA requests more replicas.
+3. The scheduler places Pods on existing nodes where possible.
+4. Pending Pods indicate insufficient suitable capacity.
+5. The node autoscaler provisions additional nodes.
+6. Pending Pods get scheduled.
+7. Capacity decreases when demand falls and scale-down conditions permit.
+
+Interview point: HPA scales application replicas; node autoscaling supplies the compute capacity for them.
+
+### 12. When would you use HPA versus VPA?
+
+Answer:
+
+Use HPA for applications that can handle increased traffic by adding more replicas, such as REST APIs and web applications.
+
+Use VPA for workloads that need their resource requests right-sized, such as certain batch processors or applications with variable memory requirements.
+
+Production consideration: For a database with fixed storage and carefully managed replicas, VPA recommendations may be safer than automatically changing replica counts without understanding replication behavior.
+
+### 13. How does HPA work with StatefulSets?
+
+Answer:
+
+HPA can scale StatefulSets because StatefulSets expose the Kubernetes scale subresource.
+
+For example:
+
+```
+scaleTargetRef:
+  apiVersion: apps/v1
+  kind: StatefulSet
+  name: mongodb
+```
+
+When scaling from 3 to 5, a StatefulSet can create:
+
+```
+mongodb-3
+mongodb-4
+```
+
+These Pods can receive their own persistent claims through `volumeClaimTemplates`.
+
+Interview point: HPA can technically scale StatefulSets, but database replication membership, quorum, and storage readiness must be considered. Increasing replicas does not automatically configure database replication.
+
+### 14. What happens to PVC data when StatefulSet Pods are created during HPA scaling?
+
+Answer:
+
+When a StatefulSet scales up, new replicas receive dedicated PVCs if `volumeClaimTemplates` is configured.
+
+Example:
+
+```
+mongo-0 → PVC 0
+mongo-1 → PVC 1
+mongo-2 → PVC 2
+mongo-3 → PVC 3  (new)
+```
+
+When scaling down, the default StatefulSet PVC retention behavior preserves the claims unless the retention policy is explicitly changed.
+
+Important: A new PVC typically provides new storage; it does not automatically contain an existing database replica's data.
+
+Interview point: StatefulSet PVC retention policies can control claim deletion on scale-down or StatefulSet deletion. Storage reclamation then follows the PV and storage provider's lifecycle rules.
+
+### 15. How do you troubleshoot HPA when an application suddenly stops scaling?
+
+Answer:
+
+Start with:
+
+```
+kubectl get hpa -A
+kubectl describe hpa web-hpa
+kubectl top pods
+kubectl top nodes
+```
+
+Check:
+
+- Metrics Server health.
+- Availability of CPU or custom metrics.
+- CPU requests configured on containers.
+- HPA `minReplicas` and `maxReplicas`.
+- HPA status conditions and events.
+- Whether the metric exceeds the target.
+- Scaling stabilization windows.
+- Conflicting GitOps or manual replica changes.
+- API permissions and custom metrics adapter failures.
+
+Check resource metrics API:
+
+```
+kubectl get --raw /apis/metrics.k8s.io/v1beta1/pods
+```
+
+Interview point: An HPA at `maxReplicas` cannot scale further even when application utilization is high.
+
+### 16. Why might Pods remain Pending even after HPA is configured?
+
+Answer:
+
+HPA increases replica counts but does not guarantee that the scheduler can place those Pods.
+
+Common causes include:
+
+- Insufficient CPU or memory requests capacity.
+- Node affinity constraints.
+- Untolerated taints.
+- PVC provisioning or topology restrictions.
+- Namespace resource quotas.
+- Pod topology spread constraints.
+- Node autoscaler maximum capacity.
+- Cloud instance capacity or subnet IP shortages.
+
+Troubleshoot:
+
+```
+kubectl describe pod <pending-pod>
+kubectl get events -A --sort-by=.lastTimestamp
+kubectl get nodes -o wide
+```
+
+Interview point: HPA may be functioning correctly while node scheduling or capacity provisioning is failing.
+
+### 17. What are the differences between Kubernetes Cluster Autoscaler and Karpenter?
+
+Answer:
+
+| Cluster Autoscaler                                     | Karpenter                                                   |
+| ------------------------------------------------------ | ----------------------------------------------------------- |
+| Scales configured node groups                          | Can provision nodes directly based on workload requirements |
+| Commonly works with ASGs or managed node groups        | Uses NodePools and cloud-provider node definitions          |
+| Capacity selection depends on node group configuration | Flexible instance type selection                            |
+| Well established across clouds                         | Strong cloud-aware provisioning capabilities                |
+| Removes unneeded nodes                                 | Supports consolidation and disruption controls              |
+
+AWS example: Cluster Autoscaler commonly changes Auto Scaling Group capacity. Karpenter can select compatible EC2 instance types and provision nodes more directly.
+
+Interview point: Both address unschedulable Pods, but Karpenter offers more flexible node selection and consolidation in supported environments.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://karpenter.sh\&sz=32)
+
+Karpenter
+
++1
+
+
+
+### 18. How do you optimize autoscaling costs in Kubernetes?
+
+Answer:
+
+I would combine several techniques:
+
+- Set accurate resource requests.
+- Use HPA for demand-based replica scaling.
+- Use VPA recommendations to right-size requests.
+- Configure Karpenter or Cluster Autoscaler for node efficiency.
+- Use Spot instances for interruption-tolerant workloads.
+- Use On-Demand capacity for critical workloads where appropriate.
+- Configure sensible HPA minimums, maximums, and stabilization windows.
+- Use topology constraints and PDBs to preserve availability during consolidation.
+- Remove unused PVCs and other cloud resources after reviewing retention requirements.
+- Monitor costs by namespace, team, and workload.
+
+Interview point: Low CPU utilization alone does not mean nodes are wasteful. Memory, Pod requests, availability requirements, and workload placement also matter.
+
+## Section 2: Resource Requests, Limits, Quotas, and QoS (Questions 19–29)
+
+### 19. How do you configure resource requests and limits for Pods?
+
+Answer:
+
+Resource requests specify resources Kubernetes uses for scheduling and reservation accounting. Limits specify the maximum resources a container is permitted to use.
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+spec:
+  containers:
+    - name: nginx
+      image: nginx:stable
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "1000m"
+          memory: "1Gi"
+```
+
+Here:
+
+- CPU request: 0.5 vCPU
+- CPU limit: 1 vCPU
+- Memory request: 512 MiB
+- Memory limit: 1 GiB
+
+Interview point: CPU usage beyond a CPU limit is generally throttled; memory use beyond the enforced memory limit can result in an OOM kill.
+
+### 20. What happens when a Pod exceeds its memory limit?
+
+Answer:
+
+When a container exceeds its enforced memory limit under memory pressure, the Linux kernel may terminate it with an out-of-memory (OOM) kill.
+
+Common symptoms:
+
+```
+Reason: OOMKilled
+Exit Code: 137
+```
+
+Kubernetes may restart the container depending on the Pod's restart policy.
+
+Troubleshoot:
+
+```
+kubectl describe pod <pod-name>
+kubectl logs <pod-name> --previous
+kubectl top pod <pod-name> --containers
+```
+
+Interview point: A memory limit is not a performance target. Memory pressure can terminate a container instead of merely slowing it down.
+
+### 21. How do you troubleshoot a Pod experiencing memory constraints?
+
+Answer:
+
+My troubleshooting process would be:
+
+1. Run `kubectl describe pod` and check for `OOMKilled`.
+2. Inspect the previous container logs.
+3. Check current and historical memory metrics.
+4. Compare usage against requests and limits.
+5. Investigate memory leaks, caching, JVM heap configuration, or workload spikes.
+6. Adjust resource sizing if justified.
+7. Review node-level memory pressure and eviction events.
+
+Example:
+
+```
+kubectl top pod <pod-name> --containers
+kubectl describe node <node-name>
+kubectl logs <pod-name> --previous
+```
+
+Interview point: Increasing memory limits may temporarily help but does not fix an application memory leak.
+
+### 22. How do you limit resource consumption at the namespace level?
+
+Answer:
+
+Use `ResourceQuota` and `LimitRange`.
+
+`ResourceQuota` controls aggregate namespace consumption. `LimitRange` controls or defaults resource configurations for individual containers and Pods.
+
+Example ResourceQuota:
+
+```
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: development
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    pods: "30"
+    persistentvolumeclaims: "10"
+```
+
+Check:
+
+```
+kubectl describe resourcequota -n development
+```
+
+Interview point: ResourceQuota tracks Kubernetes resource requests, limits, and object counts. It does not directly measure all actual CPU or memory usage.
+
+### 23. How do you ensure different application teams do not exceed their resource quotas?
+
+Answer:
+
+I would create a namespace per team or workload boundary, then apply:
+
+- ResourceQuotas to limit total requests, limits, and object counts.
+- LimitRanges to enforce sensible container defaults and constraints.
+- RBAC to restrict team access.
+- Admission policies for additional validation.
+- Monitoring and alerts for quota consumption.
+
+Example:
+
+```
+kubectl get resourcequota -A
+kubectl describe quota team-quota -n team-a
+```
+
+Interview point: Quotas are enforced by the API server during admission of relevant resource changes. They do not act as hard real-time consumption caps for all workloads.
+
+### 24. What are the Kubernetes Quality of Service (QoS) classes?
+
+Answer:
+
+Kubernetes assigns three traditional QoS classes.
+
+| QoS        | Description                                                                         | Typical setup                                            |
+| ---------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Guaranteed | Strongest protection relative to other classes during node memory-pressure eviction | CPU and memory requests equal limits for every container |
+| Burstable  | Some resource requests configured but not meeting Guaranteed                        | Requests lower than limits                               |
+| BestEffort | No CPU or memory requests or limits                                                 | Neither specified                                        |
+
+Example Guaranteed:
+
+```
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+```
+
+Interview point: QoS affects eviction behavior under resource pressure. It does not guarantee that an application can never be evicted or fail.
+
+### 25. How does Kubernetes decide whether a Pod can be scheduled based on requests and limits?
+
+Answer:
+
+The scheduler primarily considers resource requests, not actual usage or normal container limits.
+
+Example:
+
+```
+Node allocatable CPU: 4 vCPU
+Already requested:   2 vCPU
+New Pod request:     1 vCPU
+```
+
+The Pod may fit, subject to all other scheduling constraints.
+
+Kubernetes considers:
+
+- Node allocatable resources.
+- Existing Pod resource requests.
+- Pod overhead and relevant scheduling accounting.
+- Node selectors, affinity, taints, topology, and storage constraints.
+
+Interview point: A Pod may be Pending even when `kubectl top nodes` shows low actual usage, because the node's remaining schedulable resources are calculated from requests.
+
+### 26. A node has 8 vCPUs and 32 GB RAM. If each Pod requests 2 vCPUs and 10 GB RAM, how many Pods can be scheduled?
+
+Answer:
+
+Compute both constraints:
+
+- CPU: 8 ÷ 2 = 4 Pods.
+- Memory: 32 ÷ 10 = 3.2 Pods.
+
+CPU capacity
+
+# 4 Pods
+
+8 vCPU ÷ 2 vCPU
+
+Memory capacity
+
+# 3 Pods
+
+32 GB ÷ 10 GB
+
+Answer: 3 Pods, assuming the stated resources are fully allocatable and no existing requests or other constraints apply.
+
+In a real cluster, the number might be lower because some node capacity is reserved for Kubernetes and system processes.
+
+### 27. If an AKS cluster has 32 GB of memory with 30 GB utilized, can a Pod requesting 500 MB with a 4 GiB limit be scheduled?
+
+Answer:
+
+Possibly yes. Kubernetes scheduling is based primarily on the Pod's 500 MB memory request, not its 4 GiB limit or the current total memory usage.
+
+The scheduler checks whether an individual eligible node has enough unallocated requested memory capacity.
+
+Even with 30 GB actual usage, the Pod could be scheduled if a node has adequate remaining allocatable request capacity.
+
+However, the Pod may later experience memory pressure if it consumes considerably more than its request.
+
+Interview point: Cluster-wide free memory is not enough to determine scheduling. You need node-level allocatable capacity and existing requests.
+
+### 28. How do you prevent critical workloads from being affected by resource-intensive applications?
+
+Answer:
+
+Use a combination of workload isolation and resource management:
+
+- Resource requests and limits.
+- PriorityClasses for critical workloads.
+- Taints and tolerations for dedicated nodes.
+- Node affinity and node pools.
+- ResourceQuotas and LimitRanges.
+- PodDisruptionBudgets.
+- HPA and node autoscaling.
+- Topology spread constraints and monitoring.
+
+Interview point: Critical application Pods can run on dedicated node pools with appropriate scheduling restrictions, while less critical workloads use separate pools.
+
+### 29. How do you optimize Kubernetes deployment configurations?
+
+Answer:
+
+I would review these areas:
+
+| Area                | Optimization                                                  |
+| ------------------- | ------------------------------------------------------------- |
+| Resource efficiency | Right-size CPU and memory requests                            |
+| Scalability         | Configure HPA and node autoscaling                            |
+| Availability        | Multiple replicas and topology spreading                      |
+| Updates             | Rolling update strategy                                       |
+| Health              | Readiness, liveness, and startup probes                       |
+| Security            | Non-root containers, restricted capabilities, least privilege |
+| Reliability         | PDBs and graceful termination                                 |
+| Storage             | Appropriate access modes and StorageClasses                   |
+| Observability       | Metrics, logs, traces, alerts                                 |
+| Cost                | Efficient node types and consolidation                        |
+
+Interview point: A good Deployment balances availability, performance, security, and cost instead of optimizing only replica count.
+
+## Section 3: Availability and Scheduling Constraints (Questions 30–42)
+
+### 30. What is a PodDisruptionBudget (PDB)?
+
+Answer:
+
+A PodDisruptionBudget limits how many matching Pods can be voluntarily disrupted at once through the Kubernetes eviction mechanism.
+
+It is useful during node draining, maintenance, and compatible autoscaler operations.
+
+Example:
+
+```
+Application replicas: 5
+PDB minAvailable: 4
+
+At most 1 healthy Pod can be voluntarily
+evicted at a time while 4 remain healthy.
+```
+
+Interview point: PDBs do not prevent involuntary failures such as node crashes, and they do not guarantee protection against direct Pod deletion or all rollout mechanisms.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://kubernetes.io\&sz=32)
+
+Kubernetes
+
+
+
+### 31. How do you configure PDBs for critical applications?
+
+Answer:
+
+Create a PDB selecting the application's Pods:
+
+```
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: payment
+```
+
+For a three-replica application, this allows voluntary evictions only while the minimum two healthy Pods can remain available.
+
+Check:
+
+```
+kubectl get pdb
+kubectl describe pdb payment-pdb
+```
+
+Interview point: Choose a PDB that protects availability without blocking node maintenance indefinitely. For example, `minAvailable: 3` on a three-replica application can block voluntary evictions.
+
+### 32. What is node affinity and anti-affinity?
+
+Answer:
+
+Node affinity selects nodes based on their labels and supports expressive matching rules.
+
+Node anti-affinity is not a separate Kubernetes API field; exclusion is expressed using node affinity operators such as `NotIn` or `DoesNotExist`.
+
+Example:
+
+```
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node.kubernetes.io/instance-type
+              operator: In
+              values:
+                - m5.large
+                - m5.xlarge
+```
+
+This restricts initial scheduling to matching nodes.
+
+Interview point: `requiredDuringSchedulingIgnoredDuringExecution` is a hard scheduling requirement, but subsequent label changes do not automatically evict existing Pods.
+
+### 33. What is Pod affinity and anti-affinity?
+
+Answer:
+
+Pod affinity places Pods near other Pods matching specified labels.
+
+Pod anti-affinity helps separate Pods from matching workloads.
+
+Examples:
+
+- Place frontend Pods near backend Pods to reduce network latency.
+- Spread database replicas across different nodes to reduce correlated failures.
+
+Pod anti-affinity example:
+
+```
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: payment
+        topologyKey: kubernetes.io/hostname
+```
+
+This prevents matching payment Pods from being placed on the same hostname topology domain, subject to the full Pod specification and existing placements.
+
+### 34. What is the difference between nodeSelector, node affinity, and taints and tolerations?
+
+| Mechanism      | Purpose                                                     |
+| -------------- | ----------------------------------------------------------- |
+| `nodeSelector` | Simple, exact-match node selection                          |
+| Node affinity  | Flexible node selection using operators and hard/soft rules |
+| Taints         | Repel Pods from nodes unless tolerated                      |
+| Tolerations    | Allow Pods to use matching tainted nodes                    |
+
+Interview point: A toleration permits scheduling onto a tainted node, but does not force the scheduler to choose it.
+
+### 35. What are taints and tolerations in Kubernetes?
+
+Answer:
+
+Taints are applied to nodes to restrict Pod placement. Tolerations are configured in Pods to permit matching taints.
+
+Example taint:
+
+```
+kubectl taint nodes worker-1 \
+  dedicated=database:NoSchedule
+```
+
+Corresponding toleration:
+
+```
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: database
+    effect: NoSchedule
+```
+
+Common effects:
+
+- `NoSchedule`: Prevents new Pods without matching tolerations.
+- `PreferNoSchedule`: Soft preference against scheduling.
+- `NoExecute`: Can also evict running Pods without appropriate tolerations.
+
+### 36. Why are taints applied to worker nodes?
+
+Answer:
+
+Taints are commonly used to:
+
+- Reserve dedicated nodes for databases.
+- Separate GPU workloads.
+- Protect critical workloads.
+- Isolate specialized hardware.
+- Prevent placement on unavailable or unhealthy nodes.
+
+Interview point: Nodes may also receive condition-related taints from Kubernetes, such as for memory pressure or node unavailability.
+
+### 37. How do you schedule Pods on a specific node?
+
+Answer:
+
+The recommended approach is to label the node and use `nodeSelector` or node affinity.
+
+```
+kubectl label node worker-1 workload=database
+```
+
+Pod configuration:
+
+```
+spec:
+  nodeSelector:
+    workload: database
+  containers:
+    - name: database
+      image: postgres:16
+```
+
+You can set `spec.nodeName` to bypass normal scheduler selection, but that is generally not recommended for production workload placement.
+
+### 38. How do you prevent a Pod from being scheduled on a particular node?
+
+Answer:
+
+Use node affinity with `NotIn`, or taint the node where appropriate.
+
+Example excluding `worker-3`:
+
+```
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: NotIn
+              values:
+                - worker-3
+```
+
+Interview point: Exclusion rules should be carefully designed so eligible nodes remain available.
+
+### 39. How do you schedule an application only on large and medium-sized nodes, excluding small nodes?
+
+Answer:
+
+Label nodes by size:
+
+```
+kubectl label node node-a size=medium
+kubectl label node node-b size=large
+kubectl label node node-c size=small
+```
+
+Use node affinity:
+
+```
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: size
+              operator: In
+              values:
+                - medium
+                - large
+```
+
+This selects medium or large nodes and excludes small nodes.
+
+### 40. How do you schedule a stateful application on a particular worker node?
+
+Answer:
+
+For strict placement, use node affinity with node labels.
+
+However, for EBS-backed stateful workloads, it is often safer to constrain placement by Availability Zone rather than one particular node.
+
+Example:
+
+```
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                - ap-south-1a
+```
+
+This allows replacement nodes in the same AZ to host the Pod.
+
+Interview point: Binding a database to one specific node can make recovery harder if that node fails.
+
+### 41. How do you configure dependencies between two Pods?
+
+Answer:
+
+Kubernetes does not provide a general native mechanism guaranteeing startup order across independent Pods.
+
+Recommended approaches include:
+
+- Use Services for stable discovery.
+- Configure readiness probes so dependencies receive traffic only when ready.
+- Use init containers when startup must wait for an external dependency.
+- Implement application retry and exponential backoff.
+- Use Jobs for one-time initialization tasks.
+- Use Operators when advanced orchestration is required.
+
+Interview point: Do not rely solely on startup order. Applications should tolerate temporary dependency unavailability.
+
+### 42. What is the role of Kubernetes scheduling constraints?
+
+Answer:
+
+Scheduling constraints control which nodes can host particular Pods.
+
+They can enforce:
+
+- CPU and memory availability.
+- Node label requirements.
+- Taint toleration requirements.
+- Workload co-location or separation.
+- Availability-zone distribution.
+- Storage topology requirements.
+- Pod topology spread limits.
+
+Interview point: Hard constraints improve placement control but can create Pending Pods if no eligible node satisfies all requirements.
+
+## Section 4: Security Context and Kubernetes Probes (Questions 43–50)
+
+### 43. What happens if a Pod's securityContext specifies `runAsNonRoot: true` and `runAsUser: 0`?
+
+Answer:
+
+The configuration is contradictory:
+
+- `runAsNonRoot: true` requires the container to run with a non-root user.
+- `runAsUser: 0` explicitly specifies the root user.
+
+Example:
+
+```
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 0
+```
+
+Kubelet will refuse to start the affected container because the configured UID is root, and the Pod may show a container configuration error.
+
+Correct example:
+
+```
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+```
+
+Interview point: `runAsNonRoot` provides a runtime safeguard against accidentally running containers as root.
+
+### 44. How do you create a Pod with a readiness probe that checks for the existence of `/tmp/ready`?
+
+Answer:
+
+Use an `exec` readiness probe with the shell `test` command.
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: readiness-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:stable
+      command:
+        - sh
+        - -c
+        - sleep 3600
+      readinessProbe:
+        exec:
+          command:
+            - sh
+            - -c
+            - test -f /tmp/ready
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        failureThreshold: 3
+```
+
+Apply:
+
+```
+kubectl apply -f readiness.yaml
+```
+
+Initially, the container is running but not Ready because `/tmp/ready` does not exist.
+
+Create the file:
+
+```
+kubectl exec readiness-demo -- touch /tmp/ready
+```
+
+Check:
+
+```
+kubectl get pod readiness-demo
+```
+
+Once the probe succeeds, the Pod can become Ready.
+
+Interview point: A failed readiness probe prevents the Pod from being considered a ready Service endpoint. It does not restart the container.
+
+### 45. What is the difference between liveness, readiness, and startup probes?
+
+Answer:
+
+| Probe     | Question it answers                                  | Failure behavior                                               |
+| --------- | ---------------------------------------------------- | -------------------------------------------------------------- |
+| Liveness  | Is the container healthy enough to continue running? | Restarts the container after the failure threshold             |
+| Readiness | Can the application serve traffic?                   | Marks the Pod/container not ready                              |
+| Startup   | Has the application started successfully?            | Restarts the container if startup failure threshold is reached |
+
+How Kubernetes health probes work
+
+Container starts
+
+Startup Probe
+
+Waits for application startup to succeed
+
+Liveness
+
+Repeated failure → restart container
+
+Readiness
+
+Failure → remove from ready endpoints
+
+Interview point: When a startup probe is configured, Kubernetes delays liveness and readiness probing until startup succeeds.
+
+### 46. What types of checks can Kubernetes probes perform?
+
+Answer:
+
+Kubernetes supports these probe mechanisms:
+
+| Probe mechanism | Description                                        |
+| --------------- | -------------------------------------------------- |
+| `httpGet`       | Sends an HTTP request and checks the response      |
+| `tcpSocket`     | Checks whether a TCP connection can be established |
+| `exec`          | Executes a command inside the container            |
+| `grpc`          | Uses the gRPC health checking protocol             |
+
+Example HTTP check:
+
+```
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
+
+Interview point: Choose a probe mechanism appropriate for the application. An open TCP port does not necessarily mean the application is fully ready.
+
+### 47. What is the difference between liveness and readiness probes?
+
+Answer:
+
+A liveness probe checks whether the container needs to be restarted.
+
+A readiness probe checks whether the application is currently able to handle traffic.
+
+Scenario: Database dependency becomes temporarily unavailable.
+
+- A readiness probe may fail to stop new traffic reaching the affected Pod.
+- A liveness probe should generally not fail solely because a temporary external dependency is unavailable.
+
+Otherwise, a database outage could cause many application containers to restart unnecessarily.
+
+Interview point: Liveness should detect an unrecoverable or stuck application state. Readiness should detect temporary inability to serve requests.
+
+### 48. How do you configure Kubernetes probes?
+
+Answer:
+
+The following Deployment configures startup, readiness, and liveness probes:
+
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: example/api:1.0
+          ports:
+            - containerPort: 8080
+
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 30
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+```
+
+The application must implement the specified endpoints. Replace the example container image with the real image.
+
+Interview point: The startup probe provides extra time for slow application startup without prematurely triggering liveness restarts.
+
+### 49. How do you troubleshoot a failing liveness or readiness probe?
+
+Answer:
+
+Start with:
+
+```
+kubectl describe pod <pod-name>
+kubectl logs <pod-name>
+kubectl logs <pod-name> --previous
+```
+
+Inspect the configured probe:
+
+```
+kubectl get pod <pod-name> -o yaml
+```
+
+Common causes:
+
+- Incorrect probe path.
+- Wrong container port.
+- Application starts slowly.
+- Dependency failures.
+- CPU throttling or memory pressure.
+- Probe timeouts too short.
+- TLS or authentication problems.
+- Application listening on an unexpected interface.
+
+Test the endpoint from inside the container if the relevant tools are installed:
+
+```
+kubectl exec <pod-name> -- \
+  curl -v http://127.0.0.1:8080/health/ready
+```
+
+Interview point: A failing probe is a symptom. Fix the underlying application or configuration issue rather than simply increasing timeouts without investigation.
+
+### 50. What happens when a Pod's liveness probe fails?
+
+Answer:
+
+When a liveness probe fails the configured number of consecutive times, kubelet treats the container as unhealthy and restarts it according to the container lifecycle and restart policy.
+
+Sequence:
+
+1. Kubelet performs the liveness check.
+2. The check fails repeatedly until `failureThreshold` is reached.
+3. Kubelet terminates the unhealthy container.
+4. The container is restarted when permitted by the restart policy.
+5. Repeated failures can cause a `CrashLoopBackOff` state or restart backoff behavior.
+
+Important: The liveness probe normally restarts the affected container, not the entire Pod. A Pod containing multiple containers may therefore continue running other containers.
+
+Interview point: A liveness failure does not automatically cause a Deployment to create an entirely new Pod. Kubelet normally restarts the failed container within the existing Pod.
+
+## Quick Revision: Key Kubernetes Concepts
+
+| Concept            | Remember                                          |
+| ------------------ | ------------------------------------------------- |
+| HPA                | Changes Pod replica count                         |
+| VPA                | Recommends or adjusts container resource requests |
+| Cluster Autoscaler | Scales node group capacity                        |
+| Karpenter          | Provisions and consolidates nodes                 |
+| Resource request   | Primary input to resource-based scheduling        |
+| CPU limit          | Can cause CPU throttling                          |
+| Memory limit       | Can result in OOM kills                           |
+| ResourceQuota      | Restricts aggregate namespace resources           |
+| LimitRange         | Controls resource defaults and constraints        |
+| Guaranteed QoS     | CPU and memory requests equal limits              |
+| PDB                | Limits voluntary disruption                       |
+| Node affinity      | Selects nodes using labels                        |
+| Pod anti-affinity  | Helps separate matching Pods                      |
+| Taints             | Restrict node placement                           |
+| Tolerations        | Permit placement on tainted nodes                 |
+| Readiness probe    | Controls readiness for Service traffic            |
+| Liveness probe     | Restarts unhealthy containers                     |
+| Startup probe      | Protects slow-starting applications               |
+
+## Practical Interview Quiz
+
+Scenario practice
+
+Question 1 of 5
+
+A node has low actual CPU usage, but a new Pod is Pending. What is a likely reason?
+
+CoreDNS must be restarted
+
+Existing CPU requests consume available allocatable capacity
+
+HPA is disabled
+
+The Pod has no container image
+
+PreviousNext&#x20;
+
+Interview preparation priority: Practice questions 4, 9, 11, 15–17, 20, 25–28, 30–35, and 43–50 especially carefully. They test practical Kubernetes behavior, not just definitions, and are particularly useful preparation for production DevOps, EKS, and AKS troubleshooting interviews.
