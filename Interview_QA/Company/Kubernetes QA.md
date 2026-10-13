@@ -2034,3 +2034,1690 @@ CoreDNS
 PreviousNext&#x20;
 
 Interview preparation tip: For AWS EKS roles, give extra attention to questions 13–15 and 17–25. Be ready to explain AWS VPC CNI IP allocation, the difference between EBS and EFS, why an EBS PVC might remain Pending, and how StatefulSets provide dedicated persistent storage to each database replica.
+
+
+# Kubernetes Interview Questions and Answers (51–100)
+
+Advanced DevOps and AWS EKS Interview Preparation
+
+These 50 questions cover real-world Kubernetes scenarios involving persistent storage, application deployments, networking, Ingress, security, and service mesh.
+
+The answers are written so you can explain each concept confidently in an interview, with practical commands and YAML examples.
+
+## Section 1: StatefulSets, PVCs, EBS, EFS, and Application Data
+
+### 1. Why do we need StatefulSets when a Deployment can also use PVCs?
+
+Answer:
+
+Although both Deployments and StatefulSets can use PersistentVolumeClaims, StatefulSets provide stable identity and persistent storage management for each replica.
+
+| Deployment                                 | StatefulSet                                   |
+| ------------------------------------------ | --------------------------------------------- |
+| Pods are interchangeable                   | Each Pod has a stable identity                |
+| Replicas may reference the same PVC        | Can create dedicated PVCs per replica         |
+| Pods have generated names                  | Pods have predictable names like `mysql-0`    |
+| Designed primarily for stateless workloads | Designed for stateful workloads               |
+| No built-in ordered startup requirement    | Supports ordered Pod creation and termination |
+
+Real-world example:
+
+If we deploy MongoDB with three replicas using a StatefulSet:
+
+```
+mongo-0 → pvc-mongo-0 → EBS Volume 1
+mongo-1 → pvc-mongo-1 → EBS Volume 2
+mongo-2 → pvc-mongo-2 → EBS Volume 3
+```
+
+Each database Pod has its own persistent storage.
+
+Interview point: StatefulSets are recommended for databases because they provide stable identities and per-replica storage, but database replication and failover require additional configuration or an Operator.
+
+### 2. What happens when a Deployment sharing one PVC is scaled from one replica to three replicas?
+
+Answer:
+
+It depends on the PVC's access mode, storage backend, and where Kubernetes schedules the three Pods.
+
+Consider a Deployment using a single AWS EBS PVC with `ReadWriteOnce`.
+
+One EBS PVC shared by three replicas
+
+Pod 1
+
+Pod 2
+
+Pod 3
+
+Single PVC (ReadWriteOnce)
+
+AWS EBS Volume
+
+Normally attached to one EC2 node
+
+Scenario A: All three Pods run on the same node
+
+They may be able to mount the same RWO volume. However, simultaneous writes could corrupt application data if the application isn't designed for shared filesystem access.
+
+Scenario B: Pods run on different nodes
+
+With a standard EBS volume, only the node holding the volume attachment can mount it. Other Pods may remain in `ContainerCreating` or experience `Multi-Attach` errors.
+
+Solution: Use a StatefulSet with individual PVCs for database replicas, or use EFS when multiple Pods need shared filesystem storage.
+
+Interview point: `ReadWriteOnce` means a volume can be mounted read-write by one node, not necessarily one Pod.
+
+### 3. Can multiple Pods on the same node share an EBS volume?
+
+Answer:
+
+Yes. Multiple Pods running on the same node can generally mount the same EBS-backed `ReadWriteOnce` PVC, provided the filesystem and application usage are compatible.
+
+Example:
+
+```
+EC2 Worker Node
+  ├── Pod A ──┐
+  ├── Pod B ──┼── PVC → EBS
+  └── Pod C ──┘
+```
+
+However, this does not guarantee safe concurrent file writes.
+
+For exclusive mounting by a single Pod, use `ReadWriteOncePod` with a compatible CSI driver.
+
+Advanced interview point: Supported EBS `io2` Multi-Attach configurations are a specialized exception for multi-node attachment, requiring block mode and application-level coordination. They are not a general replacement for EFS.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
++1
+
+
+
+### 4. How would you implement shared storage across multiple Pods running on different EKS nodes?
+
+Answer:
+
+For general shared filesystem access, I would use Amazon EFS with the EFS CSI driver.
+
+Implementation steps:
+
+1. Create an Amazon EFS filesystem.
+2. Configure mount targets in the appropriate VPC subnets/AZs.
+3. Allow NFS port 2049 through the required security groups.
+4. Install and configure the EFS CSI driver.
+5. Create a StorageClass using `efs.csi.aws.com`.
+6. Create a PVC with `ReadWriteMany`.
+7. Mount the same PVC into multiple Pods.
+
+Example PVC:
+
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-data
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+Interview point: EFS supports shared filesystem access across nodes. Ensure application-level concurrency safety, EFS permissions, and appropriate access-point configuration.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://docs.aws.amazon.com\&sz=32)
+
+Amazon EKS
+
+
+
+### 5. What happens to data when a database Pod goes down?
+
+Answer:
+
+The result depends on where the database stores its data.
+
+| Storage type                | What happens when the Pod fails?                                     |
+| --------------------------- | -------------------------------------------------------------------- |
+| Container writable layer    | Data in the failed container can be lost when it is replaced         |
+| `emptyDir`                  | Survives container restarts within the same Pod, but not Pod removal |
+| EBS-backed PVC              | Data remains on the persistent volume                                |
+| EFS-backed PVC              | Data remains in the shared file system                               |
+| Externally managed database | Data remains in the external database                                |
+
+With an EBS-backed PVC, a replacement Pod can reattach and mount the volume on a compatible node in the correct Availability Zone.
+
+Important: Storage persistence does not guarantee database availability. Database recovery may still require crash recovery, transaction log replay, replication, or failover.
+
+### 6. What happens to sticky session data when a Pod goes down?
+
+Answer:
+
+Sticky sessions direct requests from a particular user to the same backend Pod.
+
+If that Pod fails, any session state stored only in that Pod's memory may be lost.
+
+The traffic router can direct subsequent requests to another healthy Pod, but that Pod may not have the previous session data.
+
+Recommended solution:
+
+Store session data in an external shared store such as Redis, rather than relying on Pod-local memory.
+
+```
+User → Ingress → Pod A
+                   ↓
+                Redis
+                   ↑
+User → Ingress → Pod B
+```
+
+If Pod A fails, Pod B can retrieve the user's session state from Redis.
+
+Interview point: Session affinity does not provide session persistence. Externalized session storage is more resilient.
+
+### 7. What is the difference between stateful and stateless applications?
+
+| Stateful Application                | Stateless Application                                  |
+| ----------------------------------- | ------------------------------------------------------ |
+| Maintains durable application state | Does not rely on local instance state between requests |
+| Often needs persistent storage      | Can often use ephemeral containers                     |
+| Replica identity may matter         | Replicas are generally interchangeable                 |
+| Recovery can involve stored data    | Failed Pods can usually be replaced easily             |
+| Example: MongoDB                    | Example: REST API                                      |
+
+Interview point: A stateless application can still read and write data. The important distinction is that the individual application instance does not need to retain that data locally between requests.
+
+### 8. How do you manage data for stateless applications?
+
+Answer:
+
+Stateless applications typically store durable data outside their own Pods.
+
+Common patterns include:
+
+- Amazon RDS or DynamoDB for persistent application data.
+- Redis for sessions or caching.
+- Amazon S3 for uploaded files and objects.
+- EFS where a shared filesystem is necessary.
+- Secrets Manager or Kubernetes Secrets for credentials.
+- ConfigMaps for non-sensitive application configuration.
+
+Real-world example: A Spring Boot API runs as three interchangeable Pods, stores business data in RDS, and stores user sessions in Redis.
+
+If one Pod fails, another Pod can serve the user without depending on the failed Pod's local data.
+
+### 9. How do you deploy MongoDB in an EKS cluster?
+
+Answer:
+
+For a production MongoDB deployment, I would generally use a supported MongoDB Operator, a validated Helm-based deployment, or a managed database service such as MongoDB Atlas, depending on requirements.
+
+For self-managed MongoDB on EKS:
+
+1. Create an EKS cluster with suitable EC2 worker nodes.
+2. Install the EBS CSI driver with appropriate IAM permissions.
+3. Create a `gp3` StorageClass using `WaitForFirstConsumer`.
+4. Install the MongoDB Operator.
+5. Configure a MongoDB replica set with three members.
+6. Provision separate PVCs for each member.
+7. Enable authentication, TLS, backups, monitoring, and suitable Pod distribution.
+8. Configure internal Services for MongoDB member discovery.
+
+Example conceptual architecture:
+
+```
+MongoDB Replica Set
+├── mongo-0 → EBS PVC 1
+├── mongo-1 → EBS PVC 2
+└── mongo-2 → EBS PVC 3
+```
+
+With proper replica set configuration, the database can elect a new primary if the current primary fails and a voting majority remains available.
+
+Interview point: A StatefulSet alone does not configure a MongoDB replica set. Use an Operator or implement replication, authentication, lifecycle, and recovery configuration separately.
+
+### 10. What storage limitations exist when using EBS volumes in EKS?
+
+Answer:
+
+Important limitations include:
+
+1. Availability Zone restriction: An EBS volume must normally be attached to an EC2 node in its own AZ.
+2. Attachment restrictions: Standard filesystem volumes cannot be mounted read-write across multiple nodes simultaneously.
+3. Volume attachment limits: EC2 instance types have limits on attached EBS volumes.
+4. Scheduling constraints: Pods can remain Pending if no suitable node can use the required volume.
+5. Fargate restrictions: EBS volumes cannot be mounted to EKS Fargate Pods.
+6. Performance limits: IOPS and throughput depend on volume configuration and underlying EC2 limits.
+
+Recommended practice is to use `WaitForFirstConsumer`, appropriate topology constraints, and separate PVCs for independent stateful replicas.
+
+Interview point: EKS Auto Mode uses the `ebs.csi.eks.amazonaws.com` provisioner, while the standard EBS CSI driver uses `ebs.csi.aws.com`.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://docs.aws.amazon.com\&sz=32)
+
+Amazon EKS
+
+
+
+## Section 2: Deployments, YAML, and kubectl
+
+### 11. How do you deploy an application in Kubernetes?
+
+Answer:
+
+A typical application deployment process is:
+
+1. Build the application's container image.
+2. Push the image to Amazon ECR, Docker Hub, or another registry.
+3. Create a Kubernetes Deployment manifest.
+4. Configure a Service to expose the application.
+5. Apply the manifests using `kubectl`.
+6. Verify the rollout, Pods, logs, and connectivity.
+
+Example:
+
+```
+kubectl create deployment nginx-app \
+  --image=nginx:stable \
+  --replicas=3
+
+kubectl expose deployment nginx-app \
+  --port=80 \
+  --type=ClusterIP
+
+kubectl rollout status deployment/nginx-app
+```
+
+Interview point: In production, use declarative YAML, Helm, Kustomize, or GitOps to make deployments reproducible.
+
+### 12. How do you write Kubernetes Deployment YAML files?
+
+Answer:
+
+A Deployment YAML file defines the application name, desired replica count, Pod selector, Pod template, and container configuration.
+
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:stable
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              memory: "256Mi"
+```
+
+Deploy:
+
+```
+kubectl apply -f deployment.yaml
+kubectl get deployments
+kubectl get pods
+```
+
+Interview point: The labels in `spec.selector.matchLabels` must match those in `spec.template.metadata.labels`.
+
+### 13. Explain the different fields in a Kubernetes Deployment YAML file.
+
+| Field                           | Purpose                                   |
+| ------------------------------- | ----------------------------------------- |
+| `apiVersion`                    | API version, normally `apps/v1`           |
+| `kind`                          | Resource type, `Deployment`               |
+| `metadata.name`                 | Deployment name                           |
+| `metadata.namespace`            | Target namespace                          |
+| `spec.replicas`                 | Desired number of Pods                    |
+| `spec.selector`                 | Identifies Pods managed by the Deployment |
+| `spec.template`                 | Defines the Pod template                  |
+| `spec.template.metadata.labels` | Labels assigned to Pods                   |
+| `spec.template.spec.containers` | Application container definitions         |
+| `image`                         | Container image                           |
+| `ports.containerPort`           | Declares an application container port    |
+| `resources.requests`            | CPU/memory used for scheduling            |
+| `resources.limits`              | Configured resource limits                |
+| `env`                           | Environment variables                     |
+| `volumeMounts`                  | Container filesystem mounts               |
+| `volumes`                       | Pod-level volume definitions              |
+| `strategy`                      | Deployment update strategy                |
+
+Interview point: `containerPort` is metadata about the container's intended port; it does not automatically expose the application outside the Pod.
+
+### 14. How do you deploy an Apache HTTPD container with three replicas?
+
+Answer:
+
+Create a Deployment:
+
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apache
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: apache
+  template:
+    metadata:
+      labels:
+        app: apache
+    spec:
+      containers:
+        - name: httpd
+          image: httpd:2.4
+          ports:
+            - containerPort: 80
+```
+
+Apply:
+
+```
+kubectl apply -f apache.yaml
+```
+
+Expose internally:
+
+```
+kubectl expose deployment apache \
+  --name=apache-service \
+  --port=80 \
+  --target-port=80
+```
+
+Verify:
+
+```
+kubectl get deployment apache
+kubectl get pods -l app=apache
+kubectl get svc apache-service
+```
+
+Interview point: The Deployment maintains three replicas and replaces failed Pods to restore the desired count.
+
+### 15. How do you deploy a Tomcat application on every Kubernetes worker node?
+
+Answer:
+
+Use a DaemonSet, because it ensures one Pod runs on each eligible node.
+
+```
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tomcat-daemon
+spec:
+  selector:
+    matchLabels:
+      app: tomcat
+  template:
+    metadata:
+      labels:
+        app: tomcat
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: tomcat
+          image: tomcat:10.1
+          ports:
+            - containerPort: 8080
+```
+
+This targets eligible Linux nodes. To target only worker nodes, apply a dedicated worker label and add it to `nodeSelector` or node affinity, rather than assuming every Linux node is a worker.
+
+Interview point: A DaemonSet is technically appropriate for one Pod per node, although ordinary Tomcat web applications are normally better deployed using Deployments.
+
+### 16. How do you deploy multiple Pods across all worker nodes?
+
+Answer:
+
+There are two different requirements:
+
+One Pod on every worker node: Use a DaemonSet.
+
+Multiple application replicas distributed among worker nodes: Use a Deployment with topology spread constraints or Pod anti-affinity.
+
+Example Deployment distribution constraint:
+
+```
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: web
+      containers:
+        - name: nginx
+          image: nginx:stable
+```
+
+This encourages even distribution across eligible nodes. It does not guarantee coverage of every worker node.
+
+### 17. What happens internally when you run `kubectl apply`?
+
+Answer:
+
+When we execute:
+
+```
+kubectl apply -f deployment.yaml
+```
+
+Kubernetes performs the following general sequence:
+
+kubectl
+
+Reads manifest and sends API request
+
+kube-apiserver
+
+Authenticates, authorizes, validates and admits request
+
+etcd
+
+Persists the updated cluster state
+
+Deployment Controller
+
+Reconciles Deployment and ReplicaSet
+
+ReplicaSet Controller
+
+Creates the required Pod objects
+
+Scheduler
+
+Assigns unscheduled Pods to nodes
+
+kubelet
+
+Starts containers through the runtime
+
+CNI / CSI
+
+Configures required networking and storage
+
+The exact API operation depends on client-side versus server-side apply, existing objects, and field ownership.
+
+Interview point: `kubectl apply` submits the desired configuration; the API server and Kubernetes controllers then reconcile the cluster toward that state. The command does not directly start containers.
+
+### 18. What are the commonly used kubectl commands?
+
+| Command                                 | Purpose                    |
+| --------------------------------------- | -------------------------- |
+| `kubectl get pods -A`                   | List all Pods              |
+| `kubectl get nodes -o wide`             | List nodes                 |
+| `kubectl describe pod POD`              | Inspect Pod details/events |
+| `kubectl logs POD`                      | View container logs        |
+| `kubectl exec -it POD -- sh`            | Execute shell in container |
+| `kubectl apply -f file.yaml`            | Apply manifest             |
+| `kubectl delete -f file.yaml`           | Delete manifest resources  |
+| `kubectl get svc -A`                    | List Services              |
+| `kubectl get ingress -A`                | List Ingress resources     |
+| `kubectl rollout status deploy/APP`     | Check rollout              |
+| `kubectl rollout undo deploy/APP`       | Roll back Deployment       |
+| `kubectl scale deploy APP --replicas=3` | Change replicas            |
+| `kubectl top pods`                      | Display Pod resource usage |
+| `kubectl get events -A`                 | List events                |
+| `kubectl config get-contexts`           | List contexts              |
+| `kubectl auth can-i create pods`        | Check API permission       |
+
+### 19. How do you list Pods running on specific nodes?
+
+Answer:
+
+List Pods and their nodes:
+
+```
+kubectl get pods -A -o wide
+```
+
+List Pods on a particular node:
+
+```
+kubectl get pods -A \
+  --field-selector spec.nodeName=worker-node-1
+```
+
+Find a Pod's assigned node:
+
+```
+kubectl get pod nginx-pod \
+  -o jsonpath='{.spec.nodeName}'
+```
+
+Interview point: The `spec.nodeName` field identifies the node where a Pod is assigned.
+
+### 20. How do you log in to a Pod using kubectl?
+
+Answer:
+
+Use `kubectl exec` to execute a shell inside a running container:
+
+```
+kubectl exec -it nginx-pod -- /bin/sh
+```
+
+If Bash is available:
+
+```
+kubectl exec -it nginx-pod -- /bin/bash
+```
+
+For a multi-container Pod:
+
+```
+kubectl exec -it nginx-pod \
+  -c nginx -- /bin/sh
+```
+
+For containers without shell utilities, `kubectl debug` can be useful when permissions and cluster features allow it.
+
+Interview point: `kubectl exec` does not perform an SSH login. It starts a process inside a container.
+
+### 21. How do you switch between Kubernetes clusters using kubectl?
+
+Answer:
+
+Use Kubernetes contexts configured in your kubeconfig file.
+
+List contexts:
+
+```
+kubectl config get-contexts
+```
+
+Display the current context:
+
+```
+kubectl config current-context
+```
+
+Switch contexts:
+
+```
+kubectl config use-context production-cluster
+```
+
+For EKS, create or update a kubeconfig context:
+
+```
+aws eks update-kubeconfig \
+  --region ap-south-1 \
+  --name production-eks
+```
+
+Interview point: Always verify your current context and namespace before modifying a production cluster.
+
+### 22. What is a Kubernetes context?
+
+Answer:
+
+A Kubernetes context is a named combination of:
+
+- A cluster connection configuration.
+- A user or authentication configuration.
+- An optional default namespace.
+
+Kubernetes contexts are normally stored in kubeconfig.
+
+Example:
+
+```
+kubectl config get-contexts
+```
+
+Set the namespace for the current context:
+
+```
+kubectl config set-context --current \
+  --namespace=production
+```
+
+Interview point: A context helps switch environments, but it does not itself grant permissions. Permissions are enforced by the target cluster.
+
+### 23. How do you access a private Kubernetes cluster using kubectl?
+
+Answer:
+
+For a private EKS API endpoint, the machine running `kubectl` must have network connectivity to the private API endpoint and valid Kubernetes authentication/authorization.
+
+Common solutions include:
+
+- Connecting through a VPN.
+- Using AWS Direct Connect.
+- Running `kubectl` on an authorized EC2 administration host.
+- Using an SSM-managed host inside the connected VPC.
+- Using a secured network path through peering or a transit gateway.
+
+Example:
+
+```
+aws eks update-kubeconfig \
+  --region ap-south-1 \
+  --name private-eks
+
+kubectl get nodes
+```
+
+Interview point: Updating kubeconfig is insufficient without network routing, DNS resolution, security rules, AWS identity permissions, and Kubernetes authorization.
+
+## Section 3: Services, Ingress, Gateway API, and Traffic Flow
+
+### 24. How do you configure Services and Ingress for microservices?
+
+Answer:
+
+A typical microservices design uses one ClusterIP Service per microservice and an Ingress or Gateway to route external HTTP requests.
+
+Example:
+
+```
+api.example.com/users  → user-service → User Pods
+api.example.com/orders → order-service → Order Pods
+```
+
+First define the Services:
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+spec:
+  selector:
+    app: users
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  selector:
+    app: orders
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+Then create the Ingress:
+
+```
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: microservices-ingress
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /users
+            pathType: Prefix
+            backend:
+              service:
+                name: user-service
+                port:
+                  number: 80
+          - path: /orders
+            pathType: Prefix
+            backend:
+              service:
+                name: order-service
+                port:
+                  number: 80
+```
+
+This assumes a compatible NGINX-based Ingress Controller is installed and owns the `nginx` IngressClass. The backends must also exist with matching labels and ports.
+
+Interview point: An Ingress defines routing rules. An Ingress Controller implements those rules.
+
+### 25. What is an Ingress in Kubernetes?
+
+Answer:
+
+Ingress is a Kubernetes API resource used to describe HTTP and HTTPS routing from outside a cluster to Services inside the cluster.
+
+It supports features such as:
+
+- Host-based routing.
+- Path-based routing.
+- TLS termination configuration.
+- Routing multiple applications through a shared entry point.
+
+Example:
+
+```
+shop.example.com/products → product-service
+shop.example.com/orders   → order-service
+```
+
+Interview point: Creating an Ingress resource alone does not expose traffic. You need a compatible Ingress Controller.
+
+### 26. What is an Ingress Controller?
+
+Answer:
+
+An Ingress Controller is a component that watches Kubernetes Ingress resources and configures the actual routing infrastructure.
+
+For example, an NGINX-based controller may configure NGINX proxies to forward HTTP requests to application backends.
+
+An AWS Load Balancer Controller can translate supported Ingress resources into AWS Application Load Balancer configuration.
+
+Difference:
+
+| Ingress                                | Ingress Controller                   |
+| -------------------------------------- | ------------------------------------ |
+| Kubernetes configuration resource      | Software that implements routing     |
+| Defines desired routing rules          | Configures proxies or load balancers |
+| Does not independently process traffic | Manages the actual traffic path      |
+
+### 27. How do you configure an Ingress Controller?
+
+Answer:
+
+The process depends on the controller.
+
+For AWS EKS using AWS Load Balancer Controller, the broad setup is:
+
+1. Configure the controller's required IAM permissions.
+2. Configure EKS Pod Identity or IRSA as supported.
+3. Install the AWS Load Balancer Controller using its supported Helm chart.
+4. Configure VPC subnet discovery or explicit subnet selection.
+5. Create an Ingress resource using the appropriate IngressClass.
+6. Configure AWS ALB listener, scheme, certificates, and target settings.
+7. Point DNS to the resulting load balancer.
+
+Example ALB Ingress:
+
+```
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  ingressClassName: alb
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-service
+                port:
+                  number: 80
+```
+
+Interview point: AWS ALB operates at Layer 7 and provides HTTP/HTTPS features. An AWS NLB is a Layer 4 load balancer and is commonly used with `LoadBalancer` Services.
+
+### 28. What is the difference between Ingress and Egress?
+
+| Ingress                                                 | Egress                                                                   |
+| ------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Traffic entering a workload or network boundary         | Traffic leaving a workload or network boundary                           |
+| Example: Browser accessing a web application            | Example: Application calling an external API                             |
+| Can be controlled by Ingress routing and security rules | Can be restricted through NetworkPolicies, firewalls, or egress gateways |
+| Often called north-south inbound traffic                | May be external or internal outbound traffic                             |
+
+Important: Kubernetes Ingress is also the name of a specific HTTP routing API. The term ingress in NetworkPolicies simply means incoming network traffic.
+
+### 29. What is the difference between Kubernetes Ingress and Gateway API?
+
+Answer:
+
+Gateway API is a newer, more expressive Kubernetes networking API designed to support routing and traffic management across different protocols.
+
+| Ingress                                            | Gateway API                                                 |
+| -------------------------------------------------- | ----------------------------------------------------------- |
+| Primarily HTTP/HTTPS routing                       | Supports HTTP, gRPC, and additional protocol routing APIs   |
+| Uses the `Ingress` resource                        | Uses resources such as GatewayClass, Gateway, and HTTPRoute |
+| Limited native routing model                       | More expressive and extensible routing model                |
+| Advanced features often use controller annotations | More features have portable API definitions                 |
+| Less granular role separation                      | Explicit infrastructure and routing ownership               |
+
+Gateway API commonly separates responsibilities:
+
+- GatewayClass: Defines the controller/implementation.
+- Gateway: Defines listeners and traffic entry points.
+- HTTPRoute: Defines HTTP routing behavior.
+
+Interview point: Gateway API is positioned as the next generation of Kubernetes traffic routing APIs, but a supported Gateway API implementation/controller is still required.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://gateway-api.sigs.k8s.io\&sz=32)
+
+Gateway API
+
+
+
+### 30. Explain the complete request flow from a user accessing a URL until the request reaches an application Pod.
+
+Answer:
+
+Consider a public application deployed on AWS EKS with an Application Load Balancer and AWS Load Balancer Controller using IP targets.
+
+External request flow — AWS EKS ALB
+
+User's Browser
+
+Requests https\://app.example.com
+
+Public DNS
+
+Resolves hostname to the ALB
+
+AWS Application Load Balancer
+
+Accepts HTTPS request and evaluates listener rules
+
+ALB Target Group
+
+Selects a healthy registered Pod IP target
+
+EKS Pod Networking
+
+Routes traffic to the target Pod IP
+
+Application Pod
+
+Application handles the HTTP request
+
+Example using ALB IP target mode. Other controllers and NodePort/instance-target implementations have different forwarding paths.
+
+Detailed explanation:
+
+1. A user enters `https://app.example.com`.
+2. DNS resolves the domain to the external load balancer.
+3. The ALB receives the HTTPS connection.
+4. Its listener evaluates the configured routing rules.
+5. The matching target group selects a healthy registered Pod IP.
+6. VPC networking delivers traffic to the Pod.
+7. The application container processes the request and returns a response.
+
+The AWS Load Balancer Controller reconciles Kubernetes Ingress and Service/Endpoint information into AWS ALB resources. It is not generally in the request datapath.
+
+Interview point: With ALB IP targets, traffic can go directly to Pod IPs. It does not necessarily pass through kube-proxy or a ClusterIP Service.
+
+### 31. How does traffic flow inside a Kubernetes cluster?
+
+Answer:
+
+There are two common cases.
+
+Pod-to-Pod communication
+
+```
+Pod A → CNI-configured network → Pod B
+```
+
+Pods can generally communicate using their IP addresses without requiring a Service, assuming routing and security policies allow it.
+
+Pod-to-Service communication
+
+```
+Pod A
+  ↓
+ClusterIP Service
+  ↓
+Service networking implementation
+  ↓
+Backend Pod B
+```
+
+The Service provides a stable virtual address while backend Pods may be created, removed, or replaced.
+
+Interview point: DNS resolves Service names; kube-proxy or an alternative datapath commonly implements ClusterIP forwarding.
+
+### 32. How do you expose a Kubernetes application to external users?
+
+Answer:
+
+Common approaches:
+
+| Approach                | Typical use                                    |
+| ----------------------- | ---------------------------------------------- |
+| NodePort                | Testing or external load-balancer integrations |
+| LoadBalancer Service    | TCP/UDP applications or direct load balancing  |
+| Ingress                 | HTTP/HTTPS applications                        |
+| Gateway API             | Advanced and structured traffic routing        |
+| API Gateway integration | Centralized external API management            |
+
+For an EKS web application, I would often use an ALB-backed Ingress or Gateway implementation.
+
+For a Layer 4 application, I might use an NLB-backed LoadBalancer Service.
+
+### 33. How do you expose an application internally without using LoadBalancer or NodePort?
+
+Answer:
+
+Use a ClusterIP Service.
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+Other Pods can access:
+
+```
+http://backend-service:80
+```
+
+Or across namespaces:
+
+```
+http://backend-service.production.svc.cluster.local
+```
+
+Interview point: ClusterIP is intended for internal cluster networking, although private connectivity from outside the cluster may also be possible depending on routing.
+
+### 34. How do two Pods communicate without using a Service?
+
+Answer:
+
+Two Pods can communicate directly using their Pod IP addresses.
+
+```
+Pod A (10.0.1.20)
+       ↓
+Pod B (10.0.2.30)
+```
+
+Example:
+
+```
+kubectl get pods -o wide
+```
+
+From a Pod that has curl installed:
+
+```
+curl http://10.0.2.30:8080
+```
+
+However, Pod IP addresses can change when Pods are recreated.
+
+Interview point: Direct Pod-to-Pod communication is possible, but Services provide stable discovery and routing.
+
+### 35. Can two Pods on the same worker node communicate?
+
+Answer:
+
+Yes. Two Pods on the same worker node can communicate using their Pod IPs.
+
+The CNI configures the required virtual interfaces, networking, and routing.
+
+NetworkPolicy rules may still restrict their communication.
+
+Interview point: Pods on the same node normally have different Pod IP addresses. They do not share `localhost` unless they are containers within the same Pod or special networking is configured.
+
+### 36. Can Pods running on different worker nodes communicate?
+
+Answer:
+
+Yes. Kubernetes networking is designed to enable Pod-to-Pod connectivity across nodes.
+
+The exact implementation depends on the CNI.
+
+For example:
+
+- AWS VPC CNI uses VPC-integrated Pod networking.
+- Calico can use routed or overlay networking.
+- Cilium supports various networking modes.
+
+Interview point: Cross-node Pod communication depends on correct routes, CNI configuration, security groups, firewalls, and network policies.
+
+### 37. How do Pods communicate across different namespaces?
+
+Answer:
+
+Pods can communicate across namespaces using Pod IPs or Services.
+
+The recommended approach is Service DNS.
+
+Example:
+
+A Pod in namespace `frontend` needs to access the `payment-service` in namespace `backend`.
+
+```
+payment-service.backend.svc.cluster.local
+```
+
+Application request:
+
+```
+curl http://payment-service.backend.svc.cluster.local:8080
+```
+
+Interview point: Kubernetes namespaces do not automatically block Pod-to-Pod communication. NetworkPolicies are needed for network-level isolation.
+
+### 38. How do you securely allow two Pods in different namespaces to communicate?
+
+Answer:
+
+Use namespace labels, Pod labels, and NetworkPolicies to restrict traffic to authorized workloads.
+
+For stronger security, combine these controls with authenticated TLS or mTLS.
+
+Example scenario:
+
+- `frontend` namespace contains client Pods labeled `app: frontend`.
+- `backend` namespace contains server Pods labeled `app: payment`.
+- Only frontend Pods should connect to payment Pods on TCP port 8080.
+
+Label namespaces:
+
+```
+kubectl label namespace frontend \
+  kubernetes.io/metadata.name=frontend --overwrite
+```
+
+The standard namespace-name label is normally managed by Kubernetes, so explicitly changing it is unnecessary. You can use that existing label in NetworkPolicy selectors.
+
+Example policy in the backend namespace:
+
+```
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      app: payment
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: frontend
+          podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+This allows matching frontend Pods into payment Pods on port 8080. For an allowlist-only result, ensure payment Pods have no other ingress policies granting unwanted access and that frontend egress policies also permit the flow.
+
+Interview point: NetworkPolicies filter network traffic. They do not authenticate the identity of the calling application.
+
+## Section 4: Kubernetes NetworkPolicies and Zero-Trust Security
+
+### 39. How do you restrict communication between Pods using NetworkPolicies?
+
+Answer:
+
+Use Kubernetes NetworkPolicy resources to control permitted ingress and egress traffic for selected Pods.
+
+A common approach is to deny all traffic by default and explicitly allow required communication.
+
+Example default-deny policy:
+
+```
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+This selects all Pods in the production namespace and isolates their ingress and egress traffic.
+
+Then create targeted allow rules for required application traffic, DNS, monitoring, and external dependencies.
+
+Important: Policies are additive. Multiple policies can allow traffic; a policy cannot override another policy's allowed traffic with an explicit deny rule.
+
+Interview point: NetworkPolicies only work when the cluster's networking solution supports and enforces them.
+
+### 40. How do you check whether NetworkPolicy enforcement is enabled?
+
+Answer:
+
+Kubernetes does not provide a single universal command proving that NetworkPolicies are enforced.
+
+Check the installed CNI:
+
+```
+kubectl get daemonsets -n kube-system
+```
+
+Check existing policies:
+
+```
+kubectl get networkpolicy -A
+```
+
+Inspect the cluster's network implementation.
+
+For EKS, check the AWS VPC CNI configuration and whether its network policy functionality is enabled. For Calico or Cilium, inspect their relevant components and configuration.
+
+Best verification method:
+
+1. Deploy two test Pods.
+2. Confirm traffic between them initially succeeds.
+3. Apply a deny policy selecting the destination.
+4. Repeat the connectivity test.
+5. Confirm the traffic is blocked.
+6. Apply an explicit allow rule.
+7. Confirm the authorized traffic succeeds again.
+
+Interview point: Creating a NetworkPolicy resource does not prove enforcement. Test the actual network behavior.
+
+### 41. What components do you configure in a NetworkPolicy YAML file?
+
+Answer:
+
+The main fields are:
+
+| Field                | Purpose                             |
+| -------------------- | ----------------------------------- |
+| `apiVersion`         | `networking.k8s.io/v1`              |
+| `kind`               | `NetworkPolicy`                     |
+| `metadata.name`      | Policy name                         |
+| `metadata.namespace` | Namespace containing selected Pods  |
+| `spec.podSelector`   | Selects Pods affected by the policy |
+| `spec.policyTypes`   | Ingress, Egress, or both            |
+| `spec.ingress`       | Allowed incoming traffic            |
+| `spec.egress`        | Allowed outgoing traffic            |
+| `namespaceSelector`  | Selects namespaces                  |
+| `ipBlock`            | Selects IP CIDR ranges              |
+| `ports`              | Restricts protocol and port         |
+
+Example allowing only matching application traffic:
+
+```
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+This example allows `frontend` Pods in the same namespace to reach `backend` Pods on port 8080.
+
+### 42. How do you implement zero-trust networking inside Kubernetes without a service mesh?
+
+Answer:
+
+Zero-trust networking means not automatically trusting traffic simply because it originates inside the cluster.
+
+I would implement it using several layers:
+
+1. Apply default-deny ingress and egress NetworkPolicies.
+2. Allow only the required service-to-service communication.
+3. Isolate workloads using namespaces and labels.
+4. Use dedicated ServiceAccounts with least-privilege RBAC.
+5. Encrypt sensitive application traffic using application-level TLS or mTLS.
+6. Use certificate automation for identity and rotation.
+7. Restrict access to external APIs and databases.
+8. Implement workload security controls and monitoring.
+9. Regularly test network reachability and authorization.
+
+Interview point: NetworkPolicies alone do not deliver complete zero trust. They generally provide Layer 3/4 filtering, while workload authentication, encryption, and application authorization require additional controls.
+
+### 43. How do you implement and manage NetworkPolicies for strict inter-service communication?
+
+Answer:
+
+For a production microservices environment, I would define a service communication matrix.
+
+Example:
+
+| Source            | Destination               | Port | Allow? |
+| ----------------- | ------------------------- | ---- | ------ |
+| Frontend          | API                       | 8080 | Yes    |
+| API               | Database                  | 5432 | Yes    |
+| Frontend          | Database                  | 5432 | No     |
+| API               | External payment provider | 443  | Yes    |
+| Unknown workloads | Database                  | 5432 | No     |
+
+Implementation process:
+
+- Create default-deny policies per namespace.
+- Add explicit ingress and egress allow policies.
+- Use narrowly scoped Pod and namespace selectors.
+- Allow DNS only where needed.
+- Manage policy YAML through GitOps.
+- Validate policies using automated connectivity tests.
+- Audit changes and monitor rejected connections.
+
+Interview point: Both the source's egress policy and destination's ingress policy must permit a connection when both directions are isolated.
+
+## Section 5: Service Mesh, Istio, and Production Security
+
+### 44. What is a service mesh?
+
+Answer:
+
+A service mesh is infrastructure that manages communication between services, especially in distributed microservices environments.
+
+Common capabilities include:
+
+- Mutual TLS (mTLS) encryption.
+- Service identity and authorization.
+- Traffic management.
+- Retries and timeouts.
+- Traffic observability.
+- Canary and progressive deployments.
+- Service-to-service access controls.
+
+Popular service mesh technologies include Istio, Linkerd, and Consul-based service mesh solutions.
+
+Interview point: A service mesh primarily manages service-to-service communication. It does not replace Kubernetes Services, storage, RBAC, or application security.
+
+### 45. How do you design an Istio service mesh for Kubernetes?
+
+Answer:
+
+For a production EKS cluster, I would design Istio based on workload requirements, operational complexity, and whether I need Layer 4 or Layer 7 functionality.
+
+Two common deployment models are:
+
+| Sidecar mode                               | Ambient mode                                    |
+| ------------------------------------------ | ----------------------------------------------- |
+| Envoy proxy runs alongside application Pod | Node-level ztunnel provides secure transport    |
+| Per-Pod proxy resource overhead            | No sidecar required for basic L4 mesh           |
+| Supports L7 features through sidecars      | Optional waypoint proxies provide L7 features   |
+| Requires sidecar lifecycle management      | Applications can join without sidecar injection |
+
+Conceptual Istio Architecture
+
+Istio Control Plane — istiod
+
+Service discovery, configuration, identity and certificates
+
+Sidecar data plane
+
+App + Envoy
+
+App + Envoy
+
+Per-Pod proxies
+
+Ambient data plane
+
+App Pods
+
+ztunnel + Waypoint\*
+
+Node L4 and optional L7 proxy
+
+\*Waypoint proxies are optional and can be shared by workloads; they are not necessarily deployed per node.
+
+Implementation approach:
+
+1. Define which namespaces and services require mesh capabilities.
+2. Install Istio using a supported installation method.
+3. Choose sidecar or ambient data plane mode.
+4. Enroll selected workloads.
+5. Configure ingress and egress gateways where required.
+6. Enable mTLS and workload identity-based authorization.
+7. Configure traffic routing, resilience, and telemetry.
+8. Integrate monitoring and tracing.
+9. Validate failures, upgrades, resource usage, and security policies.
+
+Ambient enrollment example, after installing ambient mode:
+
+```
+kubectl label namespace production \
+  istio.io/dataplane-mode=ambient
+```
+
+Interview point: Ambient mesh can supply L4 security without sidecars, with optional waypoint proxies for L7 functionality.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://istio.io\&sz=32)
+
+Istio
+
++1
+
+
+
+### 46. What security policies would you implement in a service mesh?
+
+Answer:
+
+I would implement several security layers.
+
+1\. Mutual TLS
+
+Require encrypted, authenticated service-to-service connections.
+
+Example Istio policy:
+
+```
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT
+```
+
+2\. Workload authorization
+
+Restrict which services are allowed to communicate using verified workload identities.
+
+3\. Request authentication
+
+Validate JWTs where appropriate for application-facing APIs.
+
+4\. Egress controls
+
+Restrict and observe calls to external services.
+
+5\. Ingress security
+
+Configure HTTPS, gateway authorization, certificate management, and appropriate rate limiting.
+
+6\. Audit and observability
+
+Collect metrics, logs, and traces for authorized and denied traffic.
+
+Interview point: Istio authorization should use verified workload identities and narrowly scoped policies. In ambient mode, L7 authorization generally requires waypoint proxies.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://istio.io\&sz=32)
+
+Istio
+
++1
+
+
+
+### 47. Is a service mesh always necessary, or can alternative tools provide similar capabilities?
+
+Answer:
+
+No. A service mesh is not always necessary.
+
+For smaller or simpler applications, adding a service mesh may introduce unnecessary resource overhead and operational complexity.
+
+| Requirement                | Possible alternative                        |
+| -------------------------- | ------------------------------------------- |
+| Restrict Pod communication | NetworkPolicies                             |
+| TLS between applications   | Application TLS with certificate automation |
+| HTTP ingress routing       | Ingress or Gateway API                      |
+| Traffic routing            | Gateway controller or application proxy     |
+| Observability              | OpenTelemetry and Prometheus                |
+| Retries and timeouts       | Application libraries or gateway            |
+| Rate limiting              | API gateway, reverse proxy, or application  |
+| External access control    | Firewall, security groups, or egress proxy  |
+
+Interview point: Choose a service mesh when centralized service identity, mTLS, policy enforcement, and advanced traffic management provide enough value to justify the operational cost.
+
+### 48. What is the difference between service mesh control planes and data planes?
+
+Answer:
+
+| Control Plane                                        | Data Plane                               |
+| ---------------------------------------------------- | ---------------------------------------- |
+| Distributes configuration                            | Processes application traffic            |
+| Handles service and workload discovery               | Routes or forwards traffic               |
+| Manages identity/certificate-related configuration   | Enforces mTLS and traffic policy         |
+| Does not normally handle application request traffic | Lies in the application traffic path     |
+| Istio example: `istiod`                              | Istio example: Envoy, ztunnel, waypoints |
+
+Interview point: If the control plane becomes temporarily unavailable, existing proxies may continue handling traffic using their current configuration, but configuration changes, certificate operations, and new workloads may be affected.
+
+### 49. What are alternative Ingress Controllers available for Kubernetes?
+
+Answer:
+
+Common Kubernetes ingress implementations include:
+
+| Controller                            | Typical use                       |
+| ------------------------------------- | --------------------------------- |
+| AWS Load Balancer Controller          | AWS ALB ingress for EKS           |
+| F5 NGINX Ingress Controller           | NGINX-based ingress and routing   |
+| Traefik                               | Dynamic reverse proxy and ingress |
+| HAProxy Kubernetes Ingress Controller | HAProxy-based ingress             |
+| Contour                               | Envoy-based Kubernetes ingress    |
+| Kong Ingress Controller               | API gateway and ingress           |
+| Istio ingress gateway                 | Istio-based north-south traffic   |
+
+The historical community ingress-nginx project should be distinguished from the separately maintained F5 NGINX Ingress Controller. Check current support and maintenance status before selecting a controller for a new production deployment.
+
+Interview point: Select an ingress implementation based on cloud integration, routing capabilities, operational support, security features, and Gateway API compatibility.
+
+### 50. How do you restrict public access to Kubernetes LoadBalancers?
+
+Answer:
+
+In AWS EKS, the strongest common approach is to provision an internal load balancer when public access is not required.
+
+Other measures include restricting inbound source CIDRs, security group rules, private DNS, and authentication.
+
+Option 1: Internal AWS ALB
+
+```
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: internal-api
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+spec:
+  ingressClassName: alb
+  rules:
+    - host: api.internal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80
+```
+
+Option 2: Internal LoadBalancer Service
+
+Using a supported AWS NLB controller configuration:
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: internal-service
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+spec:
+  type: LoadBalancer
+  selector:
+    app: internal-api
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+The annotation is AWS-controller-specific, so its interpretation depends on the configured load-balancer integration.
+
+Option 3: Restrict allowed source CIDRs
+
+For an appropriately supported LoadBalancer Service:
+
+```
+spec:
+  type: LoadBalancer
+  loadBalancerSourceRanges:
+    - 203.0.113.0/24
+```
+
+Replace the example CIDR with the authorized client network. Verify the cloud controller enforces the setting.
+
+Additional production controls include:
+
+- Restricting security groups.
+- Using private subnets and private network connectivity.
+- Authenticating users through an application or identity-aware gateway.
+- Using TLS.
+- Applying AWS WAF where compatible.
+- Auditing load-balancer listeners and target security.
+
+Interview point: An internal AWS load balancer is not publicly internet-facing, but it can still be reachable from permitted connected private networks. Security groups and application authentication remain important.
+
+## Final Interview Revision: 10 Critical Concepts
+
+| Topic                         | Key answer to remember                                                    |
+| ----------------------------- | ------------------------------------------------------------------------- |
+| StatefulSet vs Deployment     | Stable identities and individual PVCs vs interchangeable replicas         |
+| EBS vs EFS                    | AZ-bound block storage vs shared network filesystem                       |
+| PVC and multiple Pods         | Sharing depends on access mode, node placement, and storage driver        |
+| `kubectl apply`               | Sends desired configuration through API server; controllers reconcile     |
+| Ingress vs Controller         | Defines routing vs implements routing                                     |
+| ALB IP target mode            | Load balancer can send traffic directly to Pod IPs                        |
+| Cross-namespace communication | Possible by default unless network controls restrict it                   |
+| NetworkPolicy                 | Enforces traffic restrictions through a compatible network implementation |
+| Zero trust                    | Requires least privilege, network isolation, identity, and encryption     |
+| Istio                         | Manages service identity, security, traffic, and observability            |
+
+Important current update: The community `ingress-nginx` project was officially retired on March 24, 2026. It no longer receives security fixes. For new production deployments, consider a maintained Ingress Controller or Gateway API implementation. This retirement does not apply to all NGINX-based ingress products.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://kubernetes.io\&sz=32)
+
+Kubernetes
+
++1
+
+
+
+## Production Troubleshooting Commands
+
+```
+# Check cluster and current context
+kubectl config current-context
+kubectl get nodes -o wide
+
+# Check Pod scheduling
+kubectl get pods -A -o wide
+kubectl describe pod <pod-name>
+
+# Check deployment rollout
+kubectl rollout status deployment/<name>
+kubectl rollout history deployment/<name>
+
+# Inspect Services and EndpointSlices
+kubectl get svc -A
+kubectl get endpointslices -A
+
+# Check Ingress and Gateway resources
+kubectl get ingress -A
+kubectl get gateway -A
+kubectl get httproute -A
+
+# Check persistent storage
+kubectl get pv
+kubectl get pvc -A
+kubectl get storageclass
+
+# Check policies
+kubectl get networkpolicy -A
+
+# Check Kubernetes events
+kubectl get events -A --sort-by=.lastTimestamp
+
+# Test Service access from an application Pod
+kubectl exec <pod-name> -- \
+  curl -v http://backend-service:8080
+
+# Check configured CSI drivers
+kubectl get csidrivers
+```
+
+## Interview Practice: Scenario-Based Questions
+
+Advanced Kubernetes Quiz
+
+1 / 5
+
+You scale an EBS-backed Deployment to three Pods on different nodes. Two fail with Multi-Attach errors. What is the likely issue?
+
+CoreDNS is unavailable
+
+The Pods share a standard EBS RWO volume across nodes
+
+The Deployment selector is missing
+
+The API server cannot schedule Deployments
+
+PreviousNext&#x20;
+
+For an experienced DevOps or EKS interview, prioritize being able to explain questions 1–5, 17, 23–24, 29–30, 38–43, and 45–50 with practical examples. These test how you reason about real production environments rather than simply recall definitions.
